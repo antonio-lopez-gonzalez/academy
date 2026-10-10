@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="es" data-module="18" data-lesson="04-rate-limiting-profundo">
+<head>
+  <meta charset="UTF-8">
+  <title>Rate Limiting en profundidad — Módulo 18 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Rate Limiting en profundidad</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 18 · Seguridad en APIs (OWASP)</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección profundizamos en <strong>rate limiting</strong>, una de las mitigaciones más efectivas contra A04 (Unrestricted Resource Consumption) y A06 (Unrestricted Access to Sensitive Business Flows). Veremos los algoritmos disponibles en ASP.NET Core, cómo aplicarlos por cliente y cómo escalarlos con Redis.</p>
+        <p><strong>¿Qué problema resuelve?</strong> Limita la cantidad de peticiones que un cliente puede hacer en un periodo de tiempo, protegiendo contra abuso, scraping, ataques de denegación de servicio y automatización de flujos de negocio.</p>
+        <p><strong>¿Cuándo se utiliza?</strong> En cualquier API pública, especialmente en endpoints de autenticación, creación de recursos, operaciones costosas y flujos sensibles como pagos o reservas.</p>
+        <div class="callout callout--warning">
+          <strong>Errores típicos:</strong> aplicar un único límite global, no distinguir entre usuarios autenticados y anónimos, no devolver <code>Retry-After</code> cuando se excede el límite, o ignorar que el rate limiting en memoria no funciona bien con múltiples instancias.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <p>ASP.NET Core 8 incluye rate limiting nativo en el namespace <code>System.Threading.RateLimiting</code>. Soporta varios algoritmos, cada uno con características diferentes:</p>
+        <ul>
+          <li><strong>Fixed Window:</strong> divide el tiempo en ventanas fijas. Simple pero permite picos al inicio de cada ventana. Es fácil de implementar y entender.</li>
+          <li><strong>Sliding Window:</strong> similar al fijo, pero distribuye el permiso a lo largo de la ventana, suavizando los picos. Es el más equilibrado para APIs generales.</li>
+          <li><strong>Token Bucket:</strong> permite ráfagas controladas hasta un tamaño de bucket, útil para APIs con picos ocasionales pero límites medios a largo plazo.</li>
+          <li><strong>Concurrency:</strong> limita el número de peticiones simultáneas, no por unidad de tiempo. Útil para proteger recursos limitados como conexiones de base de datos.</li>
+        </ul>
+        <pre><code class="language-text">
+Comparación de algoritmos
+─────────────────────────
+Fixed Window    →  fácil, picos al cambio de ventana
+Sliding Window  →  más justo, evita picos de ventana
+Token Bucket    →  permite ráfagas, bueno para APIs interactivas
+Concurrency     →  limita peticiones paralelas, no frecuencia
+        </code></pre>
+        <p>Por defecto, el rate limiter de ASP.NET Core almacena los contadores en memoria. Para aplicaciones escaladas horizontalmente, necesitamos un almacén distribuido como Redis. Aunque ASP.NET Core no incluye un rate limiter distribuido por defecto, existen paquetes como <code>AspNetCoreRateLimit</code> o implementaciones personalizadas sobre <code>IDistributedCache</code>.</p>
+        <h3>Claves de rate limiting</h3>
+        <p>El rate limiter necesita una clave para agrupar peticiones. Las claves comunes son:</p>
+        <ul>
+          <li>IP del cliente (anónimos).</li>
+          <li>Identificador de usuario autenticado (<code>ClaimTypes.NameIdentifier</code>).</li>
+          <li>Combinación de IP + endpoint.</li>
+          <li>API key.</li>
+        </ul>
+        <p>Para proxies o balanceadores, la IP real suele venir en <code>X-Forwarded-For</code>. ASP.NET Core puede configurarse para leer correctamente estas cabeceras con <code>ForwardedHeadersOptions</code>.</p>
+        <h3>Retry-After</h3>
+        <p>La respuesta <code>429 Too Many Requests</code> debe incluir el header <code>Retry-After</code> para indicar al cliente cuándo puede reintentar. Esto mejora la experiencia de usuario y permite a clientes respetuosos backoff correctamente.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Configuramos un rate limiter global con ventana deslizante y lo aplicamos a toda la aplicación.</p>
+        <pre><code class="language-csharp">var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddSlidingWindowLimiter("general", slidingOptions =>
+    {
+        slidingOptions.PermitLimit = 100;         // 100 peticiones
+        slidingOptions.Window = TimeSpan.FromMinutes(1); // por minuto
+        slidingOptions.SegmentsPerWindow = 4;     // 4 segmentos de 15s
+        slidingOptions.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        slidingOptions.QueueLimit = 2;            // 2 peticiones en cola
+    });
+
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+});
+
+var app = builder.Build();
+app.UseRateLimiter();
+app.MapControllers();
+app.Run();</code></pre>
+        <p>Con esta configuración, un cliente puede hacer hasta 100 peticiones por minuto, distribuidas de forma más uniforme gracias a la ventana deslizante. Las peticiones excedentes pueden esperar en cola si hay espacio.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una API profesional queremos políticas diferenciadas: una para usuarios anónimos, otra para autenticados y otra más estricta para endpoints sensibles como login o creación de posts.</p>
+        <pre><code class="language-csharp">builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("authenticated", context =>
+    {
+        // Usamos el claim de usuario como clave de rate limiting
+        var userId = context.User.FindFirstValue(ClaimTypes.NameIdentifier)
+                     ?? context.Connection.RemoteIpAddress?.ToString()
+                     ?? "anonymous";
+
+        return RateLimitPartition.GetSlidingWindowLimiter(
+            userId,
+            _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 200,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 4
+            });
+    });
+
+    options.AddFixedWindowLimiter("strict", fixedOptions =>
+    {
+        fixedOptions.PermitLimit = 5;
+        fixedOptions.Window = TimeSpan.FromMinutes(1);
+    });
+
+    options.AddTokenBucketLimiter("burst", tokenOptions =>
+    {
+        tokenOptions.TokenLimit = 20;
+        tokenOptions.ReplenishmentPeriod = TimeSpan.FromSeconds(10);
+        tokenOptions.TokensPerPeriod = 5;
+        tokenOptions.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        tokenOptions.QueueLimit = 0;
+    });
+
+    options.OnRejected = async (context, token) =>
+    {
+        context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        context.HttpContext.Response.ContentType = "application/json";
+
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int)retryAfter.TotalSeconds).ToString(NumberFormatInfo.InvariantInfo);
+        }
+
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new { message = "Demasiadas peticiones. Inténtalo más tarde." },
+            token);
+    };
+});</code></pre>
+        <p>Aplicamos las políticas a los endpoints:</p>
+        <pre><code class="language-csharp">// Todos los endpoints usan la política "general" por defecto
+app.UseRateLimiter();
+
+app.MapPost("/api/auth/login", (LoginRequest request) => Results.Ok())
+   .RequireRateLimiting("strict")
+   .AllowAnonymous();
+
+app.MapPost("/api/v1/posts", async (CreatePostRequest request, IMediator mediator) =>
+{
+    var postId = await mediator.Send(request);
+    return Results.Created($"/api/v1/posts/{postId}", postId);
+})
+.RequireRateLimiting("authenticated")
+.RequireAuthorization();
+
+app.MapPost("/api/v1/media/upload", async (IFormFile file) =>
+{
+    // Procesar archivo...
+    return Results.Ok();
+})
+.RequireRateLimiting("burst")
+.RequireAuthorization();</code></pre>
+        <p>La política <code>strict</code> protege contra fuerza bruta en login. La política <code>authenticated</code> limita por usuario. La política <code>burst</code> permite ráfagas cortas pero controladas, útil para subida de archivos.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Diferencia usuarios autenticados de anónimos:</strong> los anónimos tienen límites más bajos porque no puedes identificarlos de forma fiable.</li>
+          <li><strong>Usa la IP como fallback:</strong> si no hay usuario autenticado, la dirección IP es la mejor clave disponible (ten cuidado con proxies).</li>
+          <li><strong>Devuelve <code>Retry-After</code>:</strong> los clientes respetuosos sabrán cuándo reintentar.</li>
+          <li><strong>Combina rate limiting con paginación:</strong> nunca permitas listados ilimitados.</li>
+          <li><strong>Escalabilidad:</strong> en producción con múltiples instancias, usa Redis u otro almacén distribuido.</li>
+          <li><strong>No dependas solo del rate limiting:</strong> es una capa más, no la única defensa contra abuso.</li>
+          <li><strong>Monitorea los rechazos:</strong> alerta si hay picos de 429, puede indicar un ataque o un cliente mal configurado.</li>
+          <li><strong>Prueba los límites:</strong> incluye tests que verifiquen que se devuelve 429 tras superar el límite.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <strong>Consejo:</strong> para endpoints críticos (login, registro, recuperación de contraseña), usa límites muy bajos (5 intentos/minuto) para mitigar ataques de fuerza bruta. Considera también bloquear temporalmente la cuenta tras varios intentos fallidos.
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <table>
+          <thead>
+            <tr><th>Incorrecto</th><th>Por qué está mal</th><th>Correcto</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Un solo límite global para toda la API</td>
+              <td>Endpoint barato y endpoint costoso tienen el mismo límite</td>
+              <td>Políticas por endpoint o grupo funcional</td>
+            </tr>
+            <tr>
+              <td>Clave de rate limiting solo por IP en APIs autenticadas</td>
+              <td>Un usuario malintencionado puede cambiar de IP o usar un pool</td>
+              <td>Usar <code>NameIdentifier</code> como clave primaria</td>
+            </tr>
+            <tr>
+              <td>No devolver <code>Retry-After</code></td>
+              <td>El cliente no sabe cuándo reintentar</td>
+              <td>Incluir el header en la respuesta 429</td>
+            </tr>
+            <tr>
+              <td>Usar solo rate limiting en memoria en producción escalada</td>
+              <td>Cada instancia tiene su propio contador</td>
+              <td>Implementar rate limiting distribuido con Redis</td>
+            </tr>
+            <tr>
+              <td>Ignorar proxies al leer la IP</td>
+              <td>El rate limiter agrupa por IP del proxy, no del cliente</td>
+              <td>Configurar <code>ForwardedHeadersOptions</code></td>
+            </tr>
+            <tr>
+              <td>Rate limiting muy laxo en endpoints de autenticación</td>
+              <td>Permite ataques de fuerza bruta</td>
+              <td>Límites estrictos y bloqueo de cuenta tras fallos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Vamos a implementar rate limiting por usuario para el endpoint de creación de posts del CMS.</p>
+        <ol>
+          <li>Registra <code>AddRateLimiter</code> en <code>Program.cs</code>.</li>
+          <li>Crea una política "create-post" con <code>TokenBucketRateLimiter</code>: 10 tokens, recarga de 2 tokens cada 10 segundos.</li>
+          <li>Usa el <code>NameIdentifier</code> del usuario como clave.</li>
+          <li>Aplica la política al endpoint <code>POST /api/v1/posts</code>.</li>
+          <li>Verifica que al superar el límite recibes <code>429</code> con <code>Retry-After</code>.</li>
+          <li>Registra los rechazos en el log para auditoría.</li>
+        </ol>
+        <pre><code class="language-csharp">options.AddPolicy("create-post", context =>
+{
+    var userId = context.User.FindFirstValue(ClaimTypes.NameIdentifier)
+                 ?? "anonymous";
+
+    return RateLimitPartition.GetTokenBucketLimiter(
+        userId,
+        _ => new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = 10,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0,
+            ReplenishmentPeriod = TimeSpan.FromSeconds(10),
+            TokensPerPeriod = 2,
+            AutoReplenishment = true
+        });
+});</code></pre>
+        <p>Registro del endpoint:</p>
+        <pre><code class="language-csharp">app.MapPost("/api/v1/posts", async (CreatePostRequest request, IMediator mediator) =>
+{
+    var postId = await mediator.Send(request);
+    return Results.Created($"/api/v1/posts/{postId}", postId);
+})
+.RequireRateLimiting("create-post")
+.RequireAuthorization();</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un <strong>rate limiter distribuido con Redis</strong> para el CMS. El desafío es:</p>
+        <ul>
+          <li>Implementar <code>IRateLimiterPolicy&lt;T&gt;</code> o un middleware personalizado.</li>
+          <li>Almacenar los contadores en Redis con expiración (<code>IDistributedCache</code>).</li>
+          <li>Hacer que funcione correctamente cuando la API se ejecuta en múltiples contenedores.</li>
+          <li>Considerar la atomicidad de las operaciones de Redis para evitar condiciones de carrera.</li>
+        </ul>
+        <p>No resuelvas el reto todavía. Piensa en las operaciones atómicas de Redis y la serialización de los contadores. Investiga <code>AspNetCoreRateLimit</code> como alternativa probada.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El rate limiting protege contra abuso y consumo descontrolado de recursos.</li>
+          <li>ASP.NET Core 8 soporta Fixed Window, Sliding Window, Token Bucket y Concurrency.</li>
+          <li>Debes diferenciar usuarios autenticados y anónimos, y usar claves estables.</li>
+          <li>Devuelve siempre <code>Retry-After</code> en respuestas 429.</li>
+          <li>En producción escalada, usa un almacén distribuido como Redis.</li>
+          <li>Los endpoints de autenticación deben tener los límites más estrictos.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Qué algoritmo elijo?</summary>
+          <p>Sliding Window para la mayoría de endpoints. Token Bucket si esperas ráfagas legítimas. Concurrency para limitar peticiones paralelas. Fixed Window solo si necesitas simplicidad y puedes aceptar picos de ventana.</p>
+        </details>
+        <details>
+          <summary>¿El rate limiter de ASP.NET Core es distribuido?</summary>
+          <p>No por defecto; trabaja en memoria. Para escalar horizontalmente necesitas Redis o una implementación personalizada.</p>
+        </details>
+        <details>
+          <summary>¿Cómo identifico a un usuario anónimo?</summary>
+          <p>Usa la dirección IP como clave, pero ten en cuenta que puede estar detrás de proxies. Revisa <code>X-Forwarded-For</code> si aplica.</p>
+        </details>
+        <details>
+          <summary>¿El rate limiting reemplaza la autenticación?</summary>
+          <p>No. Es una capa adicional. Un endpoint sensible debe estar protegido por autenticación, autorización y rate limiting.</p>
+        </details>
+        <details>
+          <summary>¿Cómo pruebo el rate limiting?</summary>
+          <p>Lanza múltiples peticiones consecutivas desde un script o herramienta como <code> bombardier</code> o <code>wrk</code>, y verifica que tras superar el límite recibes <code>429</code>.</p>
+        </details>
+        <details>
+          <summary>¿Qué pasa si coloco el rate limiter después de autenticación?</summary>
+          <p>El rate limiter suele ir antes de autenticación para proteger endpoints de login. Sin embargo, para políticas basadas en usuario, debe ir después de <code>UseAuthentication</code>.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="04-fallover-y-recuperacion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Desconexiones, heartbeats y fallover — Módulo 7 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Desconexiones, heartbeats y fallover</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · El Hub de Conexiones WebSocket con Redis</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El hub vive de estados frágiles: sockets que se caen, nodos que mueren, Redis que parpadea. Aquí cierras el círculo con las tres «redes de seguridad»: <strong>heartbeat</strong> (quién sigue vivo), <strong>expiración</strong> (limpieza automática) y <strong>fallover/re-registro</strong> (recuperación).</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Heartbeat del socket (cliente ↔ servidor ↔ Redis)</h3>
+        <pre><code class="language-text">Cliente ──ping──────────────► Nodo ──KeyExpire/ScoreRefresh──► Redis
+         ◄────────────pong───   (lease 30s)                     (presencia+)
+muerto: no responde pong ──► unregister                        (expira sola)</code></pre>
+        <ul>
+          <li>El servidor refresca el lease y el score en cada mensaje/heartbeat del cliente.</li>
+          <li>Si no llega nada y el renewal no mantiene, la expiración «borra» la presencia.</li>
+        </ul>
+
+        <h3>Re-registro del nodo al arrancar / reconectar</h3>
+        <pre><code class="language-csharp">// Al arrancar un nodo (o al restaurarse Redis):
+mux.ConnectionRestored += async (_, _) =&gt;
+{
+    _logger.LogInformation("Redis restablecido: repito registro y suscripciones");
+    await _registry.RegisterNodeAsync(_nodeId);     // SADD hub:nodes
+    await _sub.SubscribeAsync("hub:events", OnEvent);   // re-subscribir
+    await _sub.SubscribeAsync("hub:direct", OnDirect);
+};
+</code></pre>
+
+        <h3>Fallover de un nodo</h3>
+        <ol>
+          <li>El cliente pierde la conexión → lo detecta (Frames) y reintenta a otro nodo (load balancer).</li>
+          <li>Su presencia expira por los TTL (lease) si nadie la refresca.</li>
+          <li>El nuevo nodo <code>RegisterAsync</code> de nuevo (el DB ya no tiene «dónde estaba»).</li>
+          <li>Un «barrido» ocasional limpia hashes huérfanos (<code>SCAN MATCH hub:conn:*</code>) si hiciera falta.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># simulación: nodo muere
+# 1) no refresca:
+#    (el cliente se fue → EXPIRE del registro expira a los 30 s)
+# 2) nuevo nodo registra:
+HSET hub:conn:200 node node-2 userId 7 EXPIRE hub:conn:200 30
+ZADD hub:presence 1750000000 user:7</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El «recovery» completo del proyecto final:</p>
+        <pre><code class="language-csharp">public sealed class HubRecovery
+{
+    public static void Wire(IConnectionMultiplexer mux, ConnectionRegistry reg,
+        ConnectionHub hub, ILogger logger, string nodeId)
+    {
+        mux.ConnectionFailed += (_, e) =&gt;
+            logger.LogWarning("Redis caído: {Msg}", e.Exception?.Message);
+
+        mux.ConnectionRestored += async (_, _) =&gt;
+        {
+            logger.LogInformation("Redis restaurado: re-registro y re-suscripción");
+            await reg.RegisterNodeAsync(nodeId);
+            await hub.ReSubscribeAsync();         // re-inscribir canales
+        };
+    }
+}
+
+// Heartbeat: en el loop del socket, refresca lease + score
+//   (ConnectionRegistry.HeartbeatAsync que viste en M7-02)</code></pre>
+        <p>Y una limpieza periódica opcional (job de mantenimiento):</p>
+        <pre><code class="language-csharp">// Cada X minutos: SCAN MATCH hub:conn:* y borrar las que ya no tienen TTL sano
+// (o confiar en la expiración; el barrido es contingencia de bugs)
+</code></pre>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Cliente con reconexión (backoff) y re-subscribe</td><td>Que el cliente «muera» por socket caído</td><td>La resurrección es normal en un hub escalado</td></tr>
+            <tr><td>Refresh con lease &gt; interval</td><td>TTL injusto que mata a clientes sanos</td><td>Jitter de red — lease ≫ heartbeat</td></tr>
+            <tr><td>Registro/Re-subscribe en ConnectionRestored</td><td>Asumir que el nodo queda «limpio» solo</td><td>Después de una caída de Redis hay que reconciliar</td></tr>
+            <tr><td>Barrido periódico de huérfanos (SCAN, no KEYS)</td><td>Dejar basura de conexiones muertas</td><td>Contingencia ante crashes: la expiración cubre, pero conviene auditar</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Heartbeat que refresca la presencia pero no el registro</h3>
+        <pre><code class="language-csharp">// ❌ Solo KeyExpire del hash, olvidando el zset (o al revés)
+// ✅ HeartbeatAsync refresca AMBOS (visto en M7-02)</code></pre>
+
+        <h3>Evitar la reconexión del cliente creyendo que «solo» la posee el servidor</h3>
+        <p>El fallover del hub depende de que el cliente reintente: sin reconnect del lado cliente, la caída de un nodo tumba al usuario. Es contrato de diseño.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Añade el heartbeat al loop de tu socket (refresh de lease + presencia).</li>
+          <li><strong>Paso 2:</strong> Implementa re-subscribe + re-registro en ConnectionRestored.</li>
+          <li><strong>Paso 3:</strong> Simula la caída de un nodo: detén el proceso, espera la expiración y verifica que «presencia» y «registro» quedan limpios sin intervención.</li>
+          <li><strong>Paso 4:</strong> Escribe en README tu plan de «nodo muerto → cliente reconecta → nuevo nodo registra».</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El escenario difícil</h3>
+          <p>Diseña qué pasa si Redis cae 2 minutos EN MEDIO de un flujo de broadcast dirigido: ¿mensajes perdidos? ¿cómo lo notas? Propón 2 mitigaciones (p. ej. cola de pendientes local, o aviso al cliente de «retardo») y decide cuál es aceptable para tu producto.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Heartbeat + lease: la presencia se limpia sola (~30 s).</li>
+          <li>ConnectionRestored: re-registro + re-suscripción.</li>
+          <li>Cliente reconectar = parte del diseño; barrido SCAN como contingencia.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuánto tiempo de «hueco» ve el resto si un nodo muere?</summary>
+            <div><p>Lo que marque el TTL (lease) del registro/presencia tras el último heartbeat: ~30 s. Los clientes reconocen el corte y en ese tiempo el nuevo registro está limpio.</p></div>
+          </details>
+          <details>
+            <summary>¿La limpieza SCAN es obligatoria?</summary>
+            <div><p>No en el flujo feliz (la expiración ya limpia), pero sí es una red de seguridad ante bugs (un nodo sin unregister + sin TTL). Hazla con cuidado (pocas keys, sin bloquear).</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

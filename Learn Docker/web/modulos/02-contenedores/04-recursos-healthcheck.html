@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-recursos-healthcheck">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Límites de recursos y HEALTHCHECK — Módulo 2 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Límites de recursos y HEALTHCHECK</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Contenedores en ejecución</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Contenedores y máquinas virtuales aíslan de forma distinta (lo viste en el módulo 0): los contenedores <strong>comparten el kernel del host</strong>. Eso los hace ligeros, pero también significa que, sin control, un solo proceso puede engullir toda la RAM o todos los núcleos de la máquina — el clásico «vecino ruidoso». Docker resuelve esto con <strong>cgroups</strong>: el mecanismo del kernel que permite asignar cuota de CPU, memoria y procesos a un grupo, y que el propio kernel la haga cumplir. Un contenedor sin límites es una promesa de apagón.</p>
+        <p>Y una vez que el proceso está acotado, queda la pregunta más importante: <strong>¿está vivo… o está sano?</strong> Un proceso «Up» puede estar bloqueado en un deadlock o devolviendo 500 en todas las peticiones. El <code>HEALTHCHECK</code> de Docker responde a eso: una sonda periódica que el daemon ejecuta para decidir si el contenedor está <em>healthy</em> o <em>unhealthy</em>. En esta lección dominarás <code>--memory</code>, <code>--cpus</code>, <code>--pids-limit</code>, <code>docker stats</code>, <code>docker update</code> y el <code>HEALTHCHECK</code> del Dockerfile, y verás cómo este concepto madura hasta convertirse en las <em>probes</em> de Kubernetes.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección cierra el módulo?</strong> Porque recoge todo lo operativo de las tres anteriores (ejecución, red, ciclo de vida) y lo eleva de «funciona en mi máquina» a «se comporta bien en una máquina compartida y se vigila solo». Son las dos habilidades que separan a un usuario de Docker de un operador de contenedores.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>cgroups: el contrato de recursos del kernel</h3>
+        <p>Un <strong>control group (cgroup)</strong> es un mecanismo del kernel Linux para agrupar procesos y darles una porción (o un máximo) de un recurso. Cuando Docker crea un contenedor, mete sus procesos en su propio cgroup y en él escribe los límites que te pidan: memoria máxima, CPU máxima, número máximo de procesos (pids). El kernel — no tu aplicación — es quien hace cumplir esos límites. Esto responde al «porqué» del diseño: tu app no tiene que colaborar; el sistema la contiene igualmente.</p>
+        <pre class="diagram">  CONTENEDOR = procesos dentro de su propio cgroup
+  ┌──────────────────────────────────────────────────────┐
+  │  cgroup "docker/&lt;id-contenedor&gt;"                     │
+  │  ┌────────────┐ ┌──────────────┐ ┌───────────────┐   │
+  │  │ PID 1 node │ │ PID 17 fork  │ │ PID 42 net…  │   │
+  │  └────────────┘ └──────────────┘ └───────────────┘   │
+  │                                                      │
+  │  límites escritos por Docker y aplicados por el      │
+  │  KERNEL (cgroup v2 en todas las distros modernas):   │
+  │    memory.max  = 256 MiB   → OOM-kill si se supera   │
+  │    cpu.max     = 0.5 núcleo → periodos de uso        │
+  │    pids.max    = 256        → no más de 256 procesos │
+  └──────────────────────────────────────────────────────┘
+             ▲
+  El kernel aplica el límite aunque tu app lo ignore.</pre>
+        <p><strong>--memory</strong> (p. ej. <code>512m</code>) fija el máximo de RAM: si el proceso conjunto la supera, el kernel invoca el <em>OOM killer</em> y mata el proceso del contenedor (que verás como <code>ExitCode 137</code> y el flag <code>State.OOMKilled=true</code>). Ojo con <code>--memory-swap</code>: por defecto, al limitar memoria sin swap explícito, Docker pone swap del mismo tamaño. Para usar swap de verdad (devil, no recomendado en prod) <code>--memory-swap &gt; --memory</code>. <strong>--cpus</strong> (p. ej. <code>0.5</code>) limita el uso de CPU: Docker mapea el valor a una cuota de periodos (<code>--cpus 0.5</code> ≈ 50 µs de cada 100 µs por periodo). <strong>--pids-limit</strong> limita cuántos procesos puede crear el contenedor; imprescindible contra <em>fork bombs</em> (apps que se multiplican sin control).</p>
+
+        <h3>docker stats y docker update: observar y ajustar en vivo</h3>
+        <p><code>docker stats</code> muestra el consumo <em>en tiempo real</em> (CPU, memoria, net I/O, block I/O, pids) — el «top» de los contenedores. <code>docker stats --no-stream</code> da una foto única (ideal para piping en scripts). Y lo mejor de los límites: <strong>se pueden cambiar con el contenedor en marcha</strong> mediante <code>docker update</code>, sin reiniciarlo. Esto permite, por ejemplo, subir la memoria de una API saturada sin downtime. (Los healthchecks, en cambio, no se pueden añadir en caliente a un contenedor que no los traiga de su imagen.)</p>
+
+        <h3>HEALTHCHECK: ¿el proceso respira… o está sano?</h3>
+        <p><code>docker ps</code> te dice el estado del motor (<code>Up</code>), no el de tu aplicación. El <code>HEALTHCHECK</code> del Dockerfile define un comando que el daemon ejecuta periódicamente <em>dentro</em> del contenedor; su <strong>código de salida</strong> decide el veredicto: 0 = healthy, ≠0 = unhealthy (tras <code>--retries</code> fallos seguidos). Docker lo registra y expone <code>docker inspect</code> en <code>.State.Health</code>, y la cuadrícula de <code>docker ps</code> pasa a mostrar <code>(healthy)</code>/<code>(unhealthy)</code>. Puedes definir la sonda <em>ahí</em> (imagen) con <code>HEALTHCHECK</code>, o <em>en el arranque</em> con <code>--health-cmd</code>/<code>--health-interval</code>/…</p>
+        <pre class="diagram">  dockerd ejecuta, cada --interval, el comando del HEALTHCHECK
+  dentro del contenedor (ej.: wget -qO- http://localhost:3000/health)
+        │
+        ├── exit 0 ──────────────► healthy   (estado que ve docker ps)
+        └── exit ≠ 0 ──┐
+                       ▼  ¿--retries seguidos? ─► unhealthy
+  El HEALTHCHECK SOLO informa del estado: NO reinicia el contenedor ni
+  corta/redirige tráfico. Eso es trabajo del ORQUESTADOR (K8s probes).</pre>
+        <p><strong>Adelanto a Kubernetes (módulos 5-6):</strong> en K8s las sondas son del orquestador y <em>sí actúan</em>. La <em>liveness</em> reinicia el contenedor si no responde (dejó de ser útil), la <em>readiness</em> decide si el Pod recibe tráfico del Service (lo «saca del juego» mientras no esté listo) y la <em>startup</em> protege a apps lentas. Docker solo tiene la parte «informativa»: el healthcheck no reinicia ni desconecta — y eso es una diferencia de diseño fundamental que explica por qué, para <em>self-healing</em> real de un solo contenedor, hay que combinarlo con <code>--restart</code> (lección anterior) y para múltiples hosts hay que subir de nivel a un orquestador.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> la restart policy es como un <em>guardia de seguridad en la puerta</em>: si el inquilino se desmaya (proceso muerto), lo despierta. El healthcheck es como un <em>médico de cabecera</em>: revisa periódicamente que el inquilino esté sano de verdad, pero <strong>solo informa</strong> a la familia; no le administra fármacos. En Kubernetes, la familia contrata también a un doctor-propio (kubelet) que sabe que «marearse» merece descanso (liveness) y «estar resfriado» merece no salir a trabajar (readiness).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Los límites más comunes, aplicados y verificados en cuatro líneas:</p>
+        <pre><code class="language-bash"># Memoria tope 128 MB, medio núcleo de CPU, y máximo 128 procesos.
+# La app puede pedir ser más grande… el KERNEL se lo niega.
+docker run -d --name api-node \
+  --memory 128m --cpus 0.5 --pids-limit 128 \
+  -p 8080:3000 node:24-alpine node server.js
+
+# Observa el consumo REAL en vivo (equivalente al "top" del sistema):
+docker stats           # Ctrl+C para salir de la vista continua
+docker stats --no-stream          # una sola foto (usable en scripts)
+docker stats --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}\t{{.PIDs}}'
+
+# Cambia un límite SIN reiniciar el contenedor (cero downtime):
+docker update --memory 512m --cpus 1 api-node
+# → api-node  (vuelca el nuevo límite: mem 512m, cpus 1)
+
+# Línea de salud SIN construir imagen (imagen de nginx viene con su propio
+# healthcheck… pero puedes poner el tuyo al arrancar con --health-*):
+docker run -d --name web --health-cmd "wget -qO- http://localhost/ >/dev/null || exit 1" \
+  --health-interval 5s --health-retries 3 -p 8080:80 nginx:1.27-alpine
+sleep 6 &amp;&amp; docker inspect web --format '{{.State.Health.Status}}'
+# → healthy   (nginx responde 200 y el daemon lo certifica)</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>¿Por qué <code>wget</code> y no <code>curl</code> en el healthcheck?</strong> Porque las imágenes Alpine (de base muy pequeña) traen <code>wget</code> de busybox de serie y NO suelen traer <code>curl</code>. Un healthcheck con curl en Alpine fallará siempre con «curl: not found» — un clásico falso negativo. Esta es una de esas diferencias sutiles que valen oro.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API de HarborTasks con límites de producción y un healthcheck que vigila el endpoint <code>/health</code> real de la app. Además, el experimento del <strong>OOM-kill</strong> para que veas con tus ojos qué hace el kernel cuando un contenedor se pasa de memoria.</p>
+        <pre><code class="language-dockerfile"># --- Dockerfile de la API de HarborTasks, con HEALTHCHECK integrado ---
+FROM node:24-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+
+# /health NO depende de la BD: responde "ok" si el proceso HTTP vive.
+# start-period: en los primeros 20 s el daemon NO penaliza fallos
+# (arranque parsea configuración, abre la BD…). Sin esto, una app
+# que tarda 15 s en arrancar sería marcada unhealthy en falso.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health >/dev/null 2>&amp;1 || exit 1
+
+EXPOSE 3000
+CMD ["node", "server.js"]</code></pre>
+        <pre><code class="language-bash"># Construye y lanza con límites realistas (memoria 256m, medio core).
+docker build -t harbor-api:0.1.0 .
+docker run -d --name api \
+  --memory 256m --cpus 0.5 --pids-limit 256 \
+  -p 8080:3000 -e DATABASE_URL=postgres://harbor:harborpass@db:5432/harbortasks \
+  harbor-api:0.1.0
+
+# Tras el arranque (espera &gt; start-period): estado de salud desde fuera
+sleep 25
+docker ps --filter name=api                        # STATUS: Up (healthy)
+docker inspect api --format '{{.State.Health.Status}}'     # → healthy
+
+# El detalle de la última sonda: código de salida y salida capturada
+docker inspect api --format '{{range .State.Health.Log}}{{.ExitCode}} · {{.Output}}{{end}}'
+# → 0 ·          (exit 0 y sin salida: el wget fue bien)
+
+# --------------------------------------------------------------------
+# EXPERIMENTO: el OOM-kill en acción (¡aplica solo el kernel!)
+# --------------------------------------------------------------------
+# Esta app "fuga": mete 1 MiB en un array cada 20 ms hasta morir.
+docker run -d --name leak --memory 256m node:24-alpine node -e \
+  'const a=[];setInterval(()=>a.push(Buffer.alloc(1024*1024)),20)'
+sleep 8
+docker inspect leak --format '{{.State.OOMKilled}} · exit={{.State.ExitCode}}'
+# → true · 137        (137 = 128 + SIGKILL(9): lo mató el OOM killer)
+docker rm -f leak
+
+# Balance general en un solo pantallazo:
+docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}'</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Prioridad de la verdad:</strong> el healthcheck no engaña por diseño: <code>/health</code> debía responder <em>también</em> cuando la BD está caída (health es «el proceso respira»), porque la <em>readiness</em> la decidirá el orquestador más adelante. Mezclar en un solo endpoint la salud del proceso y la de sus dependencias es una decisión de arquitectura que conviene tomar conscientemente: un healthcheck que devuelve 500 porque la BD está caída provocará <code>unhealthy</code> en cascada en todos los días de caída de la BD.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Límites <strong>siempre</strong>: <code>--memory</code> + <code>--cpus</code> en producción</td>
+              <td>Contenedores sin límites en hosts compartidos</td>
+              <td>Sin cgroups, un contenedor puede agotar la RAM y matar procesos del HOST; los límites son la base del «vecino silencioso»</td>
+            </tr>
+            <tr>
+              <td><code>--pids-limit</code> (p. ej. 128-256) a todo contenedor</td>
+              <td>Dejarlo ilimitado siempre</td>
+              <td>Una app con fork en bucle (bug o ataque) multiplica procesos hasta agotar el host; el límite de pids lo frena en seco</td>
+            </tr>
+            <tr>
+              <td>Valores con algo de aire; revisar con <code>docker stats</code> para calibrar</td>
+              <td>Limitar «justo» con el pico (p. ej. <code>--memory 128m</code> para una app que usa 130)</td>
+              <td>El OOM-kill no espera: limites ajustados convierten un pico transitorio en una caída dura (ExitCode 137) en producción</td>
+            </tr>
+            <tr>
+              <td><code>start-period</code> generoso en healthchecks de apps que tardan en arrancar</td>
+              <td>Sonar inmediatamente con <code>--retries</code> pequeños y sin start-period</td>
+              <td>Sin ventana de arranque, una app legítimamente lenta pasa a <code>unhealthy</code> falso y provoca alarma y reinicios inmerecidos</td>
+            </tr>
+            <tr>
+              <td>Healthcheck sobre un endpoint <em>real</em> de la app (no «ping local»)</td>
+              <td>Sondas a instrucciones que siempre devuelven 0 (<code>true</code>, <code>echo ok</code>)</td>
+              <td>El healthcheck vale lo que vale su comando: un «true» solo confirma que el shell vive, no que tu HTTP responde (falso confianza)</td>
+            </tr>
+            <tr>
+              <td>Combinar <code>--restart</code> + <code>HEALTHCHECK</code> para autovigilancia local</td>
+              <td>Esperar que el healthcheck «reinicie» el contenedor él solo</td>
+              <td>En Docker el healthcheck solo INFORMA; la reactividad real la dan las restart policies (y en K8s, las probes de los controladores)</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Healthcheck con curl en una imagen Alpine</h3>
+        <pre><code class="language-dockerfile"># ❌ curl no viene instalado en Alpine (busybox no lo trae):
+HEALTHCHECK CMD curl -f http://localhost:3000/health || exit 1
+# → /bin/sh: curl: not found → el healthcheck FALLA SIEMPRE → unhealthy crónico
+
+# ✅ wget (busybox) es el estándar en imágenes Alpine:
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health >/dev/null 2>&amp;1 || exit 1</code></pre>
+
+        <h3>Un healthcheck que «siempre pasa» porque el comando siempre devuelve 0</h3>
+        <pre><code class="language-bash"># ❌ "true" solo comprueba que el shell está vivo, no tu app
+docker run -d --name web --health-cmd "true" nginx:1.27-alpine
+# → healthy pase lo que pase (incluso con nginx detenido dentro)
+
+# ✅ La sonda comprueba la respuesta HTTP REAL del endpoint:
+docker run -d --name web \
+  --health-cmd "wget -qO- http://localhost/ >/dev/null 2>&amp;1 || exit 1" \
+  --health-interval 5s --health-retries 3 --health-start-period 5s \
+  -p 8080:80 nginx:1.27-alpine
+# → healthy SOLO si nginx responde. Esa es la información que vale.</code></pre>
+
+        <h3>Ignorar --memory-swap al limitar memoria</h3>
+        <pre><code class="language-bash"># ❌ Al usar --memory 512m, Docker por defecto crea también 512m de swap:
+#    el proceso puede "colarse" en swap y pasarte desapercibido en stats.
+docker run -d --memory 512m node:24-alpine node server.js
+
+# ✅ Si no quieres swap (recomendado en prod): swap = memoria
+docker run -d --memory 512m --memory-swap 512m node:24-alpine node server.js
+# -> el total RAM+swap queda en 512m: no hay colchón fantasma.</code></pre>
+
+        <h3>Confundir healthcheck (info) con readiness de orquestador (acción)</h3>
+        <pre><code class="language-bash"># ❌ Esperar que `docker inspect` te "saque del juego" a un contenedor unhealthy:
+#    Docker solo cambia el estado. El tráfico no se corta ni se redirige.
+docker run -d --name api --health-cmd "false" -p 8080:3000 harbor-api:0.1.0
+# → STATUS "(unhealthy)" … y SIGUE recibiendo tráfico en el puerto 8080.
+
+# ✅ En Kubernetes esto SÍ lo hace la readiness probe (módulo 6-05): el
+#    kubelet quita el Pod de los endpoints del Service cuando no responde.
+#    Docker te pide combinar roles: healthcheck (informar) + restart (reaccionar).</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> encadenar las tres piezas de la lección — límites por cgroups, observación con stats y un healthcheck operativo — verificando cada una. Todo ejecutable con imágenes públicas, sin construir nada.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Un contenedor con límites estrictos.</strong>
+            <pre><code class="language-bash">docker run -d --name limite --memory 256m --cpus 0.5 --pids-limit 100 \
+  -p 8080:80 nginx:1.27-alpine</code></pre>
+            <p>nginx corre con 256 MiB de RAM tope, medio núcleo y solo 100 procesos posibles. Verifica que el límite está aplicado:</p>
+            <pre><code class="language-bash">docker inspect limite --format 'mem={{.HostConfig.Memory}} cpu={{.HostConfig.NanoCpus}} pids={{.HostConfig.PidsLimit}}'
+# ESPERADO: mem=268435456 (256 MiB) cpu=500000000 (0.5 core) pids=100</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Observa el consumo real.</strong>
+            <pre><code class="language-bash">docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}\t{{.PIDs}}'
+# ESPERADO: la línea "limite" con un uso muy por debajo de su tope
+# (nginx idle usa ~5-10 MiB). El tope NO es lo que usa: es lo que no pasa.</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Sube el límite sin reiniciar.</strong>
+            <pre><code class="language-bash">docker update --memory 512m --cpus 1 limite
+docker inspect limite --format 'mem={{.HostConfig.Memory}} cpu={{.HostConfig.NanoCpus}}'
+# ESPERADO: mem=536870912 cpu=1000000000. El contenedor siguió Up todo el rato.</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Fuga y OOM-kill: que el kernel hable.</strong>
+            <pre><code class="language-bash">docker run -d --name fuga --memory 128m node:24-alpine node -e \
+  'const a=[];setInterval(()=>a.push(Buffer.alloc(4*1024*1024)),30)'
+sleep 6
+docker inspect fuga --format 'OOMKilled={{.State.OOMKilled}} Exit={{.State.ExitCode}}'
+# ESPERADO: OOMKilled=true Exit=137 → el OOM killer del kernel lo mató.
+docker rm -f fuga</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Healthcheck de nginx en vivo.</strong>
+            <pre><code class="language-bash">docker run -d --name sano \
+  --health-cmd "wget -qO- http://localhost/ >/dev/null 2>&amp;1 || exit 1" \
+  --health-interval 5s --health-start-period 5s --health-retries 2 \
+  -p 8081:80 nginx:1.27-alpine
+sleep 8
+docker inspect sano --format '{{.State.Health.Status}}'   # ESPERADO: healthy
+docker ps --filter name=sano                              # STATUS: Up (healthy)</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Demuestra que unhealthy NO corta el tráfico.</strong>
+            <pre><code class="language-bash">docker run -d --name enfermo --health-cmd "false" \
+  --health-retries 1 -p 8082:80 nginx:1.27-alpine
+sleep 6
+docker inspect enfermo --format '{{.State.Health.Status}}'   # ESPERADO: unhealthy
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082  # ESPERADO: 200
+# El puerto sigue sirviendo pese a "unhealthy": Docker solo informa.
+docker rm -f limite sano enfermo</code></pre>
+            <p><strong>Verificación final:</strong> has visto aplicar, medir, ajustar en vivo, matar por OOM y certificar salud — el ciclo completo de limitación y supervisión de un contenedor.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El healthcheck que K8s no puede fingir</h3>
+          <p>Construye una mini-imagen Node con un endpoint <code>/health</code> que devuelve <strong>500</strong> cuando una variable <code>READY=false</code> (defínela con <code>-e</code>) y <code>200</code> cuando es <code>true</code>. Con <code>HEALTHCHECK</code> apuntando a ese endpoint, lanza <strong>una misma imagen</strong> dos veces: una con <code>-e READY=true</code> (sale <code>healthy</code>) y otra con <code>READY=false</code> (<code>unhealthy</code>). Después, usando <code>docker update</code>… demuestra que <strong>no puedes</strong> cambiar el estado de salud sin reiniciar, y explica por escrito —con el experimento ya hecho— cuál es el mecanismo que en Kubernetes sí «mueve» a un Pod del healthy al ready/unready automáticamente y por qué aquí no aplica.</p>
+          <p><em>Pista: el healthcheck definido en la imagen se puede sustituir en el arranque con <code>--health-cmd</code> (y compañía) en el propio <code>docker run</code>; recuerda usar <code>wget</code> de busybox. La respuesta al «por qué» está comparando la tabla de la teoría: Docker healthcheck (informativo) vs liveness/readiness del kubelet (acciones sobre el ciclo de vida y los endpoints del Service) — la lección «Probes» del módulo 6 cierra el círculo.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los contenedores comparten el kernel del host: <strong>cgroups</strong> es el mecanismo que limita RAM, CPU y procesos, y el <strong>kernel hace cumplir los límites</strong> aunque tu app los ignore.</li>
+          <li><code>--memory</code>, <code>--cpus</code> y <code>--pids-limit</code> son los tres límites esenciales de cualquier despliegue serio.</li>
+          <li>Superar <code>--memory</code> dispara el <strong>OOM-killer</strong>: ExitCode <code>137</code>, <code>State.OOMKilled=true</code>.</li>
+          <li><code>docker stats</code> observa el consumo en vivo; <code>docker update</code> ajusta límites <strong>sin reiniciar</strong>.</li>
+          <li>El <code>HEALTHCHECK</code> ejecuta una sonda periódica; su código de salida decide <code>healthy</code>/<code>unhealthy</code> (con <code>--start-period</code>, <code>--interval</code>, <code>--timeout</code>, <code>--retries</code>).</li>
+          <li>El healthcheck de Docker <strong>solo informa</strong>: no reinicia ni corta tráfico. En Kubernetes, las probes (liveness/readiness/startup) de los controladores <em>sí actúan</em>; es el mismo concepto madurado a la escala del clúster.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando / instrucción</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker run --memory 512m img</code></td><td>Tope de RAM (OOM-kill del kernel si se supera)</td></tr>
+            <tr><td><code>docker run --cpus 0.5 img</code></td><td>Tope de CPU (cuota de periodos del cgroup)</td></tr>
+            <tr><td><code>docker run --pids-limit 256 img</code></td><td>Tope de procesos (contra fork bombs)</td></tr>
+            <tr><td><code>docker stats</code></td><td>Consumo en vivo de CPU/RAM/net/pids de cada contenedor</td></tr>
+            <tr><td><code>docker update --memory 1g &lt;c&gt;</code></td><td>Ajusta límites con el contenedor en marcha</td></tr>
+            <tr><td><code>HEALTHCHECK --interval … CMD …</code> (Dockerfile)</td><td>Define la sonda de salud de la imagen (exit 0 = healthy)</td></tr>
+            <tr><td><code>--health-cmd/--health-interval/--health-retries</code></td><td>Misma sonda definida en el arranque, sin tocar la imagen</td></tr>
+            <tr><td><code>docker inspect -f '{{.State.Health.Status}}' &lt;c&gt;</code></td><td>Lee el veredicto (starting/healthy/unhealthy)</td></tr>
+            <tr><td><code>docker inspect -f '{{.State.OOMKilled}}/{{.ExitCode}}'</code></td><td>Diagnostica muertes por memoria o por señal</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué ocurre exactamente cuando un contenedor supera --memory?</summary>
+            <div>
+              <p>El kernel Linux invoca el <strong>OOM killer</strong>: elige un proceso del cgroup (normalmente el que más memoria consume) y lo mata con SIGKILL. Como el proceso principal de tu contenedor muere, el contenedor pasa a <code>exited</code> con <code>ExitCode 137</code> (= 128 + 9, la señal SIGKILL) y el flag <code>State.OOMKilled=true</code>. Es inmediato y <em>sin aviso</em>: por eso los límites se calibran con margen usando <code>docker stats</code> en carga real.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿--cpus 0.5 significa que solo usará la mitad de un núcleo?</summary>
+            <div>
+              <p>Sí, exactamente: el contenedor puede usar como mucho el equivalente a medio núcleo. Docker traduce el valor a cuota de periodos del cgroup (<code>--cpus 0.5</code> ≈ 50 µs de cómputo cada 100 µs). Puedes subir hasta tantos núcleos como tenga el host, y combinarlo con <code>--cpuset-cpus</code> si además quieres fijar <em>qué</em> núcleos físicos. No es un límite «blando»: el kernel actúa por periodos, dando una garantía media muy estable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué docker stats a veces muestra más memoria de la que asigné?</summary>
+            <div>
+              <p>Porque lo que ves en <code>docker stats</code> es el uso <em>efectivo</em> (o la proyección con la caché de páginas del kernel), mientras que <code>--memory</code> es el tope del cgroup. La memoria de página cache se puede reclamar al vuelo, así que un contenedor «a tope de stats» puede no estar en peligro. El indicador de peligro real es el <code>OOMKilled</code> y el exit 137. Para una cifra «sucia pero útil» de la app, mira <code>docker inspect</code> con <code>Usage</code> de <code>MemoryStats</code>, o duplica el límite con swap anulado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuál es la diferencia entre el HEALTHCHECK de Docker y las probes de Kubernetes?</summary>
+            <div>
+              <p>Es la misma idea con poderes distintos. El <code>HEALTHCHECK</code> docker ejecuta una sonda y <strong>solo actualiza un estado</strong> (healthy/unhealthy) que puedes ver con <code>docker inspect</code>/<code>docker ps</code>: no reinicia el contenedor ni modifica el tráfico. Las probes de K8s (módulo 6-05) son ejecutadas por el <em>kubelet</em> y <strong>sí actúan</strong>: la liveness reinicia el contenedor del Pod, la readiness lo quita o añade a los endpoints del Service, y la startup protege a apps con arranque lento. Docker te pide componer (healthcheck + restart policy); Kubernetes tiene el concepto nativo del orquestador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi contenedor aparece unhealthy justo después de arrancar?</summary>
+            <div>
+              <p>El caso típico es un arranque legítimamente lento: la app necesita 15 s para estar lista y la sonda ya está fallando en el primer intervalo. La solución es el parámetro <code>--start-period</code> (o <code>HEALTHCHECK --start-period</code> en el Dockerfile): durante esa ventana inicial, Docker registra los fallos pero <strong>no cuenta</strong> para los <code>--retries</code>. Otras causas comunes: el comando usa <code>curl</code> en una imagen Alpine (no instalado), o el healthcheck apunta a un puerto que no coincide con <code>PORT</code> de la app. En esos casos el diagnóstico es inmediato con <code>docker inspect -f '{{range .State.Health.Log}}{{println .}}{{end}}'</code>.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

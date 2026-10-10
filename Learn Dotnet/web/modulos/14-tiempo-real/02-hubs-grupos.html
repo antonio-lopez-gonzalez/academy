@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="es" data-module="14" data-lesson="02-hubs-grupos">
+<head>
+  <meta charset="UTF-8">
+  <title>Hubs, Groups y Connections — Módulo 14 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Hubs, Groups y Connections</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 14 · Tiempo real</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En la lección anterior vimos cómo enviar mensajes a <strong>todos</strong> los clientes conectados. En la mayoría de aplicaciones reales necesitas dirigirte a un conjunto más específico: a un usuario concreto, a una sala de chat, a los editores de un CMS o a los administradores.</p>
+        <p>En esta lección aprenderemos a usar <strong>groups</strong> y <strong>connections</strong> para segmentar a los clientes. También veremos cómo identificar usuarios mediante claims y cómo asociar un <code>ConnectionId</code> con un usuario autenticado.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelve?</h4>
+          <p>Permite enviar notificaciones selectivas sin mantener una lista manual de clientes. SignalR gestiona internamente qué conexiones pertenecen a cada grupo o usuario, incluso cuando un usuario tiene varias pestañas abiertas.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Guardar <code>ConnectionId</code> en base de datos pensando que es estable para siempre.</li>
+          <li>Asumir que un usuario tiene una sola conexión; puede tener múltiples dispositivos o pestañas.</li>
+          <li>Enviar a un grupo sin haber añadido nunca al usuario a ese grupo.</li>
+          <li>Intentar usar <code>Context.User</code> sin haber configurado autenticación en el hub.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>Contexto del hub</h3>
+        <p>Cada instancia del hub tiene una propiedad <code>Context</code> de tipo <code>HubCallerContext</code> que ofrece información sobre la conexión actual:</p>
+        <ul>
+          <li><code>Context.ConnectionId</code>: identificador único de la conexión actual. Cambia en cada reconexión.</li>
+          <li><code>Context.User</code>: el <code>ClaimsPrincipal</code> del usuario autenticado, si la autenticación está configurada.</li>
+          <li><code>Context.UserIdentifier</code>: el identificador de usuario que SignalR usa por defecto (claim <code>NameIdentifier</code>).</li>
+          <li><code>Context.Items</code>: diccionario de objetos por conexión, útil para cachear datos temporales.</li>
+        </ul>
+
+        <h3>Connections vs Users vs Groups</h3>
+        <table>
+          <thead><tr><th>Selector</th><th>Identificador</th><th>Uso típico</th><th>Persistencia</th></tr></thead>
+          <tbody>
+            <tr><td><code>Clients.Caller</code></td><td>Conexión actual</td><td>Confirmar acción al emisor</td><td>Conexión</td></tr>
+            <tr><td><code>Clients.All</code></td><td>Todas</td><td>Anuncios globales</td><td>Conexión</td></tr>
+            <tr><td><code>Clients.Others</code></td><td>Todas menos la actual</td><td>Chat de sala</td><td>Conexión</td></tr>
+            <tr><td><code>Clients.User(userId)</code></td><td>Claim <code>NameIdentifier</code></td><td>Notificación personal</td><td>Usuario (todas sus conexiones)</td></tr>
+            <tr><td><code>Clients.Group("room-1")</code></td><td>Nombre de grupo arbitrario</td><td>Salas de chat, canales, equipos</td><td>Grupo</td></tr>
+          </tbody>
+        </table>
+
+        <div class="diagram">Usuario "Ana" en 2 pestañas
+        ┌─────────────┐  ┌─────────────┐
+        │ ConnectionA │  │ ConnectionB │
+        └──────┬──────┘  └──────┬──────┘
+               │                │
+               └──────┬─────────┘
+                      │
+              Clients.User("ana-id") → ambas
+              Clients.Group("editores") → ambas
+              Clients.Client("ConnectionA") → solo A</div>
+
+        <h3>¿Cómo funciona un grupo?</h3>
+        <p>SignalR mantiene un diccionario interno <em>grupo → lista de connectionIds</em>. Cuando llamas a <code>Groups.AddToGroupAsync(connectionId, "nombre")</code>, la conexión se añade a la lista. Luego, <code>Clients.Group("nombre")</code> envía el mensaje a todas las conexiones de esa lista. Los grupos son volátiles: si una conexión se cierra, SignalR la elimina automáticamente.</p>
+
+        <h3>Autenticación en hubs</h3>
+        <p>Los hubs pueden usar el mismo middleware de autenticación JWT que el resto de la API. El token se envía generalmente en la query string de la conexión SignalR porque los navegadores no permiten cabeceras personalizadas en el handshake de WebSockets.</p>
+
+        <div class="callout callout--tip">
+          <h4>Consejo de diseño</h4>
+          <p>Preferir <code>Clients.User(userId)</code> sobre <code>Clients.Client(connectionId)</code> cuando quieres llegar al usuario, no a la conexión. Así cubres múltiples dispositivos y reconexiones automáticas.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Crearemos un hub de chat con salas. El cliente se une a una sala y solo los miembros de esa sala reciben los mensajes.</p>
+
+        <pre><code class="language-bash">dotnet new web -n RoomsDemo -o RoomsDemo
+cd RoomsDemo
+dotnet run --project .</code></pre>
+
+        <div class="code-file">RoomsHub.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.SignalR;
+
+public sealed class RoomsHub : Hub<IRoomClient>
+{
+    public async Task JoinRoom(string roomName)
+    {
+        // Añade la conexión actual al grupo
+        await Groups.AddToGroupAsync(Context.ConnectionId, roomName);
+        await Clients.Group(roomName).SystemMessage($"{Context.ConnectionId} se unió a {roomName}");
+    }
+
+    public async Task LeaveRoom(string roomName)
+    {
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomName);
+        await Clients.Group(roomName).SystemMessage($"{Context.ConnectionId} salió de {roomName}");
+    }
+
+    public async Task SendToRoom(string roomName, string user, string message)
+    {
+        // Solo los miembros del grupo reciben el mensaje
+        await Clients.Group(roomName).ReceiveMessage(user, message);
+    }
+
+    public async Task SendToUser(string userId, string message)
+    {
+        // Envía a todas las conexiones de ese usuario
+        await Clients.User(userId).ReceiveMessage("Sistema", message);
+    }
+}
+
+public interface IRoomClient
+{
+    Task ReceiveMessage(string user, string message);
+    Task SystemMessage(string message);
+}</code></pre>
+
+        <div class="code-file">Program.cs</div>
+        <pre><code class="language-csharp">var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSignalR();
+var app = builder.Build();
+app.UseStaticFiles();
+app.MapHub<RoomsHub>("/roomsHub");
+app.Run();</code></pre>
+
+        <div class="code-file">index.html (extracto)</div>
+        <pre><code class="language-javascript">const connection = new signalR.HubConnectionBuilder()
+    .withUrl("/roomsHub")
+    .withAutomaticReconnect()
+    .build();
+
+connection.on("ReceiveMessage", (user, message) => {
+    console.log(`${user}: ${message}`);
+});
+
+await connection.start();
+await connection.invoke("JoinRoom", "dotnet");
+await connection.invoke("SendToRoom", "dotnet", "Tú", "Hola a todos en la sala");</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El cliente se une al grupo <code>"dotnet"</code>. El servidor añade su <code>ConnectionId</code> al grupo. Cualquier mensaje enviado a <code>Clients.Group("dotnet")</code> llega a todas las conexiones de ese grupo, sin importar en qué servidor estén (si hay backplane).</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una aplicación con autenticación JWT, los usuarios se identifican por claims. Configuramos SignalR para leer el token de la query string y usamos grupos por roles.</p>
+
+        <div class="code-file">Program.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "CmsIssuer",
+            ValidAudience = "CmsAudience",
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes("clave-super-secreta-de-32-caracteres!")
+        };
+
+        // WebSockets no permite cabeceras personalizadas, así que leemos el token de la query
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken))
+                {
+                    context.Token = accessToken;
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+builder.Services.AddAuthorization();
+builder.Services.AddSignalR();
+
+var app = builder.Build();
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapHub<AuthenticatedHub>("/hubs/authenticated")
+   .RequireAuthorization();
+
+app.Run();
+
+public sealed class AuthenticatedHub : Hub<IAuthClient>
+{
+    public async Task JoinRoleGroup(string role)
+    {
+        if (Context.User?.IsInRole(role) != true)
+        {
+            throw new HubException("No tienes el rol necesario para unirte a este grupo.");
+        }
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, role);
+        await Clients.Group(role).MemberJoined(Context.User?.Identity?.Name ?? "anónimo", role);
+    }
+
+    public async Task NotifyRole(string role, string title, string body)
+    {
+        await Clients.Group(role).ReceiveNotification(title, body);
+    }
+
+    public async Task NotifyCurrentUser(string message)
+    {
+        // UserIdentifier por defecto es el claim NameIdentifier
+        var userId = Context.UserIdentifier;
+        await Clients.User(userId).ReceiveNotification("Privado", message);
+    }
+}
+
+public interface IAuthClient
+{
+    Task ReceiveNotification(string title, string body);
+    Task MemberJoined(string userName, string group);
+}</code></pre>
+
+        <div class="code-file">Cliente JavaScript con token</div>
+        <pre><code class="language-javascript">const token = localStorage.getItem("access_token");
+
+const connection = new signalR.HubConnectionBuilder()
+    .withUrl("/hubs/authenticated?access_token=" + encodeURIComponent(token))
+    .withAutomaticReconnect()
+    .build();
+
+await connection.start();
+await connection.invoke("JoinRoleGroup", "Editor");
+await connection.invoke("NotifyRole", "Editor", "Nuevo artículo", "Se ha publicado un post.");</code></pre>
+
+        <div class="callout callout--warning">
+          <h4>Seguridad del token en query string</h4>
+          <p>Es seguro si usas WSS (WebSocket seguro) o HTTPS. Sin embargo, el token puede quedar en logs de servidor o proxy. Alternativas: usar SSE/Long Polling donde sí puedes enviar cabeceras, o un endpoint de negociación que cree un cookie segura.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Identifica por usuario, no por conexión.</strong> Usa <code>Clients.User(...)</code> para notificaciones personales; así cubres múltiples sesiones.</li>
+          <li><strong>Valida antes de unir a un grupo.</strong> No permitas que un cliente se una a cualquier grupo; verifica roles, suscripciones o permisos.</li>
+          <li><strong>Usa nombres de grupo predecibles y seguros.</strong> Evita concatenar datos del usuario sin sanitizar; podría permitir unirse a grupos ajenos.</li>
+          <li><strong>No almacenes <code>ConnectionId</code> como clave primaria.</strong> Es efímero; si necesitas persistir, guarda el <code>userId</code> y el timestamp.</li>
+          <li><strong>Protege los hubs con autorización.</strong> Un hub abierto puede filtrar datos si olvidas <code>RequireAuthorization</code> o <code>[Authorize]</code>.</li>
+          <li><strong>Maneja <code>HubException</code>.</strong> Cuando lances una excepción de negocio, usa <code>HubException</code> para controlar el mensaje que llega al cliente.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Enviar a un grupo sin verificar membresía</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">public async Task JoinRoom(string roomName)
+{
+    // Cualquiera puede unirse a cualquier sala
+    await Groups.AddToGroupAsync(Context.ConnectionId, roomName);
+}</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">public async Task JoinRoom(string roomName)
+{
+    if (!await _roomService.CanJoin(Context.UserIdentifier, roomName))
+    {
+        throw new HubException("No tienes acceso a esta sala.");
+    }
+
+    await Groups.AddToGroupAsync(Context.ConnectionId, roomName);
+}</code></pre>
+
+        <h3>6.2. Usar <code>ConnectionId</code> como identificador de usuario</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">public async Task SendToUser(string connectionId, string message)
+{
+    await Clients.Client(connectionId).ReceiveMessage(message);
+}</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">public async Task SendToUser(string userId, string message)
+{
+    await Clients.User(userId).ReceiveMessage(message);
+}</code></pre>
+
+        <h3>6.3. Olvidar que <code>Context.User</code> puede ser null</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">public async Task JoinAdminGroup()
+{
+    if (Context.User.IsInRole("Admin")) { ... }
+}</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">public async Task JoinAdminGroup()
+{
+    if (Context.User?.IsInRole("Admin") == true) { ... }
+}</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Crea un hub de "notificaciones por equipo". Cada usuario pertenece a un equipo que lee de un servicio. Al conectarse, el usuario se une automáticamente al grupo de su equipo. Solo los usuarios del mismo equipo reciben mensajes.</p>
+
+        <div class="code-file">TeamNotificationHub.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.SignalR;
+
+public sealed class TeamNotificationHub : Hub<ITeamClient>
+{
+    private readonly ITeamService _teamService;
+
+    public TeamNotificationHub(ITeamService teamService)
+    {
+        _teamService = teamService;
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        var userId = Context.UserIdentifier;
+        if (string.IsNullOrEmpty(userId))
+        {
+            throw new HubException("Usuario no autenticado.");
+        }
+
+        var teamId = await _teamService.GetTeamIdAsync(userId);
+        if (!string.IsNullOrEmpty(teamId))
+        {
+            await Groups.AddToGroupAsync(Context.ConnectionId, teamId);
+            // Guardamos el equipo en Items para usarlo en OnDisconnectedAsync
+            Context.Items["TeamId"] = teamId;
+        }
+
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        if (Context.Items.TryGetValue("TeamId", out var teamId) && teamId is string team)
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, team);
+        }
+
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    public async Task NotifyTeam(string title, string body)
+    {
+        if (Context.Items.TryGetValue("TeamId", out var teamId) && teamId is string team)
+        {
+            await Clients.Group(team).TeamNotification(title, body);
+        }
+    }
+}
+
+public interface ITeamClient
+{
+    Task TeamNotification(string title, string body);
+}
+
+public interface ITeamService
+{
+    Task<string?> GetTeamIdAsync(string userId);
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Por qué almacenar <code>TeamId</code> en <code>Context.Items</code>?</h4>
+          <p>En <code>OnDisconnectedAsync</code> no deberías volver a consultar el servicio porque el usuario ya no está en el contexto operativo. Guardar el valor en <code>Items</code> asegura que puedas eliminarlo del grupo correctamente al desconectarse.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <div class="challenge">
+          <h3>Reto: historial de presencia</h3>
+          <p>Implementa un servicio que rastree quién está conectado en cada sala. Cuando un usuario se une, el servidor le envía la lista de usuarios actualmente en la sala. Considera cómo evitarías duplicados si un usuario tiene dos pestañas abiertas.</p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>Context.ConnectionId</code> identifica una conexión efímera; <code>Context.UserIdentifier</code> identifica al usuario.</li>
+          <li><code>Clients.User(userId)</code> envía a todas las conexiones de ese usuario.</li>
+          <li>Los grupos son colecciones de conexiones gestionadas por SignalR; se usan para salas, canales o equipos.</li>
+          <li>Usa <code>Groups.AddToGroupAsync</code> y <code>Groups.RemoveFromGroupAsync</code> para gestionar membresía.</li>
+          <li>Protege los métodos de unión a grupos con autorización y validación de negocio.</li>
+          <li>El token JWT en SignalR se envía típicamente por query string debido a las limitaciones de WebSockets.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Un usuario con dos pestañas recibe dos veces el mismo mensaje?</summary>
+            <div>
+              <p>Si usas <code>Clients.User(userId)</code>, SignalR envía el mensaje a <strong>cada conexión</strong> de ese usuario. Por tanto, sí, dos pestañas recibirán dos mensajes. Si quieres deduplicación, debe hacerse en el cliente o usando un identificador de mensaje.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el servidor se reinicia mientras hay grupos?</summary>
+            <div>
+              <p>Los grupos se almacenan en memoria por defecto. Al reiniciar se pierden. Los clientes intentan reconectar automáticamente con <code>withAutomaticReconnect</code>, pero deben volver a unirse a los grupos porque <code>OnConnectedAsync</code> se vuelve a ejecutar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar roles para enviar a grupos?</summary>
+            <div>
+              <p>Sí, pero no de forma nativa. Debes crear un grupo por rol (p. ej. "role-admin") y añadir a los usuarios cuando se conectan. Luego envías a <code>Clients.Group("role-admin")</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los grupos distinguen mayúsculas y minúsculas?</summary>
+            <div>
+              <p>Sí, los nombres de grupo son sensibles a mayúsculas. Normaliza siempre los nombres (p. ej. <code>.ToLowerInvariant()</code>) o usa identificadores como GUIDs.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que un cliente se una a un grupo que no le pertenece?</summary>
+            <div>
+              <p>Valida en el servidor antes de llamar a <code>AddToGroupAsync</code>. No confíes en el nombre enviado por el cliente; consulta la base de datos o los claims.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

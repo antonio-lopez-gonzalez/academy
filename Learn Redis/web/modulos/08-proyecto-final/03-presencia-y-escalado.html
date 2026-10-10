@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="03-presencia-y-escalado">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Presencia, TTL y escalado multi-nodo — Módulo 8 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Presencia, TTL y escalado multi-nodo</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Proyecto Final</span>
+          <span>⏱ 45 minutos</span>
+          <span class="badge">🟢 proyecto</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Terminamos de pulir el <em>estado vivo</em>: presencia con TTL que se limpia sola, el heartbeat amortiguado y una prueba de <strong>escalado multi-nodo</strong> (3 instancias coordinadas) — el objetivo de negocio del curso.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Presencia autolimpiable</h3>
+        <pre><code class="language-text">Heartbeat → ZADD hub:presence user &lt;now&gt;   (score = último latido)
+Barrido/consulta → ZRANGEBYSCORE hub:presence &lt;now-60&gt; +inf
+Limpieza lazy → ZREMRANGEBYSCORE hub:presence -inf &lt;now-60&gt;
+
+Sin cron: la consulta «ignora» a los viejos, y el broadcast de desconexión
+lo da el propio nodo cuando detecta la caída (o la expiración del registro).</code></pre>
+
+        <h3>Heartbeat amortiguado y asimétrico</h3>
+        <pre><code class="language-csharp">// No refresques a cada mensaje si hay ráfagas: amortigua con un mínimo
+private DateTime? _lastHeartbeat;
+private static readonly TimeSpan HeartbeatEvery = TimeSpan.FromSeconds(10);
+
+bool should = _lastHeartbeat is null
+    || DateTime.UtcNow - _lastHeartbeat &gt;= HeartbeatEvery;
+if (should)
+{
+    await registry.HeartbeatAsync(connId, userId);   // refresh lease + score
+    _lastHeartbeat = DateTime.UtcNow;
+}
+</code></pre>
+        <p>Lease (30 s) ≫ intervalo (10 s) ≫ coste de cada refresh: latencia de red nunca te descuelga.</p>
+
+        <h3>Escalar: N nodos sin tocar el código</h3>
+        <pre><code class="language-text">NODO-1 (5210)   NODO-2 (5211)   NODO-3 (5212)
+     │                │                │
+     └──────► REDIS (registro + backplane) ◄──────┘
+        broadcast de cualquiera llega a todos.
+        la presencia es global (zset), el registro por conexión (hash).</code></pre>
+        <p>Prueba con 3 instancias: añadir un nodo no cambia ninguna línea de C#; solo cambia <code>NODE_ID</code> y puerto.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># consulta de presencia "últimos 60 s" + limpieza
+ZRANGEBYSCORE hub:presence 1749913600 +inf
+ZREMRANGEBYSCORE hub:presence -inf 1749913600
+ZCARD hub:presence</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Prueba de escalado con 3 instancias (en tu máquina con puertos distintos):</p>
+        <pre><code class="language-bash"># Terminal 1,2,3:
+NODE_ID=node-1 dotnet run --project src/RedisWsHub --urls http://localhost:5210
+NODE_ID=node-2 dotnet run --project src/RedisWsHub --urls http://localhost:5211
+NODE_ID=node-3 dotnet run --project src/RedisWsHub --urls http://localhost:5212
+
+# Clientes: conecta 1 a cada nodo.
+# Comprueba:
+#   - broadcast desde cualquier nodo → llega a los 3 sockets.
+#   - presencia global → los 3 usuarios online (ZRANGEBYSCORE).
+#   - registro → HGET hub:conn:&lt;id&gt; node  indica el nodo dueño.
+#   - kill node-2 → en ~30 s su presencia/registro expiran solos.</code></pre>
+        <p>¿Plantea cuántos clientes por nodo aguanta antes de añadir otro? El número lo dicta tu prueba de carga, no Redis.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Lease ≫ intervalo ≫ coste refresco</td><td>Refresh a cada mensaje bajo ráfagas</td><td>Amortigua; los refrescos sobrantes no aportan</td></tr>
+            <tr><td>Presencia global (zset) + registro por conexión</td><td>Un solo tipo de dato para todo</td><td>Cada estructura responde a su pregunta</td></tr>
+            <tr><td>Nodo = proceso idéntico + NODE_ID</td><td>Nodos con lógica «especial»</td><td>Escalar es añadir instancias idénticas</td></tr>
+            <tr><td>Verificar la expiración en una prueba real</td><td>Confiar a ojos cerrados en los TTL</td><td>Verla caer sola te da tranquilidad</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>El score «crece» para siempre sin limpieza</h3>
+        <pre><code class="language-redis"># ❌ La presencia crece si solo ZADD y nunca limpias
+# ✅ Limpieza lazy en la consulta + ZREMRANGEBYSCORE periódico</code></pre>
+
+        <h3>Subir 3 nodos pero con la MISMA config (mismo puerto/nombre)</h3>
+        <p>Si tres procesos escuchan el mismo puerto o usan el mismo NODE_ID, no es un clúster: es un caos. Puerto + NODE_ID únicos por instancia.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa el heartbeat amortiguado.</li>
+          <li><strong>Paso 2:</strong> Levanta 3 instancias y 3 clientes.</li>
+          <li><strong>Paso 3:</strong> Ejecuta la prueba de escalado del ejemplo real; anota resultados.</li>
+          <li><strong>Paso 4:</strong> Mata un nodo y cronometra cuándo su presencia/registro desaparecen (TTL).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 100 clientes, N nodos</h3>
+          <p>Diseña (no implementes aún) un mini benchmark: cuántos clientes por nodo y qué métrica de «broadcast 100% entregado» medirías (p. ej. recibidos/emitidos por nodo). Decide el cuello de tu sistema real (¿red? ¿CPU de reenvío? ¿RAM?) y cómo lo vigilarías con los healths de M6-04.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Presencia global (zset) autolimpiable + registro (hash) con TTL.</li>
+          <li>Heartbeat amortiguado con lease ≫ intervalo.</li>
+          <li>Escalado = más instancias idénticas; la prueba de 3 nodos lo demuestra.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo tener «presencia y registro» en un solo formato?</summary>
+            <div><p>Puedes ahorrar algo guardando userId en el hash del registro y derivando presencia de ahí con SCAN… pero sería caro y frágil. El zset es la forma O(log n) de responder «los online de la ventana».</p></div>
+          </details>
+          <details>
+            <summary>¿El TTL de presencia <code>hub:presence</code> depende del número de nodos?</summary>
+            <div><p>No: cada heartbeat refresca su score. La «ventana» la decides tú (60 s); el recuento de nodos no cambia el diseño.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

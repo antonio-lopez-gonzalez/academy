@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-streams">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Streams: XADD/XREAD/XREADGROUP y XACK — Módulo 3 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Streams: XADD/XREAD/XREADGROUP y XACK</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Pub/Sub y Streams</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un <strong>stream</strong> es un log de mensajes <strong>persistido</strong> con IDs progresivos, que se puede leer hacia atrás o en vivo, y que soporta <strong>grupos de consumidores con confirmación</strong> (ack). Es la respuesta de Redis a «tengo mensajes que no deben perderse y varios workers que los procesan».</p>
+        <p>Verás el modelo (ID, entradas, grupos, PEL), los comandos clave y cómo encaja en el hub para, por ejemplo, el registro de eventos o el reprocesamiento.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El modelo de un stream</h3>
+        <pre><code class="language-text">stream:trades  (append-only, acotable)
+┌─────────────┬───────────────────────────────┬──────────────────────┐
+│ ID (ms-seq) │  campos del mensaje           │  estado de consumo   │
+├─────────────┼───────────────────────────────┼──────────────────────┤
+│ 1723600000123-0 │ type=trade id=887        │  → grupo workers      │
+│ 1723600000123-1 │ type=trade id=888        │    (XREADGROUP)       │
+│ …                                             │    pending (PEL) ack │
+└─────────────┴───────────────────────────────┴──────────────────────┘</code></pre>
+        <ul>
+          <li><strong>ID</strong>: <code>milisegundos-secuencia</code> (auto hasta 2040; se puede personalizar a partir de 2040).</li>
+          <li><strong>Entradas</strong>: pares campo/valor (como un hash plano por mensaje).</li>
+          <li><strong>Grupos</strong>: varios consumidores leen <em>particiones</em> distintas del mismo stream.</li>
+          <li><strong>PEL</strong>: Pending Entries List — mensajes entregados pero sin <code>XACK</code>.</li>
+        </ul>
+
+        <h3>Comandos</h3>
+        <pre><code class="language-redis">XADD stream:trades * type trade id 887      # añade (ID auto)
+XLEN stream:trades
+XRANGE stream:trades - + COUNT 10           # leer primeros N
+XREAD COUNT 5 BLOCK 5000 STREAMS trades $   # en vivo (los nuevos, bloqueante)
+XGROUP CREATE trades workers 0 MKSTREAM     # crea grupo de consumo
+XREADGROUP GROUP workers consumidor-1 COUNT 5 STREAMS trades >   # tomar "no entregados"
+XACK trades workers 1723600000123-0         # confirmar procesado
+XGROUP DELCONSUMER trades workers c1     # quitar un consumidor
+XGROUP DESTROY trades workers             # borrar el grupo
+XTRIM trades MAXLEN ~ 1000                  # acotar tamaño (≈1000)
+XDEL trades ID</code></pre>
+        <p><code>&gt;</code> en XREADGROUP significa «los que aún no he entregado a este grupo»; luego los confirmas con <code>XACK</code>. Si un consumidor muere sin ack, los mensajes quedan pendientes (PEL) y otro puede retomarlos (XCLAIM/XPENDING).</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">XADD t '{"raw":"..."}'                       # ❌ el valor debe ser "campo valor"
+XADD t * msg '{"type":"trade","id":1}'       # ✅ hash de entradas
+XLEN t
+XRANGE t - +
+
+# grupos
+XGROUP CREATE t workers 0 MKSTREAM
+XREADGROUP GROUP workers w0 COUNT 1 STREAMS t >    # toma 1
+XACK t workers 0-1                                 # confirma</code></pre>
+        <p>Fíjate: <code>XADD</code> recibe pares <code>campo valor</code>, no un JSON plano.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el hub: persistir eventos «para auditoría/reproceso» mientras el backplane pub/sub atiende el tiempo real. Un stream como fuente de verdad de eventos:</p>
+        <pre><code class="language-csharp">// Productor (cualquier nodo)
+var id = await db.StreamAddAsync("stream:trades", new NameValueEntry[]
+{
+    new("type", "trade"),
+    new("id", "887"),
+    new("node", _nodeId),
+});
+
+// Consumidores en grupo (workers)
+await db.StreamCreateConsumerGroupAsync("stream:trades", "workers", "0", true);
+
+while (true)
+{
+    var entries = await db.StreamReadGroupAsync("stream:trades", "workers", _consumerName, count: 10);
+    foreach (var e in entries)
+    {
+        await ProcessAsync(e.Values.ToDictionary(v =&gt; v.Name!, v =&gt; v.Value));
+        await db.StreamAcknowledgeAsync("stream:trades", "workers", e.Id);   // ack
+    }
+}
+// Reintentos de mensajes huérfanos (murió sin ack):
+var pending = await db.StreamPendingAsync("stream:trades", "workers");</code></pre>
+        <p>Nada se pierde: si tu worker muere, los pendientes quedan en PEL y se reasignan.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>XACK tras procesar (idempotencia aparte)</td><td>Saltarse el ack</td><td>El PEL crece y reenvía lo ya hecho (sé idempotente)</td></tr>
+            <tr><td>XTRIM MAXLEN para acotar la retención</td><td>Streams que crecen sin fin</td><td>El log «ilimitado» llena la RAM</td></tr>
+            <tr><td>Grupo = «uno consume»; XREAD solo = «todos leen»</td><td>Mezclar XREAD y XREADGROUP a la vez</td><td>Los grupos dividen el trabajo; el simple emite a todos</td></tr>
+            <tr><td>Reintentos con XCLAIM/XPENDING</td><td>Mensajes que «se olvidan» si el worker muere</td><td>El PEL + XCLAIM permite reintentar sin perder</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Pasar un JSON como «un solo valor» a XADD</h3>
+        <pre><code class="language-redis">XADD t '{"x":1}'          # ❌ error: espera "campo valor"
+XADD t msg '{"x":1}'      # ✅ guarda un campo 'msg' con ese string
+or
+XADD t x 1                # ✅ varios campos planos</code></pre>
+
+        <h3>Faltar el ack → reenvíos infinitos al procesar sin idempotencia</h3>
+        <p>Si procesas y NO confirmas, el mensaje sigue pendiente y puede reentregarse; diseña handlers idempotentes.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea un stream y añade 5 mensajes con <code>type</code> e <code>id</code>.</li>
+          <li><strong>Paso 2:</strong> Lee con XREAD desde el principio (XRANGE) y luego en vivo con BLOCK.</li>
+          <li><strong>Paso 3:</strong> Crea el grupo <code>workers</code>, lee con XREADGROUP y haz XACK de 2.</li>
+          <li><strong>Paso 4:</strong> Consulta XPENDING: los 3 sin ack siguen ahí. XCLAIM uno para «otro consumidor».</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Reproceso de trades</h3>
+          <p>En tu hub, decide qué flujo quieres persistir en un stream (p. ej. «todos los trades»). Escribe el plan: campos, retención (XTRIM), nº de grupos/consumidores y política de reintentos (dead-letter). NO lo implementes aún; es el borrador del M8.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Stream = log persistido con IDs; <code>XADD/XLEN/XRANGE/XREAD</code>.</li>
+          <li>Grupos: <code>XREADGROUP</code> divide trabajo; <code>XACK</code> confirma; PEL permite reintentar.</li>
+          <li>Acota con <code>XTRIM</code>; sé idempotente en el procesado.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Los streams son «Redis» o un broker aparte?</summary>
+            <div><p>Son una estructura de Redis. Por debajo, usan listpack/rax optimizados; para cargas moderadas reemplazan a RabbitMQ básico. Dicho esto, un broker dedicado da más garantías a escalas extremas.</p></div>
+          </details>
+          <details>
+            <summary>¿Cómo evito el «efecto del reenvío»?</summary>
+            <div><p>Confirmando (XACK) y siendo idempotente: procesar dos veces el mismo ID no debe duplicar efectos (any key/ID único en tu fuente).</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

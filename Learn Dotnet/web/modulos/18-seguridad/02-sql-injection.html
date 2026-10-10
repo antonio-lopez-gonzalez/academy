@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="es" data-module="18" data-lesson="02-sql-injection">
+<head>
+  <meta charset="UTF-8">
+  <title>SQL Injection y cómo EF Core la previene — Módulo 18 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>SQL Injection y cómo EF Core la previene</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 18 · Seguridad en APIs (OWASP)</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>La inyección SQL sigue siendo uno de los vectores de ataque más peligrosos y comunes. En esta lección veremos por qué ocurre, cómo <strong>Entity Framework Core</strong> la previene de forma automática y qué errores podemos cometer al usar SQL crudo.</p>
+        <p><strong>¿Qué problema resuelve?</strong> Evita que un atacante ejecute comandos SQL arbitrarios enviando input malicioso por la API.</p>
+        <p><strong>¿Cuándo se utiliza?</strong> Siempre que escribas consultas contra una base de datos relacional, ya sea con EF Core, Dapper o ADO.NET.</p>
+        <div class="callout callout--warning">
+          <strong>Errores típicos:</strong> concatenar strings para formar SQL, usar <code>FromSqlRaw</code> sin parámetros, o pensar que "usar un ORM" garantiza seguridad automáticamente. También es peligroso confiar en validaciones del cliente para sanitizar SQL.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <p>SQL Injection ocurre cuando el input del usuario se interpola directamente en una consulta SQL. El motor de base de datos no puede distinguir entre código y datos, por lo que ejecuta el input como si fuera parte de la consulta.</p>
+        <p>El mecanismo de defensa es siempre el mismo: <strong>consultas parametrizadas</strong>. Los parámetros se envían por separado al motor, que los trata como valores, no como código. EF Core genera consultas parametrizadas automáticamente cuando usas LINQ.</p>
+        <pre><code class="language-text">
+Sin parametrizar (vulnerable)
+─────────────────────────────
+SELECT * FROM Posts WHERE Title = 'user input'
+
+Input malicioso: ' OR '1'='1
+Resultado: SELECT * FROM Posts WHERE Title = '' OR '1'='1'
+→ Devuelve todos los posts.
+
+Con parametrización (seguro)
+────────────────────────────
+SELECT * FROM Posts WHERE Title = @p0
+@p0 = ' OR '1'='1   ← el motor lo trata como un string literal
+→ No se ejecuta la condición OR, se busca un título exacto.
+        </code></pre>
+        <p>En .NET 8, EF Core utiliza <code>SqlParameter</code> (o el equivalente de Npgsql para PostgreSQL) internamente. Eso significa que cualquier consulta LINQ está protegida por diseño. El peligro aparece cuando el desarrollador decide escribir SQL manualmente de forma incorrecta.</p>
+        <h3>¿Cómo funciona internamente EF Core?</h3>
+        <p>Cuando escribes una consulta LINQ, EF Core la traduce a un árbol de expresiones, luego a una consulta SQL relacional y finalmente envía los parámetros de forma separada al motor de base de datos. El motor conoce la estructura de la consulta y los valores, por lo que nunca puede confundir datos con código.</p>
+        <h3>ORMs y falsos positivos</h3>
+        <p>Algunos desarrolladores creen que usar un ORM les libera de pensar en SQL Injection. Es cierto solo si usamos LINQ. Tan pronto como usamos <code>FromSqlRaw</code>, <code>ExecuteSqlRaw</code> o consultas ad hoc, recuperamos la responsabilidad de parametrizar manualmente.</p>
+        <h3>ADON.NET y Dapper</h3>
+        <p>En ADO.NET, los <code>SqlParameter</code> o <code>NpgsqlParameter</code> son la forma segura de ejecutar consultas. Dapper hace esto casi automáticamente si pasamos objetos anónimos con propiedades como parámetros. Solo se vuelve vulnerable si concatenamos strings o usamos <code>DynamicParameters</code> de forma incorrecta.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Veamos la diferencia entre una consulta LINQ segura y una consulta cruda vulnerable. Ambas devuelven posts por título, pero la segunda permite inyección SQL.</p>
+        <pre><code class="language-csharp">// ✅ SEGURO: EF Core parametriza automáticamente
+app.MapGet("/api/posts", async (string title, CmsDbContext db) =>
+{
+    var posts = await db.Posts
+        .Where(p => p.Title.Contains(title))
+        .ToListAsync();
+
+    return Results.Ok(posts);
+});
+
+// ❌ VULNERABLE: concatenación directa de SQL
+app.MapGet("/api/posts-unsafe", async (string title, CmsDbContext db) =>
+{
+    var sql = $"SELECT * FROM Posts WHERE Title LIKE '%{title}%'";
+    var posts = await db.Posts.FromSqlRaw(sql).ToListAsync();
+    return Results.Ok(posts);
+});</code></pre>
+        <p>Si un atacante envía <code>title='; DROP TABLE Posts; --</code>, la consulta insegura podría destruir datos. La primera consulta simplemente buscará un título con esos caracteres y no devolverá nada. La inyección más peligrosa no es solo leer datos; es modificar o eliminar el esquema.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una aplicación profesional usamos búsquedas dinámicas, filtros opcionales y, a veces, SQL crudo por rendimiento. Veamos cómo hacerlo de forma segura con <code>FromSqlInterpolated</code>, <code>SqlParameter</code> y Dapper.</p>
+        <pre><code class="language-csharp">// ✅ FromSqlInterpolated: parametriza automáticamente
+app.MapGet("/api/posts/search", async (string? title, CmsDbContext db) =>
+{
+    var term = $"%{title ?? string.Empty}%";
+
+    var posts = await db.Posts
+        .FromSqlInterpolated($"""
+            SELECT * FROM "Posts" WHERE "Title" LIKE {term}
+            """)
+        .AsNoTracking()
+        .ToListAsync();
+
+    return Results.Ok(posts);
+});</code></pre>
+        <p><code>FromSqlInterpolated</code> convierte las expresiones interpoladas en parámetros. Es equivalente a escribir manualmente <code>SqlParameter</code>. La clave es que <strong>la expresión entre llaves nunca se interpola directamente</strong>; se convierte en un parámetro nombrado.</p>
+        <pre><code class="language-csharp">// ✅ SQL crudo seguro con parámetros explícitos
+app.MapGet("/api/posts/by-author", async (Guid authorId, CmsDbContext db) =>
+{
+    var parameter = new SqlParameter("@authorId", authorId);
+
+    var posts = await db.Posts
+        .FromSqlRaw("""
+            SELECT * FROM "Posts" WHERE "AuthorId" = @authorId
+            """, parameter)
+        .AsNoTracking()
+        .ToListAsync();
+
+    return Results.Ok(posts);
+});</code></pre>
+        <p>Si usas Dapper, el comportamiento es el mismo: siempre parametriza con objetos anónimos o <code>DynamicParameters</code>.</p>
+        <pre><code class="language-csharp">// ✅ Dapper con parámetros
+public class PostRepository : IPostRepository
+{
+    private readonly string _connectionString;
+
+    public PostRepository(IConfiguration configuration)
+    {
+        _connectionString = configuration.GetConnectionString("Default")!;
+    }
+
+    public async Task&lt;IReadOnlyList&lt;Post&gt;&gt; SearchByAuthorAsync(Guid authorId)
+    {
+        const string sql = """
+            SELECT * FROM "Posts" WHERE "AuthorId" = @authorId
+            """;
+
+        using var connection = new NpgsqlConnection(_connectionString);
+        var posts = await connection.QueryAsync&lt;Post&gt;(sql, new { authorId });
+        return posts.ToList();
+    }
+}</code></pre>
+        <p>Para búsquedas dinámicas con filtros opcionales, podemos construir la consulta de forma programática pero siempre parametrizando:</p>
+        <pre><code class="language-csharp">public async Task&lt;IReadOnlyList&lt;Post&gt;&gt; SearchAsync(PostSearchCriteria criteria)
+{
+    var sql = new StringBuilder("SELECT * FROM \"Posts\" WHERE 1 = 1");
+    var parameters = new DynamicParameters();
+
+    if (!string.IsNullOrWhiteSpace(criteria.Title))
+    {
+        sql.Append(" AND \"Title\" LIKE @title");
+        parameters.Add("title", $"%{criteria.Title}%");
+    }
+
+    if (criteria.AuthorId.HasValue)
+    {
+        sql.Append(" AND \"AuthorId\" = @authorId");
+        parameters.Add("authorId", criteria.AuthorId.Value);
+    }
+
+    if (criteria.Status is not null)
+    {
+        sql.Append(" AND \"Status\" = @status");
+        parameters.Add("status", criteria.Status);
+    }
+
+    using var connection = new NpgsqlConnection(_connectionString);
+    var posts = await connection.QueryAsync&lt;Post&gt;(sql.ToString(), parameters);
+    return posts.ToList();
+}</code></pre>
+        <p>Observa que la consulta SQL se concatena, pero <strong>los valores nunca se concatenan</strong>. Los valores siempre van en <code>DynamicParameters</code>. Esta es la regla de oro.</p>
+        <h3>Detección de SQL Injection en tests y revisión de código</h3>
+        <p>Además de parametrizar, debemos revisar el código y escribir tests que verifiquen que no se pueden inyectar payloads. Un test típico envía un string malicioso y verifica que la respuesta no contenga más datos de los esperados o que la consulta SQL generada contenga parámetros.</p>
+        <pre><code class="language-csharp">[Fact]
+public async Task Search_ByTitle_WithSqlInjectionPayload_ReturnsNoExtraResults()
+{
+    // Arrange
+    var maliciousTitle = "test' OR '1'='1";
+    await SeedPostsAsync(title: "test");
+
+    // Act
+    var response = await _client.GetAsync($"/api/posts?title={Uri.EscapeDataString(maliciousTitle)}");
+
+    // Assert
+    response.EnsureSuccessStatusCode();
+    var posts = await response.Content.ReadFromJsonAsync&lt;List&lt;PostResponseDto&gt;&gt;();
+    posts.Should().BeEmpty("porque el payload se trata como un literal, no como SQL");
+}</code></pre>
+        <p>El test fallará si la consulta es vulnerable: en ese caso, el payload devolvería todos los posts. Si la consulta está parametrizada, devolverá cero resultados porque ningún título coincide exactamente con el literal malicioso.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Prefiere LINQ:</strong> EF Core parametriza automáticamente y abstrae las diferencias entre motores de base de datos.</li>
+          <li><strong>Si usas SQL crudo, usa parámetros:</strong> nunca concatenes input del usuario. Usa <code>FromSqlInterpolated</code> o <code>SqlParameter</code>.</li>
+          <li><strong>Valida el input antes de tocar la base de datos:</strong> longitudes, caracteres permitidos y rangos. Aunque la parametrización protege, una validación previa reduce la superficie de ataque.</li>
+          <li><strong>Principio de mínimo privilegio:</strong> el usuario de la base de datos de la aplicación no debe poder ejecutar <code>DROP TABLE</code> ni acceder a tablas que no necesite.</li>
+          <li><strong>Auditoría:</strong> loguea consultas SQL inusuales o errores de sintaxis que puedan indicar intentos de inyección.</li>
+          <li><strong>Tests de seguridad:</strong> incluye tests que envíen payloads de inyección SQL y verifiquen que no se ejecuten. Un payload clásico es <code>' OR '1'='1</code>.</li>
+          <li><strong>Stored procedures:</strong> son seguras si se llaman con parámetros. Si el procedimiento almacenado concatena internamente, sigue siendo vulnerable.</li>
+          <li><strong>Evita SQL dinámico en el cliente:</strong> nunca construyas consultas SQL en el frontend y las envíes al backend para ejecutar.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <strong>Consejo:</strong> configura EF Core para loguear las consultas SQL en desarrollo con <code>EnableSensitiveDataLogging()</code>, pero desactívalo en producción para no exponer datos reales en los logs.
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <table>
+          <thead>
+            <tr><th>Incorrecto</th><th>Por qué está mal</th><th>Correcto</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>FromSqlRaw($"...{input}...")</code></td>
+              <td>Interpola el input directamente en el SQL</td>
+              <td><code>FromSqlInterpolated($"...{input}")</code></td>
+            </tr>
+            <tr>
+              <td>Concatenar string de SQL a mano</td>
+              <td>El input se convierte en código ejecutable</td>
+              <td>Usar <code>SqlParameter</code> o Dapper con parámetros</td>
+            </tr>
+            <tr>
+              <td>Usar <code>EnableSensitiveDataLogging()</code> en producción</td>
+              <td>Expone datos reales en los logs</td>
+              <td>Usarlo solo en desarrollo</td>
+            </tr>
+            <tr>
+              <td>Permitir que la app DB user sea <code>postgres</code> o <code>sa</code></td>
+              <td>Da demasiados permisos; un ataque exitoso es catastrófico</td>
+              <td>Crear un usuario con permisos mínimos (solo DML sobre tablas necesarias)</td>
+            </tr>
+            <tr>
+              <td>Stored procedure con concatenación interna</td>
+              <td>El motor de BD ejecuta SQL construido con input del usuario</td>
+              <td>Parametrizar también dentro del stored procedure</td>
+            </tr>
+            <tr>
+              <td>Confiar en validación del cliente para evitar SQL Injection</td>
+              <td>Un atacante puede saltarse cualquier validación del cliente</td>
+              <td>Validar y parametrizar siempre en el servidor</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Vamos a convertir un endpoint vulnerable en uno seguro. El endpoint busca posts por slug (cadena de URL amigable).</p>
+        <ol>
+          <li>Crea un endpoint <code>GET /api/posts/by-slug/{slug}</code>.</li>
+          <li>Usa <code>FromSqlInterpolated</code> para consultar por el slug.</li>
+          <li>Valida que el slug solo contenga letras, números, guiones y guiones bajos.</li>
+          <li>Escribe un test que envíe <code>slug="test' OR '1'='1"</code> y verifique que no se devuelvan todos los posts.</li>
+          <li>Escribe otro test que envíe un slug válido y verifique que la consulta funciona.</li>
+        </ol>
+        <pre><code class="language-csharp">app.MapGet("/api/posts/by-slug/{slug}", async (string slug, CmsDbContext db) =>
+{
+    // Validación de formato adicional
+    if (!SlugRegex().IsMatch(slug))
+        return Results.BadRequest("Slug con formato inválido.");
+
+    var post = await db.Posts
+        .FromSqlInterpolated($"""
+            SELECT * FROM "Posts" WHERE "Slug" = {slug}
+            """)
+        .AsNoTracking()
+        .FirstOrDefaultAsync();
+
+    return post is null ? Results.NotFound() : Results.Ok(post);
+});
+
+[GeneratedRegex(@"^[a-z0-9\-_]+$", RegexOptions.IgnoreCase)]
+private static partial Regex SlugRegex();</code></pre>
+        <p>El test de seguridad envía un payload clásico de inyección. La respuesta debe ser <code>400</code> por la validación del slug o, si llegara a la consulta, <code>404</code> porque EF Core parametriza el input. Nunca debe devolver todos los posts.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un buscador avanzado de posts con múltiples filtros opcionales (título, autor, fecha, estado) usando <strong>SQL crudo de forma segura</strong>. Debe:</p>
+        <ul>
+          <li>Construir la consulta SQL dinámicamente según los filtros recibidos.</li>
+          <li>Usar siempre parámetros, nunca concatenación.</li>
+          <li>Devolver resultados paginados.</li>
+          <li>Validar que los filtros tengan formatos esperados (GUID, fechas, enumeraciones).</li>
+        </ul>
+        <p>No resuelvas el reto todavía. Inténtalo primero; veremos una posible solución más adelante.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>SQL Injection ocurre cuando el input del usuario se interpola como código SQL.</li>
+          <li>EF Core protege automáticamente las consultas LINQ.</li>
+          <li>El peligro aparece al usar SQL crudo sin parametrizar.</li>
+          <li>Usa <code>FromSqlInterpolated</code>, <code>SqlParameter</code> o Dapper con parámetros.</li>
+          <li>Valida el input y aplica el principio de mínimo privilegio en la base de datos.</li>
+          <li>Los stored procedures también deben parametrizar internamente.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Las consultas LINQ de EF Core son 100% seguras?</summary>
+          <p>Sí, contra SQL Injection, porque EF Core genera parámetros. El riesgo aparece cuando usas <code>FromSqlRaw</code> o consultas ad hoc mal construidas.</p>
+        </details>
+        <details>
+          <summary>¿Puedo usar <code>string.Format</code> en SQL?</summary>
+          <p>No. Cualquier forma de concatenar strings con input del usuario es vulnerable. Usa siempre parámetros.</p>
+        </details>
+        <details>
+          <summary>¿Dapper es seguro?</summary>
+          <p>Sí, si usas parámetros en el objeto anónimo o <code>DynamicParameters</code>. Nunca concatenes.</p>
+        </details>
+        <details>
+          <summary>¿Los stored procedures protegen contra inyección SQL?</summary>
+          <p>Solo si se llaman con parámetros. Un stored procedure que concatene internamente sigue siendo vulnerable.</p>
+        </details>
+        <details>
+          <summary>¿Es seguro usar <code>FromSqlInterpolated</code> con cualquier tipo?</summary>
+          <p>Sí, siempre que los valores vengan dentro de las llaves. No uses <code>FromSqlRaw</code> con strings interpolados.</p>
+        </details>
+        <details>
+          <summary>¿Debo desactivar <code>EnableSensitiveDataLogging</code> en producción?</summary>
+          <p>Sí. En producción solo se recomienda mostrar consultas SQL sin valores. Los datos sensibles nunca deben aparecer en logs.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

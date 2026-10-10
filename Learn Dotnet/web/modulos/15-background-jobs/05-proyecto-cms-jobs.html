@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="es" data-module="15" data-lesson="05-proyecto-cms-jobs" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: publicación automática + emails — Módulo 15 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: publicación automática + emails</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 15 · Background Jobs</span><span>50 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En este proyecto integraremos todo lo aprendido en el módulo dentro del CMS que venimos construyendo. Implementaremos dos funcionalidades en segundo plano:</p>
+        <ul>
+          <li>Un <strong>job programado</strong> que publica automáticamente los posts cuyo <code>ScheduledAt</code> ya ha llegado.</li>
+          <li>Un <strong>servicio de emails con <code>Channel&lt;T&gt;</code></strong> que notifique a los suscriptores cuando un post se publique.</li>
+        </ul>
+        <p>Usaremos Hangfire para el job programado y <code>Channel&lt;T&gt;</code> para el procesamiento de emails. También veremos cómo encadenar ambos sistemas de forma limpia.</p>
+
+        <div class="callout info">
+          <strong>Escenario real:</strong> un editor programa un post para las 9:00 del lunes. El job recurrente lo detecta, cambia su estado a <em>Published</em> y encola un email de notificación que el consumidor envía en segundo plano.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>Arquitectura del flujo</h3>
+        <pre><code class="language-text">┌─────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Scheduler  │────▶│  Hangfire Job   │────▶│  PostPublisher  │
+│  (cron)     │     │  cada minuto    │     │  publica posts  │
+└─────────────┘     └─────────────────┘     └────────┬────────┘
+                                                     │
+                                                     ▼
+                                            ┌─────────────────┐
+                                            │  Channel&lt;T&gt;     │
+                                            │  de notificaciones
+                                            └────────┬────────┘
+                                                     │
+                                                     ▼
+                                            ┌─────────────────┐
+                                            │ EmailConsumer   │
+                                            │ BackgroundService
+                                            └─────────────────┘</code></pre>
+
+        <h3>Decisiones de diseño</h3>
+        <ul>
+          <li><strong>Hangfire para publicación:</strong> necesitamos persistencia y reintentos si la base de datos no está disponible.</li>
+          <li><strong>Channel&lt;T&gt; para emails:</strong> los emails son tareas rápidas, no críticas y toleran perderse si el proceso reinicia. Un canal en memoria es suficiente y muy eficiente.</li>
+          <li><strong>Separación de responsabilidades:</strong> el job solo orquesta; la lógica de publicación y envío está en servicios testeables.</li>
+        </ul>
+
+        <h3>Idempotencia en la publicación</h3>
+        <p>El job puede ejecutarse varias veces si hay reintentos. Por eso la consulta de posts programados debe filtrar solo aquellos que aún no están publicados. Así, ejecutar el job dos veces seguidas no publicará dos veces el mismo post.</p>
+
+        <h3>Desacoplamiento con eventos de dominio</h3>
+        <p>En lugar de que el job llame directamente al servicio de emails, publicaremos un evento de dominio <code>PostPublishedEvent</code>. Un handler encolará el email. Esto mantiene el dominio independiente de la infraestructura.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>El núcleo del sistema es el job recurrente que consulta y publica posts. Veamos su versión más simple.</p>
+
+        <pre><code class="language-csharp">// IPostPublishingJob.cs
+public interface IPostPublishingJob
+{
+    Task PublishScheduledPostsAsync();
+}</code></pre>
+
+        <pre><code class="language-csharp">// PostPublishingJob.cs
+public class PostPublishingJob(
+    ILogger&lt;PostPublishingJob&gt; logger,
+    IPostRepository repository,
+    IEventBus eventBus) : IPostPublishingJob
+{
+    [AutomaticRetry(Attempts = 3)]
+    public async Task PublishScheduledPostsAsync()
+    {
+        var posts = await repository.GetScheduledToPublishAsync(DateTime.UtcNow);
+
+        foreach (var post in posts)
+        {
+            post.Publish();
+            await repository.UpdateAsync(post);
+
+            await eventBus.PublishAsync(new PostPublishedEvent(
+                post.Id, post.Title, post.AuthorEmail));
+
+            logger.LogInformation("Post publicado: {Title}", post.Title);
+        }
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// Registro del job recurrente
+RecurringJob.AddOrUpdate&lt;IPostPublishingJob&gt;(
+    "cms-publish-scheduled-posts",
+    job => job.PublishScheduledPostsAsync(),
+    Cron.Minutely);</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Ampliamos el ejemplo con el canal de emails, el consumidor como <code>BackgroundService</code> y la integración completa en <code>Program.cs</code>.</p>
+
+        <pre><code class="language-csharp">// Post.cs (modelo de dominio)
+public class Post
+{
+    public Guid Id { get; private set; }
+    public string Title { get; private set; } = string.Empty;
+    public string AuthorEmail { get; private set; } = string.Empty;
+    public PostStatus Status { get; private set; }
+    public DateTime? ScheduledAt { get; private set; }
+
+    public void Schedule(DateTime scheduledAt)
+    {
+        ScheduledAt = scheduledAt;
+        Status = PostStatus.Scheduled;
+    }
+
+    public void Publish()
+    {
+        if (Status != PostStatus.Scheduled)
+            throw new InvalidOperationException("Solo se pueden publicar posts programados");
+
+        Status = PostStatus.Published;
+        ScheduledAt = null;
+    }
+}
+
+public enum PostStatus { Draft, Scheduled, Published, Archived }</code></pre>
+
+        <pre><code class="language-csharp">// PostPublishedEvent.cs
+public sealed record PostPublishedEvent(
+    Guid PostId,
+    string Title,
+    string AuthorEmail);</code></pre>
+
+        <pre><code class="language-csharp">// IEventBus.cs
+public interface IEventBus
+{
+    Task PublishAsync&lt;TEvent&gt;(TEvent evt, CancellationToken ct = default) where TEvent : class;
+}</code></pre>
+
+        <pre><code class="language-csharp">// InMemoryEventBus.cs (versión simple para este módulo)
+public class InMemoryEventBus(IServiceProvider provider) : IEventBus
+{
+    public async Task PublishAsync&lt;TEvent&gt;(TEvent evt, CancellationToken ct = default)
+        where TEvent : class
+    {
+        var handlers = provider.GetServices&lt;IEventHandler&lt;TEvent&gt;&gt;();
+        foreach (var handler in handlers)
+        {
+            await handler.HandleAsync(evt, ct);
+        }
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// IEventHandler.cs
+public interface IEventHandler&lt;in TEvent&gt; where TEvent : class
+{
+    Task HandleAsync(TEvent evt, CancellationToken ct);
+}</code></pre>
+
+        <pre><code class="language-csharp">// EnqueueEmailOnPostPublishedHandler.cs
+public class EnqueueEmailOnPostPublishedHandler(
+    IEmailChannel channel,
+    ILogger&lt;EnqueueEmailOnPostPublishedHandler&gt; logger) : IEventHandler&lt;PostPublishedEvent&gt;
+{
+    public async Task HandleAsync(PostPublishedEvent evt, CancellationToken ct)
+    {
+        var message = new EmailMessage(
+            evt.AuthorEmail,
+            $"Tu post '{evt.Title}' ha sido publicado",
+            "El post programado ya está disponible en el CMS.");
+
+        await channel.Writer.WriteAsync(message, ct);
+        logger.LogInformation("Email encolado para {Email}", evt.AuthorEmail);
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// EmailChannel.cs y EmailConsumerService.cs
+public interface IEmailChannel
+{
+    ChannelWriter&lt;EmailMessage&gt; Writer { get; }
+    ChannelReader&lt;EmailMessage&gt; Reader { get; }
+}
+
+public class EmailChannel : IEmailChannel
+{
+    private readonly Channel&lt;EmailMessage&gt; _channel =
+        Channel.CreateBounded&lt;EmailMessage&gt;(new BoundedChannelOptions(500)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+    public ChannelWriter&lt;EmailMessage&gt; Writer => _channel.Writer;
+    public ChannelReader&lt;EmailMessage&gt; Reader => _channel.Reader;
+}
+
+public class EmailConsumerService(
+    ILogger&lt;EmailConsumerService&gt; logger,
+    IEmailChannel channel,
+    IEmailSender sender) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await foreach (var message in channel.Reader.ReadAllAsync(stoppingToken))
+        {
+            try
+            {
+                await sender.SendAsync(message, stoppingToken);
+                logger.LogInformation("Notificación enviada a {To}", message.To);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error enviando notificación a {To}", message.To);
+            }
+        }
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs (fragmentos clave)
+var builder = WebApplication.CreateBuilder(args);
+
+// Base de datos del CMS
+builder.Services.AddDbContext&lt;CmsDbContext&gt;(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Cms")));
+
+// Hangfire con PostgreSQL
+builder.Services.AddHangfire(config => config
+    .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
+    .UseSimpleAssemblyNameTypeSerializer()
+    .UseRecommendedSerializerSettings()
+    .UsePostgreSqlStorage(builder.Configuration.GetConnectionString("Hangfire")));
+
+builder.Services.AddHangfireServer(options => options.WorkerCount = 2);
+
+// Canal de emails en memoria
+builder.Services.AddSingleton&lt;IEmailChannel, EmailChannel&gt;();
+builder.Services.AddHostedService&lt;EmailConsumerService&gt;();
+
+// Eventos y handlers
+builder.Services.AddSingleton&lt;IEventBus, InMemoryEventBus&gt;();
+builder.Services.AddSingleton&lt;IEventHandler&lt;PostPublishedEvent&gt;, EnqueueEmailOnPostPublishedHandler&gt;();
+
+// Jobs y servicios
+builder.Services.AddScoped&lt;IPostPublishingJob, PostPublishingJob&gt;();
+builder.Services.AddScoped&lt;IPostRepository, PostRepository&gt;();
+builder.Services.AddSingleton&lt;IEmailSender, FakeEmailSender&gt;();
+
+var app = builder.Build();
+
+app.UseHangfireDashboard("/hangfire", new DashboardOptions
+{
+    Authorization = [new HangfireAuthorizationFilter()]
+});
+
+// Registramos jobs recurrentes
+RecurringJob.AddOrUpdate&lt;IPostPublishingJob&gt;(
+    "cms-publish-scheduled-posts",
+    job => job.PublishScheduledPostsAsync(),
+    Cron.Minutely,
+    new RecurringJobOptions { TimeZone = TimeZoneInfo.Utc });
+
+app.MapControllers();
+app.Run();</code></pre>
+
+        <div class="callout warning">
+          <strong>Importante:</strong> en un módulo posterior reemplazaremos el <code>InMemoryEventBus</code> por una solución más robusta. Por ahora nos sirve para entender el flujo sin añadir infraestructura extra.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>El job no conoce al canal:</strong> solo publica un evento de dominio. El handler decide si encolar un email, una notificación push, etc.</li>
+          <li><strong>Filtra por estado en la consulta:</strong> la publicación solo debe afectar a posts <code>Scheduled</code> con <code>ScheduledAt &lt;= ahora</code>.</li>
+          <li><strong>Usa transacciones:</strong> si el job actualiza varios posts, envuélvelo en una transacción para mantener la consistencia.</li>
+          <li><strong>Protege el dashboard:</strong> nunca expongas <code>/hangfire</code> sin autenticación.</li>
+          <li><strong>Monitoriza el canal:</strong> añade métricas de mensajes encolados y enviados para detectar cuellos de botella.</li>
+          <li><strong>Jobs idempotentes:</strong> asegúrate de que publicar dos veces el mismo post no duplique emails ni cambie el estado incorrectamente.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>Error 1: el job publica posts ya publicados</h3>
+        <pre><code class="language-csharp">// ❌ MAL: podría devolver posts ya publicados
+var posts = await repository.GetScheduledToPublishAsync(DateTime.UtcNow);</code></pre>
+        <p><strong>Solución:</strong> asegúrate de que el repositorio filtre por <code>Status == Scheduled</code>.</p>
+
+        <h3>Error 2: el handler bloquea la publicación</h3>
+        <pre><code class="language-csharp">// ❌ MAL: enviar el email de forma síncrona retrasa el job
+await _smtpClient.SendAsync(email);</code></pre>
+        <p><strong>Solución:</strong> encola el email en <code>Channel&lt;T&gt;</code> y deja que un consumidor lo envíe después.</p>
+
+        <h3>Error 3: no gestionar el cierre del canal</h3>
+        <p>Si la aplicación se reinicia, los emails pendientes en el canal se pierden. Decide si esto es aceptable; si no, usa Hangfire también para emails.</p>
+
+        <h3>Error 4: registrar handlers como scoped incorrectamente</h3>
+        <p>En este ejemplo usamos un bus en memoria. Si el handler necesita <code>DbContext</code>, crea un scope manual dentro de <code>HandleAsync</code>.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Completa el proyecto CMS añadiendo un endpoint para programar un post.</p>
+        <ol>
+          <li>Crea un endpoint <code>POST /api/posts/{id}/schedule</code> que reciba una fecha <code>scheduledAt</code>.</li>
+          <li>Verifica que el post esté en estado <code>Draft</code> o <code>Scheduled</code>.</li>
+          <li>Asigna la fecha y cambia el estado a <code>Scheduled</code>.</li>
+          <li>Guarda los cambios en el <code>DbContext</code>.</li>
+          <li>Espera a que el job recurrente de Hangfire lo publique.</li>
+          <li>Comprueba en el dashboard que el job se ejecuta cada minuto.</li>
+        </ol>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Mejora el sistema para que, además del autor, se notifique a todos los suscriptores del CMS cuando se publique un post. El job debe leer la lista de suscriptores, y el handler debe encolar un email por cada suscriptor. Asegúrate de no bloquear el handler y de que el canal limitado aplique <em>backpressure</em>.</p>
+        <p>No resuelvas el reto todavía; inténtalo primero.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El proyecto CMS ahora incluye publicación automática de posts con Hangfire.</li>
+          <li>Los eventos de dominio desacoplan la publicación del envío de notificaciones.</li>
+          <li><code>Channel&lt;T&gt;</code> procesa los emails en segundo plano de forma eficiente.</li>
+          <li>Los jobs deben ser idempotentes y los handlers no deben bloquear la lógica principal.</li>
+          <li>El dashboard de Hangfire debe protegerse en producción.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Por qué no usar Hangfire también para los emails?</summary>
+          <p>Podrías hacerlo. Sin embargo, <code>Channel&lt;T&gt;</code> es más ligero para notificaciones de alta frecuencia que toleran pérdida ocasional. Hangfire añade latencia por la persistencia en base de datos.</p>
+        </details>
+
+        <details>
+          <summary>¿Cada cuánto debe ejecutarse el job de publicación?</summary>
+          <p>Depende de la precisión que necesites. <code>Cron.Minutely</code> es suficiente para la mayoría de CMS. Si necesitas precisión de segundos, considera un job más frecuente o un servicio dedicado.</p>
+        </details>
+
+        <details>
+          <summary>¿Qué pasa si el job falla a mitad de publicar varios posts?</summary>
+          <p>Hangfire reintentará el job completo. Por eso la publicación debe ser idempotente: los posts ya publicados no deben volver a cambiar de estado.</p>
+        </details>
+
+        <details>
+          <summary>¿Puedo separar el consumidor de emails en otro proceso?</summary>
+          <p>Sí. En un sistema más grande, el consumidor puede ser un worker service independiente. El canal de memoria solo funciona dentro del mismo proceso; para separarlos necesitarías una cola externa.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

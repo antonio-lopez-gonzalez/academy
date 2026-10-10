@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="03-seguridad-rbac">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SecurityContext, no-root y RBAC básico — Módulo 8 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>SecurityContext, no-root y RBAC básico</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Helm, seguridad y operación</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta aquí has aprendido a <em>desplegar</em> contenedores. Esta lección trata de la otra cara: <strong>quién puede ejecutar qué, y con qué permisos</strong>, dentro del clúster.</p>
+        <p>El problema de seguridad número uno es que la mayoría de las imágenes ejecutan como <strong>root</strong> (UID 0). Un atacante que explote tu API correrá con los mismos privilegios que el proceso: dentro del contenedor, root es todopoderoso. Y un Pod admin comprometido puede gobernar el clúster entero.</p>
+        <p>Verás tres frentes: <strong>hardening del contenedor</strong> (SecurityContext: no-root, capabilities, filesystem de solo lectura), <strong>mínimo privilegio en el clúster</strong> (RBAC con ServiceAccounts, Roles y RoleBindings, y namespaces como límite del blast radius) y <strong>acceso a imágenes privadas</strong> (imagePullSecrets). Todo aplicado a HarborTasks.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección?</strong> Porque el fallo clásico es desplegar bonito y olvidar los permisos: una auditoría tumba antes un contenedor root que un bug de memoria. La seguridad es propiedad del <em>despliegue</em>, no solo del código.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué un contenedor no debería correr como root</h3>
+        <p>Un contenedor no es una máquina virtual: comparte el <em>kernel</em> del host (recuerda el Módulo 0). El UID 0 dentro del contenedor es "root" respecto a los namespaces y capabilities, pero sigue siendo un usuario del kernel del host. Los mecanismos de aislamiento (namespaces, seccomp) reducen el daño, pero <em>no lo eliminan</em>: cualquier vulnerabilidad de escalada de privilegios en el kernel convierte a ese "root del contenedor" en un peligro inmediato.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> dar a tu contenedor UID 0 es como dar al conserje de un edificio la llave maestra de todos los pisos. Funciona, pero cualquier desliz suyo es un desastre para todos. Mejor: cada servicio tiene su propia llave (su propio UID) y solo abre lo suyo.</p>
+        </div>
+        <p>La jerarquía de defensa en Kubernetes, de adentro hacia afuera:</p>
+        <div class="diagram">a) dentro del contenedor
+  1. imagen sin root       → Dockerfile: USER app:app
+  2. Pod SecurityContext   → runAsNonRoot, capabilities
+  3. políticas             → Pod Security Admission
+b) en el clúster
+  4. Namespaces            → frontera por app/team
+  5. RBAC                  → ServiceAccount + RoleBinding</div>
+
+        <h3>SecurityContext: el "permiso de usuario" del Pod</h3>
+        <p>Es la sección del manifiesto que configura el contexto de seguridad de un Pod o de un contenedor. Se puede declarar a nivel de <code>spec.securityContext</code> (todo el Pod) o en cada <code>containers[].securityContext</code> (solo ese contenedor). Los campos clave:</p>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué hace</th><th>Por qué importa</th></tr></thead>
+          <tbody>
+            <tr><td><code>runAsNonRoot: true</code></td><td>Prohíbe arrancar con UID 0</td><td>El kubelet rechaza el Pod si la imagen intenta correr como root</td></tr>
+            <tr><td><code>runAsUser: 10001</code></td><td>Fuerza el UID del proceso</td><td>Determinismo: da igual lo que diga la imagen, corre con un UID no privilegiado</td></tr>
+            <tr><td><code>runAsGroup: 10001</code></td><td>Fuerza el GID</td><td>Evita escrituras accidentales en archivos de otros grupos</td></tr>
+            <tr><td><code>readOnlyRootFilesystem: true</code></td><td>Sistema de archivos raíz de solo lectura</td><td>Un atacante no puede escribir binarios o scripts en la imagen en ejecución</td></tr>
+            <tr><td><code>capabilities.drop: [ALL]</code></td><td>Elimina todas las capabilities POSIX</td><td>Root tiene ~37 capabilities; las aplicaciones web necesitan poquísimas</td></tr>
+            <tr><td><code>allowPrivilegeEscalation: false</code></td><td>Prohíbe subir privilegios tras arrancar</td><td>Bloquea técnicas como setuid que escalarían tras un exploit</td></tr>
+          </tbody>
+        </table>
+
+        <h3>USER no-root en el Dockerfile: la capa 1</h3>
+        <p>El <code>securityContext</code> protege el <em>despliegue</em>, pero la imagen debe ser compatible. Si una imagen Node no tiene usuario no-root, <code>runAsNonRoot: true</code> la hará fallar. Por eso la práctica correcta es doble: crear el usuario en el Dockerfile <strong>y</strong> reforzarlo en el manifiesto.</p>
+        <pre><code class="language-dockerfile"># Dockerfile multi-stage de la API (recuerda M1-04): etapa final
+FROM node:20-alpine
+WORKDIR /app
+# Copia solo lo necesario de la etapa builder
+COPY --from=builder /app/dist ./dist
+COPY package.json ./
+RUN npm ci --omit=dev
+# 1) usuario no root DENTRO de la imagen:
+RUN adduser -D -u 10001 appuser
+USER appuser                 # CMD correrá con este usuario
+EXPOSE 3000
+CMD ["node", "dist/server.js"]</code></pre>
+
+        <h3>RBAC: quién puede hacer qué en el clúster</h3>
+        <p>RBAC (<em>Role-Based Access Control</em>) decide <strong>qué identidad puede ejecutar qué verbos sobre qué recursos</strong>. No es del Módulo 6: los pods no hablan con la API por defecto... o sí: recuerda que un pod puede hablar con <code>kube-apiserver</code>. RBAC controla ese acceso. Cuatro piezas:</p>
+        <ul>
+          <li><strong>ServiceAccount:</strong> la "identidad" de un Pod frente a la API. Cada namespace tiene una por defecto (<code>default</code>), y todo Pod corre con alguna.</li>
+          <li><strong>Role:</strong> reglas de permisos <em>dentro de un namespace</em> (p. ej. "puede hacer get/list en pods").</li>
+          <li><strong>ClusterRole:</strong> lo mismo pero en todo el clúster (o por namespace para recursos no-namespaced como Nodes).</li>
+          <li><strong>RoleBinding / ClusterRoleBinding:</strong> el "puente" que concede ese Role a un sujeto (usuario o ServiceAccount).</li>
+        </ul>
+        <div class="diagram">   +----------+        +--------+        +-----------+
+   │ Service │        │  Role  │        │ RoleBinding│
+   │Account A │  ─────▶│(pods,  │  ◀─────│ (conecta  │
+   +----------+  grant│ get,   │        │ SA A con  │
+                     │ list)  │        │  Role)    │
+                     +--------+        +-----------+
+   ¿Puede el Pod de la API listar pods?  → Solo si su SA tiene un
+   binding a un Role que lo permita.      → deny by default.</div>
+        <p>El modelo es <strong>deny by default</strong>: si no hay binding, no hay permiso. La regla de oro profesional: cuanto menos pueda hacer la ServiceAccount de una app, más segura está.</p>
+
+        <h3>Namespaces: el límite del blast radius</h3>
+        <p>Un namespace es una frontera <em>lógica</em> (no de seguridad del kernel, pero organizativa): confina recursos, ServiceAccounts, quotas y políticas. Si HarborTasks vive en su propio namespace <code>harbortasks</code>, sus problemas no contaminan al resto de la organización. Es la primera línea para limitar el alcance de un incidente.</p>
+
+        <h3>imagePullSecrets: imágenes privadas</h3>
+        <p>Cuando la imagen no es pública, el kubelet necesita credenciales para descargarla. Se guardan en un Secret de tipo <code>kubernetes.io/dockerconfigjson</code> (que se referencia desde el Dockerfile de M1-05) y el Pod lo declara con <code>imagePullSecrets</code>: el kubelet usa esas credenciales al hacer pull.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El manifiesto más pequeño posible de un Pod endurecido:</p>
+        <pre><code class="language-yaml"># pod-seguro.yaml — un Pod con SecurityContext básico
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-seguro
+spec:
+  securityContext:              # aplica a TODOS los contenedores del Pod
+    runAsNonRoot: true          # rechazado si la imagen intenta ser root
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001              # grupo para los volúmenes montados
+  containers:
+    - name: app
+      image: node:20-alpine
+      command: ["node", "-e", "console.log('uid:', process.getuid())"]
+      securityContext:          # contexto SOLO de este contenedor
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]         # elimina eslint capabilities del contenedor</code></pre>
+        <pre><code class="language-bash">kubectl apply -f pod-seguro.yaml
+kubectl logs pod-seguro       # debe imprimir: uid: 10001
+kubectl exec pod-seguro -- whoami   # "whoami" no existe en alpine; fíjate
+                                    # que sin capabilities el escaneo es mínimo</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Reforzar los despliegues de HarborTasks. Primero el SecurityContext del Deployment de la API (nivel que ya viste; ahora con el endurecimiento):</p>
+        <pre><code class="language-yaml"># deployment-api-hardened.yaml — extiende el deployment del Módulo 9
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: harbortasks
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+    spec:
+      securityContext:                # todo el Pod
+        runAsNonRoot: true            # la imagen ya usa USER appuser
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001                # los volúmenes montan con GID 10001
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # la API solo necesita escribir en tmpfs
+            capabilities:
+              drop: ["ALL"]                # mínimo absoluto
+          # La API escribe logs/temp en /tmp → monta un emptyDir con memoria
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
+          envFrom:
+            - configMapRef:
+                name: harbor-config
+            - secretRef:
+                name: harbor-secrets</code></pre>
+        <p>La web (nginx) es un caso clásico: nginx escribe en <code>/var/cache/nginx</code> y en <code>/var/run</code>. Con <code>readOnlyRootFilesystem: true</code> hay que montar esos directorios como <code>emptyDir</code>:</p>
+        <pre><code class="language-yaml"># deployment-web-hardened.yaml — extracto del contenedor web
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101          # el usuario no-root estándar de nginx
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]  # nginx necesita abrir el puerto 80
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          volumes:
+            - name: nginx-cache
+              emptyDir: {}
+            - name: nginx-run
+              emptyDir: {}</code></pre>
+
+        <h3>ServiceAccount, Role y RoleBinding para la API</h3>
+        <p>Si la API tiene que <em>preguntar</em> a la API de Kubernetes (leer pods para mostrar estado), usa mínimo privilegio:</p>
+        <pre><code class="language-yaml"># rbac.yaml — ServiceAccount + Role + RoleBinding (todo en harbortasks)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-sa
+  namespace: harbortasks
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-reader
+  namespace: harbortasks
+rules:
+  # SOLO lectura de pods en ESTE namespace: nada de secrets ni de otros
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-reader-binding
+  namespace: harbortasks
+subjects:
+  - kind: ServiceAccount
+    name: api-sa
+    namespace: harbortasks
+roleRef:
+  kind: Role
+  name: api-reader
+  apiGroup: rbac.authorization.k8s.io</code></pre>
+        <pre><code class="language-yaml"># El Deployment debe declarar su ServiceAccount: sin esto usaría "default"
+spec:
+  template:
+    spec:
+      serviceAccountName: api-sa   # el Pod corre con la identidad api-sa</code></pre>
+
+        <h3>imagePullSecrets para imágenes privadas</h3>
+        <pre><code class="language-bash"># Criar el Secret de pull desde las credenciales de GHCR (M1-05)
+kubectl create secret docker-registry ghcr-pull \
+  --docker-server=ghcr.io \
+  --docker-username="$GITHUB_USER" \
+  --docker-password="$GITHUB_TOKEN" \
+  -n harbortasks
+# Alternativa declarativa:
+# kubectl apply -f ghcr-pull.yaml  (Secret type: kubernetes.io/dockerconfigjson)</code></pre>
+        <pre><code class="language-yaml"># Referencia en cada Deployment cuyo Pod baje imágenes del registro privado
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull</code></pre>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usuario no-root en el Dockerfile <strong>y</strong> <code>runAsNonRoot</code> en el manifiesto</td>
+              <td>Confiar solo en uno de los dos</td>
+              <td>El Dockerfile dota a la imagen; el SecurityContext garantiza el endurecimiento en el clúster, incluso si alguien cambia la imagen.</td>
+            </tr>
+            <tr>
+              <td><code>capabilities.drop: [ALL]</code> + añadir solo lo imprescindible</td>
+              <td>Correr con capabilities de serie de la imagen</td>
+              <td>Principio de mínimo privilegio: menos capabilities = menos superficie para escalar tras un exploit.</td>
+            </tr>
+            <tr>
+              <td>Hawking <code>readOnlyRootFilesystem</code> y montar empties para escritura</td>
+              <td>Confiar en que "no necesito escribir" sin montar nada</td>
+              <td>Los procesos escriben en temp/cache aunque no lo planees; con RO + emptyDir controlas exactamente qué se puede escribir y dónde.</td>
+            </tr>
+            <tr>
+              <td>Una ServiceAccount dedicada por aplicación, con Role mínimo y binding por namespace</td>
+              <td>Correr todo con la ServiceAccount <code>default</code> o con permisos de admin</td>
+              <td><code>default</code> es la identidad compartida por todos los pods sin configurar; si algo la usa, el riesgo se multiplica.</td>
+            </tr>
+            <tr>
+              <td>Usar namespaces por equipo/aplicación</td>
+              <td>Todo en el namespace <code>default</code></td>
+              <td>El namespace limita el blast radius y hace los quotas y políticas aplicables por frontera.</td>
+            </tr>
+            <tr>
+              <td>Uso de <code>imagePullSecrets</code> y <code>pullSecrets</code> rotados</td>
+              <td>Imágenes privadas sin credenciales o tokens hardcodeados</td>
+              <td>La credencial vive en un Secret, no en el YAML; rotarla es recrearla y volver a referenciarla.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Imagen root con runAsNonRoot en el manifiesto</h3>
+        <pre><code class="language-yaml"># ❌ El Pod dice runAsNonRoot pero la imagen arranca como root
+# spec:
+#   securityContext:
+#     runAsNonRoot: true          # ¡y la imagen no tiene USER!
+# Resultado: CreateContainerConfigError / "container has runAsNonRoot and
+# image has non-numeric user (root)"
+
+# ✅ Dos opciones: o arreglas la imagen (USER en el Dockerfile)
+FROM node:20-alpine
+RUN adduser -D -u 10001 appuser
+USER appuser
+# ✅ o al menos fuerzas el UID explícito:
+#     runAsUser: 10001</code></pre>
+
+        <h3>Dejar writable el filesystem raíz "por si acaso"</h3>
+        <pre><code class="language-yaml"># ❌ Omitir readOnlyRootFilesystem → la imagen raíz es escribible
+# spec:
+#   securityContext:
+#     readOnlyRootFilesystem: false    # por defecto es false
+
+# ✅ Y montar lo necesario como emptyDir (mínimo privilegio)
+#  securityContext:
+#    readOnlyRootFilesystem: true
+#  volumes:
+#    - name: tmp
+#      emptyDir: {}</code></pre>
+
+        <h3>Conceder permisos de más "por comodidad"</h3>
+        <pre><code class="language-yaml"># ❌ Role con * en recursos y * en verbs: cualquiera con esa SA puede TODO
+# rules:
+#   - apiGroups: ["*"]
+#     resources: ["*"]
+#     verbs: ["*"]
+
+# ✅ Mínimo expresado de forma explícita
+rules:
+  - apiGroups: [""]            # grup núcleo (pods, services...)
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]</code></pre>
+
+        <h3>Subir de un vistazo "sudo"-minded dentro del clúster</h3>
+        <pre><code class="language-bash"># ❌ dar ClusterRole cluster-admin a un servicio para "que funcione"
+kubectl create clusterrolebinding api-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=harbortasks:api-sa
+
+# ✅ Y la forma correcta: el Role más pequeño que cumpla la función
+kubectl create role api-reader -n harbortasks \
+  --verb=get,list,watch --resource=pods
+kubectl create rolebinding api-reader -n harbortasks \
+  --role=api-reader --serviceaccount=harbortasks:api-sa</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> desplegar un pod endurecido en tu clúster de kind y verificar los efectos de la seguridad.</p>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> verifica que el clúster está activo: <code>kubectl get nodes</code>.</li>
+          <li>
+            <strong>Paso 2:</strong> crea el namespace y el Pod del ejemplo mínimo:
+            <pre><code class="language-bash">kubectl create namespace seglab
+kubectl apply -f pod-seguro.yaml -n seglab</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> comprueba el UID real:
+            <pre><code class="language-bash">kubectl logs pod-seguro -n seglab        # imprime "uid: 10001"
+kubectl exec pod-seguro -n seglab -- id   # uid=10001 gid=10001 groups=10001</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 (verificación crítica):</strong> intenta escribir en la raíz:
+            <pre><code class="language-bash">kubectl exec pod-seguro -n seglab -- sh -c "echo hola > /root.txt"
+# ❌ debe fallar: read-only file system (gracias a readOnlyRootFilesystem)</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5:</strong> replica la comprobación con el Pod sin endurecer:
+            <pre><code class="language-bash">kubectl run pod-inseguro --image=node:20-alpine \
+  --restart=Never --command -- node -e "console.log(getuid())" -n seglab
+kubectl logs pod-inseguro -n seglab      # imprime "uid: 0" — root!</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6:</strong> limpia el laboratorio:
+            <pre><code class="language-bash">kubectl delete namespace seglab
+kubectl delete -f pod-seguro.yaml</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Observa:</strong> con el mismo Dockerfile (node:20-alpine), el mismo comando y la única diferencia siendo el <code>securityContext</code>, un Pod arranca como <code>uid: 0</code> y otro como <code>uid: 10001</code>. La seguridad no cambia el código: protege el despliegue.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un Pod de solo lectura que sí funciona</h3>
+          <p>La web de HarborTasks (nginx) falla si montas <code>readOnlyRootFilesystem: true</code> sin ajustes. Tu reto: desplegar un Pod con nginx <code>harbortasks-web:1.0.0</code> que cumpla TODO a la vez: <code>runAsNonRoot</code> + <code>drop: [ALL]</code> + <code>NET_BIND_SERVICE</code> + filesystem raíz de solo lectura, y que responda HTTP. El vector: averiguar qué monta nginx para cache/temp (pista en el ejemplo real de esta lección).</p>
+          <p><em>Pista: monta <code>/var/cache/nginx</code> y <code>/var/run</code> como emptyDir; revisa el log de nginx con <code>kubectl logs</code> si algo falla — te dirá exactamente qué directorio necesita escritura.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Contenedor root = peligro: comparte kernel con el host; mínimo privilegio por capas.</li>
+          <li><strong>SecurityContext</strong> declara <code>runAsNonRoot</code>, <code>runAsUser</code>, <code>readOnlyRootFilesystem</code>, capabilities y <code>allowPrivilegeEscalation</code>.</li>
+          <li><code>USER appuser</code> en el Dockerfile dota la imagen; el manifiesto garantiza el endurecimiento.</li>
+          <li><strong>RBAC:</strong> ServiceAccount (¿quién es), Role/ClusterRole (¿qué puede), RoleBinding/ClusterRoleBinding (¿cómo se conectan). Deny by default.</li>
+          <li><strong>Namespaces</strong> limitan el blast radius de un incidente y aíslan equipos.</li>
+          <li><strong>imagePullSecrets</strong> dan el pull de imágenes privadas (type <code>dockerconfigjson</code>).</li>
+          <li>Aplicación a HarborTasks: API con <code>drop: [ALL]</code>, web con <code>NET_BIND_SERVICE</code> y empties, SA <code>api-sa</code> con Role de solo lectura.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -f pod-seguro.yaml</code></td><td>Aplica un Pod con SecurityContext</td></tr>
+            <tr><td><code>kubectl exec POD -- id</code></td><td>Muestra el UID/GID real del proceso del contenedor</td></tr>
+            <tr><td><code>kubectl create secret docker-registry …</code></td><td>Crea un Secret de pull para registros privados</td></tr>
+            <tr><td><code>kubectl create role &lt;name&gt; --verb=… --resource=…</code></td><td>Crea un Role con el mínimo de permisos</td></tr>
+            <tr><td><code>kubectl create rolebinding &lt;name&gt; …</code></td><td>Conecta la ServiceAccount con el Role</td></tr>
+            <tr><td><code>kubectl auth can-i list pods -n harbortasks --as=system:serviceaccount:harbortasks:api-sa</code></td><td>Comprueba "can-i" (qué puede hacer esa SA realmente)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Un contenedor con UID no-root es 100% seguro?</summary>
+            <div>
+              <p>Nada es 100% seguro. No-root reduce de forma drástica la superficie: limita capabilities, evita escribir en el filesystem raíz y corta la escalada setuid. Pero la seguridad total exige más capas: imágenes escaneadas, seccomp/AppArmor, network policies y RBAC mínimo. El SecurityContext es la base, no la meta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es una capability de Linux y por qué nginx necesita <code>NET_BIND_SERVICE</code>?</summary>
+            <div>
+              <p>Las capabilities dividen los privilegios de root en piezas independientes. <code>NET_BIND_SERVICE</code> permite abrir puertos por debajo de 1024 (como el 80). Al hacer <code>drop: [ALL]</code> quitas todo y luego <code>add</code> reincorpora la mínima capacidad que tu proceso necesita.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no versionar credenciales en valores o en el YAML?</summary>
+            <div>
+              <p>Porque un repo es un documento de acceso compartido: la credencial que versionas queda en el historial de Git para siempre aunque la borres. Las credenciales van en el gestionador de secretos (CI/CD, Vault, SealedSecrets) y se inyectan en el Secret en tiempo de despliegue.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿ServiceAccount y RBAC son lo mismo?</summary>
+            <div>
+              <p>No. La ServiceAccount es la <strong>identidad</strong> (quiénes somos); el Role/RoleBinding define los <strong>permisos</strong> (qué podemos hacer). Para que una identidad haga algo, necesita un Role y el binding que los conecta. Sin binding, la SA no puede hacer nada — deny by default.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo uso ClusterRole en lugar de Role?</summary>
+            <div>
+              <p>Cuando el permiso debe aplicarse en todo el clúster (p. ej. un operador que gestiona recursos en todos los namespaces, o acceso a recursos sin namespace como Nodes). Para el caso típico de una aplicación que vive en un namespace, un Role + RoleBinding es lo correcto.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

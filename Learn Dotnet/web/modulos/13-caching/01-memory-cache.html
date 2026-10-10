@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es" data-module="13" data-lesson="01-memory-cache">
+<head>
+  <meta charset="UTF-8">
+  <title>Caching en memoria: IMemoryCache — Módulo 13 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caching en memoria: IMemoryCache</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 13 · Caching y rendimiento</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aprenderemos a usar <code>IMemoryCache</code>, el caché en memoria de ASP.NET Core. Es la solución más rápida para evitar repetir trabajo costoso: consultas a base de datos, cálculos complejos, respuestas de APIs externas o listados que cambian poco.</p>
+        <p>Veremos la diferencia entre la interfaz <code>IMemoryCache</code> y la implementación <code>MemoryCache</code>, cómo almacenar y recuperar valores, estrategias de expiración, prioridades y el patrón <em>cache-aside</em>.</p>
+
+        <div class="callout info">
+          <strong>¿Cuándo usarlo?</strong> Cuando tu aplicación corre en una sola instancia, los datos caben en RAM y pueden tolerar unos segundos de desfase respecto a la fuente real. Si escalas a varias máquinas, necesitarás caché distribuido (Redis), que veremos en la siguiente lección.
+        </div>
+
+        <p>Al terminar sabrás configurar el caché, leer y escribir con <code>GetOrCreate</code>, invalidar entradas y evitar los errores más comunes como <em>cache stampede</em> o claves mal diseñadas.</p>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 IMemoryCache vs MemoryCache</h3>
+        <p>ASP.NET Core separa la interfaz de la implementación siguiendo el principio de inversión de dependencias:</p>
+        <ul>
+          <li><code>IMemoryCache</code>: abstracción. La inyectas en constructores y la usas en tu código. Es la que debes preferir siempre.</li>
+          <li><code>MemoryCache</code>: implementación concreta. Se registra en el contenedor de DI y gestiona el almacenamiento real, compresión, expiración y evicción por presión de memoria.</li>
+        </ul>
+        <p>Registro típico en <code>Program.cs</code>:</p>
+        <pre><code class="language-csharp">builder.Services.AddMemoryCache();</code></pre>
+
+        <h3>2.2 Cómo funciona internamente</h3>
+        <p><code>MemoryCache</code> guarda los valores en un <code>ConcurrentDictionary&lt;object, CacheEntry&gt;</code>. Cada entrada tiene metadatos de expiración, prioridad, tokens de invalidación y callbacks. Cuando el sistema detecta presión de memoria, el <em>MemoryCacheCompact</em> elimina primero las entradas con menor prioridad y más antiguas.</p>
+
+        <div class="callout warning">
+          <strong>Memoria compartida:</strong> el caché vive en el mismo proceso de la aplicación. Si reinicias el servidor, se pierde. Si escalas horizontalmente, cada instancia tiene su propia copia, lo que puede provocar inconsistencias.
+        </div>
+
+        <h3>2.3 Estrategias de expiración</h3>
+        <ul>
+          <li><strong>Absolute expiration:</strong> la entrada desaparece transcurrido un tiempo fijo. Útil cuando sabes exactamente cuánto vale la pena conservarla.</li>
+          <li><strong>Sliding expiration:</strong> el contador se reinicia cada vez que se accede a la entrada. Útil para datos populares, pero puede hacer que entradas poco útiles sobrevivan demasiado si se combinan con un acceso absoluto.</li>
+          <li><strong>Expiration tokens:</strong> permiten invalidar un grupo de entradas de una sola vez (por ejemplo, cuando se publica un post).</li>
+          <li><strong>Priority:</strong> define qué entradas se eliminan primero cuando hay presión de memoria.</li>
+        </ul>
+
+        <h3>2.4 Patrón cache-aside</h3>
+        <p>Es el patrón más común: primero se consulta el caché; si no está, se calcula, se guarda y se devuelve. Así el caché "envuelve" la fuente de datos real.</p>
+        <pre><code class="language-text">Request ──▶ ¿En caché? ──Sí──▶ Devolver valor
+              │
+              No
+              ▼
+        Calcular valor
+              │
+              ▼
+        Guardar en caché
+              │
+              ▼
+        Devolver valor</code></pre>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Creamos una aplicación de consola que usa <code>IMemoryCache</code> para evitar repetir una operación lenta.</p>
+
+        <pre><code class="language-bash">dotnet new console -n MemoryCacheDemo -o ejemplos/m13-caching/MemoryCacheDemo/src/MemoryCacheDemo
+dotnet add ejemplos/m13-caching/MemoryCacheDemo/src/MemoryCacheDemo package Microsoft.Extensions.Caching.Memory
+dotnet add ejemplos/m13-caching/MemoryCacheDemo/src/MemoryCacheDemo package Microsoft.Extensions.DependencyInjection</code></pre>
+
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace MemoryCacheDemo;
+
+class Program
+{
+    // Método que simula un trabajo costoso: 500 ms de espera.
+    static async Task&lt;string&gt; GetSlowDataAsync(string key)
+    {
+        await Task.Delay(500);
+        return $"Datos para {key} calculados a las {DateTime.Now:HH:mm:ss.fff}";
+    }
+
+    static async Task Main()
+    {
+        // Configuramos un contenedor de DI mínimo con el caché en memoria.
+        var services = new ServiceCollection();
+        services.AddMemoryCache();
+        var provider = services.BuildServiceProvider();
+        var cache = provider.GetRequiredService&lt;IMemoryCache&gt;();
+
+        const string cacheKey = "slow:greeting";
+
+        // --- Primera llamada: no está en caché, se ejecuta el trabajo lento.
+        var first = await cache.GetOrCreateAsync(cacheKey, async entry =&gt;
+        {
+            // Establecemos una expiración combinada para no mantener datos eternos.
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(10);
+            entry.SlidingExpiration = TimeSpan.FromSeconds(3);
+            entry.Priority = CacheItemPriority.High;
+
+            return await GetSlowDataAsync(cacheKey);
+        });
+
+        Console.WriteLine($"Primera: {first}");
+
+        // --- Segunda llamada: ya existe en caché, es instantánea.
+        var second = await cache.GetOrCreateAsync(cacheKey, async entry =&gt;
+        {
+            return await GetSlowDataAsync(cacheKey);
+        });
+
+        Console.WriteLine($"Segunda: {second}");
+
+        // Invalidamos la entrada manualmente.
+        cache.Remove(cacheKey);
+
+        // --- Tercera llamada: el caché está vacío, vuelve a calcular.
+        var third = await cache.GetOrCreateAsync(cacheKey, async entry =&gt;
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(10);
+            return await GetSlowDataAsync(cacheKey);
+        });
+
+        Console.WriteLine($"Tercera: {third}");
+    }
+}</code></pre>
+
+        <p>Salida aproximada:</p>
+        <pre><code class="language-text">Primera: Datos para slow:greeting calculados a las 14:30:10.123
+Segunda: Datos para slow:greeting calculados a las 14:30:10.123
+Tercera: Datos para slow:greeting calculados a las 14:30:11.234</code></pre>
+
+        <div class="callout tip">
+          <strong>Tip:</strong> <code>GetOrCreateAsync</code> es la forma más segura de consultar y poblar el caché en un solo paso. Evita el clásico <code>if (cache.TryGetValue(...))</code> seguido de un segundo acceso.
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En un servicio de posts del CMS podemos cachear el listado de categorías, que cambia poco, pero no un post individual en borrador, que evoluciona constantemente.</p>
+
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Memory;
+
+namespace Cms.Application.Categories;
+
+public interface ICategoryRepository
+{
+    Task&lt;IReadOnlyList&lt;Category&gt;&gt; GetAllAsync(CancellationToken ct);
+}
+
+public sealed class CategoryService
+{
+    private readonly ICategoryRepository _repository;
+    private readonly IMemoryCache _cache;
+    private readonly ILogger&lt;CategoryService&gt; _logger;
+
+    private const string AllCategoriesKey = "categories:all";
+
+    public CategoryService(
+        ICategoryRepository repository,
+        IMemoryCache cache,
+        ILogger&lt;CategoryService&gt; logger)
+    {
+        _repository = repository;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public async Task&lt;IReadOnlyList&lt;Category&gt;&gt; GetAllAsync(CancellationToken ct)
+    {
+        var cached = await _cache.GetOrCreateAsync(
+            AllCategoriesKey,
+            async entry =&gt;
+            {
+                _logger.LogInformation("Cache miss para categorías; consultando base de datos");
+
+                // Expira en 5 minutos como máximo, pero se renueva si se usa.
+                entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);
+                entry.SlidingExpiration = TimeSpan.FromMinutes(1);
+                entry.Priority = CacheItemPriority.Normal;
+
+                return await _repository.GetAllAsync(ct);
+            });
+
+        return cached ?? Array.Empty&lt;Category&gt;();
+    }
+
+    public void Invalidate()
+    {
+        _logger.LogInformation("Invalidando caché de categorías");
+        _cache.Remove(AllCategoriesKey);
+    }
+}
+
+public sealed record Category(Guid Id, string Name, string Slug);</code></pre>
+
+        <p>Registro en DI:</p>
+        <pre><code class="language-csharp">builder.Services.AddMemoryCache();
+builder.Services.AddScoped&lt;CategoryService&gt;();</code></pre>
+
+        <p>Invalidación cuando se crea una categoría:</p>
+        <pre><code class="language-csharp">public class CreateCategoryHandler
+{
+    private readonly ICategoryRepository _repository;
+    private readonly CategoryService _service;
+
+    public CreateCategoryHandler(ICategoryRepository repository, CategoryService service)
+    {
+        _repository = repository;
+        _service = service;
+    }
+
+    public async Task&lt;Category&gt; HandleAsync(CreateCategoryCommand command, CancellationToken ct)
+    {
+        var category = await _repository.CreateAsync(command, ct);
+        _service.Invalidate();
+        return category;
+    }
+}</code></pre>
+
+        <div class="callout warning">
+          <strong>Claves:</strong> usa nombres descriptivos y con prefijo de dominio, como <code>categories:all</code> o <code>post:{id}</code>. Nunca uses objetos complejos como clave: el caché internamente usa <code>GetHashCode</code> y eso puede causar colisiones inesperadas.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Prefiere <code>IMemoryCache</code>:</strong> inyecta la interfaz, no la implementación concreta.</li>
+          <li><strong>Define claves centralizadas:</strong> evita duplicar strings literales en múltiples clases. Usa constantes o un generador de claves.</li>
+          <li><strong>Combina expiraciones:</strong> usa <code>AbsoluteExpirationRelativeToNow</code> como tope y <code>SlidingExpiration</code> para datos populares. Sin absoluta, una entrada muy consultada podría vivir para siempre.</li>
+          <li><strong>Invalida al mutar:</strong> siempre que guardes, actualices o elimines un recurso, invalida las entradas de caché afectadas. El caché sin invalidación es una fuente de bugs difíciles.</li>
+          <li><strong>No almacenes objetos mutables:</strong> si guardas una lista y la modificas después, estás modificando el caché. Almacena copias de solo lectura o estructuras inmutables.</li>
+          <li><strong>Prioriza correctamente:</strong> datos grandes y poco importantes deben tener <code>CacheItemPriority.Low</code> o <code>Normal</code>. Datos críticos y pequeños pueden ser <code>High</code>.</li>
+          <li><strong>Mide antes de cachear:</strong> no añadas caché por intuición. Mide con logs o BenchmarkDotNet si la mejora justifica la complejidad.</li>
+          <li><strong>Considera <code>MemoryCacheEntryOptions</code> reutilizables:</strong> para muchas entradas con la misma configuración, crea una instancia y pásala a <code>Set</code> o <code>GetOrCreate</code>.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1 Cache stampede</h3>
+        <p>Cuando una entrada expira y muchas peticiones concurrentes llegan al mismo tiempo, todas calculan el mismo valor. Para evitarlo, usa siempre <code>GetOrCreateAsync</code>, que bloquea el cálculo para una misma clave.</p>
+        <pre><code class="language-csharp">// ❌ Mal: el trabajo costoso se ejecuta varias veces en paralelo
+if (!_cache.TryGetValue(key, out var value))
+{
+    value = await GetExpensiveValueAsync();
+    _cache.Set(key, value);
+}
+
+// ✅ Bien: GetOrCreateAsync asegura que solo un hilo calcula por clave
+value = await _cache.GetOrCreateAsync(key, async entry =&gt;
+    await GetExpensiveValueAsync());</code></pre>
+
+        <h3>6.2 No invalidar</h3>
+        <pre><code class="language-csharp">// ❌ Mal: el caché nunca se actualiza tras un cambio
+public async Task UpdateAsync(Category category)
+{
+    await _repository.UpdateAsync(category);
+}
+
+// ✅ Bien: invalidar la clave afectada tras la modificación
+public async Task UpdateAsync(Category category)
+{
+    await _repository.UpdateAsync(category);
+    _cache.Remove($"category:{category.Id}");
+    _cache.Remove("categories:all");
+}</code></pre>
+
+        <h3>6.3 Claves frágiles</h3>
+        <pre><code class="language-csharp">// ❌ Mal: concatenación manual dispersa por el código
+var key = "categories";
+
+// ✅ Bien: claves con prefijo y formato consistente
+private static string CategoryKey(Guid id) =&gt; $"category:{id}";
+private const string AllCategoriesKey = "categories:all";</code></pre>
+
+        <h3>6.4 Depender de caché en memoria en entornos multi-instancia</h3>
+        <pre><code class="language-csharp">// ❌ Mal: cada instancia ve datos distintos
+services.AddMemoryCache();
+
+// ✅ Bien: usar caché distribuido en producción con varias réplicas
+services.AddStackExchangeRedisCache(options =&gt;
+    options.Configuration = "localhost:6379");</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Vamos a cachear un cálculo de estadísticas de posts en una aplicación de consola.</p>
+
+        <h3>Paso 1: crea el proyecto</h3>
+        <pre><code class="language-bash">dotnet new console -n StatsCache -o ejemplos/m13-caching/StatsCache/src/StatsCache
+dotnet add ejemplos/m13-caching/StatsCache/src/StatsCache package Microsoft.Extensions.Caching.Memory
+dotnet add ejemplos/m13-caching/StatsCache/src/StatsCache package Microsoft.Extensions.DependencyInjection</code></pre>
+
+        <h3>Paso 2: implementa el servicio</h3>
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Memory;
+
+namespace StatsCache;
+
+public class PostStatsService(IMemoryCache cache)
+{
+    public async Task&lt;int&gt; CountPublishedAsync()
+    {
+        return await cache.GetOrCreateAsync(
+            "stats:published-count",
+            async entry =&gt;
+            {
+                await Task.Delay(300); // simula consulta a BD
+                entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30);
+                return 42;
+            });
+    }
+
+    public void Invalidate() =&gt; cache.Remove("stats:published-count");
+}</code></pre>
+
+        <h3>Paso 3: programa</h3>
+        <pre><code class="language-csharp">using Microsoft.Extensions.DependencyInjection;
+
+var services = new ServiceCollection();
+services.AddMemoryCache();
+services.AddScoped&lt;PostStatsService&gt;();
+
+var provider = services.BuildServiceProvider();
+using var scope = provider.CreateScope();
+var service = scope.ServiceProvider.GetRequiredService&lt;PostStatsService&gt;();
+
+var a = await service.CountPublishedAsync();
+var b = await service.CountPublishedAsync();
+service.Invalidate();
+var c = await service.CountPublishedAsync();
+
+Console.WriteLine($"a={a}, b={b}, c={c}");</code></pre>
+
+        <p>Verás que la segunda llamada es instantánea y la tercera vuelve a esperar 300 ms. ¿Puedes añadir una expiración deslizante de 10 segundos además de la absoluta?</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Añade a <code>PostStatsService</code> una invalidación por grupo usando <code>ChangeToken</code>:</p>
+        <ul>
+          <li>Crea un <code> CancellationTokenSource</code> compartido como campo del servicio.</li>
+          <li>Usa <code>entry.AddExpirationToken(new CancellationChangeToken(_tokenSource.Token))</code> al guardar.</li>
+          <li>Expón un método <code>InvalidateAll()</code> que llame a <code>_tokenSource.Cancel()</code> para expirar todas las entradas vinculadas a la vez.</li>
+        </ul>
+        <p><strong>No resuelvas el reto ahora.</strong> Inténtalo primero y lo revisaremos en la siguiente sesión.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>IMemoryCache</code> es el caché en memoria de ASP.NET Core, rápido pero limitado a un solo proceso.</li>
+          <li>Se registra con <code>AddMemoryCache()</code> y se usa con <code>GetOrCreateAsync</code> para evitar el patrón <code>TryGetValue</code> + <code>Set</code>.</li>
+          <li>Configura expiración absoluta, deslizante y prioridad según el tipo de dato.</li>
+          <li>Invalida entradas cuando los datos subyacentes cambian.</li>
+          <li>Usa claves con prefijo y evita objetos complejos como claves.</li>
+          <li>Para varias instancias o producción con escalado, considera Redis (<code>IDistributedCache</code>) que veremos a continuación.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Cuánto dura una entrada en <code>IMemoryCache</code>?</summary>
+          <p>Tanto como indiques con <code>AbsoluteExpiration</code> o <code>SlidingExpiration</code>. Si no estableces ninguna, la entrada puede durar indefinidamente hasta que el proceso se cierre o haya presión de memoria.</p>
+        </details>
+
+        <details>
+          <summary>¿Puedo usar <code>IMemoryCache</code> fuera de ASP.NET Core?</summary>
+          <p>Sí, como vimos en el ejemplo mínimo. Solo necesitas instalar <code>Microsoft.Extensions.Caching.Memory</code> y configurar un <code>ServiceCollection</code> mínimo.</p>
+        </details>
+
+        <details>
+          <summary>¿Es seguro almacenar objetos mutables?</summary>
+          <p>No es recomendable. Si devuelves una lista mutable y el consumidor la modifica, estás modificando el valor cacheado. Devuelve siempre <code>IReadOnlyList&lt;T&gt;</code>, inmutables o copias.</p>
+        </details>
+
+        <details>
+          <summary>¿Qué pasa si la memoria se llena?</summary>
+          <p><code>MemoryCache</code> compacta automáticamente entradas según prioridad y antigüedad. Las de prioridad <code>NeverRemove</code> solo desaparecen si se invalidan o se cierra el proceso.</p>
+        </details>
+
+        <details>
+          <summary>¿<code>GetOrCreateAsync</code> realmente evita cálculos duplicados?</summary>
+          <p>Sí, para una misma clave el caché internamente bloquea los hilos concurrentes hasta que el primero termina. Sin embargo, esto ocurre dentro de la misma instancia; entre instancias no hay bloqueo.</p>
+        </details>
+
+        <details>
+          <summary>¿Puedo ver todas las claves del caché?</summary>
+          <p>No directamente. <code>IMemoryCache</code> no expone un listado de claves por diseño. Si necesitas enumerar, deberás llevar tu propio registro de claves, aunque eso suele indicar un mal diseño.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

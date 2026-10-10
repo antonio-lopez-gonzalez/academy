@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="es" data-module="10" data-lesson="05-proyecto-cms-middleware" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: middleware + rate limiting — Módulo 10 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: middleware + rate limiting</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 10 · Proyecto</span><span>45 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aplicamos todo lo aprendido sobre middleware al proyecto CMS. Añadiremos un middleware de <strong>correlation ID</strong>, un middleware de <strong>logging de peticiones</strong>, configuraremos <strong>rate limiting</strong> por IP y por usuario, y añadiremos <strong>health checks</strong> para la base de datos y un check básico de liveness.</p>
+        <p>Al final, la API del CMS tendrá una capa transversal profesional: trazabilidad, protección contra abuso y visibilidad del estado del sistema.</p>
+
+        <div class="callout callout--goal">
+          <h4>Objetivos del proyecto</h4>
+          <ul>
+            <li>Crear un middleware <code>CorrelationIdMiddleware</code> que respete el ID entrante o genere uno nuevo.</li>
+            <li>Crear un middleware <code>RequestLoggingMiddleware</code> que loguee método, path, status code y tiempo de respuesta.</li>
+            <li>Configurar rate limiting <code>SlidingWindow</code> para rutas <code>/api</code>, excluyendo <code>/health</code>.</li>
+            <li>Añadir CORS para el frontend del CMS.</li>
+            <li>Añadir health checks: <code>/health/live</code>, <code>/health/ready</code> y <code>/health</code> detallado.</li>
+            <li>Verificar que todo compila y que los tests de integración respetan el correlation ID.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>2.1. Arquitectura del CMS</h3>
+        <p>El CMS sigue Clean Architecture:</p>
+        <ul>
+          <li><strong>Cms.Domain:</strong> entidades y reglas de negocio.</li>
+          <li><strong>Cms.Application:</strong> commands, queries, handlers, validadores y DTOs.</li>
+          <li><strong>Cms.Infrastructure:</strong> EF Core, repositorios, servicios externos.</li>
+          <li><strong>Cms.Api:</strong> endpoints, middleware, configuración y health checks.</li>
+        </ul>
+        <p>Los middleware y los health checks viven en <strong>Cms.Api</strong> porque son infraestructura de la aplicación web. El middleware de logging puede depender de <code>ILogger</code>, que es un servicio transversal.</p>
+
+        <h3>2.2. Pipeline objetivo del CMS</h3>
+        <pre><code>ExceptionHandler / IExceptionHandler
+HSTS / HTTPS
+CORS
+Correlation ID
+Request Logging
+Rate Limiting
+Authentication
+Authorization
+Endpoints / Controllers</code></pre>
+
+        <p>El <strong>correlation ID</strong> se registra antes del logging para que todas las trazas incluyan el ID. El <strong>rate limiting</strong> se coloca antes de autenticación para proteger incluso endpoints anónimos, pero excluimos <code>/health</code> para no afectar a los orquestadores.</p>
+
+        <h3>2.3. Decisiones de diseño</h3>
+        <ul>
+          <li><strong>Middleware como clases <code>IMiddleware</code></strong>: permiten inyección de dependencias y testing unitario.</li>
+          <li><strong>Rate limiting por IP</strong>: protección general contra abuso. Más adelante se añadirá por usuario autenticado.</li>
+          <li><strong>Health checks separados</strong>: <code>/health/live</code> para Kubernetes (siempre vive), <code>/health/ready</code> para dependencias (base de datos), <code>/health</code> para detalles internos.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <h4>Consejo del proyecto</h4>
+          <p>Registra todos los middlewares con métodos de extensión <code>UseXxx</code>. Así el <code>Program.cs</code> del CMS se lee como un libro de configuración.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Antes de integrar todo, veamos el middleware de correlation ID para el CMS.</p>
+
+        <pre><code class="language-csharp">// Cms.Api/Middleware/CorrelationIdMiddleware.cs
+public sealed class CorrelationIdMiddleware : IMiddleware
+{
+    public const string HeaderKey = "X-Correlation-ID";
+
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var correlationId = GetOrCreateCorrelationId(context);
+        context.Response.Headers.Append(HeaderKey, correlationId);
+
+        using (LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            await next(context);
+        }
+    }
+
+    private static string GetOrCreateCorrelationId(HttpContext context)
+    {
+        if (context.Request.Headers.TryGetValue(HeaderKey, out var value) &&
+            !string.IsNullOrWhiteSpace(value))
+        {
+            return value.ToString();
+        }
+
+        return Guid.NewGuid().ToString("N");
+    }
+}
+
+// Cms.Api/Middleware/MiddlewareExtensions.cs
+public static class MiddlewareExtensions
+{
+    public static IApplicationBuilder UseCorrelationId(this IApplicationBuilder app)
+        => app.UseMiddleware<CorrelationIdMiddleware>();
+}</code></pre>
+
+        <p>En <code>Program.cs</code> usaremos <code>app.UseCorrelationId()</code>, manteniendo el archivo principal limpio.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+
+        <h3>4.1. Middleware de logging de peticiones</h3>
+        <pre><code class="language-csharp">// Cms.Api/Middleware/RequestLoggingMiddleware.cs
+using System.Diagnostics;
+
+public sealed class RequestLoggingMiddleware : IMiddleware
+{
+    private readonly ILogger<RequestLoggingMiddleware> _logger;
+
+    public RequestLoggingMiddleware(ILogger<RequestLoggingMiddleware> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        _logger.LogInformation(
+            "Request {Method} {Path} started",
+            context.Request.Method,
+            context.Request.Path);
+
+        await next(context);
+
+        stopwatch.Stop();
+        _logger.LogInformation(
+            "Request {Method} {Path} completed with {StatusCode} in {ElapsedMs}ms",
+            context.Request.Method,
+            context.Request.Path,
+            context.Response.StatusCode,
+            stopwatch.ElapsedMilliseconds);
+    }
+}
+
+// Cms.Api/Middleware/MiddlewareExtensions.cs
+public static IApplicationBuilder UseRequestLogging(this IApplicationBuilder app)
+    => app.UseMiddleware<RequestLoggingMiddleware>();</code></pre>
+
+        <h3>4.2. Configuración de CORS, Rate Limiting y Health Checks</h3>
+        <pre><code class="language-csharp">// Cms.Api/Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+// Capa de aplicación e infraestructura
+builder.Services.AddApplication();
+builder.Services.AddInfrastructure(builder.Configuration);
+builder.Services.AddControllers();
+
+builder.Services.AddTransient<CorrelationIdMiddleware>();
+builder.Services.AddTransient<RequestLoggingMiddleware>();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("CmsFrontend", policy =>
+    {
+        var allowedOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+        policy.WithOrigins(allowedOrigins)
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = 429;
+    options.OnRejected = (context, token) =>
+    {
+        context.Response.StatusCode = 429;
+        return context.Response.WriteAsync("Too many requests. Please retry later.", token);
+    };
+
+    options.AddPolicy("cms-api", context =>
+    {
+        var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetSlidingWindowLimiter(remoteIp, _ => new SlidingWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            SegmentsPerWindow = 6,
+            QueueLimit = 0
+        });
+    });
+});
+
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<CmsDbContext>("database", tags: new[] { "ready" })
+    .AddCheck("self", () => HealthCheckResult.Healthy(), tags: new[] { "live" });
+
+var app = builder.Build();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler();
+    app.UseHsts();
+}
+
+app.UseHttpsRedirection();
+app.UseCors("CmsFrontend");
+
+app.UseCorrelationId();
+app.UseRequestLogging();
+
+app.UseRateLimiter();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("live")
+});
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
+
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    Predicate = _ => true,
+    ResponseWriter = async (context, report) =>
+    {
+        var response = new
+        {
+            Status = report.Status.ToString(),
+            Duration = report.TotalDuration,
+            Checks = report.Entries.Select(e => new
+            {
+                Name = e.Key,
+                Status = e.Value.Status.ToString(),
+                e.Value.Duration
+            })
+        };
+
+        await context.Response.WriteAsJsonAsync(response);
+    }
+}).DisableRateLimiting();
+
+app.MapControllers();
+
+app.Run();</code></pre>
+
+        <h3>4.3. <code>appsettings.json</code> del CMS</h3>
+        <pre><code class="language-json">{
+  "Cors": {
+    "AllowedOrigins": [ "https://localhost:3000" ]
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  }
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El pipeline del CMS aplica CORS, correlation ID, logging y rate limiting antes de autenticación. Los endpoints de salud no están limitados. El health check de base de datos forma parte del readiness; el self check forma parte del liveness.</p>
+        </div>
+
+        <h3>4.4. Controlador con rate limiting</h3>
+        <pre><code class="language-csharp">// Cms.Api/Controllers/PostsController.cs (extracto)
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+
+[ApiController]
+[Route("api/v1/[controller]")]
+[EnableRateLimiting("cms-api")]
+public class PostsController : ControllerBase
+{
+    [HttpGet]
+    public async Task<IActionResult> GetAll([FromServices] IMediator mediator)
+    {
+        var posts = await mediator.Send(new GetAllPostsQuery());
+        return Ok(posts);
+    }
+}</code></pre>
+
+        <div class="callout callout--warning">
+          <h4>Logging en producción</h4>
+          <p>En producción, el middleware de logging debe ser ligero: no leas el body completo de cada petición. Para debugging de body, usa un middleware separado y activo solo en desarrollo o para un porcentaje de tráfico.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Orden de middleware documentado.</strong> Añade comentarios en <code>Program.cs</code> que expliquen por qué cada middleware va en ese lugar.</li>
+          <li><strong>Rate limiting realista.</strong> 60 peticiones/minuto por IP es razonable para un CMS; ajusta según el uso real.</li>
+          <li><strong>Excepciones de salud.</strong> Nunca apliques rate limiting a endpoints que usan los balanceadores o Kubernetes para decidir si el pod está vivo.</li>
+          <li><strong>Correlation ID en tests.</strong> En tests de integración, envía un <code>X-Correlation-ID</code> de prueba y verifica que la respuesta lo repite.</li>
+          <li><strong>Configuration de CORS externa.</strong> No hardcodees orígenes; usa <code>appsettings.json</code> o variables de entorno.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Middleware de logging sin respetar el correlation ID</h3>
+        <pre><code class="language-csharp">// ❌ MAL: logging antes de UseCorrelationId
+app.UseRequestLogging();
+app.UseCorrelationId();</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO
+app.UseCorrelationId();
+app.UseRequestLogging();</code></pre>
+
+        <h3>6.2. Health check limitado por rate limiting</h3>
+        <pre><code class="language-csharp">// ❌ MAL: el balanceador puede recibir 429 y marcar el pod como no sano
+app.MapHealthChecks("/health");
+app.UseRateLimiter();</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO
+app.UseRateLimiter();
+app.MapHealthChecks("/health").DisableRateLimiting();</code></pre>
+
+        <h3>6.3. CORS después de autenticación</h3>
+        <pre><code class="language-csharp">// ❌ MAL
+app.UseAuthentication();
+app.UseCors("CmsFrontend");
+
+// ✅ CORRECTO
+app.UseCors("CmsFrontend");
+app.UseAuthentication();</code></pre>
+
+        <h3>6.4. Middleware sin registrar en DI</h3>
+        <pre><code class="language-csharp">// ❌ MAL: UseMiddleware requiere que IMiddleware esté registrado
+app.UseMiddleware<CorrelationIdMiddleware>();</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO
+builder.Services.AddTransient<CorrelationIdMiddleware>();
+app.UseCorrelationId();</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Añade un middleware que añada una cabecera de versión de la API a todas las respuestas de <code>/api/v1/*</code>.</p>
+
+        <pre><code class="language-csharp">// Cms.Api/Middleware/ApiVersionHeaderMiddleware.cs
+public sealed class ApiVersionHeaderMiddleware : IMiddleware
+{
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        if (context.Request.Path.StartsWithSegments("/api/v1"))
+        {
+            context.Response.Headers.Append("X-Api-Version", "v1");
+        }
+
+        await next(context);
+    }
+}
+
+// Cms.Api/Middleware/MiddlewareExtensions.cs
+public static IApplicationBuilder UseApiVersionHeader(this IApplicationBuilder app)
+    => app.UseMiddleware<ApiVersionHeaderMiddleware>();
+
+// Program.cs
+builder.Services.AddTransient<ApiVersionHeaderMiddleware>();
+
+app.UseCorrelationId();
+app.UseApiVersionHeader();
+app.UseRequestLogging();</code></pre>
+
+        <p>Prueba con <code>curl -i http://localhost:5000/api/v1/posts</code> y verifica que aparece <code>X-Api-Version: v1</code> en la respuesta.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un middleware que rechace peticiones <code>POST</code> a <code>/api/v1/posts</code> cuya cabecera <code>Content-Type</code> no sea <code>application/json</code>. Debe devolver 415 Unsupported Media Type con un <code>ProblemDetails</code>. El middleware debe ser testable y registrarse con <code>UseContentTypeValidation</code>. No lo apliques a <code>/api/v1/media/upload</code>.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El CMS ahora tiene un pipeline profesional: CORS, correlation ID, logging, rate limiting, autenticación y autorización.</li>
+          <li>Los middlewares son clases <code>IMiddleware</code> registrados como transient y expuestos mediante métodos de extensión <code>UseXxx</code>.</li>
+          <li>El rate limiting protege las rutas <code>/api</code> con <code>SlidingWindow</code> por IP; los endpoints de salud están excluidos.</li>
+          <li>Los health checks separan liveness y readiness, y el endpoint <code>/health</code> devuelve detalles útiles para operadores.</li>
+          <li>El orden del pipeline es crítico: correlation ID antes de logging, CORS antes de autenticación, salud fuera del rate limiting.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿Dónde deben vivir los middleware en Clean Architecture?</h3>
+        <p>En el proyecto <code>Cms.Api</code>, junto con la configuración de la aplicación web. Son parte de la infraestructura de presentación, no de la lógica de negocio.</p>
+
+        <h3>¿Por qué no usamos middleware inline en el CMS?</h3>
+        <p>Porque queremos testearlos unitariamente, reutilizarlos y mantener <code>Program.cs</code> legible. Las clases <code>IMiddleware</code> son la forma profesional.</p>
+
+        <h3>¿Cómo verificamos que el correlation ID funciona en tests?</h3>
+        <p>En un test de integración con <code>WebApplicationFactory</code>, envía la cabecera <code>X-Correlation-ID</code>, haz una petición y comprueba que la respuesta incluye el mismo valor. También puedes verificar que el logger captura el ID.</p>
+
+        <h3>¿El rate limiting afecta a los tests de integración?</h3>
+        <p>Sí, si no lo desactivas. En tests, registra una política permisiva o desactiva el middleware para evitar tests flaky por límites.</p>
+
+        <h3>¿Deberíamos añadir un health check de Redis ya?</h3>
+        <p>Sí, en el módulo de caching. Por ahora, el readiness verifica la base de datos. Cuando añadamos Redis, registraremos un <code>.AddRedis</code> o un check personalizado.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-broadcast-y-envio-dirigido">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Broadcast vía pub/sub y envío dirigido — Módulo 7 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Broadcast vía pub/sub y envío dirigido</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · El Hub de Conexiones WebSocket con Redis</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya registramos conexiones. Ahora el propósito: <strong>enviar mensajes</strong>. Dos caminos por Redis: <strong>broadcast</strong> (a todos, vía pub/sub que cada nodo reenvía) y <strong>dirigido</strong> (a un cliente concreto, buscando su nodo en el registro).</p>
+        <p>Aquí ves el código exacto del proyecto final y cómo evitar el «bucle» de broadcasts.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Broadcast</h3>
+        <pre><code class="language-text">Nodo A tiene el mensaje
+  PUBLISH hub:events {"type":"broadcast","payload":...,"from":"node-1"}
+
+Cada nodo (incl. A) recibe y reenvía a SUS sockets.
+  nodo A → a los suyos
+  nodo B → a los suyos
+  (si no quieres duplicar, A reenvía local + publica; B solo reenvía)</code></pre>
+        <p>Reenvío dirigido local: guardas tu diccionario local <code>id→WebSocket</code> y haces <code>SendAsync</code> a los que te tocan.</p>
+
+        <h3>Envío dirigido</h3>
+        <pre><code class="language-text">Quiero mandar al cliente conn 8632 (está en node-2)
+  1) HGET hub:conn:8632 node  → "node-2"
+  2) ¿soy node-2?  → sí: mi diccionario local, SendAsync
+                   → no: PUBLISH hub:direct {"to":"8632","payload":...}
+  3) el nodo dueño recibe y reenvía a su socket</code></pre>
+        <p><code>hub:direct</code> puede ser un canal aparte (o prefijo de mensaje). Así un mensaje «uno-a-uno» llega solo al nodo que tiene el socket.</p>
+
+        <h3>Evitar loops</h3>
+        <ul>
+          <li>Publica con un <code>from</code> y verifica que no te lo reenvíes a ti (o publica solo, sin reenviar local, y deja que el suscriptor lo haga).</li>
+          <li>Para envíos dirigidos: solo el dueño (según registro) responde.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># broadcast
+PUBLISH hub:events '{"type":"broadcast","payload":"hola","from":"node-1"}'
+# dirigido
+HGET hub:conn:8632 node
+PUBLISH hub:direct '{"to":"8632","payload":"privado"}'</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>ConnectionHub</code> que ensambla registro + backplane:</p>
+        <pre><code class="language-csharp">public sealed class ConnectionHub
+{
+    private readonly ConcurrentDictionary&lt;string, WebSocket&gt; _local = new();
+    private readonly ConnectionRegistry _registry;
+    private readonly ISubscriber _sub;
+    private readonly ILogger&lt;ConnectionHub&gt; _logger;
+    private readonly string _nodeId;
+
+    public ConnectionHub(IConnectionMultiplexer mux, ConnectionRegistry registry,
+        string nodeId, ILogger&lt;ConnectionHub&gt; logger)
+    {
+        _sub = mux.GetSubscriber();
+        _registry = registry; _logger = logger; _nodeId = nodeId;
+
+        // suscripción del backplane (se re-inscribe tras reconexión — M6-04)
+        _sub.SubscribeAsync("hub:events", OnEvent);
+        _sub.SubscribeAsync("hub:direct", OnDirect);
+    }
+
+    private async void OnEvent(RedisChannel ch, RedisValue value)
+    {
+        var evt = JsonSerializer.Deserialize&lt;HubEvent&gt;(value!);
+        if (evt is null || evt.From == _nodeId) return;         // no loop auto
+
+        if (evt.Type == "broadcast")
+            await SendToAllAsync(JsonSerializer.Serialize(evt.Payload));
+    }
+
+    private async void OnDirect(RedisChannel ch, RedisValue value)
+    {
+        var req = JsonSerializer.Deserialize&lt;DirectRequest&gt;(value!);
+        if (req is null) return;
+        if (_local.TryGetValue(req.To, out var ws))
+            await ws.SendAsync(JsonSerializer.Serialize(req.Payload));   // yo lo tengo
+    }
+
+    public async Task BroadcastAsync(object payload)
+    {
+        // Reenvío local + publicar (o solo publicar y dejar que el
+        // suscriptor local reenvíe también). Elegimos: publicar + reenviar local.
+        await SendToAllAsync(JsonSerializer.Serialize(payload));        // a los míos
+        await _sub.PublishAsync("hub:events",
+            JsonSerializer.Serialize(new HubEvent("broadcast", payload, _nodeId)));
+    }
+
+    public async Task SendToAsync(string connectionId, object payload)
+    {
+        // dirigido: si soy el dueño, envío local; si no, publico
+        if (_local.ContainsKey(connectionId))
+            await _local[connectionId].SendAsync(JsonSerializer.Serialize(payload));
+        else
+            await _sub.PublishAsync("hub:direct",
+                JsonSerializer.Serialize(new DirectRequest(connectionId, payload, _nodeId)));
+    }
+
+    private async Task SendToAllAsync(string json)
+    {
+        foreach (var ws in _local.Values)
+            await ws.SendAsync(json);
+    }
+}</code></pre>
+        <p>Broadcast: un suscriptor por nodo reenvía; dirigido: el dueño (del diccionario local) responde solo.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Mensaje con <code>from</code> y filtro anti-loop</td><td>Reflexión en bucle del propio nodo</td><td>Reenvíos duplicados rompen el chat</td></tr>
+            <tr><td>Hacer el trabajo fuera del callback</td><td>Permaneces dentro del callback haciendo SendAsync largos</td><td>El suscriptor no debe bloquearse</td></tr>
+            <tr><td>Verificar dueño antes de «dirigido»</td><td>Abrir conexión del otro nodo</td><td>Registro: ¿dónde está?; si no soy yo, publica</td></tr>
+            <tr><td>Capturas y logging en OnEvent</td><td>Callbacks que tiran excepciones sin rastro</td><td>Silencioso = sin visibilidad del fallo del backplane</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Broadcast doble local (reenvías tú + el suscriptor)</h3>
+        <pre><code class="language-csharp">// ❌ en OnEvent reenvías a TODOS, y BroadcastAsync también lo hizo local
+// ✅ usa un patrón coherente:
+//    (A) publish + reenviar local, y en el suscriptor NO reenviar si from == tú
+//    (B) publish solo, y el suscriptor siempre reenvía a sus sockets</code></pre>
+
+        <h3>Ignorar errores al reenviar (socket muerto)</h3>
+        <p>Si <code>SendAsync</code> falla (cliente se desconectó), captura y llama a <code>UnregisterAsync</code> para que el registro no quede sucio.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa ConnectionHub (o una versión reducida) en tu proyecto.</li>
+          <li><strong>Paso 2:</strong> Levanta 2 clientes WebSocket en «nodos» distintos (aunque en una sola máquina, con GUID de nodo distinto).</li>
+          <li><strong>Paso 3:</strong> Prueba broadcast: los 2 reciben. Prueba dirigido: solo el target.</li>
+          <li><strong>Paso 4:</strong> Añade el filtro <code>from == _nodeId</code> y verifica que no hay duplicados.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 ¿A quién le toca?</h3>
+          <p>Diseña «broadcast a los participantes de un canal» (no a todos): el remitente consulta el set <code>chan:&lt;name&gt;</code>, y… ¿publica una lista? ¿o cada nodo filtra por su diccionario? Justifica la elección y escríbelo como flujo con la estructura de datos que usarías (M2-03).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Broadcast = publica en <code>hub:events</code>; cada nodo reenvía a sus sockets.</li>
+          <li>Dirigido = consulta registro → dueño envia (o publica en <code>hub:direct</code>).</li>
+          <li>Anti-loop: <code>from</code> + filtro; el callback de suscripción hace poco trabajo.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos nodos puede aguantar este backplane?</summary>
+            <div><p>Decenas con facilidad si el volumen de mensajes es moderado y el payload es pequeño: el cuello suele estar en el reenvío local y en el volumen global de pub/sub, no en Redis.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si un nodo muere mid-reenvío?</summary>
+            <div><p>Algunos sockets se pierden; la expiración del registro y el re-registro de clientes al reconectar lo reconcilian (M7-04). Diseña reconexión en el cliente.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

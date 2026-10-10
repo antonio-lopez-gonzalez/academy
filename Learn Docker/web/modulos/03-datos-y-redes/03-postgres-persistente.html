@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-postgres-persistente">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso: Postgres persistente en Docker — Módulo 3 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso: Postgres persistente en Docker</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Datos y redes Docker</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Llega el momento de unir las dos lecciones anteriores en un caso real, el corazón de HarborTasks: <strong>una base de datos PostgreSQL corriendo en un contenedor, con sus datos a salvo en un volumen y accesible para la API por su nombre de red.</strong></p>
+        <p>Verás el ciclo completo: cómo arrancar la imagen oficial <code>postgres:16-alpine</code>, qué hacen las variables <code>POSTGRES_USER</code>/<code>POSTGRES_PASSWORD</code>/<code>POSTGRES_DB</code>, por qué el volumen va en <code>/var/lib/postgresql/data</code> (y no en otro sitio), cómo montar un <strong>healthcheck</strong> con <code>pg_isready</code>, cómo comprobar la base desde dentro con <code>docker exec psql</code>, y qué se puede — y qué <strong>no</strong> se debe — esperar de una base contenerizada (máxima honestidad: esto es un único nodo, no un clúster).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque "Postgres en Docker" es probablemente el contenedor más desplegado de la historia, y el que concentra más errores de novato: sin volumen pierdes todo al hacer <code>docker rm</code>; con variables mal puestas acabas logueándote contra una base con otro usuario; y sin entender el punto de montaje exacto, los datos se quedan en la capa de escritura aunque "hayas montado algo". Esta lección convierte esas tres trampas en hábitos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué Postgres dentro de un contenedor</h3>
+        <p>Postgres es un proceso como cualquier otro: dado un directorio de datos (el <code>PGDATA</code>, por defecto <code>/var/lib/postgresql/data</code> en la imagen oficial), puede arrancar, servir y parar. Contenerizarlo aporta un entorno <strong>idéntico en cualquier máquina</strong> (la versión de PG la controla la imagen, no tu sistema), una instalación que se <code>docker pull</code> en segundos, y el mismo flujo de despliegue que el resto del stack. El truco de la persistencia ya lo tienes de la lección 1: <strong>todo lo que Postgres escribe debe ir a un volumen</strong>.</p>
+
+        <h3>Cómo funciona el arranque de la imagen oficial</h3>
+        <p>La imagen <code>postgres</code> incluye un <em>entrypoint</em> que hace la magia: si el directorio de datos está <strong>vacío</strong> (primera vez), inicializa un cluster, crea el usuario y la base según las variables de entorno, y arranca. Si el directorio <strong>ya tiene datos</strong> (re-arranque con nuestro volumen), <em>omite</em> la inicialización y solo arranca. Esta distinción explica un comportamiento que confunde a todo el mundo: <strong>cambiar <code>POSTGRES_PASSWORD</code> no cambia la contraseña de una base ya inicializada</strong>.</p>
+        <pre><code class="diagram">  POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB
+                         │
+                         ▼
+      ┌─────────────── ENTRYPOINT docker-entrypoint.sh ───────────────┐
+      │                                                               │
+      │  ¿ /var/lib/postgresql/data está vacío?                       │
+      │      ├─ SÍ  →  initdb (cluster) + crea usuario + crea DB     │
+      │      └─ NO  →  solo arranca postgres (datos ya existen)      │
+      └───────────────┬───────────────────────────────────────────────┘
+                      ▼
+           postgres —  proceso (PID 1 del contenedor)
+                      │
+                      ▼
+     VOLUMEN pgdata ───> /var/lib/postgresql/data : sobrevive a todo
+</code></pre>
+
+        <h3>Las variables de entorno de la imagen oficial</h3>
+        <table>
+          <thead><tr><th>Variable</th><th>Qué hace (solo en el primer arranque)</th><th>Valor por defecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>POSTGRES_USER</code></td><td>Crea el superusuario de la base</td><td><code>postgres</code></td></tr>
+            <tr><td><code>POSTGRES_PASSWORD</code></td><td>Contraseña de ese usuario (obligatoria en la imagen moderna; no debe ir en código)</td><td>—</td></tr>
+            <tr><td><code>POSTGRES_DB</code></td><td>Base de datos inicial creada al inicio</td><td>igual al valor de <code>POSTGRES_USER</code></td></tr>
+            <tr><td><code>PGDATA</code></td><td>Ruta del cluster (muy útil para ensayos, pero no la cambies sin motivo)</td><td><code>/var/lib/postgresql/data</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>El punto de montaje correcto (la trampa del subdirectorio)</h3>
+        <p>Un error clásico es montar el volumen en <code>/var/lib/postgresql</code> en vez de <code>/var/lib/postgresql/data</code>, o en el subdirectorio <code>pgdata</code> de una versión nueva. La imagen moderna coloca el cluster directamente en <code>data/</code>: si montas el padre, Postgres ve el volumen "con contenido" pero no encuentra el cluster en el sitio esperado, y no vuelve a inicializar (recuerda: solo inicializa si está vacío). <strong>Monta siempre exactamente <code>/var/lib/postgresql/data</code></strong>, y un solo volumen por base.</p>
+
+        <h3>Límites con los que hay que ser honesto</h3>
+        <p>Un <code>docker run postgres</code> es <strong>una instancia única</strong> (<code>single node</code>): no hay alta disponibilidad, no hay réplicas, no hay failover automático. Las copias de seguridad no las hace "Docker por ti": las haces tú con <code>pg_dump</code>. Para un entorno local, un curso o un primer productivo pequeño es perfecto; para exigir alta disponibilidad, la industria usa soluciones orquestadas (Cloud Native PG sobre Kubernetes, o servicios gestionados) — de eso hablaremos en el curso cuando lleguemos a Helm y operación.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un Postgres con volumen, en una sola línea, y su comprobación inmediata desde dentro con <code>psql</code>.</p>
+        <pre><code class="language-bash"># 1) Crear el volumen (nombrado: la buena práctica de la lección 1)
+docker volume create pgdata
+
+# 2) Arrancar la base: variables + volumen + puerto publicado
+docker run -d --name harborpostgres \
+  -e POSTGRES_USER=harbor \
+  -e POSTGRES_PASSWORD=harborpass \
+  -e POSTGRES_DB=harbortasks \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 5432:5432 \
+  postgres:16-alpine
+
+# 3) Esperar a que termine el arranque (puede tardar unos segundos)
+sleep 5
+
+# 4) Comprobar la salud: pg_isready pregunta si el servidor acepta conexiones
+docker exec harborpostgres pg_isready -U harbor
+# Salida esperada: /var/run/postgresql:5432 - accepting connections
+
+# 5) Entrar con psql dentro del contenedor y ver la base creada
+docker exec -it harborpostgres psql -U harbor -d harbortasks -c "\l"
+</code></pre>
+        <p>Desglose línea a línea: <code>-e POSTGRES_*</code> se usan <strong>solo en el primer arranque</strong> (volumen vacío) para crear usuario, contraseña y base; <code>-v pgdata:…</code> asegura que los datos salgan de la capa efímera; <code>-p 5432:5432</code> nos deja conectar con <code>psql</code> del host durante el desarrollo; y <code>docker exec … psql</code> es la vía que no necesita instalar nada en el host: ejecuta el cliente psql <em>dentro</em> del propio contenedor de Postgres.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>harborpostgres</code> que dejará listo la capa de datos de HarborTasks: con red definida por el usuario (lección 2), healthcheck de verdad, y conectividad desde la API por nombre.</p>
+        <pre><code class="language-bash"># 0) Preparación: red y volumen
+docker network create harbortasks-net
+docker volume create pgdata
+
+# 1) PostgreSQL con healthcheck declarado en el propio run
+docker run -d --name harborpostgres \
+  --network harbortasks-net \
+  -e POSTGRES_USER=harbor \
+  -e POSTGRES_PASSWORD=harborpass \
+  -e POSTGRES_DB=harbortasks \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 5432:5432 \
+  --health-cmd "pg_isready -U harbor -d harbortasks" \
+  --health-interval 5s \
+  --health-retries 10 \
+  --health-timeout 3s \
+  postgres:16-alpine
+
+# 2) Esperar a que el healthcheck pase de "starting" a "healthy"
+docker ps --filter name=harborpostgres   # STATUS debe decir (healthy)
+
+# 3) Datos de ejemplo (usuario de HarborTasks)
+docker exec harborpostgres psql -U harbor -d harbortasks -c \
+  "CREATE TABLE IF NOT EXISTS tasks (id serial PRIMARY KEY, title text NOT NULL);"
+
+# 4) La API se conecta por NOMBRE de contenedor (DNS interno de la lección 2)
+docker run -d --name harborapi \
+  --network harbortasks-net \
+  -e PG_HOST=harborpostgres \
+  -e PG_PORT=5432 \
+  -e POSTGRES_USER=harbor \
+  -e POSTGRES_PASSWORD=harborpass \
+  -e POSTGRES_DB=harbortasks \
+  -p 3000:8080 \
+  harbortasks-api:1.0.0
+
+# 5) Verificación end-to-end: la API responde y toca la base
+curl -s http://localhost:3000/api/tasks
+curl -s -X POST http://localhost:3000/api/tasks -H 'Content-Type: application/json' \
+  -d '{"title":"comprar leche"}'
+
+# 6) Verificar que el dato escribió donde debe: en el volumen (pgdata)
+docker exec harborpostgres psql -U harbor -d harbortasks -c "SELECT * FROM tasks;"
+</code></pre>
+        <p>Decisiones tomadas: el <strong>healthcheck con <code>pg_isready</code></strong> es el patrón canónico — <code>pg_isready</code> está instalado en la propia imagen y responde 0 (OK) cuando el servidor acepta conexiones; así otros servicios o <code>docker ps</code> pueden saber cuándo la base está lista (crucial en Compose, lección 04). La API usa <strong>variables de entorno</strong>, no código con credenciales, y se conecta a <code>harborpostgres</code> por el <em>DNS interno</em> de <code>harbortasks-net</code>, sin IPs ni <code>localhost</code>. El <code>curl</code> del host mezclado con el <code>SELECT</code> interno demuestra los dos planos: fuera (puerto publicado) y dentro (red privada).</p>
+        <div class="callout callout--warning">
+          <p><strong>⚠️ Cambio de contraseña sin efecto:</strong> si tu base <strong>ya está inicializada</strong> (el volumen tiene cluster) y modificas <code>POSTGRES_PASSWORD</code> en el <code>run</code>, <strong>no cambia nada</strong>: el entrypoint solo aplica las variables en el primer arranque. Para rotar la contraseña, ejecuta <code>ALTER USER postgres WITH PASSWORD 'nueva';</code> con <code>psql</code> (o <code>\password postgres</code>). Esto es una de las preguntas del FAQ; que te sorprenda antes aquí que en producción.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Monta el volumen en <strong>exactamente</strong> <code>/var/lib/postgresql/data</code></td><td>Montar <code>/var/lib/postgresql</code> o subdirectorios</td><td>La imagen inicializa el cluster en <code>data/</code>; un volumen en el padre rompe la detección de "vacío o no" y no vuelve a inicializar</td></tr>
+            <tr><td>Declara el <strong>healthcheck</strong> con <code>pg_isready</code> y una DB concreta</td><td>Asumir que porque el contenedor está "Up" la base acepta conexiones</td><td>El arranque de PG tarda segundos; composiciones y orquestadores necesitan una señal binaria de "listo"</td></tr>
+            <tr><td>Usa <strong>una sola versión de imagen</strong> en todo el equipo</td><td>Mezclar <code>postgres:16</code>, <code>15-alpine</code>, etc. entre desarrolladores</td><td>La versión de la imagen fija el binario; la inmuta-secuencia evita sorpresas de compatibilidad</td></tr>
+            <tr><td>Credenciales por <strong>variables de entorno</strong> fuera del código</td><td>Hardcodear <code>POSTGRES_PASSWORD</code> en el Dockerfile o en commits</td><td>Cualquiera con acceso al repo tendría las credenciales; en producción verás secrets reales (Módulo 7)</td></tr>
+            <tr><td>Haz copias reales con <code>pg_dump</code> si la base importa</td><td>Pensar que el volumen <code>pgdata</code> es un backup</td><td>Un volumen se corrompe, se borra por error y vive en el mismo nodo; <code>pg_dump</code> te da portabilidad real</td></tr>
+            <tr><td>Recuerda: es <strong>una instancia única</strong>, no un clúster</td><td>Exigir alta disponibilidad/failover a este contenedor</td><td>Para HA se usa orquestación (Cloud Native PG, servicios gestionados); esto escala a tu producción pequeña, no a la granja</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Sin volumen: los datos mueren con el contenedor</h3>
+        <pre><code class="language-bash"># ❌ Postgres sin persistencia: todo lo creado se pierde al borrar el contenedor
+docker run -d --name pg-tmp -e POSTGRES_PASSWORD=x postgres:16-alpine
+docker exec pg-tmp psql -U harbor -c "CREATE DATABASE misdatos;"
+docker rm -f pg-tmp
+# …misdatos ha desaparecido para siempre
+
+# ✅ Con volumen pgdata, el cluster completo sobrevive al contenedor
+docker run -d --name pg-tmp -e POSTGRES_PASSWORD=x -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+</code></pre>
+
+        <h3>Montar el directorio equivocado</h3>
+        <pre><code class="language-bash"># ❌ Montar el padre de data: Postgres ve un volumen "lleno" y no inicializa
+docker run -d -v pgdata:/var/lib/postgresql postgres:16-alpine
+# → FATAL: no hay cluster en /var/lib/postgresql/data (el volumen está montado en el padre)
+
+# ✅ El punto exacto del cluster
+docker run -d -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+</code></pre>
+
+        <h3>Publicar 5432 en producción sin necesidad</h3>
+        <pre><code class="language-bash"># ❌ En producción se trata a la DB como si fuera una app pública
+docker run -d -p 5432:5432 -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+
+# ✅ En producción la DB solo la ve la red interna (sin -p); el -p queda para desarrollo
+docker run -d --network harbortasks-net -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+</code></pre>
+
+        <h3>Ignorar el healthcheck y arrancar la app a ciegas</h3>
+        <pre><code class="language-bash"># ❌ Lanzar la API "por si acaso" sin saber si la base está lista
+docker run -d --name harborapi -e PG_HOST=harborpostgres tu-registro/api:v1
+# → ECONNREFUSED: la API arrancó antes de que PG aceptara conexiones
+
+# ✅ Preguntar primero con pg_isready (y luego orquestar arranques; Módulo 4)
+docker exec harborpostgres pg_isready -U harbor -d harbortasks
+# accepting connections → ahora sí, lanza la API
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> demostrar la persistencia real del caso: crear datos, matar el contenedor, recrearlo con el mismo volumen, y comprobar que los datos siguen ahí.</p>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> crea volumen y arranca la base (si viene de la sección anterior, sáltate la creación del volumen):
+            <pre><code class="language-bash">docker volume create pgdata
+docker run -d --name harborpostgres \
+  -e POSTGRES_PASSWORD=harborpass -e POSTGRES_DB=harbortasks \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 5432:5432 postgres:16-alpine</code></pre>
+          </li>
+          <li><strong>Paso 2:</strong> crea una tabla y una tarea reales:
+            <pre><code class="language-bash">docker exec harborpostgres psql -U harbor -d harbortasks -c \
+  "CREATE TABLE tasks (id serial PRIMARY KEY, title text);"
+docker exec harborpostgres psql -U harbor -d harbortasks -c \
+  "INSERT INTO tasks (title) VALUES ('comprar leche');"</code></pre>
+          </li>
+          <li><strong>Paso 3 — la prueba de fuego:</strong> destruye el contenedor por completo (<code>-f</code> fuerza incluso en marcha):
+            <pre><code class="language-bash">docker rm -f harborpostgres</code></pre>
+          </li>
+          <li><strong>Paso 4:</strong> verifica que el <strong>volumen</strong> sigue existiendo (lección 1: los volúmenes no los borra ni <code>docker rm -f</code>):
+            <pre><code class="language-bash">docker volume ls | grep pgdata</code></pre>
+          </li>
+          <li><strong>Paso 5:</strong> recrea el contenedor con exactamente el <strong>mismo volumen</strong>. El cluster ya existe dentro de <code>pgdata</code>, así que el entrypoint <em>omite</em> la inicialización y solo arranca (las variables no se reaplican — teoría de la sección 2):
+            <pre><code class="language-bash">docker run -d --name harborpostgres \
+  -e POSTGRES_PASSWORD=harborpass -e POSTGRES_DB=harbortasks \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 5432:5432 postgres:16-alpine</code></pre>
+          </li>
+          <li><strong>Paso 6 — verificación:</strong> los datos creados en el paso 2 siguen ahí:
+            <pre><code class="language-bash">docker exec harborpostgres psql -U harbor -d harbortasks -c "SELECT * FROM tasks;"
+# Salida esperada: 1 | comprar leche</code></pre>
+          </li>
+          <li><strong>Paso 7 — contraste:</strong> repite los pasos 1–6 pero <strong>sin <code>-v</code></strong>, en una DB recién creada con otro nombre de contenedor, y observa cómo el <code>SELECT</code> del final devuelve <em>tabla inexistente</em>. Así aprende el cuerpo por qué sin volumen no hay persistencia.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El backup que nadie menciona</h3>
+          <p>Sin Docker, tu base necesitaría copias de seguridad. Averigua cómo hacer <strong>un dump real de tu base <code>harbortasks</code></strong> usando <code>docker exec</code> y la herramienta <code>pg_dump</code> que ya vive dentro de la imagen, y déjalo en una ruta del host (piensa qué mecanismo de la lección 1 necesitas para que el archivo del dump quede fuera del contenedor). Después, simula un desastre: borra el volumen con <code>docker volume rm pgdata</code> (¡tras parar el contenedor!) y restaura la base desde tu dump. Verifica con un <code>SELECT</code> que los datos volvieron.</p>
+          <p><em>Pista: <code>docker exec harborpostgres pg_dump -U harbor -d harbortasks</code> vierte SQL por la salida estándar; redirígela a un archivo con el bind mount o con <code>docker cp</code>. Para restaurar en la base vacía: <code>docker exec -i harborpostgres psql -U harbor -d harbortasks &lt; dump.sql</code>. Cuidado: al restaurar una base ya creada, la base <code>harbortasks</code> sigue existiendo aunque el volumen sea nuevo (la imagen la crea con <code>POSTGRES_DB</code>).</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La imagen oficial <code>postgres</code> <strong>inicializa solo la primera vez</strong> (volumen vacío): las variables de entorno no se reaplican en reinicios.</li>
+          <li>El volumen debe montarse en <strong><code>/var/lib/postgresql/data</code></strong> exactamente; montar el padre rompe la inicialización.</li>
+          <li><code>POSTGRES_USER</code>, <code>POSTGRES_PASSWORD</code> y <code>POSTGRES_DB</code> definen el arranque inicial; las credenciales van por variables, nunca en código.</li>
+          <li>El <strong>healthcheck con <code>pg_isready</code></strong> convierte el contenedor en una señal lista para orquestadores y Compose.</li>
+          <li>La API se conecta por <strong>nombre de contenedor en la red del usuario</strong>, no por IP ni <code>localhost</code>.</li>
+          <li><code>docker exec … psql</code> y <code>docker exec … pg_dump</code> dan la vía de administración sin instalar nada en el host.</li>
+          <li>Un contenedor Postgres es <strong>una instancia única</strong>: prácticо pero sin alta disponibilidad; el backup es responsabilidad tuya.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker run -d --name harborpostgres -e POSTGRES_PASSWORD=… -v pgdata:/var/lib/postgresql/data -p 5432:5432 postgres:16-alpine</code></td><td>Arranca Postgres con credenciales, volumen persistente y puerto publicado</td></tr>
+            <tr><td><code>docker exec harborpostgres pg_isready -U harbor</code></td><td>Comprueba si el servidor acepta conexiones (código de salida 0 = listo)</td></tr>
+            <tr><td><code>--health-cmd "pg_isready -U harbor" --health-interval 5s</code></td><td>Healthcheck declarado del contenedor (estado <em>healthy</em> en <code>docker ps</code>)</td></tr>
+            <tr><td><code>docker exec -it harborpostgres psql -U harbor -d harbortasks</code></td><td>Abre un cliente psql interactivo dentro del contenedor</td></tr>
+            <tr><td><code>docker exec harborpostgres psql … -c "SELECT …"</code></td><td>Ejecuta una sentencia SQL sin sesión interactiva</td></tr>
+            <tr><td><code>docker exec harborpostgres pg_dump -U harbor -d harbortasks</code></td><td>Genera un dump SQL de la base por la salida estándar (backup)</td></tr>
+            <tr><td><code>docker volume rm pgdata</code></td><td>Elimina el volumen de datos (¡con el contenedor que lo usa parado!)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué mi POSTGRES_PASSWORD nueva no "se aplica" al reiniciar?</summary>
+            <div>
+              <p>Porque las variables de entorno solo se consumen en el <strong>primer arranque con el volumen vacío</strong>. Los datos reales del usuario y su contraseña viven en el propio cluster (en <code>pgdata</code>), no en variables. Para rotar la contraseña, usa SQL: <code>docker exec harborpostgres psql -U harbor -c "ALTER USER postgres WITH PASSWORD 'nueva';"</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo conecto desde mi máquina (host) a este Postgres?</summary>
+            <div>
+              <p>Por el <strong>puerto publicado</strong>: como lanzaste con <code>-p 5432:5432</code>, desde el host conectas a <code>localhost:5432</code> (o <code>127.0.0.1</code>) con tu cliente psql, con el usuario y contraseña de <code>POSTGRES_USER</code>/<code>POSTGRES_PASSWORD</code>. En Windows/WSL2 el <code>localhost</code> del host suele redirigirse bien a WSL2; si no, usa la IP de WSL (lección 04 del módulo 0). Cuidado si ya tienes un Postgres local escuchando en 5432: cambia el lado izquierdo del mapa, p. ej. <code>-p 5433:5432</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Pierdo la configuración si actualizo la imagen de <code>16</code> a <code>17</code>?</summary>
+            <div>
+              <p>Los <strong>datos sobreviven</strong> (están en el volumen), pero el cluster está <em>versionado</em>: la versión de PostgreSQL escribe internamente con su propio formato. Subir de versión es una <strong>migración</strong> (dump + restore con <code>pg_upgrade</code>), no un simple cambio de tag. Regla: en desarrollo, prueba las migraciones antes; en producción, planifica el momento de mantenimiento. Por eso la buena práctica dice "una sola versión fijada en el equipo".</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Es seguro exponer 5432 en desarrollo? ¿Y en producción?</summary>
+            <div>
+              <p>En desarrollo es cómodo (conectar con psql desde tu IDE al <code>localhost</code>) y aceptable. En <strong>producción evítalo</strong>: la base no debe ser alcanzable desde el exterior, solo desde la red interna del stack. Ahí no publicas el puerto y la comunicación viaja por la red bridge privada. Además, una base expuesta a internet sin auth estricta es un objetivo típico de ransomware.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Este contenedor es un clúster de Postgres?</summary>
+            <div>
+              <p>No. Es <strong>una instancia única</strong>: para alta disponibilidad (replicación, failover, backups automatizados) se usan operadores como Cloud Native PG sobre Kubernetes, o servicios gestionados en la nube. Este contenedor es la pieza ideal para tu entorno local, desarrollo y pequeños despliegues; en el Módulo 9 verás cómo trasladarlo a Kubernetes con el patrón correcto.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

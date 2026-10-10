@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-pubsub-transacciones-y-lua">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ISubscriber, transacciones y scripting Lua — Módulo 6 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>ISubscriber, transacciones y scripting Lua</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · StackExchange.Redis en .NET</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Cuando un comando no basta y necesitas <strong>varios pasos atómicos</strong>, StackExchange.Redis te da tres herramientas: <code>ISubscriber</code> (pub/sub en .NET), transacciones (<code>IBatch</code>/MULTI) y <strong>scripting Lua</strong> (lógica atómica en el servidor).</p>
+        <p>Estas tres son el «arma avanzada» del hub: locks seguros, contadores compuestos y publicaciones coordinadas.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>ISubscriber (pub/sub en .NET)</h3>
+        <pre><code class="language-csharp">ISubscriber sub = mux.GetSubscriber();
+
+// Suscribir (vuelve a inscribir al reconectar)
+await sub.SubscribeAsync("hub:events", (channel, value) =&gt;
+    Handle(value!));
+
+// Publicar
+long n = await sub.PublishAsync("hub:events", JsonSerializer.Serialize(evt));</code></pre>
+        <ul>
+          <li>El callback llega en la conexión del suscriptor; no hagas trabajo pesado dentro: despáchalo a otro hilo/cola.</li>
+          <li><code>PublishAsync</code> devuelve el nº de suscriptores que recibieron.</li>
+          <li>Patrones: <code>SubscribeAsync(RedisChannel.Pattern("hub:*"), ...)</code>.</li>
+        </ul>
+
+        <h3>Transacciones: MULTI/EXEC → IBatch (pipeline)</h3>
+        <p>StackExchange.Redis no expone MULTI/EXEC clásico; usa <code>CreateTransaction</code> (MULTI+EXEC) o <code>CreateBatch</code> (pipeline sin garantía atómica). Para <strong>atomicidad</strong> de varios comandos, la API recomendada es <code>CreateTransaction</code> con condiciones:</p>
+        <pre><code class="language-csharp">var txn = db.CreateTransaction();
+txn.AddCondition(Condition.StringNotEqual("cfg:ver", "v2"));   // WATCH-like
+var set = txn.StringSetAsync("cfg:ver", "v2");
+var save = txn.StringSetAsync("cached:profile:1", "...", TimeSpan.FromHours(1));
+bool committed = await txn.ExecuteAsync();   // MULTI+EXEC real</code></pre>
+
+        <h3>Lua: el «stored procedure» atómico</h3>
+        <pre><code class="language-csharp">const string LuaLock =
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then " +
+    "  return redis.call('DEL', KEYS[1]) " +
+    "else " +
+    "  return 0 " +
+    "end";
+
+// Liberar el lock SOLO si soy el dueño (token)  — atómico y seguro
+long freed = (long)await db.ScriptEvaluateAsync(
+    LuaLock,
+    [Key: key], [Arguments: token]);
+
+// El dueño: SET nx + dt + un TTL definido
+bool got = await db.StringSetAsync(key, token, TimeSpan.FromSeconds(5), When.NotExists);</code></pre>
+        <p>Lua corre dentro del same single-thread: es la forma de hacer operaciones multi-key con lógica condicional de forma segura.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">// Un contador compuesto: guardar «último + total» en una sola operación
+const string script = """
+    local incr = redis.call('INCR', KEYS[1])
+    redis.call('SET', KEYS[2], incr)
+    return incr
+    """;
+long val = (long)await db.ScriptEvaluateAsync(script, ["stats:total", "stats:last"], []);</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el hub: el «lock de migración de nodo» (SÓLO el dueño des-registra), con Lua:</p>
+        <pre><code class="language-csharp">public async Task&lt;bool&gt; TryLockAsync(IDatabase db, RedisKey key, string token, TimeSpan ttl)
+    => await db.StringSetAsync(key, token, ttl, When.NotExists);
+
+public async Task&lt;bool&gt; UnlockAsync(IDatabase db, RedisKey key, string token)
+{
+    const string script =
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then " +
+        "  redis.call('DEL', KEYS[1]); return 1 " +
+        "end " +
+        "return 0";
+    return (long)await db.ScriptEvaluateAsync(script, [key], [token]) == 1;
+}
+
+// Uso: al migrar un cliente de nodo
+if (await TryLockAsync(db, "lock:migrate:887", myToken, TimeSpan.FromSeconds(5)))
+{
+    await MigrateAsync(887);                       // mover conexión
+    await UnlockAsync(db, "lock:migrate:887", myToken);
+}</code></pre>
+        <p>El <code>Unlock</code> con Lua es garantía de que solo el dueño cierra el lock (M5-02 prometido).</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Locks con TTL + token + liberación Lua</td><td>DEL del lock sin verificar dueño</td><td>Evita desbloquear el lock de otro proceso</td></tr>
+            <tr><td>Scripts Lua cortos y documentados</td><td>Scripts largos difíciles de auditar</td><td>Corren sin interrupción; hay que confiar en ellos</td></tr>
+            <tr><td>IBatch para pipelines (varios comandos sin atomicidad)</td><td>Gastar MULTI para "ahorrarse RTT"</td><td>Si no necesitas atomicidad, IBatch es más rápido</td></tr>
+            <tr><td>Trabajo pesado FUERA del callback de suscripción</td><td>Hacer IO lento dentro del handler</td><td>El suscriptor no debe bloquearse</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Liberar lock ajeno</h3>
+        <pre><code class="language-csharp">// ❌ El lock de otro se elimina (problema en migraciones)
+await db.KeyDeleteAsync(lockKey);
+
+// ✅ Verifica el token en el servidor (Lua) antes de DEL
+//   → script del ejemplo real</code></pre>
+
+        <h3>Usar MULTI para ahorrar latency sin WATCH de condiciones</h3>
+        <p>MULTI te da «atomicidad» pero no «optimistic concurrency»; si necesitas «solo si el valor no cambió», usa condiciones (Condition.*) sobre la transacción.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa TryLock/Unlock con Lua en tu proyecto y háblalo desde un endpoint.</li>
+          <li><strong>Paso 2:</strong> Suscríbete a <code>hub:events</code> y publica desde otro endpoint: comprueba el callback.</li>
+          <li><strong>Paso 3:</strong> Crea una transacción con una Condition (p. ej. version) y muéstrala fallar si no cumple.</li>
+          <li><strong>Paso 4:</strong> Verifica con redis-cli que el unlock solo funciona con el token correcto.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Contador compuesto atómico</h3>
+          <p>Escribe un script Lua que (a) INCR un contador, (b) guarde el «último que actualizó», (c) devuelva ambos. Compáralo con la versión «dos comandos» y argumenta cuándo elegirías Lua frente a una transacción.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>ISubscriber: suscripción/publicación en .NET (para el hub).</li>
+          <li>IBatch (pipeline) / CreateTransaction (MULTI+condiciones).</li>
+          <li>Lua: lógica atómica en el servidor (locks seguros).</li>
+          <li>Trabajo pesado fuera del callback de suscripción.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo transacción (IBatch/CreateTransaction) y cuándo Lua?</summary>
+            <div><p>Si solo necesitas «varios comandos y ya» → IBatch. Si necesitas «O todo o nada con condiciones» → CreateTransaction. Si necesitas lógica (if/leer+decidir+escribir) dentro → Lua.</p></div>
+          </details>
+          <details>
+            <summary>¿Lua bloquea Redis?</summary>
+            <div><p>Como cualquier comando: durante su ejecución, el event-loop espera. Mantenlos cortos (evita bucles largos y scripts con N grande).</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="es" data-module="17" data-lesson="06-proyecto-cms-avanzado" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: gRPC + telemetría + Polly — Módulo 17 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: gRPC + telemetría + Polly</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 17 · Temas avanzados</span><span>55 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En este proyecto integraremos en el CMS que venimos construyendo los tres temas avanzados del módulo: <strong>gRPC</strong> para consultas internas de alto rendimiento, <strong>OpenTelemetry</strong> para observabilidad y <strong>Polly</strong> para comunicaciones resilientes.</p>
+        <p>Además añadiremos un <strong>feature flag</strong> que protege un endpoint beta de la nueva API. Al final del proyecto, el CMS contará con:</p>
+        <ul>
+          <li>Un servicio gRPC para consultar posts por ID.</li>
+          <li>Trazas y métricas de OpenTelemetry para ASP.NET Core, EF Core, gRPC y <code>HttpClient</code>.</li>
+          <li>Un <code>HttpClient</code> resiliente con Polly para comunicación con un servicio externo de análisis.</li>
+          <li>Un endpoint beta protegido por <code>FeatureGate</code>.</li>
+        </ul>
+
+        <div class="callout info">
+          <strong>Escenario real:</strong> el CMS necesita consultar un servicio de análisis externo para enriquecer posts. Usamos gRPC para comunicación interna entre microservicios, Polly para no caer ante fallos transitorios y OpenTelemetry para entender qué ocurre en producción.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>Arquitectura del proyecto</h3>
+        <pre><code class="language-text">┌─────────────────┐     gRPC     ┌─────────────────┐
+│   Cliente/API   │───────────────▶│   CMS gRPC      │
+│   (Cms.Api)     │                │   Service       │
+└────────┬────────┘                └─────────────────┘
+         │
+         │ HTTP + Polly
+         ▼
+┌─────────────────┐     HTTP       ┌─────────────────┐
+│   IAnalytics    │───────────────▶│  Analytics      │
+│   Client        │   retry + CB   │  External API   │
+└─────────────────┘                └─────────────────┘
+         │
+         ▼ OpenTelemetry
+┌─────────────────┐
+│  OTLP Collector │────▶ Jaeger / Prometheus
+└─────────────────┘</code></pre>
+
+        <h3>Decisiones de diseño</h3>
+        <ul>
+          <li><strong>gRPC para consultas internas:</strong> entre microservicios del mismo backend, gRPC aporta contratos fuertes y menor latencia.</li>
+          <li><strong>REST para la API pública:</strong> los clientes externos consumen JSON a través de controladores REST.</li>
+          <li><strong>Polly para llamadas externas:</strong> la API de análisis es externa; los reintentos y el circuit breaker protegen al CMS.</li>
+          <li><strong>OpenTelemetry end-to-end:</strong> una traza sigue desde la petición REST hasta el servicio gRPC, la base de datos y el servicio externo.</li>
+          <li><strong>Feature flag para beta:</strong> permitimos activar el endpoint de análisis sin redeployar.</li>
+        </ul>
+
+        <h3>Estructura de proyectos</h3>
+        <p>Añadimos al CMS un proyecto de librería <code>Cms.Grpc</code> con los archivos <code>.proto</code> y un servicio gRPC dentro de <code>Cms.Api</code>. Las trazas se configuran en el API y se propagan automáticamente por gRPC y <code>HttpClient</code>.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>El núcleo del proyecto es la definición del servicio gRPC y su consumo desde el propio API.</p>
+
+        <pre><code class="language-bash"># Añadimos los paquetes al proyecto Cms.Api
+dotnet add package Grpc.AspNetCore
+dotnet add package Grpc.Net.Client
+
+dotnet add package Polly
+dotnet add package Microsoft.Extensions.Http.Polly
+
+dotnet add package OpenTelemetry
+dotnet add package OpenTelemetry.Exporter.Console
+dotnet add package OpenTelemetry.Instrumentation.AspNetCore
+dotnet add package OpenTelemetry.Instrumentation.Http
+dotnet add package OpenTelemetry.Instrumentation.EntityFrameworkCore
+dotnet add package Microsoft.FeatureManagement.AspNetCore</code></pre>
+
+        <pre><code class="language-protobuf">// Protos/cms_posts.proto
+syntax = "proto3";
+
+option csharp_namespace = "Cms.Grpc";
+
+package cms;
+
+service CmsPostService {
+  rpc GetPostById (GetPostByIdRequest) returns (PostGrpcResponse);
+  rpc ListPostsByAuthor (ListPostsByAuthorRequest) returns (stream PostGrpcResponse);
+}
+
+message GetPostByIdRequest {
+  string post_id = 1;
+}
+
+message ListPostsByAuthorRequest {
+  string author_email = 1;
+}
+
+message PostGrpcResponse {
+  string post_id = 1;
+  string title = 2;
+  string slug = 3;
+  string status = 4;
+  string author_email = 5;
+}</code></pre>
+
+        <pre><code class="language-xml">&lt;!-- Cms.Api.csproj --&gt;
+&lt;ItemGroup&gt;
+  &lt;Protobuf Include="Protos\cms_posts.proto" GrpcServices="Server,Client" /&gt;
+  &lt;PackageReference Include="Grpc.AspNetCore" Version="2.59.0" /&gt;
+  &lt;PackageReference Include="Grpc.Net.Client" Version="2.59.0" /&gt;
+  &lt;PackageReference Include="Polly" Version="8.3.0" /&gt;
+  &lt;PackageReference Include="Microsoft.Extensions.Http.Polly" Version="8.0.0" /&gt;
+  &lt;PackageReference Include="OpenTelemetry" Version="1.7.0" /&gt;
+  &lt;PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.7.0" /&gt;
+  &lt;PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.7.0" /&gt;
+  &lt;PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.7.0" /&gt;
+  &lt;PackageReference Include="OpenTelemetry.Instrumentation.EntityFrameworkCore" Version="1.0.0-beta.10" /&gt;
+  &lt;PackageReference Include="Microsoft.FeatureManagement.AspNetCore" Version="3.2.0" /&gt;
+&lt;/ItemGroup&gt;</code></pre>
+
+        <pre><code class="language-csharp">// CmsPostGrpcService.cs
+public class CmsPostGrpcService(
+    IPostRepository repository,
+    ILogger&lt;CmsPostGrpcService&gt; logger) : CmsPostService.CmsPostServiceBase
+{
+    public override async Task&lt;PostGrpcResponse&gt; GetPostById(
+        GetPostByIdRequest request,
+        ServerCallContext context)
+    {
+        using var activity = CmsTelemetry.ActivitySource.StartActivity("GrpcGetPostById");
+        activity?.SetTag("post.id", request.PostId);
+
+        var post = await repository.GetByIdAsync(Guid.Parse(request.PostId), context.CancellationToken);
+
+        if (post is null)
+            throw new RpcException(new Status(StatusCode.NotFound, "Post no encontrado"));
+
+        return new PostGrpcResponse
+        {
+            PostId = post.Id.ToString(),
+            Title = post.Title,
+            Slug = post.Slug,
+            Status = post.Status.ToString(),
+            AuthorEmail = post.AuthorEmail
+        };
+    }
+
+    public override async Task ListPostsByAuthor(
+        ListPostsByAuthorRequest request,
+        IServerStreamWriter&lt;PostGrpcResponse&gt; responseStream,
+        ServerCallContext context)
+    {
+        await foreach (var post in repository.GetByAuthorAsync(request.AuthorEmail, context.CancellationToken))
+        {
+            await responseStream.WriteAsync(new PostGrpcResponse
+            {
+                PostId = post.Id.ToString(),
+                Title = post.Title,
+                Slug = post.Slug,
+                Status = post.Status.ToString(),
+                AuthorEmail = post.AuthorEmail
+            });
+        }
+    }
+}</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Integramos gRPC, Polly, OpenTelemetry y Feature Management en el <code>Program.cs</code> del CMS.</p>
+
+        <pre><code class="language-csharp">// Program.cs (fragmentos relevantes)
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+using OpenTelemetry.Metrics;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// 1. Feature Management
+builder.Services.AddFeatureManagement();
+
+// 2. OpenTelemetry
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource =&gt; resource
+        .AddService("Cms.Api")
+        .AddAttributes(new Dictionary&lt;string, object&gt;
+        {
+            ["deployment.environment"] = builder.Environment.EnvironmentName
+        }))
+    .WithTracing(tracing =&gt; tracing
+        .AddSource("Cms.Api")
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddGrpcClientInstrumentation()
+        .AddGrpcAspNetCoreInstrumentation()
+        .AddEntityFrameworkCoreInstrumentation()
+        .AddConsoleExporter()
+        .AddOtlpExporter(options =&gt; options.Endpoint = new Uri("http://localhost:4317")))
+    .WithMetrics(metrics =&gt; metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddRuntimeInstrumentation()
+        .AddPrometheusExporter());
+
+// 3. HttpClient con Polly para el servicio de análisis
+builder.Services.AddHttpClient&lt;IAnalyticsClient, AnalyticsClient&gt;(client =&gt;
+{
+    client.BaseAddress = new Uri(builder.Configuration["Analytics:BaseUrl"]!);
+    client.DefaultRequestHeaders.Add("Accept", "application/json");
+})
+.AddPolicyHandler(GetRetryPolicy())
+.AddPolicyHandler(GetCircuitBreakerPolicy());
+
+// 4. gRPC
+builder.Services.AddGrpc();
+
+// 5. Controladores y servicios habituales
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+// Middleware y endpoints
+app.UseOpenTelemetryPrometheusScrapingEndpoint();
+
+app.MapGrpcService&lt;CmsPostGrpcService&gt;();
+
+app.MapControllers();
+
+// Endpoint beta protegido por feature flag
+app.MapGet("/api/v1/analytics/posts/{postId:guid}",
+    [FeatureGate("PostAnalytics")]
+    async Task&lt;Results&lt;Ok&lt;PostAnalyticsResponse&gt;, NotFound&gt;&gt; (
+        Guid postId,
+        IAnalyticsClient analyticsClient,
+        CancellationToken ct) =&gt;
+    {
+        var result = await analyticsClient.GetPostAnalyticsAsync(postId, ct);
+        return result is null ? TypedResults.NotFound() : TypedResults.Ok(result);
+    });
+
+app.Run();
+
+static IAsyncPolicy&lt;HttpResponseMessage&gt; GetRetryPolicy()
+{
+    return HttpPolicyExtensions
+        .HandleTransientHttpError()
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: retryAttempt =&gt;
+                TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) +
+                TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1000)),
+            onRetry: (outcome, duration, attempt, context) =&gt;
+            {
+                var logger = context.GetLogger();
+                logger?.LogWarning("Analytics retry {Attempt} after {Seconds}s", attempt, duration.TotalSeconds);
+            });
+}
+
+static IAsyncPolicy&lt;HttpResponseMessage&gt; GetCircuitBreakerPolicy()
+{
+    return HttpPolicyExtensions
+        .HandleTransientHttpError()
+        .CircuitBreakerAsync(
+            handledEventsAllowedBeforeBreaking: 5,
+            durationOfBreak: TimeSpan.FromSeconds(30));
+}</code></pre>
+
+        <pre><code class="language-csharp">// CmsTelemetry.cs
+public static class CmsTelemetry
+{
+    public static readonly ActivitySource ActivitySource = new("Cms.Api");
+    public static readonly Meter Meter = new("Cms.Api");
+
+    public static readonly Counter&lt;long&gt; AnalyticsRequests =
+        Meter.CreateCounter&lt;long&gt;("cms.analytics_requests", "requests", "Llamadas al servicio de análisis");
+
+    public static readonly Histogram&lt;double&gt; AnalyticsResponseTimeMs =
+        Meter.CreateHistogram&lt;double&gt;("cms.analytics_response_time_ms", "ms", "Tiempo de respuesta del servicio de análisis");
+
+    public static ILogger? GetLogger(this Context context)
+    {
+        context.TryGetLogger(out var logger);
+        return logger;
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// AnalyticsClient.cs
+public interface IAnalyticsClient
+{
+    Task&lt;PostAnalyticsResponse?&gt; GetPostAnalyticsAsync(Guid postId, CancellationToken ct = default);
+}
+
+public class AnalyticsClient(
+    HttpClient httpClient,
+    ILogger&lt;AnalyticsClient&gt; logger) : IAnalyticsClient
+{
+    public async Task&lt;PostAnalyticsResponse?&gt; GetPostAnalyticsAsync(Guid postId, CancellationToken ct = default)
+    {
+        using var activity = CmsTelemetry.ActivitySource.StartActivity("AnalyticsClient.GetPostAnalytics");
+
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            var response = await httpClient.GetAsync($"posts/{postId}/analytics", ct);
+            response.EnsureSuccessStatusCode();
+
+            CmsTelemetry.AnalyticsRequests.Add(1,
+                new KeyValuePair&lt;string, object?&gt;("status", "success"));
+
+            return await response.Content.ReadFromJsonAsync&lt;PostAnalyticsResponse&gt;(ct);
+        }
+        catch (HttpRequestException ex)
+        {
+            logger.LogError(ex, "Error consultando analytics del post {PostId}", postId);
+            CmsTelemetry.AnalyticsRequests.Add(1,
+                new KeyValuePair&lt;string, object?&gt;("status", "error"));
+            return null;
+        }
+        finally
+        {
+            CmsTelemetry.AnalyticsResponseTimeMs.Record(stopwatch.Elapsed.TotalMilliseconds);
+        }
+    }
+}
+
+public sealed record PostAnalyticsResponse(Guid PostId, int Views, int Likes, DateTime CalculatedAt);</code></pre>
+
+        <pre><code class="language-json">// appsettings.json
+{
+  "Analytics": {
+    "BaseUrl": "https://analytics.example.com/api/v1/"
+  },
+  "FeatureManagement": {
+    "PostAnalytics": {
+      "EnabledFor": [
+        {
+          "Name": "Percentage",
+          "Parameters": { "Value": 50 }
+        }
+      ]
+    }
+  }
+}</code></pre>
+
+        <div class="callout tip">
+          <strong>Tip:</strong> para probar el gRPC sin un cliente externo, el propio API puede exponer un endpoint REST que internamente use un <code>CmsPostService.CmsPostServiceClient</code> apuntando a <code>https://localhost</code>. Esto no es productivo pero sirve para validar localmente.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Usa gRPC para comunicación interna entre servicios .NET:</strong> aprovecha contratos fuertes y menor serialización.</li>
+          <li><strong>Expone REST al exterior:</strong> los clientes públicos y terceros entienden JSON y HTTP.</li>
+          <li><strong>Configura Polly en todos los clientes externos:</strong> retry, circuit breaker y timeout deben ser la norma.</li>
+          <li><strong>Instrumenta automáticamente y manualmente:</strong> las librerías de OpenTelemetry cubren el framework; tú añade spans y métricas de negocio.</li>
+          <li><strong>Usa feature flags para capacidades nuevas:</strong> permite activar funcionalidades gradualmente y desactivarlas si fallan.</li>
+          <li><strong>Guarda secretos en variables de entorno o key vault:</strong> nunca commitea la URL o claves de servicios externos.</li>
+          <li><strong>Documenta las métricas y trazas personalizadas:</strong> tu equipo de operaciones necesita saber qué significan.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>No exponer HTTP/2 sin TLS en producción</h3>
+        <p>gRPC requiere HTTP/2. En producción configura TLS. En desarrollo, Kestrel puede aceptar HTTP/2 sin TLS, pero nunca en un entorno real.</p>
+
+        <h3>Registrar HttpClient sin nombre o tipo</h3>
+        <pre><code class="language-csharp">// MAL: HttpClient sin Polly, no gestiona sockets ni resiliencia
+builder.Services.AddHttpClient();</code></pre>
+        <p><strong>Solución:</strong> usa <code>AddHttpClient&lt;IAnalyticsClient, AnalyticsClient&gt;</code> con <code>AddPolicyHandler</code>.</p>
+
+        <h3>Mezclar feature flags con autorización</h3>
+        <pre><code class="language-csharp">// MAL: un feature flag no es un permiso
+[FeatureGate("AdminFeature")]</code></pre>
+        <p><strong>Solución:</strong> usa <code>[Authorize(Roles = "Admin")]</code> para permisos y <code>FeatureGate</code> para disponibilidad de funcionalidades.</p>
+
+        <h3>Olvidar registrar ActivitySource</h3>
+        <pre><code class="language-csharp">// MAL: se crea ActivitySource pero no se añade al provider
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t =&gt; t.AddAspNetCoreInstrumentation());</code></pre>
+        <p><strong>Solución:</strong> añade <code>.AddSource("Cms.Api")</code> en el <code>TracerProvider</code>.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Completa el CMS con los siguientes pasos:</p>
+        <ol>
+          <li>En el proyecto <code>Cms.Api</code>, añade el archivo <code>Protos/cms_posts.proto</code> y genera servidor y cliente.</li>
+          <li>Implementa <code>CmsPostGrpcService</code> con <code>GetPostById</code> y <code>ListPostsByAuthor</code> (server streaming).</li>
+          <li>Registra <code>AddGrpc()</code> y <code>MapGrpcService</code> en <code>Program.cs</code>.</li>
+          <li>Crea <code>IAnalyticsClient</code> y <code>AnalyticsClient</code> con <code>HttpClient</code> y políticas de Polly.</li>
+          <li>Configura OpenTelemetry con <code>AddGrpcClientInstrumentation</code> y <code>AddGrpcAspNetCoreInstrumentation</code>.</li>
+          <li>Añade un feature flag <code>PostAnalytics</code> en <code>appsettings.json</code> y protégelo con <code>FeatureGate</code>.</li>
+          <li>Verifica con <code>dotnet build</code> y ejecuta la API. Prueba el endpoint REST y el gRPC con Bloom RPC o un cliente de consola.</li>
+        </ol>
+
+        <pre><code class="language-bash"># Compilar y ejecutar el proyecto final
+dotnet build proyecto-final/src/Cms.Api
+
+dotnet run --project proyecto-final/src/Cms.Api
+
+# Probar endpoint REST (con flag activado)
+curl https://localhost:7001/api/v1/analytics/posts/00000000-0000-0000-0000-000000000000</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <ul>
+          <li>Despliega un <strong>collector OpenTelemetry</strong> con Docker Compose y envía las trazas a <strong>Jaeger</strong>.</li>
+          <li>Añade un <strong>health check personalizado</strong> que verifique si el circuit breaker de Polly está abierto y devuelva <code>Degraded</code>.</li>
+          <li>Implementa un <strong>cliente gRPC de consola</strong> que consuma <code>ListPostsByAuthor</code> y muestre los posts en tiempo real.</li>
+        </ul>
+        <p>No resuelvas el reto todavía. Inténtalo primero y luego compara con la solución propuesta.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>gRPC añade consultas internas de alto rendimiento al CMS.</li>
+          <li>OpenTelemetry proporciona observabilidad end-to-end sobre REST, gRPC, EF Core y HttpClient.</li>
+          <li>Polly protege las llamadas al servicio externo de análisis con retry y circuit breaker.</li>
+          <li>Los feature flags permiten activar funcionalidades beta sin redeployar.</li>
+          <li>La combinación de estas técnicas eleva el CMS a un nivel profesional y preparado para producción.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿Necesito dos puertos para gRPC y REST?</h3>
+        <p>No. ASP.NET Core puede servir gRPC y REST en el mismo puerto si el cliente soporta HTTP/2. Algunos clientes antiguos requieren puertos separados.</p>
+
+        <h3>¿Cómo visualizo las trazas del CMS?</h3>
+        <p>Configura el exportador OTLP apuntando a un collector local. Usa Jaeger en <code>http://localhost:16686</code> para explorar las trazas.</p>
+
+        <h3>¿El circuit breaker de Polly afecta a todos los endpoints?</h3>
+        <p>No. La política está vinculada al <code>HttpClient</code> de <code>AnalyticsClient</code>. Solo afecta a las llamadas a ese servicio externo.</p>
+
+        <h3>¿Puedo desactivar un feature flag en caliente?</h3>
+        <p>Con <code>appsettings.json</code> el archivo se recarga automáticamente. Para cambios inmediatos sin reiniciar, usa Azure App Configuration.</p>
+
+        <h3>¿Qué pasa si el gRPC devuelve NotFound?</h3>
+        <p>El servidor lanza un <code>RpcException</code> con <code>StatusCode.NotFound</code>. El cliente lo recibe como una excepción que debe manejar o transformar a un <code>NotFound</code> de REST.</p>
+
+        <h3>¿Es obligatorio usar Polly si uso HttpClientFactory?</h3>
+        <p>No es obligatorio, pero es muy recomendable para cualquier llamada a servicios externos. La fábrica soluciona el agotamiento de sockets; Polly añade resiliencia ante fallos.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

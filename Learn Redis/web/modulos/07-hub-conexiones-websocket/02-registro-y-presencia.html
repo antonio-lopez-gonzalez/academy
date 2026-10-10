@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-registro-y-presencia">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Registro de conexiones y presencia — Módulo 7 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Registro de conexiones y presencia</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · El Hub de Conexiones WebSocket con Redis</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El corazón del hub: <strong>«¿dónde está la conexión X?»</strong> (registro) y <strong>«¿quién está conectado ahora?»</strong> (presencia). Ambas son responsabilidad de Redis, con hashes y zsets + TTL.</p>
+        <p>Aquí está el código concreto (redis-cli y .NET) que usará el proyecto final.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Registro por conexión (hash)</h3>
+        <pre><code class="language-redis">HSET hub:conn:8632 node node-1 userId 42 since 1750000000
+EXPIRE hub:conn:8632 30
+# ¿dónde está 8632? → HGET hub:conn:8632 node
+# Detalle → HGETALL hub:conn:8632</code></pre>
+        <p>Cada conexión es una key con su hash; el TTL se renueva con el heartbeat (lease).</p>
+
+        <h3>Presencia global (zset)</h3>
+        <pre><code class="language-redis">ZADD hub:presence 1750000000 user:42
+ZRANGEBYSCORE hub:presence 1749913600 +inf    # online desde hace 60 s
+ZREMRANGEBYSCORE hub:presence -inf 1748913600 # limpiar viejos
+ZCARD hub:presence</code></pre>
+
+        <h3>Cardinalidad de «presencia» (por nodo)</h3>
+        <pre><code class="language-redis">ZADD hub:presence:node:node-1 1750000000 user:42   # por nodo (opcional)
+ZADD hub:presence:node:node-2 1750000000 user:7</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Decisión:</strong> un zset global para «¿quién online?» + hashes por conexión para «¿dónde está cada uno?». Si además quieres «¿quién en qué nodo?», separa por nodo (o sácaselo del hash).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">HSET hub:conn:100 node node-1 userId 42
+EXPIRE hub:conn:100 30
+ZADD hub:presence 1750000000 user:42
+# simula clientes verde: consultas
+HGET hub:conn:100 node
+ZRANGEBYSCORE hub:presence -inf +inf</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Los métodos con que el <code>redis-ws-hub</code> gestiona registro + presencia:</p>
+        <pre><code class="language-csharp">public sealed class ConnectionRegistry
+{
+    private const long PresenceWindowSecs = 60;
+    private readonly IDatabase _db;
+    private readonly string _nodeId;
+
+    public ConnectionRegistry(IConnectionMultiplexer mux, string nodeId)
+        { _db = mux.GetDatabase(); _nodeId = nodeId; }
+
+    public async Task RegisterAsync(string connectionId, string userId)
+    {
+        RedisKey key = $"hub:conn:{connectionId}";
+        await _db.HashSetAsync(key,
+            [new HashEntry("node", _nodeId),
+             new HashEntry("userId", userId),
+             new HashEntry("since", DateTimeOffset.UtcNow.ToUnixTimeSeconds())]);
+        await _db.KeyExpireAsync(key, Lease);         // presencia por conexión
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        await _db.SortedSetAddAsync("hub:presence", userId, now);        // global
+    }
+
+    public async Task HeartbeatAsync(string connectionId, string userId)
+    {
+        // refresca el lease del registro y el score de presencia
+        await _db.KeyExpireAsync($"hub:conn:{connectionId}", Lease);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        await _db.SortedSetAddAsync("hub:presence", userId, now);
+    }
+
+    public async Task UnregisterAsync(string connectionId, string userId)
+    {
+        await _db.KeyDeleteAsync($"hub:conn:{connectionId}");
+        await _db.SortedSetRemoveAsync("hub:presence", userId);
+    }
+
+    public async Task&lt;RedisValue&gt; FindNodeAsync(string connectionId)
+        => await _db.HashGetAsync($"hub:conn:{connectionId}", "node");
+
+    public async Task&lt;RedisValue[]&gt; OnlineAsync()
+    {
+        long cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - PresenceWindowSecs;
+        return await _db.SortedSetRangeByScoreAsync("hub:presence", cutoff, double.PositiveInfinity);
+    }
+
+    private static readonly TimeSpan Lease = TimeSpan.FromSeconds(30);
+}</code></pre>
+        <p>Un solo servicio centraliza registro/presencia y es el que reutilizan los handlers del socket.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>TTL en registro + zset de presencia</td><td>Guardar presencia solo en el hash</td><td>El hash ayuda «dónde», no «quién ahora»; el zset responde presencia</td></tr>
+            <tr><td>Heartbeat refrescando ambos (lease y score)</td><td>Refrescar solo uno de los dos</td><td>Un registro vivo con presencia muerta es inconsistente</td></tr>
+            <tr><td>Unregister explícito al desconectar (además del TTL)</td><td>Dejarlo todo a la expiración</td><td>La expiración es el safety net; el unregister limpia al instante</td></tr>
+            <tr><td>Consulta de presencia con score cutoff</td><td>ZRANGE por rango pensando que es «online»</td><td>«Online» = score reciente, no posición</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Esperar «cero» presencia tras purgar con TTL</h3>
+        <pre><code class="language-redis"># ❌ Crear el registro sin EXPIRE → fantasma eterno
+HSET hub:conn:8632 node node-1
+
+# ✅ Siempre TTL (lease) + unregister
+HSET hub:conn:8632 node node-1 EXPIRE hub:conn:8632 30</code></pre>
+
+        <h3>Contar «online» con SMEMBERS de un set en vez de zset</h3>
+        <p>Un set no tiene tiempo; te dice «se añadió una vez». La presencia necesita score/ts → zset.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa ConnectionRegistry en tu proyecto (o en un scratch).</li>
+          <li><strong>Paso 2:</strong> Registra 3 conexiones de 2 usuarios y consulta presencia/FindNode.</li>
+          <li><strong>Paso 3:</strong> Simula heartbeat y unregister; verifica que la expiración también limpia sola.</li>
+          <li><strong>Paso 4:</strong> Consulta el zset con ZRANGEBYSCORE y compáralo con ZRANGE.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Presencia multi-usuario</h3>
+          <p>Tu presencia guarda «userId», pero un usuario puede tener varias conexiones (pestañas). Diseña cómo contarlas: pista — usa el zset con un miembro por (userId:connectionId) o un contador por usuario. Escribe la estructura elegida y 2 consultas que responderían «quantos sockets tiene user:42».</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Registro = hash/TTL por conexión («¿dónde está?»).</li>
+          <li>Presencia = zset con score-timestamp («¿quién y desde cuándo?»).</li>
+          <li>Heartbeat refresca ambos; unregister explícito + expiración safety.</li>
+          <li>Un servicio ConnectionRegistry para reutilizar.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no usar solo el hash para «quién está online»?</summary>
+            <div><p>El hash no es enumerable por tiempo; el zset responde «los de la última ventana» al instante. Son dos estructuras para dos preguntas, ambas baratas.</p></div>
+          </details>
+          <details>
+            <summary>¿El TTL del registro y el del zset deben coincidir?</summary>
+            <div><p>No necesariamente. El registro (dónde) puede vivir 30 s; la ventana de presencia 60 s. Define cada lease por su propósito.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

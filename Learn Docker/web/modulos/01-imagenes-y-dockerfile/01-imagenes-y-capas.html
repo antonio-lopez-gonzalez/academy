@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="01-imagenes-y-capas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Imágenes, capas y Union FS — Módulo 1 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Imágenes, capas y Union FS</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Imágenes y Dockerfile</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo en Docker empieza por una <strong>imagen</strong>. Un contenedor no deja de ser una imagen <em>en ejecución</em>: sin imágenes no hay contenedores, sin imágenes no hay <code>docker compose</code>, y sin imágenes no hay Pods en Kubernetes. Por eso, antes de escribir un solo Dockerfile, hay que entender de qué está hecha una imagen y por qué su diseño —capas, Union FS y copy-on-write— es la clave de todo el ecosistema.</p>
+        <p>En esta lección aprenderás qué es exactamente una imagen, qué son las <strong>capas</strong> (<em>layers</em>), cómo las monta el <strong>Union FS</strong> (overlay2), qué significa <strong>copy-on-write</strong> y por qué las imágenes son <strong>inmutables</strong>. Además dominarás los cuatro comandos con los que vas a trabajar imágenes durante todo el curso: <code>docker pull</code>, <code>docker images</code>, <code>docker inspect</code> y <code>docker history</code>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todos los errores de Docker (imágenes que «pesan demasiado», builds lentos, versiones que cambian sin avisar) se explican con una buena comprensión de las capas. El día que entiendas capas, Union FS y copy-on-write, el Dockerfile de la siguiente lección dejará de ser magia y se convertirá en lógica pura.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>¿Qué es una imagen?</h3>
+        <p>Una <strong>imagen Docker</strong> es un <strong>snapshot de un sistema de archivos + metadatos</strong>, <strong>solo de lectura</strong>, que contiene todo lo necesario para ejecutar una aplicación: el sistema base (por ejemplo Alpine), las librerías, el runtime (Node, nginx), el código de tu aplicación y la configuración (variables de entorno, puertos, comando de arranque).</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — la receta y la tarta:</strong> una imagen es la <em>receta y los ingredientes envasados</em>; un contenedor es la <em>tarta ya horneada</em> que se está sirviendo. Puedes hornear la misma tarta mil veces a partir de la misma receta: cada vez sale una tarta nueva, con su propio plato, pero todas usan exactamente la misma receta. Y la receta no cambia mientras la estás horneando: es inmutable.</p>
+        </div>
+        <p>Una imagen <strong>no es un disco de máquina virtual</strong>. No contiene un kernel ni arranca un sistema operativo completo. Una imagen es solo un conjunto de archivos + metadatos que el motor Docker monta como sistema de archivos raíz (<em>rootfs</em>) sobre el kernel del host. Por eso los contenedores pesan megabytes y las VMs gigas, y por eso arrancan en milisegundos.</p>
+
+        <h3>Capas (layers): la anatomía de una imagen</h3>
+        <p>Una imagen no es un bloque monolítico: es una <strong>pila de capas</strong> (<em>layers</em>). Cada capa es un <strong>conjunto de cambios</strong> (archivos añadidos, modificados o borrados) respecto a la capa anterior, guardado de forma comprimida y con un <em>digest</em> (un hash SHA-256) que la identifica de forma única e inmutable.</p>
+        <p>Cuando construyas una imagen con un Dockerfile, cada instrucción que toca el sistema de archivos (<code>RUN</code>, <code>COPY</code>, <code>ADD</code>) crea una capa nueva. Las instrucciones de metadatos (<code>CMD</code>, <code>EXPOSE</code>, <code>ENV</code>, <code>WORKDIR</code>) no crean contenido, solo «pegatinas» en el manifiesto de la imagen.</p>
+        <div class="diagram">
++------------------------------------------------------------------+
+| CONTENEDOR (solo él tiene escritura)                             |
+|                                                                |
+|   capa del contenedor  (fina, se crea al arrancar; aquí van     |
+|   todos los cambios en caliente: logs, caches, archivos que     |
+|   escribe tu app) . . . . . . . . . . .  <- COPY-ON-WRITE      |
++------------------------------------------------------------------+
+|  IMAGEN NGINX:1.27-ALPINE  (inmutable, compartida)             |
+|  +------------------------------------------------------------+ |
+|  | capa 3 (digest D3): COPY index.html /usr/share/nginx/html   | |
+|  +------------------------------------------------------------+ |
+|  | capa 2 (digest D2): apk add --no-cache ...  (dependencias)  | |
+|  +------------------------------------------------------------+ |
+|  | capa 1 (digest D1): Alpine base (musl, apk, su shell)       | |
+|  +------------------------------------------------------------+ |
++------------------------------------------------------------------+
+| MOTOR DOCKER : overlay2 (Union FS) mezcla todas las capas en    |
+| una única vista / (diagrama simplificado: en realidad el host   |
+| almacena cada layer en su propio directorio con su digest).     |
++------------------------------------------------------------------+
+        </div>
+        <p>Al montar la imagen, el motor Docker <strong>apila</strong> las capas de abajo hacia arriba formando un solo árbol de directorios que se ve como un sistema de archivos normal. Tú ves una única raíz <code>/</code> con <code>/usr</code>, <code>/etc</code>, etc.; Docker ve N capas superpuestas.</p>
+
+        <h3>Union FS: la magia de montar varias capas como una</h3>
+        <p>El <strong>Union File System</strong> es una familia de técnicas que montan varios directorios en un único punto de montaje. Docker usa el driver de almacenamiento <strong>overlay2</strong> por defecto: cada capa es un directorio «lowerdir» y el montaje resultante expone la unión de todos. Cuando dos capas tienen un archivo con el mismo nombre, <strong>gana la capa superior</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta arquitectura en capas?</strong> Por tres motivos que verás durante todo el curso: (1) <strong>ahorro de espacio</strong> — dos imágenes que comparten la base Alpine no duplican esa base en disco, comparten las mismas capas; (2) <strong>velocidad de transferencia</strong> — <code>docker pull</code> solo descarga las capas que no tienes; (3) <strong>caché de build</strong> — al reconstruir, Docker reutiliza las capas que no cambiaron (lo explotarás en la lección 02).</p>
+        </div>
+        <p>Esto explica por qué descargar <code>node:20-alpine</code> cuando ya tienes <code>nginx:1.27-alpine</code> suele ser casi instantáneo: la capa de Alpine base ya está en tu disco y solo se bajan las capas nuevas.</p>
+
+        <h3>Copy-on-write: el contenedor «copia solo cuando escribe»</h3>
+        <p>Cuando arrancas un contenedor, Docker crea una <strong>capa nueva y vacía</strong> encima de las de la imagen: la capa del contenedor. Los contenedores <strong>nunca escriben sobre las capas de la imagen</strong> (son de solo lectura). Cuando tu aplicación escribe un archivo, el mecanismo <strong>copy-on-write</strong> (CoW) copia ese archivo de la capa de la imagen a la capa del contenedor y hace la escritura ahí. Si se escribe un archivo nuevo, se crea directamente en la capa del contenedor.</p>
+        <div class="diagram">
+lectura  ->  se busca de arriba hacia abajo: capa contenedor,
+             luego capa 3, 2, 1.  A la primera coincidencia se para.
+
+escritura -> COW: el archivo se COPIA primero a la capa del
+             contenedor y se modifica allí. La imagen queda intacta.
+
+borrado   -> se marca un "whiteout": el archivo queda tapado pero
+             sigue existiendo en la imagen original (por eso borrar
+             algo de la imagen NO reduce su tamaño en el contenedor).
+        </div>
+        <p>De ahí la regla de oro: <strong>la imagen nunca cambia</strong>. Si detienes un contenedor, su capa queda «congelada»; si lo borras, la capa del contenedor desaparece y la imagen sigue exactamente igual que antes. Para cambiar algo de la imagen no «editas» la imagen: <strong>reconstruyes una imagen nueva</strong> (próxima lección).</p>
+
+        <h3>Imágenes inmutables y su identificador</h3>
+        <p>Cada capa (y por extensión cada imagen) tiene un <strong>digest</strong>: un hash SHA-256 del contenido. El digest es lo único verdaderamente inmutable y reproducible: <code>sha256:9f5b0d...</code> siempre se refiere exactamente al mismo contenido. La <code>IMAGE ID</code> que ves en <code>docker images</code> es el digest de la capa superior de la imagen (en versión corta de 12 dígitos). Esta idea se vuelve crítica en la lección 05 cuando publiques imágenes y quieras garantías de que «lo que veo es lo que ejecuto».</p>
+
+        <h3>Los cuatro comandos básicos</h3>
+        <ul>
+          <li><code>docker pull &lt;imagen&gt;</code> — descarga de un registro (por defecto Docker Hub) las capas de la imagen que faltan en tu disco.</li>
+          <li><code>docker images</code> (alias <code>docker image ls</code>) — lista las imágenes locales con REPOSITORY, TAG, IMAGE ID, CREATED y SIZE.</li>
+          <li><code>docker inspect &lt;imagen&gt;</code> — devuelve el manifiesto JSON completo: metadatos, env, cmd, puertos y, clave aquí, las capas en <code>RootFS.Layers</code>.</li>
+          <li><code>docker history &lt;imagen&gt;</code> — muestra instrucción a instrucción cómo se construyó la imagen y el tamaño de cada capa.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Multi-OS:</strong> los cuatro comandos son idénticos en Linux, macOS y Windows/WSL2. Lo único que cambia es <em>dónde</em> se guardan físicamente las capas. En Linux nativo están en <code>/var/lib/docker/overlay2/</code>; en macOS y Windows viven dentro de la VM/entorno de Docker Desktop (accesible en Windows vía la distro <code>docker-desktop</code> de WSL2 con <code>ls /var/lib/docker/overlay2</code>). No los necesitas tocar nunca a mano, pero saberlo evita «investigaciones» inútiles en tu disco de Windows.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a tocar una imagen con los cuatro ojos: <code>pull</code>, <code>images</code>, <code>inspect</code> e <code>history</code>. Usaremos <code>alpine:3.20</code>, la distro base mínima (~3 MB) sobre la que se construyen casi todas las imágenes «alpine» del ecosistema.</p>
+        <pre><code class="language-bash"># 1) Descargamos la imagen desde Docker Hub (docker.io/library/alpine)
+docker pull alpine:3.20
+
+# Salida importante (resumida):
+#   3e04d42f29cb: Pull complete      <- CAPA: cada "Pull complete" es una capa
+#   digest: sha256:9f5b0d9b1c45...    <- digest de la IMAGEN completa
+#   Status: Downloaded newer image for alpine:3.20
+
+# 2) ¿Qué imágenes hay en local?
+docker images
+
+# Salida (columnas):
+# REPOSITORY   TAG      IMAGE ID       CREATED        SIZE
+# alpine       3.20     3e04d42f29cb   4 weeks ago    3.32MB
+# "CREATED" es cuándo se construyó la imagen NO cuándo la bajaste tú.
+
+# 3) El manifiesto JSON de la imagen (metadatos + capas)
+docker inspect alpine:3.20
+# Fíjate en la salida (JSON) en:
+#   .RootFS.Layers      -> ["sha256:..." ]  lista de capas (aquí: 1)
+#   .Config.Env         -> ["PATH=..."]
+#   .Config.Cmd         -> ["/bin/sh"]      comando por defecto
+#
+# Para ver solo las capas sin todo el ruido:
+docker inspect -f '{{.RootFS.Layers}}' alpine:3.20
+
+# 4) ¿Cómo se construyó? Capa a capa
+docker history alpine:3.20
+# IMAGE          CREATED      CREATED BY       SIZE
+# 3e04d42f29cb   4 weeks ago  /bin/sh -c #(nop) CMD ["/bin/sh"]   0B
+# 3e04d42f29cb   4 weeks ago  /bin/sh -c #(nop) ADD file:... in /  3.32MB
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Lectura de la salida:</strong> Alpine tiene una única capa de contenido (el <code>ADD file:... in /</code> que añade todo su sistema) y una capa de metadatos de 0&nbsp;B (el <code>CMD</code>). Cuando veas imágenes con decenas de capas (<code>history</code>), será porque su Dockerfile ejecutó muchas instrucciones <code>RUN</code>/<code>COPY</code>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En HarborTasks contenerizaremos tres piezas: <code>web</code> (nginx), <code>api</code> (Node.js/Express) y <code>postgres</code>. Empieza por bajar las dos imágenes de aplicaciones y observa el efecto de las capas compartidas:</p>
+        <pre><code class="language-bash"># Baja primero la web (nginx sobre Alpine) y luego la API (Node sobre Alpine)
+docker pull nginx:1.27-alpine
+docker pull node:20-alpine
+
+# Observación clave en el pull de node:20-alpine:
+#   ...: Pull complete       <- solo descarga las capas que faltan
+#   ...: Already exists      <- las capas de Alpine base YA estaban:
+#   Status: Downloaded newer image for node:20-alpine
+# tarda MUCHO menos que la primera descarga: compartes la base.
+
+# La vista general del almacén local
+docker images
+# REPOSITORY   TAG            IMAGE ID       SIZE
+# node         20-alpine      e230c8b2e1f1   164MB
+# nginx        1.27-alpine    9c1bf53e33c8   49.5MB
+# alpine       3.20           3e04d42f29cb   3.32MB
+# 164 + 49.5 + 3.32 NO es lo que ocupa tu disco: las capas de Alpine
+# base se comparten y se cuentan una sola vez.
+
+# Manifiesto de producción: qué configuran nginx de fábrica
+docker inspect nginx:1.27-alpine -f 'CMD={{.Config.Cmd}}  EXPOSE={{.Config.ExposedPorts}}'
+# CMD=[nginx -g daemon off;]  EXPOSE=map[80/tcp:{}]
+# (El "daemon off" es para que nginx corra en primer plano como PID 1;
+#  lo retomaremos en la lección 03.)
+
+# Cómo está construida la imagen oficial de nginx: capas y tamaño real
+docker history nginx:1.27-alpine
+# ...  /bin/sh -c #(nop)  CMD ["nginx" "-g" "daemon off;"]      0B
+# ...  /bin/sh -c #(nop)  EXPOSE 80                             0B
+# ...  /bin/sh -c #(nop)  ENTRYPOINT ["/docker-entrypoint.sh"]  0B
+# ...  /bin/sh -c #(nop)  STOPSIGNAL SIGQUIT                   0B
+# ...  /bin/sh -c #(nop)  COPY file:... in /docker-entrypoint.sh  1.2kB
+# ...  /bin/sh -c apk add --no-cache --virtual .build-deps ...   39MB <- la
+# ...                     y depués elimina .build-deps: por eso la capa
+# ...                     final de nginx alpine ocupa "solo" 49MB.
+# Si comparas con la de Node verás capas de apk add de librerías.
+        </code></pre>
+        <div class="callout callout--why">
+          <p><strong>El porqué de las imágenes «alpine»:</strong> <code>alpine</code> usa <code>musl</code> (en vez de glibc) y el gestor <code>apk</code>. Resultado: una base de ~3&nbsp;MB, imágenes de aplicación decenas o cientos de veces más pequeñas que sus hermanas <code>debian</code>/<code>ubuntu</code>. Menos tamaño = pull más rápido, menos disco y menos superficie de ataque. El «coste» es que algún binario compilado para glibc puede no funcionar; por eso algunas imágenes oficiales no ofrecen variante alpine.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usa imágenes oficiales con <strong>tag fijo y versionado</strong> (<code>nginx:1.27-alpine</code>)</td>
+              <td>La etiqueta <code>latest</code></td>
+              <td><code>latest</code> es una etiqueta movediza (mutable): un mismo comando puede bajar contenido distinto según el día → builds no reproducibles.</td>
+            </tr>
+            <tr>
+              <td>Prefiere variantes <strong>alpine</strong> o slim</td>
+              <td>Imágenes full (debian/ubuntu) «por si acaso»</td>
+              <td>Menos MB = pull más rápido, menos superficie de ataque, menos cosas que mantener actualizadas.</td>
+            </tr>
+            <tr>
+              <td>Inspecciona <code>docker history</code> / <code>docker inspect</code> antes de confiar en una imagen de terceros</td>
+              <td>Ejecutar imágenes de fuentes desconocidas a ciegas</td>
+              <td>Una imagen es código ejecutable como root en tu máquina. Mirar sus capas es la revisión mínima de seguridad.</td>
+            </tr>
+            <tr>
+              <td>Recuerda que las capas se <strong>comparten</strong> entre imágenes</td>
+              <td>Borrar imágenes «para liberar espacio» sin preguntar</td>
+              <td>Dos imágenes comparten la base Alpine: borrar una no libera el tamaño completo que marca <code>docker images</code>.</td>
+            </tr>
+            <tr>
+              <td>Usa <code>alpine:3.20</code> como base «limpia» para experimentos</td>
+              <td>Probar con <code>ubuntu:latest</code> en miniatura</td>
+              <td>El pull de alpine tarda segundos y su shell (<code>/bin/sh</code>, no bash) te enseña el modo de trabajo minimalista de los contenedores.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Confundir imagen con contenedor</h3>
+        <pre><code class="language-bash"># ❌ Pensar que "borrar un contenedor borra la imagen"
+docker rm mi-contenedor      # borra el contenedor...
+
+# ✅ La imagen sigue ahí, intacta (para eso se construyó)
+docker images                # nginx:1.27-alpine sigue en la lista
+docker run nginx:1.27-alpine # y puedes crear otro contenedor nuevo
+
+# ❌ Pensar que "editar" un contenedor modifica la imagen
+docker run nginx:1.27-alpine touch /tmp/reto.txt   # escribe en capa contenedor
+docker run nginx:1.27-alpine ls /tmp               # /tmp/reto.txt NO existe:
+# cada contenedor nuevo parte de la imagen inmutable, sin cambios.
+
+# ✅ Para cambiar la imagen se reconstruye (próxima lección: Dockerfile)
+        </code></pre>
+
+        <h3>Malinterpretar la columna SIZE de docker images</h3>
+        <pre><code class="language-bash"># ❌ "Estas 3 imágenes ocupan la suma de sus SIZE en mi disco"
+# Eso ignora que node:20-alpine y nginx:1.27-alpine comparten la
+# capa base de alpine. El almacén real es menor.
+
+# ✅ Para ver el uso real de disco por imagen "única" usa:
+docker system df
+# TYPE     TOTAL   ACTIVE  SIZE       RECLAIMABLE
+# Images   4       0       217.8MB    217.8MB
+# (muestra el espacio de bloques ÚNICOS, ya descontadas las capas
+#  compartidas; la etiqueta "Local Volumes" no aparece porque aún
+#  no has creado volúmenes: eso es la lección 03 del Módulo 3.)
+        </code></pre>
+
+        <h3>Ejecutar docker inspect / docker history sobre algo que no existe</h3>
+        <pre><code class="language-bash"># ❌ Usar una imagen que nunca se bajó ni se construyó
+docker inspect mi-app:1.0
+# Error: No such image: mi-app:1.0
+docker history ubuntu:24.04    # → No such image (¡no está en local!)
+
+# ✅ Primero baja la imagen (aunque exista en Docker Hub, el comando
+#    anterior solo trabaja sobre el almacén LOCAL)
+docker pull ubuntu:24.04
+docker history ubuntu:24.04
+        </code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver con tus propios ojos (y con capas reales) cómo funciona el ahorro de espacio compartiendo la base de Alpine. Contenido: pullear, inspeccionar capas y comprobar la reutilización.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Prepara el terreno.</strong> Si hay imágenes anteriores de otros experimentos, no pasa nada: son aparte.
+            <pre><code class="language-bash">docker pull alpine:3.20                 # base mínima: 1 capa (~3 MB)
+docker pull nginx:1.27-alpine            # comparte la capa de alpine
+docker pull node:20-alpine               # también comparte la capa
+docker images                            # mira los SIZE y las IMAGE ID
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Cuenta las capas de cada imagen.</strong>
+            <pre><code class="language-bash"># El truco: filtrar con --format aprovecha la plantilla de Go de Docker
+docker inspect -f '{{.Name}} capas={{len .RootFS.Layers}}' alpine:3.20
+docker inspect -f '{{.Name}} capas={{len .RootFS.Layers}}' nginx:1.27-alpine
+docker inspect -f '{{.Name}} capas={{len .RootFS.Layers}}' node:20-alpine
+# Esperado (aproximado, depende de la versión):
+# alpine:3.20    capas=2     (1 contenido + 1 de metadatos)
+# nginx:1.27-alpine capas=6  (base + apks + COPY entrypoint + metas)
+# node:20-alpine capas=9
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Comprueba que comparten la capa base.</strong> La primera de las capas de nginx y node debe ser <em>la misma</em> que la única capa de contenido de alpine.
+            <pre><code class="language-bash">docker inspect -f '{{json .RootFS.Layers}}' alpine:3.20
+docker inspect -f '{{json .RootFS.Layers}}' node:20-alpine
+# Los hashes sha256 de la primera entrada deben coincidir.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Ejecuta la imagen para confirmar qué contiene.</strong> Usa <code>--rm</code> para que el contenedor se borre solo al salir (la bandera se repasará en profundidad en el Módulo 2).
+            <pre><code class="language-bash">docker run --rm alpine:3.20 cat /etc/alpine-release   # 3.20.x
+docker run --rm node:20-alpine node --version          # v20.x.x LTS
+docker run --rm nginx:1.27-alpine nginx -v             # nginx/1.27.x
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Verificación final.</strong> Vuelve a mirar el árbol de capas con <code>docker history node:20-alpine</code> e identifica: la capa de la base (ADD file...), las capas de <code>apk add</code> de librerías, la capa de <code>ENV</code>/<code>CMD</code> de 0&nbsp;B. Cuando lo tengas, borra las imágenes sin miedo:
+            <pre><code class="language-bash">docker rmi nginx:1.27-alpine node:20-alpine alpine:3.20
+# Si docker responde "image is being used by a stopped container",
+# antes hay que borrar (o borrar con -f) el contenedor que la usa:
+#   docker rm &lt;id-o-nombre&gt;      # borra el contenedor
+#   docker rmi nginx:1.27-alpine # y repite el borrado de la imagen
+# La limpieza es segura: una imagen no es más que sus capas; si otra
+# imagen comparte la capa base de alpine, solo se borra lo que sobra.
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Windows/WSL2:</strong> en PowerShell el filtro de plantilla con comillas simples <code>'{{.Name}} capas={{len .RootFS.Layers}}'</code> también funciona si lo ejecutas <em>dentro de la terminal de WSL con bash</em>. Si estás en PowerShell puro, usa comillas dobles y escapa los corchetes si tu versión lo exige (ej. <code>--format "{{.Name}} {{len .RootFS.Layers}}"</code>). Este curso recomienda, como siempre, trabajar dentro de WSL2.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 ¿Dónde está el mayor «agujero» de la imagen de Postgres?</h3>
+          <p><strong>Postgres es enorme para lo que tú usas.</strong> Arranca en tu almacén a <code>postgres:16-alpine</code> e investiga con <code>docker history postgres:16-alpine</code> qué capa ocupa más y de qué instrucción viene. Después contesta en papel (o en un comentario de tu terminal): ¿por qué una sola capa de ~180&nbsp;MB suele venir de una instrucción <code>RUN apk add</code> con un listado enorme, y por qué Docker <em>no puede</em> «adelgazar» una capa ya publicada aunque luego borres archivos en la siguiente línea?</p>
+          <p><em>Pista: una capa es un diff <strong>en positivo</strong> — solo se añade. Lo que una capa borra se registra como whiteout en la capa de encima, y en el historial verás que detrás de un <code>apk add</code> gigante no hay ninguna compensación. Piensa en el diagrama de COW de la sección 2.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>imagen</strong> es un snapshot <strong>solo lectura</strong> de un sistema de archivos + metadatos (sin kernel: lo usa el del host).</li>
+          <li>Se divide en <strong>capas</strong>: cada capa es un conjunto de cambios con un <strong>digest</strong> SHA-256 inmutable.</li>
+          <li>El <strong>Union FS</strong> (overlay2) monta las capas en una única vista: arriba gana.</li>
+          <li><strong>Copy-on-write</strong>: el contenedor escribe solo en su capa superior, copiando antes el archivo de la imagen.</li>
+          <li>Las imágenes son <strong>inmutables</strong>: para cambiarlas se reconstruyen, nunca se editan.</li>
+          <li>Las capas <strong>se comparten</strong> entre imágenes → ahorro de disco y pulls casi instantáneos.</li>
+          <li><code>docker pull</code>, <code>docker images</code>, <code>docker inspect</code> y <code>docker history</code> son tus cuatro ojos sobre el almacén local.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker pull &lt;imagen&gt;:&lt;tag&gt;</code></td><td>Descarga del registro las capas que faltan en local.</td></tr>
+            <tr><td><code>docker images</code></td><td>Lista las imágenes locales (repo, tag, id, tamaño).</td></tr>
+            <tr><td><code>docker inspect &lt;imagen&gt;</code></td><td>Devuelve el manifiesto JSON: metadatos y capas (<code>RootFS.Layers</code>).</td></tr>
+            <tr><td><code>docker history &lt;imagen&gt;</code></td><td>Muestra las instrucciones y el tamaño de cada capa.</td></tr>
+            <tr><td><code>docker image rm &lt;imagen&gt;</code></td><td>Borra la imagen local (no las capas compartidas con otras).</td></tr>
+            <tr><td><code>docker system df</code></td><td>Uso real de disco diferenciando capas compartidas.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Dónde se guardan físicamente las imágenes en mi sistema?</summary>
+            <div>
+              <p>En Linux, en <code>/var/lib/docker/overlay2/</code> (cada capa, un directorio con su digest). En macOS y Windows viven dentro del entorno de la VM de Docker Desktop; en Windows puedes verlos desde la distro <code>docker-desktop</code> de WSL2 con <code>docker system df</code> y <code>docker image inspect</code>, pero nunca deberías manipularlos a mano: úsalo siempre a través de la CLI de Docker.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué nginx:1.27-alpine pesa ~50 MB y node:20-alpine ~160 MB?</summary>
+            <div>
+              <p>Por las herramientas y runtime que incluyen. Alpine base son ~3&nbsp;MB; nginx añade su binario compilado (<code>apk add nginx</code>) y node añade el runtime completo de Node más sus librerías. Más funcionalidad = más bytes en capas. La misma imagen en <code>debian</code> pesaría bastante más todavía, de ahí el consejo de preferir las variantes alpine/slim cuando puedas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Seguro que las capas se comparten entre imágenes en mi máquina?</summary>
+            <div>
+              <p>Sí, si las capas del mismo digest ya existen en el almacén local. La prueba más barata: pullea <code>alpine:3.20</code>, reinicia tu terminal (o espera un momento) y pullea <code>node:20-alpine</code>: verás «Already exists» (no re-descarga). Eso es la capa base compartida por diseño de Union FS + deduplicación por digest.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es realmente el «digest» y por qué importa?</summary>
+            <div>
+              <p>Es el hash SHA-256 del contenido de una capa o imagen. Como el contenido es inmutable, el digest te identifica el contenido de forma única y reproducible. Si dos capas tienen el mismo digest, son exactamente el mismo contenido, y el motor las comparte y no las descarga dos veces. Esta propiedad es la base de la «inmutabilidad» y la volverás a usar en la lección 05 para fijar versiones exactas con <code>image@sha256:...</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿«CREATED» de docker images es cuándo la bajé yo?</summary>
+            <div>
+              <p>No. Es la fecha en que el autor construyó y publicó esa capa en el registro («4 weeks ago»). Para saber cuándo la trajiste tú no hay columna directa: puedes comparar <code>docker history</code> o consultar el campo <code>.Created</code> de <code>docker inspect</code>. Confundir ambos es un clásico al depurar «¿esta imagen es nueva?».</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="es" data-module="07" data-lesson="05-transacciones-concurrencia">
+<head>
+  <meta charset="UTF-8">
+  <title>Transacciones y concurrencia optimista — Módulo 7 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Transacciones y concurrencia optimista</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 7 · Entity Framework Core</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>Cuando varios usuarios o procesos trabajan sobre los mismos datos, aparecen dos problemas: cómo garantizar que un conjunto de operaciones se aplique de forma atómica y cómo evitar que una actualización sobrescriba los cambios de otro usuario sin saberlo. En esta lección aprenderemos transacciones y concurrencia optimista.</p>
+        <p>Veremos:</p>
+        <ul>
+          <li><code>SaveChanges</code> como transacción implícita.</li>
+          <li>Transacciones explícitas con <code>IDbContextTransaction</code>.</li>
+          <li>Interceptores de EF Core.</li>
+          <li>Concurrencia optimista con <code>RowVersion</code> o <code>Timestamp</code>.</li>
+          <li>Manejo de <code>DbUpdateConcurrencyException</code>.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 SaveChanges como transacción</h3>
+        <p>Por defecto, <code>SaveChanges</code> envuelve todas las operaciones en una única transacción. Si alguna falla, se hace <code>ROLLBACK</code>. Esto es fundamental para mantener la integridad.</p>
+        <pre><code class="language-csharp">context.Posts.Add(post1);
+context.Posts.Add(post2);
+await context.SaveChangesAsync(); // Todo o nada.</code></pre>
+
+        <h3>2.2 Transacciones explícitas</h3>
+        <p>A veces necesitas agrupar varios <code>SaveChanges</code>, ejecutar SQL directo o coordinar operaciones externas. Para eso usa <code>BeginTransactionAsync</code>.</p>
+        <pre><code class="language-csharp">await using var transaction = await context.Database.BeginTransactionAsync();
+
+try
+{
+    context.Posts.Add(post);
+    await context.SaveChangesAsync();
+
+    await context.Database.ExecuteSqlRawAsync(
+        "INSERT INTO audit_log (entity, action) VALUES ({0}, {1})",
+        "Post", "Created");
+
+    await transaction.CommitAsync();
+}
+catch
+{
+    await transaction.RollbackAsync();
+    throw;
+}</code></pre>
+        <div class="callout warning">
+          <strong>Importante:</strong> no mantengas transacciones abiertas durante operaciones de red o largas esperas. Bloqueas recursos y reduces la escalabilidad.
+        </div>
+
+        <h3>2.3 Interceptores</h3>
+        <p>Los interceptores permiten ejecutar código antes o después de operaciones de EF Core de forma transversal. Ejemplos: auditoría, lógica de tenancy, enriquecimiento de consultas.</p>
+        <pre><code class="language-csharp">public class AuditingInterceptor : SaveChangesInterceptor
+{
+    public override async ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult&lt;int&gt; result,
+        CancellationToken cancellationToken = default)
+    {
+        var context = eventData.Context;
+        if (context is null) return result;
+
+        foreach (var entry in context.ChangeTracker.Entries&lt;IAuditable&gt;())
+        {
+            if (entry.State == EntityState.Added)
+                entry.Entity.CreatedAt = DateTime.UtcNow;
+
+            if (entry.State == EntityState.Modified)
+                entry.Entity.UpdatedAt = DateTime.UtcNow;
+        }
+
+        return await base.SavingChangesAsync(eventData, result, cancellationToken);
+    }
+}
+
+// Registro en Program.cs
+builder.Services.AddDbContext&lt;AppDbContext&gt;(options =&gt;
+    options.UseNpgsql(connectionString)
+           .AddInterceptors(new AuditingInterceptor()));</code></pre>
+
+        <h3>2.4 Concurrencia optimista</h3>
+        <p>La concurrencia optimista asume que los conflictos son poco frecuentes. En lugar de bloquear filas, se añade una columna de versión. Al guardar, EF Core verifica que la versión no haya cambiado. Si cambió, lanza <code>DbUpdateConcurrencyException</code>.</p>
+        <pre><code class="language-csharp">public class Post
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+
+    [Timestamp]
+    public byte[] RowVersion { get; set; } = null!;
+}</code></pre>
+        <pre><code class="language-csharp">// Fluent API
+modelBuilder.Entity&lt;Post&gt;()
+    .Property(p =&gt; p.RowVersion)
+    .IsRowVersion();</code></pre>
+        <p>En PostgreSQL, el equivalente a <code>rowversion</code> de SQL Server es una columna de tipo <code>xid</code> o una propiedad de control manual. Npgsql usa <code>ConcurrencyCheck</code> o una columna de timestamp generada.</p>
+        <pre><code class="language-csharp">// PostgreSQL con Npgsql: usa una propiedad de versión que el proveedor maneja.
+modelBuilder.Entity&lt;Post&gt;()
+    .Property(p =&gt; p.RowVersion)
+    .IsConcurrencyToken()
+    .ValueGeneratedOnAddOrUpdate();</code></pre>
+
+        <h3>2.5 Manejo de DbUpdateConcurrencyException</h3>
+        <p>Cuando ocurre un conflicto, debes decidir: recargar los valores del cliente, del servidor o abortar la operación.</p>
+        <pre><code class="language-csharp">public async Task UpdatePostAsync(int id, PostUpdateDto dto)
+{
+    var post = await _context.Posts.FindAsync(id);
+    if (post is null) throw new NotFoundException();
+
+    post.Title = dto.Title;
+
+    try
+    {
+        await _context.SaveChangesAsync();
+    }
+    catch (DbUpdateConcurrencyException ex)
+    {
+        var entry = ex.Entries.Single();
+        var databaseValues = await entry.GetDatabaseValuesAsync();
+
+        if (databaseValues is null)
+        {
+            // La entidad fue eliminada por otro usuario.
+            throw new ConflictException("El post fue eliminado por otro usuario.");
+        }
+
+        // Recargar valores del servidor y perder los del cliente.
+        entry.OriginalValues.SetValues(databaseValues);
+        entry.Reload();
+
+        // O bien: fusionar cambios manualmente.
+        throw new ConflictException("El post fue modificado por otro usuario. Recarga y vuelve a intentarlo.");
+    }
+}</code></pre>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Transacción explícita que actualiza un post y registra en auditoría.</p>
+        <pre><code class="language-csharp">await using var transaction = await context.Database.BeginTransactionAsync();
+
+try
+{
+    var post = await context.Posts.FindAsync(1);
+    post!.Title = "Nuevo título";
+    await context.SaveChangesAsync();
+
+    await context.Database.ExecuteSqlRawAsync(
+        "INSERT INTO audit_log (action, entity_id) VALUES ('update', 1)");
+
+    await transaction.CommitAsync();
+    Console.WriteLine("Transacción confirmada.");
+}
+catch (Exception ex)
+{
+    await transaction.RollbackAsync();
+    Console.WriteLine($"Error: {ex.Message}");
+}</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Implementación de un interceptor de auditoría y un handler CQRS con control de concurrencia para el CMS.</p>
+        <pre><code class="language-csharp">// Domain/IAuditable.cs
+public interface IAuditable
+{
+    DateTime CreatedAt { get; set; }
+    DateTime? UpdatedAt { get; set; }
+}
+
+// Domain/Post.cs
+public class Post : IAuditable
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+    public DateTime? UpdatedAt { get; set; }
+    public byte[] RowVersion { get; set; } = null!;
+}
+
+// Data/Configurations/PostConfiguration.cs
+public void Configure(EntityTypeBuilder&lt;Post&gt; entity)
+{
+    entity.Property(p =&gt; p.RowVersion)
+          .IsConcurrencyToken()
+          .ValueGeneratedOnAddOrUpdate();
+}
+
+// Data/Interceptors/AuditingInterceptor.cs
+public class AuditingInterceptor : SaveChangesInterceptor
+{
+    public override async ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult&lt;int&gt; result,
+        CancellationToken cancellationToken = default)
+    {
+        var context = eventData.Context;
+        if (context is null) return result;
+
+        var now = DateTime.UtcNow;
+        foreach (var entry in context.ChangeTracker.Entries&lt;IAuditable&gt;())
+        {
+            if (entry.State == EntityState.Added)
+                entry.Entity.CreatedAt = now;
+
+            if (entry.State == EntityState.Modified)
+                entry.Entity.UpdatedAt = now;
+        }
+
+        return await base.SavingChangesAsync(eventData, result, cancellationToken);
+    }
+}
+
+// Application/Handlers/UpdatePostHandler.cs
+public async Task Handle(UpdatePostCommand request, CancellationToken cancellationToken)
+{
+    var post = await _context.Posts.FindAsync(new object[] { request.Id }, cancellationToken);
+    if (post is null) throw new NotFoundException();
+
+    post.Title = request.Title;
+    post.Content = request.Content;
+
+    try
+    {
+        await _context.SaveChangesAsync(cancellationToken);
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        throw new ConflictException("El post fue modificado o eliminado por otro usuario.");
+    }
+}</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Confía en <code>SaveChanges</code> para transacciones simples:</strong> no uses transacciones explícitas si no las necesitas.</li>
+          <li><strong>Mantén las transacciones cortas:</strong> no invoques servicios externos ni hagas I/O dentro de una transacción.</li>
+          <li><strong>Usa interceptores para cross-cutting concerns:</strong> auditoría, tenancy, soft deletes, etc.</li>
+          <li><strong>Implementa concurrencia optimista en entidades críticas:</strong> evita sobrescrituras silenciosas.</li>
+          <li><strong>Decide una política ante conflictos:</strong> ¿recargas, ganas el cliente, gana el servidor o notificas al usuario?</li>
+          <li><strong>Loggea los conflictos de concurrencia:</strong> son indicadores de diseño o de carga inesperada.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Error 1: Llamar a SaveChanges dentro de una transacción sin necesidad</h3>
+        <p>Varios <code>SaveChanges</code> en una transacción explícita son válidos cuando coordinas operaciones, pero intenta agrupar todo en uno si es posible.</p>
+
+        <h3>Error 2: Mantener transacciones abiertas durante I/O</h3>
+        <p>Una transacción abierta mientras llamas a un servicio externo bloquea la fila o la tabla. Esto degrada el rendimiento y aumenta el riesgo de deadlocks.</p>
+
+        <h3>Error 3: No capturar DbUpdateConcurrencyException</h3>
+        <p>Si usas tokens de concurrencia, cualquier conflicto lanzará una excepción. Si no la manejas, el usuario verá un error 500 genérico.</p>
+
+        <h3>Error 4: Usar RowVersion con PostgreSQL como en SQL Server</h3>
+        <p>SQL Server tiene <code>rowversion</code> nativo. PostgreSQL no. Con Npgsql usa <code>IsConcurrencyToken</code> + <code>ValueGeneratedOnAddOrUpdate</code>, típicamente con una columna de timestamp o <code>xid</code>.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Implementa un interceptor que registre automáticamente el usuario que crea o modifica una entidad.</p>
+        <ol>
+          <li>Crea una interfaz <code>IUserAuditable</code> con <code>CreatedBy</code> y <code>UpdatedBy</code>.</li>
+          <li>Implementa un interceptor que reciba el usuario actual por constructor.</li>
+          <li>En <code>SavingChangesAsync</code>, rellena los campos según el estado de la entidad.</li>
+          <li>Registra el interceptor en el contenedor de DI.</li>
+        </ol>
+        <pre><code class="language-csharp">public class UserAuditingInterceptor : SaveChangesInterceptor
+{
+    private readonly ICurrentUser _currentUser;
+    public UserAuditingInterceptor(ICurrentUser currentUser) =&gt; _currentUser = currentUser;
+
+    public override async ValueTask&lt;InterceptionResult&lt;int&gt;&gt; SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult&lt;int&gt; result,
+        CancellationToken cancellationToken = default)
+    {
+        var context = eventData.Context;
+        if (context is null) return result;
+
+        var userId = _currentUser.UserId;
+        foreach (var entry in context.ChangeTracker.Entries&lt;IUserAuditable&gt;())
+        {
+            if (entry.State == EntityState.Added)
+                entry.Entity.CreatedBy = userId;
+
+            if (entry.State == EntityState.Modified)
+                entry.Entity.UpdatedBy = userId;
+        }
+
+        return await base.SavingChangesAsync(eventData, result, cancellationToken);
+    }
+}</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un endpoint que permita publicar un post solo si no ha sido modificado por otro usuario desde que se cargó. Añade un token de concurrencia y devuelve un <code>409 Conflict</code> con los valores actuales del servidor cuando haya un conflicto.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>SaveChanges</code> es una transacción implícita: todo o nada.</li>
+          <li>Las transacciones explícitas permiten coordinar múltiples operaciones.</li>
+          <li>Los interceptores ejecutan lógica transversal antes o después de guardar.</li>
+          <li>La concurrencia optimista detecta conflictos sin bloquear filas.</li>
+          <li><code>DbUpdateConcurrencyException</code> debe manejarse con una política clara.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Puedo usar transacciones entre múltiples DbContext?</summary>
+          <p>Sí, compartiendo la misma conexión y transacción de ADO.NET. Usa <code>context.Database.UseTransaction</code> con la transacción del primer contexto.</p>
+        </details>
+        <details>
+          <summary>¿SaveChanges siempre crea una transacción?</summary>
+          <p>Sí, a menos que desactives el cambio de tracking o llames a <code>SaveChanges</code> sin entidades pendientes. También puedes controlar el nivel de aislamiento.</p>
+        </details>
+        <details>
+          <summary>¿Qué pasa si no manejo DbUpdateConcurrencyException?</summary>
+          <p>La excepción se propagará y normalmente se convertirá en un error 500. Deberías transformarla en un 409 Conflict con un mensaje útil.</p>
+        </details>
+        <details>
+          <summary>¿La concurrencia optimista es suficiente para todos los casos?</summary>
+          <p>No. Para operaciones críticas con alta contención, considera concurrencia pesimista (locks) o patrones de colas.</p>
+        </details>
+        <details>
+          <summary>¿Puedo usar interceptores con DI?</summary>
+          <p>Sí, los interceptores pueden recibir dependencias por constructor. Regístralos como instancias o resuélvelos desde el service provider.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

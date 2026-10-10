@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="05-probes">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Probes: liveness, readiness y startup — Módulo 6 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Probes: liveness, readiness y startup</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Workloads</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un contenedor que "está corriendo" (proceso vivo) no es lo mismo que una aplicación que "funciona" (responde peticiones). Hasta ahora Kubernetes sabía que un contenedor estaba vivo mirando su proceso; pero un proceso vivo puede estar en <strong>deadlock</strong>, agotado de memoria o atascado sin atender tráfico. Las <strong>probes</strong> son los chequeos de salud que le dicen a Kubernetes exactamente eso: ¿sigue vivo? ¿está listo para recibir tráfico? ¿terminó de arrancar?</p>
+        <p>En esta lección verás las tres probes — <code>livenessProbe</code>, <code>readinessProbe</code> y <code>startupProbe</code> —, los cuatro tipos de chequeo (<code>httpGet</code>, <code>exec</code>, <code>tcpSocket</code>, <code>grpc</code>), sus tiempos definitorios (<code>initialDelaySeconds</code>, <code>periodSeconds</code>, <code>failureThreshold</code>…) y — lo más importante — <strong>qué pasa exactamente cuando cada una falla</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque las probes son la diferencia entre "los Pods están Running" (fachada) y "el servicio responde" (realidad). Un Service con Endpoints que apuntan a Pods colgados reparte tráfico al vacío; sin readiness, tus rollouts nunca sabrían cuándo "hacer hueco" al Pod nuevo.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> usar la misma probe para liveness y readiness sin pensar, hacer que la readiness dependa de servicios externos que no controlas, umbrales demasiado agresivos (timeout/failureThreshold bajísimos) que provocan reinicios innecesarios, y olvidar <code>startupProbe</code> en aplicaciones con arranque lento (Node, JVM, grandes descargas de dependencias).</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Las tres preguntas que Kubernetes necesita responder</h3>
+        <table>
+          <thead><tr><th>Probe</th><th>Pregunta</th><th>Si falla…</th><th>Pregunta clave</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>startupProbe</code></td>
+              <td>¿Has terminado de inicializar?</td>
+              <td>El kubelet <strong>mata el contenedor</strong> (como liveness) mientras se ejecuta la probe</td>
+              <td>"Aún estoy calentando motores"</td>
+            </tr>
+            <tr>
+              <td><code>livenessProbe</code></td>
+              <td>¿Sigues vivo?</td>
+              <td>El kubelet <strong>mata el contenedor</strong> (fallo del proceso → restart)</td>
+              <td>"Aún NO estoy en deadlock"</td>
+            </tr>
+            <tr>
+              <td><code>readinessProbe</code></td>
+              <td>¿Estás listo para recibir tráfico?</td>
+              <td>El Pod se <strong>retira de los Endpoints</strong> (el Service deja de enviarle) pero NO se reinicia</td>
+              <td>"Puedo servir peticiones ahora"</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>Lee la tabla con atención: <strong>liveness y startup matan; readiness solo aparta</strong>. Esta distinción es el núcleo de la lección y la fuente de la mayoría de los problemas de diseño.</p>
+
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un camarero de restaurante: <em>readiness</em> es la mesa preparada (te sientan o te pasan a la lista de espera); <em>liveness</em> es el camarero despierto (si se desmaya, lo reaniman); <em>startup</em> es el cocinero que aún está encendiendo los fuegos (no hagas la prueba de "despierto" mientras está montando la cocina).</p>
+        </div>
+
+        <h3>Los cuatro tipos de verificación</h3>
+        <ul>
+          <li><code>httpGet path/port</code> — hace <code>GET</code>; es exitosa con código <strong>HTTP 200–399</strong> (cualquier respuesta no-4xx/5xx). Es la más cómoda para APIs y webs.</li>
+          <li><code>exec command</code> — ejecuta un comando <em>dentro del contenedor</em>; exitosa si el <strong>código de salida es 0</strong>. Útil cuando tu app no expone HTTP.</li>
+          <li><code>tcpSocket port</code> — intenta abrir un TCP <strong>al puerto</strong> del contenedor; exitosa si la conexión se establece. Solo comprueba "alguien escucha", no si funciona.</li>
+          <li><code>grpc service</code> — probe de tipo <code>GRPC</code> (Kubernetes 1.24+) contra el servicio gRPC del contenedor.</li>
+        </ul>
+
+        <h3>Los tiempos de control (escala de reloj)</h3>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué mide</th><th>Default</th></tr></thead>
+          <tbody>
+            <tr><td><code>initialDelaySeconds</code></td><td>Espera tras arrancar el contenedor <strong>antes de la primera probe</strong> (da tiempo a cargar)</td><td>0</td></tr>
+            <tr><td><code>periodSeconds</code></td><td>Cada cuánto se repite la probe mientras el contenedor exista</td><td>10</td></tr>
+            <tr><td><code>timeoutSeconds</code></td><td>Cuánto espera la probe antes de declararla fallida</td><td>1</td></tr>
+            <tr><td><code>successThreshold</code></td><td>Éxitos consecutivos para pasar de "fallando" a "sano" (solo readiness usa &gt;1, para evitar apagones intermitentes)</td><td>1</td></tr>
+            <tr><td><code>failureThreshold</code></td><td>Fallos consecutivos para dar la probe por fallida (y actuar)</td><td>3</td></tr>
+            <tr><td><code>terminationGracePeriodSeconds</code></td><td>Segundos de gracia que espera el proceso al matarlo (default del Pod)</td><td>30</td></tr>
+          </tbody>
+        </table>
+
+        <h3>El orden del arranque</h3>
+        <div class="diagram">contendor arranca
+   │
+   ▼  ¿startupProbe definida?
+   ┌──────────►  NO: liveness/readiness empiezan a medir de inmediato
+   │                          (peligroso con arranque lento)
+   │
+   └─► SÍ: durante startup, `liveness` y `readiness` NO SE EJECUTAN.
+                 │  si startup falla hasta alcanzar failureThreshold -> se mata el Pod
+                 ▼  cuando startup PASA -> empiezan liveness y readiness
+        readiness OK -> el Pod entra en los Endpoints del Service
+        liveness OK  -> el Pod sigue vivo; si falla -> reinicio</div>
+
+        <p>La <code>startupProbe</code> existe para un caso muy real: una app con arranque lento (Node compilando lambdas, JVM cargando memoria, app que baja dependencias) haría que la <code>livenessProbe</code> (con su timeout de 1 segundo) se gatillara "creyendo" que la app está muerta, matándola en bucle antes de que arranque. <strong>La startupProbe protege a liveness/readiness durante el arranque.</strong></p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Chequeos sobre el nginx que ya conoces. nginx responde <code>200</code> en <code>/</code> y <code>404</code> en <code>/health</code> (por defecto no existe). Juega con ese detalle:</p>
+        <div class="code-file">deployment-web-probes.yaml</div>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          # readinessProbe: ¿puedo recibir tráfico AHORA?
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            # Esperamos 3 segundos antes de emitir la primera probe
+            # (el kubelet ya tarda un poco en montar el contenedor).
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            # Con 1 fallo (en lugar de 3) la verás retirarse rápido al experimentar.
+            failureThreshold: 1
+          # livenessProbe: ¿el proceso sigue sano y respondiendo?
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2</code></pre>
+        <p>Cómo observarlo (sin conectar el servicio de momento):</p>
+        <pre><code class="language-bash"># Aplicar y ver el estado READY (el "1/1" es readiness, no "corriendo").
+kubectl apply -f deployment-web-probes.yaml
+kubectl get pods -l app=web -w
+
+# Si READY muestra 1/1, la readiness pasó; si 0/1, se retiró del tráfico.
+kubectl describe pod web-xxxxx | grep -A2 "Readiness\|Liveness"
+# Verás de pasada los eventos de la probe al arrancar:
+#    Readiness probe failed: HTTP probe failed with statuscode: 404</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Dato clave:</strong> fíjate que la columna <code>READY 1/1</code> de <code>kubectl get pods</code> muestra el estado de <em>readiness</em>: es lo que decide si el Pod aparece en los Endpoints de un Service. Un Pod puede estar <code>Running</code> con READY <code>0/1</code>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En <strong>HarborTasks</strong>, la API de Node/Express necesita las <strong>tres probes</strong>: arranque lento (startup), vida del proceso (liveness) y disponibilidad de tráfico (readiness) — que en este caso comprueba, además, que la conexión a Postgres esté operativa.</p>
+        <div class="code-file">deployment-api-probes.yaml</div>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: harbortasks
+  labels:
+    app: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+          ports:
+            - containerPort: 3000
+          # startupProbe: "¡AÚN ESTOY ARRANCANDO!". Mientras esta probe
+          # esté activa, liveness y readiness NO corren. Da hasta 20 intentos
+          # x 2s = 40 segundos de margen para el arranque de Node y la DB.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            periodSeconds: 2
+            failureThreshold: 20
+          # livenessProbe: "¿sigues vivo?" -> si falla 3 veces seguidas,
+          # el kubelet MATA el contenedor (reiniciarlo) para salir del deadlock.
+          livenessProbe:
+            httpGet:
+              path: /healthz   # endpoint barato del proceso (no toca la DB)
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # readinessProbe: "¿PUEDO RECIBIR TRÁFICO?" -> /api/health comprueba
+          # también la conexión a Postgres. Si falla: el Pod NO se reinicia,
+          # simplemente SALE de los Endpoints hasta recuperarse.
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 6
+            periodSeconds: 5
+            timeoutSeconds: 3
+            # successThreshold 1 es lo normal para readiness (el Pod nuevo
+            # solo entra a servir cuando la primera probe pasa).
+            successThreshold: 1
+            failureThreshold: 3</code></pre>
+        <p>Las tres lecturas para el diagnóstico en producción:</p>
+        <pre><code class="language-bash"># 1. ¿Por qué la readiness comprueba /api/health y la liveness /healthz?
+#    liveness = recuperación del PROCESO: no debe depender de otras piezas
+#    readiness = capacidad de TRÁFICO: puede depender de la DB.
+kubectl describe pod api-xxxxx -n harbortasks | grep -i "probe"
+
+# 2. Consecuencias en acción (simula una caída de postgres):
+#    - readiness falla  -> Pod disponible 0/1, fuera de Endpoints.
+kubectl get pods -n harbortasks
+kubectl get endpoints -n harbortasks      # la IP de ese Pod desaparece
+
+# 3. ...y la liveness con deadlock (no responde) -> restart:
+kubectl get pods -n harbortasks   # RESTARTS sube a 1, fase Running de nuevo</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Por qué /api/health y no /healthz para ambas:</strong> <code>/healthz</code> solo pregunta "¿el proceso vive?" (barato y estable). <code>/api/health</code> además comprueba la DB. Si la liveness comprobara la DB y Postgres cayera, la API se reiniciaría en bucle <em>sin poder arreglar nada</em> — el reinicio no recupera a Postgres. Regla: <strong>liveness solo sobre lo que el reinicio puede arreglar (el propio proceso).</strong></p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usa <code>readinessProbe</code> para "dependencias" (DB, API externa) y <code>livenessProbe</code> solo para la salud del propio proceso</td>
+              <td>Meter la DB en la liveness</td>
+              <td>Reiniciar el contenedor no cura la DB: un problema externo se convierte en un crash-loop interno y escalas el caos</td>
+            </tr>
+            <tr>
+              <td>Siempre que el arranque pueda tardar, define <code>startupProbe</code></td>
+              <td>Arranques lentos solo con liveness inicial agresiva</td>
+              <td>liveness con <code>timeoutSeconds: 1</code> matará la app en bucle antes de que termine de arrancar</td>
+            </tr>
+            <tr>
+              <td>Haz el endpoint de liveness <strong>barato</strong> (sin queries costosas)</td>
+              <td>Llamadas pesadas o de larga duración en las probes</td>
+              <td>Una probe que tarda más que <code>timeoutSeconds</code> cuenta como fallo; el endpoint debe responder en milisegundos</td>
+            </tr>
+            <tr>
+              <td>Ajusta el reloj a tu arranque: <code>initialDelaySeconds</code> + <code>periodSeconds</code> + <code>failureThreshold</code></td>
+              <td>Copiar valores por defecto sin pensar</td>
+              <td>Tiempos de arranque de 60-90s exigen umbrales propios; de lo contrario falsos positivos de reinicio</td>
+            </tr>
+            <tr>
+              <td>Comprueba las probes en el ROLLOUT: un Pod ready entra a servir solo cuando pasa readiness</td>
+              <td>Publicar sin probes y "cruzar los dedos"</td>
+              <td>Con <code>maxUnavailable: 0</code> (lección 02), el rollout depende ENTERAMENTE de que la readiness del Pod nuevo pase</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar la MÍSMA probe para liveness y readiness</h3>
+        <pre><code class="language-yaml"># ❌ Si liveness y readiness son idénticas (path /api/health que toca la DB),
+# una caída de la DB genera reinicios en bucle de la app.
+livenessProbe:
+  httpGet: { path: /api/health, port: 3000 }
+readinessProbe:
+  httpGet: { path: /api/health, port: 3000 }
+
+# ✅ liveness en /healthz (solo proceso); readiness en /api/health (+ DB).
+livenessProbe:
+  httpGet: { path: /healthz, port: 3000 }
+readinessProbe:
+  httpGet: { path: /api/health, port: 3000 }</code></pre>
+
+        <h3>Tiempos que matan una app de arranque lento</h3>
+        <pre><code class="language-yaml"># ❌ sin startupProbe y con liveness con timeout/failureThreshold mínimos:
+# la app tarda 90s en arrancar, pero a los ~33s la liveness ya la ha matado
+# 3 veces -> CrashLoopBackOff para siempre.
+livenessProbe:
+  httpGet: { path: /healthz, port: 3000 }
+  initialDelaySeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 3
+
+# ✅ startupProbe que da margen al arranque y "protege" a liveness/readiness.
+startupProbe:
+  httpGet: { path: /healthz, port: 3000 }
+  periodSeconds: 5
+  failureThreshold: 20     # 20 * 5s = hasta 100s de margen para arrancar</code></pre>
+
+        <h3>Readiness que depende de lo que el Pod no controla</h3>
+        <pre><code class="language-yaml"># ❌ El Pod se retira de tráfico cuando un servicio EXTERNO (que tú no gestionas)
+# se cae: todo el clúster pierde capacidad porque "la app" parece no estar lista.
+readinessProbe:
+  httpGet: { path: /external-status, port: 3000 }   # ❌ dependencia externa
+
+# ✅ La readiness mide TU capacidad de servir; la dependencia externa la
+# gestiona el Service/circuit breaker de la app (timeouts, retries).
+readinessProbe:
+  httpGet: { path: /api/health, port: 3000 }        # depende solo de tus piezas</code></pre>
+
+        <h3>kubectl describe para diagnosticar probes</h3>
+        <pre><code class="language-bash"># ❌ Mirar solo `kubectl get pods` y ver "Running" -> no te explica el motivo
+# de una readiness rota.
+kubectl get pods
+
+# ✅ El diagnóstico real está en los EVENTOS del Pod:
+kubectl describe pod web-xxxxx | tail -15
+#      Readiness probe failed: HTTP probe failed with statuscode: 404
+# Ahí lo ves claro: la URL de tu probe no existe (404).</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver con tus propios ojos cómo una <code>readinessProbe</code> rota (un <code>404</code>) retira al Pod del tráfico <em>sin reiniciarlo</em>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un Deployment de 2 réplicas de nginx con una readinessProbe que apunte a una URL que NO existe:
+            <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-readiness-rota
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-r
+  template:
+    metadata:
+      labels:
+        app: web-r
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /no-existe    # nginx responde 404 aquí
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 1</code></pre>
+          </li>
+          <li><strong>Paso 2:</strong> aplícalo (<code>kubectl apply -f ...</code>) y mira el estado en <code>kubectl get pods -l app=web-r -w</code>. En cuanto la probe detecte el 404 verás <code>Ready 0/2</code> o <code>0/1</code>: Running PERO no listo.</li>
+          <li><strong>Paso 3:</strong> diagnostica: <code>kubectl describe pod web-readiness-rota-xxxx</code> y localiza el evento <code>Readiness probe failed: HTTP probe failed with statuscode: 404</code>.</li>
+          <li><strong>Paso 4:</strong> conecta un Service para ver la consecuencia en el tráfico:
+            <pre><code class="language-bash">kubectl expose deployment web-readiness-rota --port=80 --target-port=80
+kubectl get endpoints web-readiness-rota   # -> <none> (cero IPs listas)</code></pre>
+            Nadie entra a estos Pods aunque "están corriendo": la readiness los retiró de los Endpoints.
+          </li>
+          <li><strong>Paso 5:</strong> corrige la URL a <code>/</code> y re-aplica: <code>kubectl apply -f ...</code> (con el path /). En unos segundos: <code>Ready 1/1</code> y los Endpoints vuelven a tener IPs.</li>
+          <li><strong>Paso 6:</strong> limpia: <code>kubectl delete deploy web-readiness-rota svc/web-readiness-rota</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación final:</strong> si en el paso 2 viste <code>Running</code> con READY <code>0/1</code> y en el paso 4 los Endpoints estaban vacíos — y en el paso 5 volvieron a tener IPs — has comprobado que <em>readiness aparta sin matar</em>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Liveness en acción: prueba de reinicio</h3>
+          <p>Transforma el ejercicio anterior en una prueba de <strong>readiness + liveness combinadas</strong> contra un endpoint que simula deadlock. Deja solos (sin Service) 2 réplicas de nginx con <code>livenessProbe</code> sobre <code>/no-existe</code>. Observa el contador <code>RESTARTS</code>, los eventos de <code>describe</code>, y responde: ¿por qué la liveness reinicia el Pod (RESTARTS++), mientras la readiness solo lo retira de los Endpoints?</p>
+          <p><em>Pista: la diferencia está en el reino de acción — READY vs ALIVE — y en lo que el kubelet decide en cada umbral de fallos. Mide unos minutos con <code>kubectl get pods -w</code> y fíjate en que el Pod re-arranca (fase <code>ContainerCreating</code> de nuevo) y en los eventos <code>Killing</code>/<code>Started container</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una app <em>corriendo</em> no es una app <em>saludable</em>: las <strong>probes</strong> miden salud real.</li>
+          <li><code>livenessProbe</code>: ¿sigue vivo? <strong>Falla → reinicia</strong> el contenedor.</li>
+          <li><code>readinessProbe</code>: ¿puede recibir tráfico? <strong>Falla → lo retira de los Endpoints</strong>, sin reiniciar.</li>
+          <li><code>startupProbe</code>: ¿terminó de arrancar? <strong>Protege a liveness/readiness</strong> mientras la app arranca lento.</li>
+          <li>Tipos de chequeo: <code>httpGet</code>, <code>exec</code>, <code>tcpSocket</code>, <code>grpc</code>; el reloj se controla con <code>initialDelaySeconds</code>, <code>periodSeconds</code>, <code>timeoutSeconds</code> y <code>failureThreshold</code>.</li>
+          <li>Regla de oro: <strong>liveness</strong> solo sobre lo que el reinicio puede arreglar; <strong>readiness</strong> sobre nuestra capacidad real de servir.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando/Manifiesto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>spec.containers[].livenessProbe</code></td><td>Define el chequeo de vida; al fallar, el kubelet reinicia el contenedor</td></tr>
+            <tr><td><code>spec.containers[].readinessProbe</code></td><td>Define el chequeo de disponibilidad; al fallar, retira el Pod de los Endpoints</td></tr>
+            <tr><td><code>spec.containers[].startupProbe</code></td><td>Da margen al arranque; mientras corre, liveness/readiness están pausadas</td></tr>
+            <tr><td><code>httpGet {path, port}</code></td><td>Probe vía HTTP: exitosa con status 200–399</td></tr>
+            <tr><td><code>exec {command}</code></td><td>Probe vía comando dentro del contenedor: exitosa si el exit code es 0</td></tr>
+            <tr><td><code>tcpSocket {port}</code></td><td>Probe vía conexión TCP al puerto: exitosa si se puede conectar</td></tr>
+            <tr><td><code>initialDelaySeconds / periodSeconds</code></td><td>Retardo inicial antes de la primera probe y frecuencia de repetición</td></tr>
+            <tr><td><code>timeoutSeconds / failureThreshold</code></td><td>Cuánto puede tardar una probe y cuántos fallos consecutivos gatillan la acción</td></tr>
+            <tr><td><code>kubectl describe pod X</code></td><td>Muestra los eventos de las probes: es la pista forense de un fallo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué pasa EXACTAMENTE cuando una livenessProbe falla?</summary>
+            <div>
+              <p>Tras <code>failureThreshold</code> fallos consecutivos, el kubelet envía <code>SIGTERM</code> al contenedor, espera <code>terminationGracePeriodSeconds</code> y, si no termina, lo mata con <code>SIGKILL</code>. El reinicio lo hace <em>el propio kubelet</em> del nodo (no el Deployment) respetando la <code>restartPolicy</code>. En <code>kubectl get pods</code> verás el contador RESTARTS subir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La readiness evita que el Service envíe tráfico a un Pod roto?</summary>
+            <div>
+              <p>Sí: mientras la readiness falla, la IP del Pod desaparece de los <code>Endpoints</code> del Service; kube-proxy deja de repartirle peticiones. El Pod sigue <em>vivo</em> (el proceso corre), reconstruye su estado y, cuando readiness vuelve a pasar, <strong>re-entra automáticamente</strong> a los Endpoints. No hay reinicio, no hay intervención humana.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Para qué sirve la startupProbe si ya existe initialDelaySeconds?</summary>
+            <div>
+              <p><code>initialDelaySeconds</code> se aplica solo a la <strong>primera</strong> probe. Con un arranque de 90 segundos, ‘delay + 3 failures × periodSeconds’ acaba invariablemente en un falso reinicio. La <code>startupProbe</code> cubre TODO el periodo de arranque de forma explícita (<code>failureThreshold × periodSeconds</code> de margen) y <strong>suspende liveness/readiness hasta que pasa</strong>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar exec para comprobar la salud de una app que no expone HTTP?</summary>
+            <div>
+              <p>Sí. Con <code>exec</code> el checquer corre un comando dentro del contenedor: <code>command: ["/bin/sh","-c","test -f /tmp/ready && exit 0 || exit 1"]</code>. Eso vale para procesos, workers y daemons sin HTTP. Para <code>httpGet</code> recuerda que el host desde el que se prueba es el propio Pod (similar a <code>localhost</code>).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

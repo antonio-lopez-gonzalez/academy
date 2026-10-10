@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="00" data-lesson="04-caso-de-estudio-websocket-api-dotnet">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso de estudio: servidor WebSocket + API en .NET — Módulo 0 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso de estudio: servidor WebSocket + API en .NET</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 0 · Observabilidad y New Relic</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Toda la teoría del curso se aplica sobre un solo sistema real: un <strong>servidor WebSocket + Minimal API en .NET 8</strong> que recibe mensajes JSON con <strong>tipo de mensaje</strong>, <strong>fecha y hora</strong> y <strong>traceId</strong>. Es el mismo tipo de app que describes: conexiones persistentes, streaming de mensajes y algunos endpoints de API para consultas o administración.</p>
+        <p>El objetivo de esta lección: conocer la anatomía de ese sistema y entender <strong>por qué es exactamente el caso en el que el agente APM automático se queda corto</strong> — y por tanto donde más valor tiene la instrumentación custom que aprenderás.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El protocolo WebSocket</h3>
+        <p>WebSocket arranca con un <strong>handshake HTTP</strong> (un GET común que pide upgrade) y luego deja abierto un canal <strong>full-duplex</strong>: cliente y servidor se envían <em>frames</em> en ambos sentidos sin rehacer la conexión. Para el agente de New Relic, ese handshake inicial sí se ve (es una transacción HTTP), pero los <strong>mensajes posteriores no</strong>.</p>
+
+        <h3>La anatomía de un mensaje</h3>
+        <p>Una buena práctica de diseño es un <strong>envoltorio JSON</strong> común para todo el tráfico de negocio:</p>
+        <pre><code class="language-json">{
+  "type": "trade",
+  "timestamp": "2026-08-31T10:15:00.123Z",
+  "traceId": "8f6b2c1a9d4e7f3a2b1c9d8e7f6a5b4c",
+  "messageId": "887",
+  "payload": {
+    "symbol": "EURUSDD",
+    "price": 1.0842,
+    "amount": 1000
+  }
+}</code></pre>
+        <ul>
+          <li><code>type</code>: el <strong>tipo de mensaje</strong> (<code>ping</code>, <code>trade</code>, <code>disconnect</code>…) → perfecto para <code>FACET</code>.</li>
+          <li><code>timestamp</code>: <strong>fecha y hora</strong> en ISO-8601 → sirve para latencias y para ordenar lo que llega tarde.</li>
+          <li><code>traceId</code>: deja sitio en el protocolo para sembrar <strong>trazas distribuidas</strong> (Módulos 3-4).</li>
+          <li><code>messageId</code> + <code>payload</code>: identidad y datos de negocio.</li>
+        </ul>
+
+        <h3>Qué hará el agente automáticamente y qué no</h3>
+        <table>
+          <thead><tr><th>Parte del sistema</th><th>¿La ve el agente solo?</th></tr></thead>
+          <tbody>
+            <tr><td>Handshake/Upgrade del WebSocket</td><td>Sí (transacción HTTP)</td></tr>
+            <tr><td>Endpoints de la Minimal API (<code>GET /api/status</code>, <code>POST /api/broadcast</code>)</td><td>Sí (transacciones web automáticas)</td></tr>
+            <tr><td>Procesamiento de cada mensaje del WebSocket</td><td><strong>No</strong> → lo instrumentas tú</td></tr>
+            <tr><td>Llamadas a bases de datos / HTTP outbound conocidas</td><td>Sí (datastores y external services)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>En una frase:</strong> el agente ve los bordes HTTP, no el corazón del mensaje. Traer el volumen de mensajes, sus latencias, errores y tipos a New Relic es exactamente lo que vas a aprender a hacer.</p>
+        </div>
+
+        <h3>Diagrama de la app de ejemplo</h3>
+        <pre><code class="language-text">Clientes (WebSocket)
+     │   handshake HTTP (upgrade)  ──► [agente ve transacción HTTP]
+     ▼
++──────────────────────────┐
+│ Program.cs  (ASP.NET Core│
+│ WebSocket + Minimal API) │   [agente ve /api/*, /ws]
+│  /ws                      │
+│  /api/status              │
+│  /api/broadcast           │
+└───────┬──────────────────┘
+        │  procesa mensaje JSON (type, timestamp, traceId)
+        ▼
++──────────────────────────┐
+│ MessageProcessor         │   [NO lo ve el agente: custom en M4]
+│  parsea, valida, actúa   │
++───────┬──────────────────┘
+        │  a veces → HTTP/DB external
+        ▼
+Cola/Workers (opcional) ─────────────► [distributed tracing en M3]</code></pre>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El modelo que usarás en el proyecto:</p>
+        <pre><code class="language-csharp">// El payload común de todos los mensajes del WebSocket
+public sealed record MessageEnvelope(
+    string Type,                 // tipo de mensaje: "ping", "trade", ...
+    DateTimeOffset Timestamp,    // fecha y hora (ISO-8601) en la que se emitió
+    string TraceId,              // traceId: identificador de la traza (32 hex)
+    string MessageId,            // identidad del mensaje
+    JsonElement Payload);        // el contenido de negocio sin tipar</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el <strong>Módulo 8</strong> construirás esta app y la instrumentarás end-to-end. Adelanto de las preguntas que tendrás instrumentadas al acabar:</p>
+        <table>
+          <thead><tr><th>Pregunta de operaciones</th><th>Dato en New Relic</th></tr></thead>
+          <tbody>
+            <tr><td>¿Cuántos mensajes/min por tipo?</td><td>Métrica custom + <code>FACET messageType</code></td></tr>
+            <tr><td>¿Cuál es el p95 de procesar un <code>trade</code>?</td><td>Transacción custom / span <code>ProcessTrade</code></td></tr>
+            <tr><td>¿Qué mensaje de la traza <code>traceId</code> X falló?</td><td>Logs con <code>trace.id</code> en contexto</td></tr>
+            <tr><td>¿Cuánto tarda el envío al cliente (<code>send</code>)?</td><td>Span custom <code>BroadcastToClients</code></td></tr>
+            <tr><td>¿Cómo está la API? Apdex global</td><td>Transacciones automáticas de la Minimal API</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un envoltorio JSON común (<code>type/timestamp/traceId</code>)</td><td>Cada mensaje con su propio esquema sin contexto común</td><td>Permite facetear y correlacionar cualquier mensaje de forma uniforme</td></tr>
+            <tr><td>Deja <code>traceId</code> en el protocolo desde el día 1</td><td>Añadir el campo cuando ya hay miles de clientes</td><td>La propagación depende de que el emisor sepa incluirlo</td></tr>
+            <tr><td>Usa ISO-8601 con zona horaria en <code>timestamp</code></td><td>Timestamps sin zona o ambiguos</td><td>Las latencias y comparativas con el reloj de New Relic dependen de ella</td></tr>
+            <tr><td>Envía <code>messageId</code> para correlación</td><td>IDs cacheados solo en memoria del worker</td><td>Necesitas identidad global para unir logs/eventos del mismo mensaje</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Asumir que el WebSocket queda monitorizado por instalar el agente</h3>
+        <pre><code class="language-csharp">// ❌ Instalar el agente y NO tocar el handler: los mensajes son invisibles
+// ✅ Añadir instrumentación custom en el punto de recepción (Módulo 4)
+</code></pre>
+
+        <h3>El <code>timestamp</code> como mero decorado</h3>
+        <p>Si el servidor procesa con retraso mensajes con su <code>timestamp</code> original, sin medir la latencia (diferencia con el reloj del servidor) pierdes la señal de «cola llena» o «red lenta». Mide <code>DateTimeOffset.UtcNow - msg.Timestamp</code> como atributo.</p>
+
+        <h3>Usar el traceId del cliente como trust boundary</h3>
+        <p>El valor llega del cliente. Sánalo (longitud/hex) antes de usarlo, o un cliente malicioso puede fabricar trazas falsas.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Inventa el esquema de tu <code>MessageEnvelope</code> en tu app real (o usa el del curso). Enumera los tipos de mensaje que emites y recibes (p. ej. <code>ping</code>, <code>ack</code>, <code>trade</code>, <code>error</code>).</li>
+          <li><strong>Paso 2:</strong> Para cada tipo, escribe 1 pregunta que quieras poder responder con datos de New Relic (volumen, latencia, errores).</li>
+          <li><strong>Paso 3:</strong> Decide qué tipo de dato la responde: métrica (agregado), evento (hecho), traza (recorrido/timing), log (detalle).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 ¿Qué cuenta cada tipo?</h3>
+          <p>Diseña la tabla de telemetría de tu app: para cada <code>type</code> de mensaje indica qué enviarás como <em>métrica custom</em>, qué como <em>span</em>, qué como <em>log</em> y qué como <em>custom event</em>. Presta atención a la cardinalidad (mensajes por minuto) para no inflar el consumo. Volverás a este diseño en el proyecto final.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Caso de estudio = servidor WebSocket + Minimal API en .NET 8 con mensajes JSON.</li>
+          <li>Envoltorio común: <code>type</code>, <code>timestamp</code>, <code>traceId</code>, <code>messageId</code>, <code>payload</code>.</li>
+          <li>El agente ve los bordes HTTP; el <strong>procesamiento de mensajes requiere instrumentación custom</strong>.</li>
+          <li>El <code>timestamp</code> habilitó medir latencias end-to-end de la cola de mensajes.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Mi app no usa WebSocket; puedo continuar?</summary>
+            <div><p>Sí. Todo lo que se enseña para «el corazón del mensaje» aplica a cualquier canal no instrumentado: colas (RabbitMQ, Azure Service Bus), gRPC, workers. Fíjate en los patrones, no en el transporte.</p></div>
+          </details>
+          <details>
+            <summary>¿Por qué poner traceId en el payload en vez de solo en headers?</summary>
+            <div><p>En HTTP usas headers (<code>traceparent</code>); en WebSocket no hay headers por mensaje, así que <strong>el propio mensaje es el carrier</strong>. Es la misma idea que almacenar los headers en las propiedades de un mensaje de cola.</p></div>
+          </details>
+          <details>
+            <summary>¿Vale SignalR?</summary>
+            <div><p>SignalR es WebSocket con caperuza. El agente instrumenta el ASP.NET Core subyacente; los húb y mensajes concretos siguen necesitando instrumentación custom con los mismos patrones del curso.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

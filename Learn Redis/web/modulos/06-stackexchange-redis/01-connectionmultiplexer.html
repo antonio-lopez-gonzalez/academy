@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-connectionmultiplexer">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ConnectionMultiplexer: conexión y reuso — Módulo 6 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>ConnectionMultiplexer: conexión y reuso</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · StackExchange.Redis en .NET</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En .NET, Redis se usa mediante <strong>StackExchange.Redis</strong> y su pieza central, el <code>ConnectionMultiplexer</code>: una «fábrica de conexiones» que multiplexa todos tus comandos sobre pocas conexiones físicas, maneja reconexiones y te da <code>IDatabase</code>, <code>ISubscriber</code>, etc.</p>
+        <p>Esta lección te enseña a conectarlo bien: <strong>uno por proceso</strong>, registrado en DI, con configuración consciente de timeouts y pipelining.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué es y por qué «uno solo»</h3>
+        <pre><code class="language-text">PID .NET
+   │
+   └─ ConnectionMultiplexer  (UNO por proceso)
+        ├─ getDatabase()   → IDatabase  (strings, hashes, sets…)
+        ├─ getSubscriber() → ISubscriber (pub/sub)
+        └─ crear uno nuevo   → ❌ multiplica conexiones y sockets
+
+Crear multiplexers repetidamente agota conexiones, memoria y agrava reconexiones. La regla: singleton (DI lo garantiza).</code></pre>
+
+        <h3>Instalación y primer uso</h3>
+        <pre><code class="language-bash">dotnet add src/RedisWsHub package StackExchange.Redis</code></pre>
+        <pre><code class="language-csharp">using StackExchange.Redis;
+
+var mux = ConnectionMultiplexer.Connect("localhost:6379");
+IDatabase db = mux.GetDatabase();          // comando CRUD
+ISubscriber sub = mux.GetSubscriber();     // pub/sub
+
+await db.StringSetAsync("hub:conn:1", "node-1", TimeSpan.FromSeconds(30));
+string? node = await db.StringGetAsync("hub:conn:1");</code></pre>
+
+        <h3>Registrar en DI (ASP.NET Core)</h3>
+        <pre><code class="language-csharp">builder.Services.AddSingleton&lt;IConnectionMultiplexer&gt;(_ =&gt;
+{
+    var opts = ConfigurationOptions.Parse(builder.Configuration.GetConnectionString("Redis")
+        ?? "localhost:6379");
+    opts.AbortOnConnectFail = false;      // no abras la app si Redis tarda
+    opts.ConnectTimeout = 5000;           // ms
+    return ConnectionMultiplexer.Connect(opts);
+});
+builder.Services.AddSingleton&lt;IDatabase&gt;(sp =&gt;
+    sp.GetRequiredService&lt;IConnectionMultiplexer&gt;().GetDatabase());</code></pre>
+        <p>Con eso, en tu hub inyectas <code>IDatabase</code> y <code>ISubscriber</code> donde los necesites.</p>
+
+        <h3>Pipelining y latencia</h3>
+        <ul>
+          <li>Cada <code>await</code> de un comando es un round-trip; agrupa con <code>IBatch</code> o <code>db.Pipeline</code>/Task.WhenAll para varios a la vez.</li>
+          <li>Los async (…Async) no bloquean; usa siempre la variante async bajo carga.</li>
+          <li>Si el multiplexer debe esperar a reconexar, tus comandos ya «esperan en cola» con timeout.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <p><strong>Configuración clave:</strong> <code>AbortOnConnectFail=false</code> evita el clásico «la app no arrancó porque Redis no estaba»; la conexión se intenta sola y se conecta cuando pueda (M6-04).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">using StackExchange.Redis;
+
+var mux = ConnectionMultiplexer.Connect("localhost:6379");
+var db = mux.GetDatabase();
+
+// set con TTL y get atómico
+await db.StringSetAsync("demo:k", "v", TimeSpan.FromMinutes(1));
+RedisValue v = await db.StringGetAsync("demo:k");   // "v"
+mux.Close();    // en apps reales NO cierras: vive por todo el proceso</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Servicio del hub que usa dos "vistas" del multiplexer (DAL y suscripción):</p>
+        <pre><code class="language-csharp">public sealed class HubRegistry
+{
+    private readonly IDatabase _db;
+    private readonly ISubscriber _sub;
+
+    public HubRegistry(IConnectionMultiplexer mux, string nodeId)
+    {
+        _db = mux.GetDatabase();
+        _sub = mux.GetSubscriber();
+        NodeId = nodeId;
+    }
+
+    public string NodeId { get; }
+
+    public async Task RegisterAsync(string connectionId, string userId)
+    {
+        var key = $"hub:conn:{connectionId}";
+        await _db.HashSetAsync(key,
+            [new HashEntry("node", NodeId), new HashEntry("userId", userId)]);
+        await _db.KeyExpireAsync(key, TimeSpan.FromSeconds(30));
+        // notificar al resto de nodos el alta
+        await _sub.PublishAsync("hub:events",
+            $$"""{"type":"connect","conn":"{{connectionId}}","node":"{{NodeId}}"}""");
+    }
+}</code></pre>
+        <p>Un único multiplexer alimenta las dos vistas sin duplicar sockets.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un ConnectionMultiplexer por proceso (DI singleton)</td><td>Crear uno por request/handler</td><td>Multiplexar es el punto; N multiplexers = N sockets + memoria</td></tr>
+            <tr><td>AbortOnConnectFail=false</td><td>Que la app caiga si Redis tarda</td><td>La app debe degradar y reconectar sola</td></tr>
+            <tr><td>Usar las variantes async y pipelines</td><td>Llamadas síncronas (block) bajo carga</td><td>La síncrona bloquea hilos del pool</td></tr>
+            <tr><td>Configuración por connection string</td><td>Hardcodear host/puertos en el código</td><td>Mismo patrón que tu SQL/other config</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Crear el multiplexer por request</h3>
+        <pre><code class="language-csharp">// ❌ “Un mux por handler” → en cada request abres sockets nuevos
+await using var mux = ConnectionMultiplexer.Connect(cs);
+
+// ✅ DI singleton: uno por proceso, reutilizado
+builder.Services.AddSingleton&lt;IConnectionMultiplexer&gt;(...)</code></pre>
+
+        <h3>Ignorar «Redis.TimeoutException» / «No connection is available»</h3>
+        <p>Son síntoma habitual de: muchos comandos síncronos, timeouts de socket cortos o conexiones perdidas sin reconexión. Resuelve con async, timeouts y configuración robusta (M6-04).</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea un proyecto <code>dotnet new web</code> y añade StackExchange.Redis.</li>
+          <li><strong>Paso 2:</strong> Registra IConnectionMultiplexer en DI con AbortOnConnectFail=false.</li>
+          <li><strong>Paso 3:</strong> Endpoint <code>/ping</code> que haga <code>PING</code> y devuelva latency; ejecuta con Redis arriba y abajo para ver la degradación limpia.</li>
+          <li><strong>Paso 4:</strong> Usa <code>mux.GetServer().Info()</code> para leer stats y anota keyspace_hits/misses.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Ping por multiplexer único</h3>
+          <p>Escribe un test (sin Redis real: mock) que demuestre que tu servicio recibe SIEMPRE el mismo multiplexer por todo su uso (singleton), y explica en 2 líneas por qué romperías eso con un mock que crea conexiones por llamada.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>ConnectionMultiplexer = singleton por proceso; multiplexa sockets.</li>
+          <li><code>GetDatabase()</code> / <code>GetSubscriber()</code> = las dos vistas.</li>
+          <li>DI + connection string + AbortOnConnectFail=false.</li>
+          <li>Async + pipelines para no bloquear el pool de hilos.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito una conexión distinta para pub/sub?</summary>
+            <div><p>StackExchange.Redis puede usar una conexión dedicada para el suscriptor (recomendable) y otra para los comandos; el multiplexer te da ambas API. La conexión «dedicada» de pub/sub es la llamada <code>mux.GetSubscriber()</code> sobre una conexión gestionada por el propio multiplexer.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si uso Redis remoto (Upstash/Cloud)?</summary>
+            <div><p>Configuras host/puerto/TLS en el connection string (o la URL de Upstash) y la API es idéntica. En esos servicios suele exigirse TLS; StackExchange.Redis lo soporta con <code>,ssl=true</code>.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

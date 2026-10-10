@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="09" data-lesson="01-arquitectura-despliegue">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura del despliegue final — Módulo 9 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura del despliegue final</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 9 · Proyecto final</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Llegaste al final del camino. Durante los módulos 5 a 8 aprendiste cada pieza de Kubernetes por separado: Pods, Deployments, Services, ConfigMaps, Secrets, PVCs, Ingress, Helm y seguridad. Ahora llega el momento de <strong>unirlo todo</strong>: desplegar <strong>HarborTasks</strong> completo en un clúster local de <strong>kind</strong>, igual que lo haría un equipo de plataforma en producción.</p>
+        <p>HarborTasks es el caso de estudio que ha recorrido contigo todo el curso: una <strong>API REST</strong> en Node.js/Express, una <strong>web</strong> estática servida por nginx y una base de datos <strong>PostgreSQL</strong>. En los módulos 1–3 las contenerizaste por separado; en el módulo 4 las orquestaste con Compose; hoy vas a trasladar ese mismo stack a Kubernetes.</p>
+        <p>En esta lección diseñas el <strong>plano</strong> del despliegue: qué recursos existen, cómo se relacionan, por qué están organizados así y cuál es el plan de trabajo en los próximos pasos. Es la diferencia entre "aplicar manifiestos al azar" y "<strong>desplegar con intención</strong>".</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque en producción el 90% de los problemas no vienen de un manifiesto incorrecto, sino de no tener un modelo mental claro de cómo fluye el tráfico y los datos. Dibujar la arquitectura antes de escribir YAML te permite anticipar fallos: ¿el API puede alcanzar a Postgres? ¿el usuario puede llegar al API a través del Ingress? ¿qué pasa si un pod muere?</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Errores típicos de esta fase:</strong> desplegar piezas sin un orden lógico, olvidar cargar las imágenes en kind, dejar credenciales en ConfigMaps, lanzar Postgres sin PVC (y perder los datos al reiniciar) y no definir probes. Esta lección y las siguientes te blindan contra todos ellos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El despliegue objetivo: siete familias de recursos</h3>
+        <p>La arquitectura final del proyecto utiliza exactamente los recursos que estudiaste en los módulos 6 y 7. Cada uno resuelve un problema concreto:</p>
+        <ul>
+          <li><strong>Namespace <code>harbortasks</code></strong> — un "inquilino" aislado dentro del clúster donde vive TODO el proyecto. Evita colisiones de nombres y permite aplicar políticas de acceso solo a este espacio.</li>
+          <li><strong>Deployments</strong> (<code>api</code>, <code>web</code>, <code>postgres</code>) — declaran el estado deseado: cuántas réplicas, qué imagen, qué config, qué probes. Kubernetes lo reconcilia de forma continua.</li>
+          <li><strong>Services</strong> (<code>api</code>, <code>web</code>, <code>postgres</code>) — dan un nombre DNS estable (<code>api.harbortasks.svc.cluster.local</code>) y reparten tráfico entre los pods vivos. Los pods mueren y renacen; el Service nunca cambia.</li>
+          <li><strong>ConfigMaps y Secrets</strong> — separan la configuración (puertos, hosts) y lo sensible (contraseñas) del código de la imagen. La misma imagen sirve para dev y prod cambiando solo estos objetos.</li>
+          <li><strong>PVC + StorageClass</strong> — persistencia declarativa para Postgres. El dato vive fuera del pod; si el pod muere, el disco y los datos sobreviven.</li>
+          <li><strong>Ingress + ingress-nginx</strong> — una única puerta de entrada al clúster con enrutado por host y path: <code>/api</code> al API y <code>/</code> a la web.</li>
+          <li><strong>HPA</strong> — escalado automático del API según CPU.</li>
+        </ul>
+
+        <h3>Diagrama del clúster con flujos de tráfico</h3>
+        <p>Este es el plano mental que debes conservar. El tráfico del usuario entra por el Ingress y se reparte; el flujo de datos viaja del API hacia Postgres:</p>
+        <pre class="diagram">                  ┌───────────────────────────────────────────────┐
+                  │        TU NAVEGADOR │ curl                        │
+                  │       http://harbor.test/  (host local /etc/hosts)│
+                  └──────────────────────┬────────────────────────────┘
+                                         │  HTTP (puerto 80 del cluster)
+                                         ▼
+        ┌──────────────────────────────────────────────────────────────────────────────┐
+        │                           CLÚSTER kind (1 nodo)                              │
+        │                                                                              │
+        │   ┌───────────────────────────────────────────────────────────────────┐     │
+        │   │  ingress-nginx ──▶ Ingress "harbortasks" (ingressClassName: nginx)│     │
+        │   │                    rules:  host: harbor.test                      │     │
+        │   │                       /api  ──▶ Service api:80                   │     │
+        │   │                       /     ──▶ Service web:80                   │     │
+        │   └───────────┬──────────────────────────┬────────────────────────────┘     │
+        │               │ /api                      │ /                               │
+        │               ▼                           ▼                                 │
+        │   ┌──────────────────────┐   ┌──────────────────────┐                        │
+        │   │ Service api :80      │   │ Service web :80      │                        │
+        │   │ DNS: api.harbortasks │   │ DNS: web.harbortasks │                        │
+        │   └──────────┬───────────┘   └──────────┬───────────┘                        │
+        │              ▼                          ▼                                    │
+        │   ┌──────────────────────┐   ┌──────────────────────┐                        │
+        │   │ Pods api (2)         │   │ Pods web (2)         │                        │
+        │   │ Express :3000        │   │ nginx :80            │                        │
+        │   │ probes /health /ready│   │ proxy /api→api       │                        │
+        │   └──────────┬───────────┘   └──────────────────────┘                        │
+        │              │  flujo de DATOS: pg client (TCP 5432)                        │
+        │              ▼                                                               │
+        │   ┌──────────────────────────────────────────────┐                          │
+        │   │ Service postgres :5432 · DNS: postgres       │                          │
+        │   └──────────────────┬───────────────────────────┘                          │
+        │                      ▼                                                      │
+        │   ┌──────────────────────────────────────────────┐                          │
+        │   │ Pod postgres (1) → PVC postgres-data (1Gi)   │                          │
+        │   │ StorageClass "standard" (local-path de kind) │                          │
+        │   └──────────────────────────────────────────────┘                          │
+        └──────────────────────────────────────────────────────────────────────────────┘
+
+        FLUJO DE TRÁFICO  : usuario → Ingress → Service → Pod (y vuelta).
+        FLUJO DE DATOS    : Pod api → Service postgres → Pod postgres → PVC (disco).</pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía (el puerto que da nombre al proyecto):</strong> HarborTasks es un puerto marítimo. El <em>Ingress</em> es la aduana: decide qué mercancía (peticiones) va a qué muelle. Los <em>Services</em> son los muelles con nombre fijo: aunque el barco (pod) que atraca cambie cada día, el muelle siempre se llama igual. El <em>PVC</em> es el almacén en tierra: aunque el barco zarpe (pod destruido), la mercancía (datos) sigue en el almacén.</p>
+        </div>
+
+        <h3>Por qué NO exponemos Postgres por el Ingress</h3>
+        <p>Observa que el Ingress solo enruta a <code>api</code> y <code>web</code>. Postgres queda <strong>dentro</strong> del clúster, accesible únicamente por su Service <code>postgres:5432</code>. Esto es una decisión de seguridad deliberada: la base de datos es el activo más valioso y solo debe hablar con el API, nunca con el mundo exterior. En producción se aplica además la isolación por red (NetworkPolicies) entre namespaces.</p>
+
+        <h3>El plan de trabajo en 3 movimientos</h3>
+        <ol>
+          <li><strong>Lección 2:</strong> desplegar el plano de datos de configuración (ConfigMap + Secret) y los workloads <code>api</code> y <code>web</code> con sus Services, probes y HPA.</li>
+          <li><strong>Lección 3:</strong> añadir <code>postgres</code> (Secret, PVC, Deployment, Service), su migración inicial y el Ingress con <code>ingress-nginx</code>.</li>
+          <li><strong>Lección 4:</strong> verificación end-to-end, checklist de producción y próximos pasos (CI/CD, Helm, observabilidad).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El despliegue completo tiene decenas de manifiestos, pero el "huevo" del que nace todo es solo dos piezas: el <strong>clúster</strong> y el <strong>namespace</strong>. Sin ellos, nada tiene dónde vivir ni con qué ordenarse.</p>
+        <div class="code-file">k8s/namespace.yaml</div>
+        <pre><code class="language-yaml"># namespace.yaml — el contenedor lógico de todo el proyecto
+apiVersion: v1                    # API estable de Kubernetes
+kind: Namespace                   # Tipo de recurso: un namespace
+metadata:
+  name: harbortasks               # Nombre del namespace (identificador)
+  labels:
+    app.kubernetes.io/name: harbortasks   # Etiqueta estándar del proyecto
+    app.kubernetes.io/part-of: harbortasks
+</code></pre>
+        <pre><code class="language-bash"># 1. Crear un clúster kind con un nombre reconfortante
+kind create cluster --name harbor
+
+# 2. Aplicar el namespace (idempotente: repetirlo no rompe nada)
+kubectl apply -f k8s/namespace.yaml
+
+# 3. Comprobar que existe
+kubectl get namespaces
+</code></pre>
+        <p><strong>Línea por línea:</strong> <code>kind create cluster --name harbor</code> levanta un clúster completo (control plane + nodo worker) como contenedores de Docker; es la forma más ligera de tener Kubernetes real en tu máquina. <code>kubectl apply -f</code> es el verbo principal del despliegue declarativo: le dices a Kubernetes <em>cómo debe quedar el mundo</em> y él lo reconcilia. <code>kubectl get namespaces</code> te permite verificar: deberías ver <code>harbortasks</code> además de <code>default</code>, <code>kube-system</code>, <code>kube-public</code> y <code>kube-node-lease</code>.</p>
+        <div class="callout callout--tip">
+          <p><strong>Dato:</strong> el namespace <code>default</code> existe en todo clúster. Un error muy común es aplicar los manifiestos sin namespace y "contaminar" el espacio por defecto; por eso el primer manifiesto del proyecto es precisamente su propia <em>casa</em>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Este es el mapa completo de archivos que desplegarás en el clúster. Es exactamente la estructura de <code>proyectos/harbortasks/k8s/</code>:</p>
+        <pre class="diagram">proyectos/harbortasks/k8s/
+├── namespace.yaml              # 1. La casa (namespace harbortasks)
+├── secrets.yaml                # 2. Secret compartido (database-url + postgres-password)
+├── api/
+│   ├── configmap.yaml          #    Config no sensible del API (PORT, NODE_ENV)
+│   ├── deployment.yaml         #    Pods Express + probes + recursos + no-root
+│   ├── service.yaml            #    Service ClusterIP api:3000
+│   └── hpa.yaml                #    Escalado automático 2→5 según CPU
+├── web/
+│   ├── configmap.yaml          #    nginx.conf que hace de proxy → /api
+│   ├── deployment.yaml         #    Pods nginx + probes
+│   └── service.yaml            #    Service ClusterIP web:80
+└── postgres/
+    ├── configmap.yaml          #    Migración inicial (001-init.sql)
+    ├── pvc.yaml                #    Disco persistente 1Gi (StorageClass standard)
+    ├── deployment.yaml         #    Pod Postgres 16 + volumen + probes pg_isready
+    └── service.yaml            #    Service postgres:5432 (solo interno)</pre>
+        <p><strong>Decisiones de diseño que conviene entender ahora (no memorizar):</strong></p>
+        <ul>
+          <li><strong>Un Secret compartido y ConfigMaps por servicio:</strong> las credenciales sensibles (usuario, contraseña, URL de conexión) viven en un único <code>secrets.yaml</code> que consumen tanto el API como Postgres, de modo que no puedan divergir. Lo no sensible (puerto, nivel de log, nginx.conf) va en el ConfigMap de cada servicio.</li>
+          <li><strong>Imágenes de Postgres oficiales:</strong> <code>postgres:16-alpine</code>. El dato (las tareas) vive en el cluster, pero el binario es una imagen estándar mantenida por la comunidad.</li>
+          <li><strong>El web "trabaja" de proxy:</strong> su nginx.conf usa <code>proxy_pass</code> para reenviar <code>/api/*</code> al Service <code>api</code>. Así el navegador habla con un solo origen (sin CORS) y el Ingress solo enruta dos paths.</li>
+          <li><strong>HPA solo sobre el API:</strong> la web y Postgres son casi siempre estáticos; el API es la pieza que sufre picos de CPU al atender peticiones. Escalar lo que aporta valor, no lo que añade ruido.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Pasos siguientes (las 3 lecciones que completan el módulo):</strong> (02) aplicas API + web y los verificas con port-forward; (03) incorporas Postgres + Ingress y haces la primera prueba completa con <code>curl</code>; (04) ejecutas la batería de verificación y cierras el curso con el checklist de producción.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Aisla el proyecto en un namespace propio</td>
+              <td>Desplegar en <code>default</code></td>
+              <td>Evita colisiones de nombres y permite aplicar RBAC/quota solo al proyecto</td>
+            </tr>
+            <tr>
+              <td>Usa etiquetas <code>app</code> consistentes en selector y template</td>
+              <td>Etiquetas distintas en cada manifiesto</td>
+              <td>Un Service selecciona pods por etiquetas; un desajuste produce <em>no endpoints</em> sin error explícito</td>
+            </tr>
+            <tr>
+              <td>Define probes (<code>startup</code>, <code>liveness</code>, <code>readiness</code>)</td>
+              <td>Confiar solo en que el pod "arranque"</td>
+              <td>Kubernetes no sabe si tu app funciona: se lo dices tú con /health y /ready</td>
+            </tr>
+            <tr>
+              <td>Igualdad de imágenes pinned (etiquetas fijas, no <code>latest</code>)</td>
+              <td>Usar <code>:latest</code> en producción</td>
+              <td><code>latest</code> cambia sin aviso; imposible reproducir un despliegue exacto</td>
+            </tr>
+            <tr>
+              <td>Dibuja el flujo de tráfico y datos ANTES de escribir YAML</td>
+              <td>Aplicar manifiestos "sobre la marcha"</td>
+              <td>El plano te dice qué Service necesita qué selector y qué pod habla con quién</td>
+            </tr>
+            <tr>
+              <td>Carga las imágenes locales en kind con <code>kind load</code></td>
+              <td>Asumir que kind ve el Docker local</td>
+              <td>kind ejecuta los pods en otro "runtime"; <code>ImagePullBackOff</code> es el síntoma típico</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Desplegar sin plano, pieza a pieza</h3>
+        <pre><code class="language-bash"># ❌ Aplicar primero lo más "visible" y descubrir después los huecos
+kubectl apply -f api-deployment.yaml   # pods que no tienen a quién hablar
+kubectl apply -f web-deployment.yaml
+# ... ¿y el namespace? ¿y el servicio? ¿y postgres?
+
+# ✅ Orden lógico: base → configuración → workloads → puertas
+kubectl apply -f namespace.yaml         # 1. la casa
+kubectl apply -f api/configmap.yaml     # 2. la configuración
+kubectl apply -f api/secret.yaml
+kubectl apply -f api/deployment.yaml    # 3. los workloads
+...
+</code></pre>
+
+        <h3>Poner credenciales en un ConfigMap</h3>
+        <pre><code class="language-yaml"># ❌ La contraseña es "config", pero NO debe ir en un ConfigMap:
+# api/configmap.yaml
+data:
+  DB_PASSWORD: harborpass          # visible para cualquiera con permiso de lectura
+
+# ✅ La contraseña vive en un Secret (base64) y se referencian así:
+# envFrom: [configMapRef, secretRef]
+# Un Secret no es magia criptográfica: es una separación de responsabilidades
+# y de permisos (RBAC puede restringir "get secrets" por separado).
+</code></pre>
+
+        <h3>Confundir "Running" con "funciona"</h3>
+        <pre><code class="language-bash"># ❌ Verificación pobre: solo miramos si el pod "está"
+kubectl get pods          # Todo Running... ¿y las probes? ¿y la BD?
+
+# ✅ Verificación real: estado + logs + tráfico real
+kubectl get pods -n harbortasks
+kubectl logs deploy/api -n harbortasks --tail=50
+kubectl port-forward svc/api 8080:80 &   # y curl http://localhost:8080/health
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> dejar tu clúster kind y el namespace de HarborTasks listos y verificar el contexto de kubectl. Es la cimentación del módulo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Arrancar el clúster:</strong>
+            <pre><code class="language-bash"># Crear el clúster (si ya existe, ignora el error o usa kind delete)
+kind create cluster --name harbor
+kubectl cluster-info        # confirma el endpoint del API server
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Repasar los namespaces que trae Kubernetes de fábrica:</strong>
+            <pre><code class="language-bash">kubectl get namespaces
+# Verás: default, kube-node-lease, kube-public, kube-system
+# kube-system aloja los componentes del control plane (coredns, etc.)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Crear el namespace <code>harbortasks</code> y verificar el contexto:</strong>
+            <pre><code class="language-bash">kubectl create namespace harbortasks   # alternativa directa
+# O declarativo: kubectl apply -f k8s/namespace.yaml (preferido en el curso)
+
+kubectl get namespaces                 # ahora debe aparecer harbortasks
+kubectl config get-contexts            # revisa el contexto "kind-harbortasks"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Verificación del resultado esperado:</strong>
+            <pre><code class="language-bash"># REFERENCIA: resultado correcto final
+kubectl get namespace harbortasks
+# NAME          STATUS   AGE
+# harbortasks   Active   12s
+
+# Y el contexto activo:
+kubectl config current-context
+# kind-harbortasks
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación:</strong> si <code>STATUS</code> dice <code>Active</code> y tu contexto es <code>kind-harbortasks</code>, la base está lista. En Windows usas los mismos comandos dentro de WSL2 (binarios Linux de kind/kubectl); solo cambia la instalación, nunca la sintaxis.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Diseña un plano multi-entorno (dev / prod)</h3>
+          <p>Dibuja en tu cuaderno (o en un archivo <code>architecture.md</code>) cómo sería el mismo HarborTasks en un clúster <strong>de producción real</strong> con 3 nodos: dos entornos (<code>harbortasks-dev</code> y <code>harbortasks-prod</code>), el API con 5 réplicas detrás de un Ingress con TLS, Postgres en nodos dedicados con discos <code>gp3</code> y un sistema de backup <em>cron</em>.</p>
+          <p><em>Pista: piensa en qué cambia respecto a kind: las StorageClass no serán local-path, habrá <code>NetworkPolicies</code>, el Secret de TLS del Ingress apuntará a un certificado real (Let's Encrypt), y cada entorno tendrá su propio Secret — nunca se comparten credenciales entre entornos.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>HarborTasks completo en K8s = <strong>namespace + 3 Deployments + 3 Services + ConfigMaps + Secrets + PVC + Ingress + HPA</strong>.</li>
+          <li>El <strong>tráfico</strong> fluye usuario → Ingress → Service → Pod; el <strong>dato</strong> fluye api → Service postgres → Pod postgres → PVC.</li>
+          <li>Postgres <strong>no</strong> se expone al exterior: es un Service interno para el API.</li>
+          <li>La web usa nginx como <strong>proxy</strong> de <code>/api</code> para evitar problemas de CORS en el navegador.</li>
+          <li>Orden de despliegue lógico: <strong>base → config → workloads → puertas</strong>.</li>
+          <li>kind no ve tu registro local de imágenes: hay que <code>kind load docker-image</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kind create cluster --name harbor</code></td><td>Crea el clúster kind "harbor"</td></tr>
+            <tr><td><code>kubectl apply -f k8s/namespace.yaml</code></td><td>Crea el namespace <code>harbortasks</code> (declarativo, idempotente)</td></tr>
+            <tr><td><code>kubectl get namespaces</code></td><td>Lista los espacios y su estado</td></tr>
+            <tr><td><code>kubectl get namespaces</code> → <code>harbortasks Active</code></td><td>Verificación de que la base está lista</td></tr>
+            <tr><td><code>kubectl config current-context</code></td><td>Muestra el contexto activo (<code>kind-harbortasks</code>)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué tantos archivos para una app tan pequeña?</summary>
+            <div>
+              <p>Porque cada archivo separa una <em>preocupación</em>: la config, lo sensible, el estado, el tráfico y la puerta de entrada. Separar es lo que permite cambiar una contraseña sin tocar el Deployment, o escalar sin reescribir nada. En producción real, un API con 4 servicios y 2 BDs tendría 40+ manifiestos; por eso al final aprenderás Helm para empaquetarlos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Es normal que Postgres viva como un único pod?</summary>
+            <div>
+              <p>Sí, en un clúster local es lo esperable. En producción, una BD de un solo pod con disco persistente ya es un buen comienzo; la alta disponibilidad de datos (réplicas síncronas, failover) se consigue con StatefulSets, operadores como CloudNativePG o servicios gestionados (RDS, Cloud SQL). El curso te deja la base para entender esas piezas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el API tiene dos rutas de health (<code>/health</code> y <code>/ready</code>)?</summary>
+            <div>
+              <p>Son dos preguntas distintas: <code>/health</code> responde "el proceso está vivo" (para liveness) y <code>/ready</code> responde "estoy listo para recibir tráfico", por ejemplo tras comprobar que Postgres responde (para readiness). En el módulo 6 (lección 5) viste por qué mezclarlas causa cortes de servicio innecesarios.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si aplico los manifiestos fuera de orden?</summary>
+            <div>
+              <p>Kubernetes es tolerante: puedes aplicar un Deployment antes de su ConfigMap o Service sin error, porque la reconciliación reintenta. La diferencia está en el <em>comportamiento observado</em>: hasta que existan los objetos referenciados los pods estarán en <code>Pending</code>/<code>CrashLoopBackOff</code>. El orden lógico minimiza el ruido al diagnosticar y hace que aprecies que "está todo verde" desde el primer minuto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si no tengo Docker para crear kind en Windows?</summary>
+            <div>
+              <p>kind necesita un runtime de contenedores (Docker o containerd). En Windows la vía recomendada es WSL2 + Docker Desktop con integración de la distro habilitada: Docker corre dentro de WSL y kind crea "contenedores dentro de contenedores" sin drama de redes. El detalle paso a paso está en el módulo 0, lección 4.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

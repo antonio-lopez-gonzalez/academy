@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="es" data-module="07" data-lesson="04-consultas-rendimiento">
+<head>
+  <meta charset="UTF-8">
+  <title>Consultas, rendimiento y N+1 — Módulo 7 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Consultas, rendimiento y N+1</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 7 · Entity Framework Core</span><span>40 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>EF Core hace que escribir consultas sea sencillo, pero eso no significa que todas las consultas sean eficientes. El rendimiento es responsabilidad del desarrollador. En esta lección aprenderemos a pensar en SQL mientras escribimos LINQ, a detectar el problema N+1 y a usar las herramientas que EF Core ofrece para optimizar.</p>
+        <p>Veremos:</p>
+        <ul>
+          <li><code>IQueryable</code> vs <code>IEnumerable</code>.</li>
+          <li>Ejecución diferida e inmediata.</li>
+          <li><code>Include</code>, <code>ThenInclude</code> y proyecciones con <code>Select</code>.</li>
+          <li><code>AsNoTracking</code>, <code>AsSplitQuery</code> y <code>AsNoTrackingWithIdentityResolution</code>.</li>
+          <li><code>ToQueryString</code> y paginación.</li>
+          <li>Cómo detectar y evitar el problema N+1.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 IQueryable vs IEnumerable</h3>
+        <p><code>IQueryable&lt;T&gt;</code> representa una consulta que aún no se ha ejecutado. Cada operación LINQ que añadimos se traduce a SQL. <code>IEnumerable&lt;T&gt;</code>, en cambio, opera en memoria una vez que los datos ya están materializados.</p>
+        <pre><code class="language-csharp">IQueryable&lt;Post&gt; query = context.Posts.Where(p =&gt; p.IsPublished);
+query = query.OrderByDescending(p =&gt; p.PublishedAt);
+query = query.Take(10);
+
+// SQL se genera y ejecuta aquí:
+List&lt;Post&gt; posts = await query.ToListAsync();</code></pre>
+        <div class="callout warning">
+          <strong>Regla de oro:</strong> filtra, ordena y pagina antes de llamar a <code>ToListAsync</code> u otro operador de ejecución inmediata.
+        </div>
+
+        <h3>2.2 Operadores de ejecución inmediata</h3>
+        <p>Los métodos que materializan la consulta son: <code>ToListAsync</code>, <code>FirstAsync</code>, <code>FirstOrDefaultAsync</code>, <code>SingleAsync</code>, <code>SingleOrDefaultAsync</code>, <code>CountAsync</code>, <code>AnyAsync</code>, <code>SumAsync</code>, <code>LoadAsync</code>, <code>ToArrayAsync</code>, etc.</p>
+
+        <h3>2.3 Eager Loading con Include</h3>
+        <p><code>Include</code> carga datos relacionados en una sola consulta mediante <code>JOIN</code>. <code>ThenInclude</code> desciende niveles adicionales.</p>
+        <pre><code class="language-csharp">var posts = await context.Posts
+    .Include(p =&gt; p.Category)
+    .Include(p =&gt; p.Author)
+    .ThenInclude(a =&gt; a.Profile)
+    .Where(p =&gt; p.IsPublished)
+    .ToListAsync();</code></pre>
+
+        <h3>2.4 Proyecciones con Select</h3>
+        <p>La mejor forma de mejorar el rendimiento es no traer columnas que no necesitas. <code>Select</code> permite proyectar a un DTO directamente en SQL.</p>
+        <pre><code class="language-csharp">var dtos = await context.Posts
+    .Where(p =&gt; p.IsPublished)
+    .Select(p =&gt; new PostSummaryDto
+    {
+        Id = p.Id,
+        Title = p.Title,
+        CategoryName = p.Category.Name
+    })
+    .ToListAsync();</code></pre>
+        <p>SQL generado (simplificado):</p>
+        <pre><code class="language-sql">SELECT p.id, p.title, c.name
+FROM posts AS p
+INNER JOIN categories AS c ON p.category_id = c.id
+WHERE p.is_published = TRUE;</code></pre>
+
+        <h3>2.5 AsNoTracking</h3>
+        <p>Para consultas de solo lectura, desactiva el change tracking. Mejora el rendimiento y reduce el uso de memoria.</p>
+        <pre><code class="language-csharp">var posts = await context.Posts
+    .AsNoTracking()
+    .Where(p =&gt; p.IsPublished)
+    .ToListAsync();</code></pre>
+        <p>Para proyecciones que reusan entidades seguimiento, usa <code>AsNoTrackingWithIdentityResolution</code> para evitar duplicados en memoria.</p>
+
+        <h3>2.6 AsSplitQuery</h3>
+        <p>Cuando <code>Include</code> genera muchos <code>JOIN</code>, el resultado cartesiano puede multiplicar filas. <code>AsSplitQuery</code> divide la consulta en varias SQL para reducir redundancia.</p>
+        <pre><code class="language-csharp">var posts = await context.Posts
+    .AsSplitQuery()
+    .Include(p =&gt; p.Category)
+    .Include(p =&gt; p.Tags)
+    .ToListAsync();</code></pre>
+        <div class="callout info">
+          <strong>Trade-off:</strong> <code>AsSplitQuery</code> hace más consultas SQL pero cada una es más pequeña. Úsalo cuando hay muchas colecciones incluidas.
+        </div>
+
+        <h3>2.7 ToQueryString</h3>
+        <p>Para depurar, obtén la consulta SQL sin ejecutarla. Es útil durante el desarrollo y en tests.</p>
+        <pre><code class="language-csharp">var query = context.Posts.Where(p =&gt; p.IsPublished);
+Console.WriteLine(query.ToQueryString());</code></pre>
+
+        <h3>2.8 Paginación</h3>
+        <p>Usa <code>Skip</code> y <code>Take</code> siempre combinados con un <code>OrderBy</code> para resultados deterministas.</p>
+        <pre><code class="language-csharp">var page = await context.Posts
+    .AsNoTracking()
+    .Where(p =&gt; p.IsPublished)
+    .OrderByDescending(p =&gt; p.PublishedAt)
+    .Skip((pageNumber - 1) * pageSize)
+    .Take(pageSize)
+    .ToListAsync();
+
+var total = await context.Posts.CountAsync(p =&gt; p.IsPublished);</code></pre>
+
+        <h3>2.9 El problema N+1</h3>
+        <p>Ocurre cuando cargamos una lista de entidades y luego, en un bucle, accedemos a una propiedad de navegación sin haberla incluido. Cada acceso dispara una nueva consulta SQL.</p>
+        <pre><code class="language-csharp">// ❌ N+1: una consulta para posts y N consultas para categorías.
+var posts = await context.Posts.ToListAsync();
+foreach (var post in posts)
+{
+    Console.WriteLine(post.Category.Name); // ¡Nueva consulta por cada post!
+}</code></pre>
+        <pre><code class="language-csharp">// ✅ Solución: Eager Loading.
+var posts = await context.Posts
+    .Include(p =&gt; p.Category)
+    .ToListAsync();</code></pre>
+        <p>Otra opción es proyectar el DTO directamente, que evita la necesidad de cargar la entidad completa.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Consulta paginada de posts publicados con su categoría.</p>
+        <pre><code class="language-csharp">int page = 1;
+int size = 5;
+
+var posts = await context.Posts
+    .AsNoTracking()
+    .Where(p =&gt; p.IsPublished)
+    .Include(p =&gt; p.Category)
+    .OrderByDescending(p =&gt; p.PublishedAt)
+    .Skip((page - 1) * size)
+    .Take(size)
+    .ToListAsync();
+
+Console.WriteLine(context.Posts.ToQueryString()); // Solo para depuración</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Endpoint de búsqueda del CMS con filtros, paginación, proyección y DTOs.</p>
+        <pre><code class="language-csharp">public record PostListItemDto(
+    int Id,
+    string Title,
+    string Slug,
+    string CategoryName,
+    string AuthorName,
+    DateTime? PublishedAt);
+
+public class SearchPostsHandler : IRequestHandler&lt;SearchPostsQuery, PagedResult&lt;PostListItemDto&gt;&gt;
+{
+    private readonly CmsDbContext _context;
+    public SearchPostsHandler(CmsDbContext context) =&gt; _context = context;
+
+    public async Task&lt;PagedResult&lt;PostListItemDto&gt;&gt; Handle(SearchPostsQuery request, CancellationToken cancellationToken)
+    {
+        var query = _context.Posts
+            .AsNoTracking()
+            .Where(p =&gt; p.Status == PostStatus.Published);
+
+        if (!string.IsNullOrWhiteSpace(request.Category))
+            query = query.Where(p =&gt; p.Category.Name == request.Category);
+
+        if (!string.IsNullOrWhiteSpace(request.SearchTerm))
+            query = query.Where(p =&gt; p.Title.Contains(request.SearchTerm));
+
+        var total = await query.CountAsync(cancellationToken);
+
+        var items = await query
+            .OrderByDescending(p =&gt; p.PublishedAt)
+            .Skip((request.Page - 1) * request.PageSize)
+            .Take(request.PageSize)
+            .Select(p =&gt; new PostListItemDto(
+                p.Id,
+                p.Title,
+                p.Slug,
+                p.Category.Name,
+                p.Author.DisplayName,
+                p.PublishedAt))
+            .ToListAsync(cancellationToken);
+
+        return new PagedResult&lt;PostListItemDto&gt;(items, total, request.Page, request.PageSize);
+    }
+}</code></pre>
+        <div class="callout info">
+          <strong>Observación:</strong> la proyección <code>Select</code> hace que SQL solo traiga las columnas necesarias. No hay change tracking, no hay N+1 y no hay carga de colecciones innecesarias.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Proyecta siempre que puedas:</strong> usa <code>Select</code> para traer solo los datos necesarios.</li>
+          <li><strong>Usa <code>AsNoTracking</code> en lecturas:</strong> mejora el rendimiento y la memoria.</li>
+          <li><strong>Ordena antes de <code>Skip</code>/<code>Take</code>:</strong> de lo contrario, la paginación es indeterminista.</li>
+          <li><strong>Usa <code>Include</code> para relaciones obligatorias:</strong> evita el N+1.</li>
+          <li><strong>Considera <code>AsSplitQuery</code> cuando incluyas múltiples colecciones:</strong> reduce la redundancia de datos.</li>
+          <li><strong>Revisa el SQL con <code>ToQueryString</code>:</strong> es la forma más rápida de entender qué está haciendo EF Core.</li>
+          <li><strong>Evita <code>CountAsync</code> si no necesitas el total:</strong> en listados infinitos, usa cursor o keyset pagination.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Error 1: Filtrar en memoria</h3>
+        <pre><code class="language-csharp">// ❌ Mal: ToList trae todo, Where filtra en memoria.
+var posts = context.Posts.ToList().Where(p =&gt; p.IsPublished);</code></pre>
+        <pre><code class="language-csharp">// ✅ Bien: el filtro se traduce a SQL.
+var posts = await context.Posts.Where(p =&gt; p.IsPublished).ToListAsync();</code></pre>
+
+        <h3>Error 2: Ordenar después de paginar</h3>
+        <p>El orden debe ir antes de <code>Skip</code> y <code>Take</code>. De lo contrario, cada página puede devolver resultados distintos.</p>
+
+        <h3>Error 3: Materializar dentro de un bucle</h3>
+        <pre><code class="language-csharp">// ❌ Mal: cada iteración ejecuta una consulta.
+foreach (var id in ids)
+{
+    var post = await context.Posts.FindAsync(id);
+    Console.WriteLine(post?.Title);
+}
+
+// ✅ Bien: una sola consulta con Where(...).Contains(...).
+var posts = await context.Posts
+    .Where(p =&gt; ids.Contains(p.Id))
+    .ToListAsync();</code></pre>
+
+        <h3>Error 4: AsNoTracking en actualizaciones</h3>
+        <p>Si necesitas modificar una entidad, no uses <code>AsNoTracking</code>. El contexto no detectará los cambios y <code>SaveChanges</code> no hará nada.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Implementa un listado de pedidos con sus clientes y productos:</p>
+        <ol>
+          <li>Crea las entidades <code>Order</code>, <code>Customer</code> y <code>OrderLine</code> (1:N entre Order y OrderLine).</li>
+          <li>Escribe una consulta que devuelva los últimos 10 pedidos con cliente y líneas.</li>
+          <li>Usa <code>AsSplitQuery</code> si incluyes varias colecciones.</li>
+          <li>Proyecta a un DTO con totales calculados.</li>
+          <li>Imprime el SQL con <code>ToQueryString</code> y analiza los JOIN.</li>
+        </ol>
+        <pre><code class="language-csharp">var dtos = await context.Orders
+    .AsNoTracking()
+    .AsSplitQuery()
+    .Include(o =&gt; o.Customer)
+    .Include(o =&gt; o.Lines)
+    .OrderByDescending(o =&gt; o.OrderDate)
+    .Take(10)
+    .Select(o =&gt; new OrderDto(
+        o.Id,
+        o.Customer.Name,
+        o.Lines.Sum(l =&gt; l.Quantity * l.UnitPrice)))
+    .ToListAsync();</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa una consulta de búsqueda de posts por etiqueta. El endpoint debe:</p>
+        <ul>
+          <li>Filtrar por nombre de etiqueta.</li>
+          <li>Proyectar a un DTO con título, autor y lista de etiquetas.</li>
+          <li>Usar paginación con <code>Skip</code>/<code>Take</code>.</li>
+          <li>Evitar el problema N+1 sin usar <code>Include</code> (solo con <code>Select</code>).</li>
+        </ul>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>IQueryable</code> permite componer consultas que se traducen a SQL.</li>
+          <li>Los operadores de ejecución inmediata materializan los resultados.</li>
+          <li><code>Include</code> y <code>ThenInclude</code> resuelven relaciones en una sola consulta.</li>
+          <li>Las proyecciones con <code>Select</code> reducen el volumen de datos.</li>
+          <li><code>AsNoTracking</code> acelera consultas de solo lectura.</li>
+          <li>La paginación requiere <code>OrderBy</code> antes de <code>Skip</code>/<code>Take</code>.</li>
+          <li>El problema N+1 se evita cargando relaciones explícitamente o proyectando.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Siempre debo usar Include?</summary>
+          <p>No. Si solo necesitas algunos campos de la relación, una proyección con <code>Select</code> suele ser más eficiente.</p>
+        </details>
+        <details>
+          <summary>¿AsSplitQuery es siempre mejor?</summary>
+          <p>No. Hace más consultas a la base de datos. Úsalo cuando haya muchas colecciones incluidas y el JOIN cartesiano supere un umbral de redundancia.</p>
+        </details>
+        <details>
+          <summary>¿Por qué mi consulta no se traduce a SQL?</summary>
+          <p>Probablemente uses un método no soportado por el proveedor de LINQ. Revisa el error: indica la expresión que no pudo traducirse.</p>
+        </details>
+        <details>
+          <summary>¿Puedo usar GroupBy con EF Core?</summary>
+          <p>Sí, pero con limitaciones. Algunas agregaciones no se traducen y deben hacerse en memoria después de materializar. Revisa siempre el SQL.</p>
+        </details>
+        <details>
+          <summary>¿Cómo depuro el rendimiento de una consulta?</summary>
+          <p>Usa <code>ToQueryString</code>, logs de EF Core, EXPLAIN ANALYZE en PostgreSQL y herramientas como <code>dotnet trace</code> o pgAdmin.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

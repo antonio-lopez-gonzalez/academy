@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="01-el-reto-instrumentar-websocket">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>El reto: por qué el agente no ve los WebSocket — Módulo 4 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>El reto: por qué el agente no ve los WebSocket</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Instrumentar WebSocket</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya sabes que «instalar el agente» no cubre tu WebSocket. Ahora vamos a entender <strong>por qué</strong> a nivel de mecánica del agente, y qué es lo que sí captura (para aprovecharlo) frente a lo que no (para instrumentarlo).</p>
+        <p>Este análisis previo es el que te permitirá decidir sin miedo <em>qué</em> instrumentar y <em>qué no</em>, en lugar de crear ruido.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué ve el agente en un WebSocket</h3>
+        <p>Un WebSocket empieza como HTTP (handshake de upgrade). El agente instrumenta ASP.NET Core, así que verá:</p>
+        <ul>
+          <li>La transacción de la petición de upgrade (<code>WS /ws</code> con status 101).</li>
+          <li>Todo lo que ocurra <em>durante</em> esa transacción antes de que termine.</li>
+          <li>Llamadas HTTP salientes, bases de datos, etc., si se ejecutan dentro de esa transacción.</li>
+        </ul>
+        <p>Pero la conexión queda «abierta»: el agente no crea una transacción por cada frame que llega después. Esa es la clave del problema.</p>
+
+        <h3>Por qué no hay transacciones por mensaje</h3>
+        <pre><code class="language-text">Cliente            Servidor .NET (agente)
+   │  handshake GET /ws (101)  │ ← transacción "corta" del upgrade
+   ├─► mensaje 1 ─────────────►│  (solo enmarcado como parte del upgrade)
+   ├─► mensaje 2 ─────────────►│  The agent no inicia nada nuevo
+   ├─► mensaje 3 ─────────────►│  ──► sin duración, sin atributos, sin trace por mensaje
+   │  ...                      │
+   └─► close                   │</code></pre>
+        <p>La razón de diseño: WebSocket es long-lived y de mensajería arbitraria; el agente no conoce la «unidad de trabajo» de tus mensajes (eso solo lo sabes tú: qué es un <code>trade</code>, cuándo termina). Por eso la instrumentación de ese nivel es <strong>responsabilidad de la app</strong>.</p>
+
+        <h3>Qué ganas si lo instrumentas</h3>
+        <table>
+          <thead><tr><th>Antes</th><th>Después</th></tr></thead>
+          <tbody>
+            <tr><td>Un «bloque» de tiempo sin desglose en la traza del upgrade</td><td>Transaction por mensaje con sus segmentos</td></tr>
+            <tr><td>No sabes cuántos mensajes ni cuánto tarda cada tipo</td><td>Count, percentiles y facet por <code>messageType</code></td></tr>
+            <tr><td>Errores invisibles en el handler</td><td><code>TransactionError</code> + logs en contexto</td></tr>
+            <tr><td>traceId del HTTP de upgrade no ligado al flujo de negocio</td><td>trace por mensaje con propagación W3C (M3-04)</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--note">
+          <p><strong>Mentalidad:</strong> no intentes que el agente «entienda tu protocolo». Instrumenta <em>¿qué es una unidad de trabajo para tu negocio?</em> y deja que el agente provea el transporte (métricas, headers, spans) de esa unidad.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El núcleo del handler que verás en las próximas lecciones: una transacción por mensaje con sus atributos.</p>
+        <pre><code class="language-csharp">[Transaction]                              // 1 mensaje = 1 transacción
+public void OnMessage(MessageEnvelope msg)
+{
+    var txn = NewRelic.Api.Agent.NewRelic.GetAgent().CurrentTransaction;
+    txn.AddCustomAttribute("messageType", msg.Type);
+    txn.AddCustomAttribute("messageId", msg.MessageId);
+
+    // ... el resto del procesado ...
+}</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Métricas y eventos para completar el cuadro. La toma de decisiones instrumentación:</p>
+        <table>
+          <thead><tr><th>Quieres saber</th><th>Qué instrumentas</th><th>Tipo</th></tr></thead>
+          <tbody>
+            <tr><td>Volumen de mensajes/min por tipo</td><td><code>[Transaction]</code> + count / <code>IncrementCounter</code></td><td>Métrica</td></tr>
+            <tr><td>Duración p95 por tipo</td><td>Transacción custom (duración ya medida)</td><td>Transacción/spans</td></tr>
+            <tr><td>Cuánto tarda el socket en escribir al cliente</td><td>Segmento (<code>[Trace]</code>) alrededor del <code>SendAsync</code></td><td>Span</td></tr>
+            <tr><td>Hecho de negocio "order placed"</td><td><code>RecordCustomEvent("OrderPlaced", attrs)</code></td><td>Evento (bajo volumen)</td></tr>
+            <tr><td>Errores al parsear</td><td><code>NoticeError(..., isExpected)</code></td><td>Error</td></tr>
+          </tbody>
+        </table>
+        <p>Regla de oro del <strong>coste</strong>: la transacción por mensaje ya te da count+duration+errors con un precio contenido (muestreo de trazas). No añadas un custom event por mensaje: guarda los eventos para caras de negocio relevantes.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Definir «unidad de trabajo» = mensaje entrante procesado</td><td>Instrumentar el socket frame a frame</td><td>La unidad de negocio es el mensaje, no el frame</td></tr>
+            <tr><td>Mantener la transacción por mensaje contenida y no síncrona de bloqueo</td><td>Abarcar la vida de la conexión en una transacción</td><td>La conexión vive minutos; una transacción debe durar el trabajo</td></tr>
+            <tr><td>Reutilizar el upgrade HTTP (su traceId) para el primer mensaje</td><td>Desperdiciar el contexto ya capturado</td><td>Puedes propagar del upgrade al primer trabajo con M3-04</td></tr>
+            <tr><td>Medir también la latencia de cola (timestamp→ahora)</td><td>Medir solo el procesado</td><td>El «delay de llegada» es mitad de la latencia del sistema</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Esperar transacciones WebSocket automáticas</h3>
+        <pre><code class="language-text"># ❌ "Instalé el agente, ¿por qué no veo los mensajes?"
+# ✅ Algo ya ves (el upgrade HTTP). Los mensajes se instrumentan
+#    con [Transaction] + atributos (M4-02, M4-03).</code></pre>
+
+        <h3>Instrumentar el hilo/ loop completo de la conexión</h3>
+        <pre><code class="language-csharp">// ❌ Una transacción que abarca toda la conexión (minutos)
+[Transaction]
+public async Task HandleConnection(WebSocket socket)
+{
+    while (socket.State == WebSocketState.Open)
+    {
+        var msg = await ReceiveAsync(socket);
+        Process(msg);
+    }
+}
+
+// ✅ Transacción por mensaje, dentro del loop
+public async Task HandleConnection(WebSocket socket)
+{
+    while (socket.State == WebSocketState.Open)
+    {
+        var msg = await ReceiveAsync(socket);
+        OnMessage(msg);   // [Transaction] por mensaje
+    }
+}</code></pre>
+
+        <h3>Poner todo el tráfico en eventos</h3>
+        <p>10k mensajes/min × evento = factura alta. Métrica/transacción para el volumen; eventos para lo que merece la pena.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> En tu proyecto, localiza el <code>while (socket.Open)</code> del handler.</li>
+          <li><strong>Paso 2:</strong> Marca el método que procesa cada mensaje con <code>[Transaction]</code> y añade <code>messageType</code>/<code>messageId</code> como atributos.</li>
+          <li><strong>Paso 3:</strong> Ejecuta con el agente y envía varios tipos de mensaje.</li>
+          <li><strong>Paso 4:</strong> Consulta el facet por tipo:
+          <pre><code class="language-nrql">SELECT count(*), average(duration) FROM Transaction WHERE name LIKE 'OtherTransaction/%' FACET messageType SINCE 15 minutes ago</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El upgrade como primer eslabón</h3>
+          <p>Investiga cómo recuperar el traceId de la transacción del upgrade (pista: <code>GetLinkingMetadata()</code> o un atributo) y diseña cómo lo pasarías al primer mensaje de la conexión. Escríbelo como cola de tu proyecto (lo aplicamos en M8).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El agente ve el <strong>handshake HTTP</strong>, no la mensajería posterior.</li>
+          <li>La unidad de trabajo del WebSocket la define el negocio → <strong>instrumentación tuya</strong>.</li>
+          <li>Una transacción por mensaje + atributos + <code>[Trace]</code> en fases clave.</li>
+          <li>Volumen en métricas/transacciones; eventos solo para hechos valiosos.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿SignalR cambia esto?</summary>
+            <div><p>La mecánica es la misma: el transporte es socket; el agente instrumenta HTTP/ASP.NET. Los hubs y la lógica de negocio se instrumentan igual con atributos/API.</p></div>
+          </details>
+          <details>
+            <summary>Y si el volumen es enorme, ¿la transacción por mensaje es viable?</summary>
+            <div><p>Sí, con muestreo. Las transacciones (eventos) se generan en cliente, pero el tracing de spans va muestreado. Para contadores masivos sin trazas, usa métricas <code>IncrementCounter</code>.</p></div>
+          </details>
+          <details>
+            <summary>¿La transacción por mensaje incluye el tiempo en el socket?</summary>
+            <div><p>No por defecto: el <code>ReceiveAsync</code> bloqueante esperaría el próximo mensaje. Mide el «tiempo de espera» del loop aparte (métricas) y la duración del <em>procesado</em> en la transacción.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="es" data-module="15" data-lesson="04-channel">
+<head>
+  <meta charset="UTF-8">
+  <title>Channel&lt;T&gt; para productor/consumidor — Módulo 15 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Channel&lt;T&gt; para productor/consumidor</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 15 · Background Jobs</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aprenderemos a usar <code>System.Threading.Channels.Channel&lt;T&gt;</code>, una cola asíncrona y de alto rendimiento incluida en .NET. Es la herramienta ideal para implementar el patrón productor/consumidor dentro de un mismo proceso.</p>
+        <p>Un <em>channel</em> permite que un hilo escriba tareas mientras otro las procesa, sin bloqueos innecios y con control de <em>backpressure</em> si la cola tiene límite. Es útil para encolar emails, eventos de dominio o trabajos que no necesitan persistencia entre reinicios.</p>
+
+        <div class="callout info">
+          <strong>Cuándo usar Channel&lt;T&gt;:</strong> cuando necesitas una cola en memoria rápida, ligera y sin dependencias externas, y puedes permitirte perder los mensajes no procesados al reiniciar.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>¿Qué es un channel?</h3>
+        <p>Un <code>Channel&lt;T&gt;</code> es una estructura de datos que conecta un <em>writer</em> (productor) con uno o varios <em>readers</em> (consumidores). Es similar a <code>BlockingCollection&lt;T&gt;</code> pero completamente asíncrono y optimizado para <code>async/await</code>.</p>
+
+        <h3>Canales ilimitados y limitados</h3>
+        <ul>
+          <li><strong>Unbounded:</strong> no tiene límite de capacidad. El productor nunca espera, pero puede consumir memoria ilimitada.</li>
+          <li><strong>Bounded:</strong> tiene un tamaño máximo. Si la cola está llena, el productor espera hasta que haya espacio (<em>backpressure</em>).</li>
+        </ul>
+
+        <h3>API principal</h3>
+        <ul>
+          <li><code>Channel.CreateUnbounded&lt;T&gt;()</code> y <code>Channel.CreateBounded&lt;T&gt;(capacity)</code>.</li>
+          <li><code>ChannelWriter&lt;T&gt;</code>: escribe con <code>WriteAsync</code>, completa con <code>Complete</code>.</li>
+          <li><code>ChannelReader&lt;T&gt;</code>: lee con <code>ReadAllAsync</code> o <code>TryRead</code>/<code>WaitToReadAsync</code>.</li>
+        </ul>
+
+        <h3>Backpressure</h3>
+        <p>Con un canal limitado, el productor puede esperar o descartar mensajes. Esto protege al consumidor de ser saturado. Es especialmente útil cuando el productor es mucho más rápido que el consumidor.</p>
+
+        <div class="callout warning">
+          <strong>Advertencia:</strong> los datos de un <code>Channel&lt;T&gt;</code> residen en memoria. Si el proceso se reinicia, los mensajes pendientes se pierden. Para durabilidad usa Hangfire, Quartz persistente o una cola como RabbitMQ.
+        </div>
+
+        <h3>¿Cuándo prefiero Channel&lt;T&gt; sobre otras colas?</h3>
+        <ul>
+          <li><strong>Channel&lt;T&gt;:</strong> mismo proceso, alta frecuencia, baja latencia, no necesitas operaciones.</li>
+          <li><strong>Hangfire/Quartz:</strong> persistencia, reintentos, planificación y monitorización.</li>
+          <li><strong>RabbitMQ / Azure Service Bus:</strong> comunicación entre procesos o máquinas, mayor durabilidad.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Creamos un canal ilimitado, un productor que escribe números y un consumidor que los imprime.</p>
+
+        <pre><code class="language-csharp">// Program.cs
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
+
+// Creamos un canal de enteros sin límite
+var channel = Channel.CreateUnbounded&lt;int&gt;();
+
+// Tarea productora
+var producer = Task.Run(async () =>
+{
+    for (var i = 1; i &lt;= 10; i++)
+    {
+        await channel.Writer.WriteAsync(i, cts.Token);
+        Console.WriteLine($"Producido: {i}");
+        await Task.Delay(200, cts.Token);
+    }
+
+    // Indicamos que no habrá más mensajes
+    channel.Writer.Complete();
+});
+
+// Tarea consumidora
+var consumer = Task.Run(async () =>
+{
+    await foreach (var item in channel.Reader.ReadAllAsync(cts.Token))
+    {
+        Console.WriteLine($"Consumido: {item}");
+    }
+});
+
+await Task.WhenAll(producer, consumer);
+Console.WriteLine("Fin");</code></pre>
+
+        <p>Para ejecutarlo:</p>
+        <pre><code class="language-bash">dotnet new console -n ChannelDemo
+dotnet run --project ChannelDemo</code></pre>
+
+        <div class="callout tip">
+          <strong>Tip:</strong> <code>await foreach</code> con <code>ReadAllAsync</code> es la forma más limpia de consumir un canal. El bucle termina automáticamente cuando el writer llama a <code>Complete</code>.
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Vamos a integrar <code>Channel&lt;T&gt;</code> en una API que recibe solicitudes de envío de email y las procesa en segundo plano. Usaremos un canal limitado para aplicar <em>backpressure</em> y un <code>BackgroundService</code> como consumidor.</p>
+
+        <pre><code class="language-csharp">// EmailMessage.cs
+public sealed record EmailMessage(string To, string Subject, string Body);</code></pre>
+
+        <pre><code class="language-csharp">// IEmailChannel.cs
+public interface IEmailChannel
+{
+    ValueTask<bool> TryWriteAsync(EmailMessage message, CancellationToken ct);
+    ValueTask&lt;EmailMessage&gt; ReadAsync(CancellationToken ct);
+}</code></pre>
+
+        <pre><code class="language-csharp">// EmailChannel.cs
+public class EmailChannel : IEmailChannel
+{
+    private readonly Channel&lt;EmailMessage&gt; _channel =
+        Channel.CreateBounded&lt;EmailMessage&gt;(new BoundedChannelOptions(100)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+    public ValueTask<bool> TryWriteAsync(EmailMessage message, CancellationToken ct)
+        => _channel.Writer.TryWrite(message);
+
+    public ValueTask&lt;EmailMessage&gt; ReadAsync(CancellationToken ct)
+        => _channel.Reader.ReadAsync(ct);
+}</code></pre>
+
+        <pre><code class="language-csharp">// EmailConsumerService.cs
+public class EmailConsumerService(
+    ILogger&lt;EmailConsumerService&gt; logger,
+    IEmailChannel channel,
+    IEmailSender sender) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        logger.LogInformation("Consumidor de emails arrancado");
+
+        await foreach (var message in channel.ReadAsync(stoppingToken))
+        {
+            try
+            {
+                await sender.SendAsync(message, stoppingToken);
+                logger.LogInformation("Email enviado a {To}", message.To);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error enviando email a {To}", message.To);
+            }
+        }
+    }
+}
+
+// Extensión para permitir await foreach sobre IEmailChannel
+public static class EmailChannelExtensions
+{
+    public static IAsyncEnumerable&lt;EmailMessage&gt; ReadAllAsync(
+        this IEmailChannel channel, CancellationToken ct)
+    {
+        // Implementación simplificada para el ejemplo
+        return ReadAllCore(channel, ct);
+    }
+
+    private static async IAsyncEnumerable&lt;EmailMessage&gt; ReadAllCore(
+        IEmailChannel channel, [EnumeratorCancellation] CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            yield return await channel.ReadAsync(ct);
+        }
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton&lt;IEmailChannel, EmailChannel&gt;();
+builder.Services.AddHostedService&lt;EmailConsumerService&gt;();
+builder.Services.AddSingleton&lt;IEmailSender, FakeEmailSender&gt;();
+
+var app = builder.Build();
+
+app.MapPost("/send-email", async (EmailMessage message, IEmailChannel channel) =>
+{
+    var written = await channel.TryWriteAsync(message, default);
+    return written
+        ? Results.Accepted(value: new { status = "encolado" })
+        : Results.Problem("La cola de emails está saturada", statusCode: 503);
+});
+
+app.Run();</code></pre>
+
+        <div class="callout info">
+          <strong>Patrón productor/consumidor:</strong> el endpoint actúa como productor rápido; el <code>BackgroundService</code> actúa como consumidor lento. El canal desacopla ambos y protege al sistema contra picos de carga.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Prefiere canales limitados:</strong> evitan que la memoria crezca indefinidamente bajo carga.</li>
+          <li><strong>Define una política de cola llena:</strong> <code>Wait</code>, <code>DropNewest</code>, <code>DropOldest</code> o <code>DropWrite</code> según el caso.</li>
+          <li><strong>Completa el writer al cerrar:</strong> llama a <code>Writer.Complete()</code> para que los consumidores terminen su <code>await foreach</code>.</li>
+          <li><strong>Usa <code>CancellationToken</code> en lecturas y escrituras:</strong> permite un cierre limpio.</li>
+          <li><strong>No captures excepciones del canal:</strong> las operaciones canceladas lanzan <code>OperationCanceledException</code>; trátala como señal de cierre.</li>
+          <li><strong>Considera múltiples consumidores:</strong> configura <code>SingleReader = false</code> si varios servicios van a leer del mismo canal.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>Error 1: canal ilimitado bajo carga alta</h3>
+        <pre><code class="language-csharp">// ❌ MAL: puede agotar la memoria
+var channel = Channel.CreateUnbounded&lt;EmailMessage&gt;();</code></pre>
+        <p><strong>Solución:</strong> usa <code>CreateBounded</code> con una capacidad razonable y una política de cola llena.</p>
+
+        <h3>Error 2: no completar el writer</h3>
+        <pre><code class="language-csharp">// ❌ MAL: el consumidor quedará esperando para siempre
+await foreach (var item in channel.Reader.ReadAllAsync(ct)) { ... }</code></pre>
+        <p><strong>Solución:</strong> llama a <code>channel.Writer.Complete()</code> cuando el productor termine.</p>
+
+        <h3>Error 3: mezclar single reader/writer incorrectamente</h3>
+        <p>Si configuras <code>SingleReader = true</code> pero lees desde varios consumidores, el comportamiento puede ser incorrecto o ineficiente. Ajusta las opciones a tu arquitectura real.</p>
+
+        <h3>Error 4: usar Channel&lt;T&gt; como cola persistente</h3>
+        <p>Los mensajes se pierden al reiniciar. Para durabilidad usa Hangfire, Quartz persistente o un broker de mensajería.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Crea un canal limitado de capacidad 5 con política <code>DropOldest</code>. Un productor escribe 20 números rápidamente y un consumidor los procesa cada segundo. Comprueba cuántos mensajes se descartan.</p>
+        <ol>
+          <li>Crea un proyecto de consola.</li>
+          <li>Configura <code>Channel.CreateBounded&lt;int&gt;</code> con <code>FullMode = BoundedChannelFullMode.DropOldest</code>.</li>
+          <li>El productor escribe 20 números sin esperar.</li>
+          <li>El consumidor espera 1 segundo entre lecturas.</li>
+          <li>Cuenta cuántos mensajes llegan al consumidor.</li>
+        </ol>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un sistema con dos consumidores leyendo del mismo canal. Asegúrate de que cada mensaje solo se procese una vez. Para ello tendrás que ajustar <code>SingleReader</code> y gestionar la competencia entre consumidores.</p>
+        <p>No mires la solución todavía.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>Channel&lt;T&gt;</code> es una cola asíncrona en memoria ideal para el patrón productor/consumidor.</li>
+          <li>Puede ser ilimitada o limitada; las limitadas aplican <em>backpressure</em>.</li>
+          <li><code>ChannelWriter&lt;T&gt;</code> produce; <code>ChannelReader&lt;T&gt;</code> consume.</li>
+          <li>Integra el canal con <code>BackgroundService</code> para procesar mensajes en segundo plano.</li>
+          <li>No es una cola persistente; reiniciar el proceso pierde los mensajes pendientes.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Channel&lt;T&gt; reemplaza a Queue&lt;T&gt;?</summary>
+          <p>No exactamente. <code>Queue&lt;T&gt;</code> es síncrona y no está pensada para escenarios <code>async/await</code>. <code>Channel&lt;T&gt;</code> está optimizada para concurrencia asíncrona.</p>
+        </details>
+
+        <details>
+          <summary>¿Es thread-safe?</summary>
+          <p>Sí. Múltiples productores y consumidores pueden escribir y leer concurrentemente si las opciones del canal lo permiten.</p>
+        </details>
+
+        <details>
+          <summary>¿Puedo usar Channel&lt;T&gt; entre procesos?</summary>
+          <p>No. Es solo para comunicación dentro de un proceso. Para procesos distintos usa un broker como RabbitMQ, Azure Service Bus o Redis Streams.</p>
+        </details>
+
+        <details>
+          <summary>¿Qué diferencia hay entre TryWrite y WriteAsync?</summary>
+          <p><code>TryWrite</code> intenta escribir inmediatamente y devuelve <code>false</code> si no puede. <code>WriteAsync</code> espera hasta que haya espacio en canales limitados.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

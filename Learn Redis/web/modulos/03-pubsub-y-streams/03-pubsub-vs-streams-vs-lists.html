@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-pubsub-vs-streams-vs-lists">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cuándo usar pub/sub, streams o lists — Módulo 3 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Cuándo usar pub/sub, streams o lists</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Pub/Sub y Streams</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Redis te da <strong>tres herramientas de mensajería</strong> y saber cuál usar ahorra arquitecturas dolorosas: <em>pub/sub</em> (broadcast push, sin cola), <em>lists</em> (cola FIFO simple) y <em>streams</em> (log persistente con grupos y ack).</p>
+        <p>Esta lección es la «tabla que lo decide» y su aplicación a los flujos del hub.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La tabla de decisión</h3>
+        <table>
+          <thead><tr><th>Necesitas…</th><th>Usa</th><th>Mejor solución</th></tr></thead>
+          <tbody>
+            <tr><td>Un mensaje llega a TODOS los suscriptores, en vivo, sin persistir</td><td><strong>Pub/Sub</strong></td><td>backplane del hub (broadcast entre nodos)</td></tr>
+            <tr><td>Una cola FIFO simple, cero garantías extra</td><td><strong>List</strong></td><td>tareas ligeras por nodo</td></tr>
+            <tr><td>Cola con persistencia, grupos, ack, reset</td><td><strong>Stream</strong></td><td>trades para auditoría/reproceso</td></tr>
+            <tr><td>Necesito leer historia / reprocesar</td><td><strong>Stream</strong></td><td>pub/sub y lists lo pierden</td></tr>
+            <tr><td>Many-to-many con fan-out y confirmación</td><td><strong>Stream + grupos</strong></td><td>cada grupo su «cola»</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Comparación de garantías</h3>
+        <table>
+          <thead><tr><th>Característica</th><th>Pub/Sub</th><th>List</th><th>Stream</th></tr></thead>
+          <tbody>
+            <tr><td>Persistencia</td><td>No</td><td>En memoria (persiste si RDB/AOF)</td><td>Sí (log)</td></tr>
+            <tr><td>Entrega</td><td>Broadcast (todos)</td><td>FIFO (uno se lo lleva)</td><td>Grupos: uno por consumidor</td></tr>
+            <tr><td>Confirmación (ack)</td><td>No</td><td>No (BRPOPLPUSH como truco)</td><td>Sí (XACK)</td></tr>
+            <tr><td>Releer/historia</td><td>No</td><td>LRANGE parcial</td><td>XRANGE / XREAD desde ID</td></tr>
+            <tr><td>Compatibilidad</td><td>Ideal para broadcast</td><td>Colas cortas</td><td>Colas robustas</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Regla mental para el hub</h3>
+        <ul>
+          <li><strong>Broadcast entre nodos</strong> (mensajes a todos los clientes): pub/sub.</li>
+          <li><strong>Trabajo «uno lo procesa»</strong> (auditoría, notificaciones): list (simple) o stream (robusto).</li>
+          <li><strong>No uses pub/sub para «entregar una vez»:</strong> no hay ack ni cola.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>El caso que más se equivoca:</strong> usar pub/sub para «tareas» pensando que funciona como cola. Un único consumidor, sin ack, con mensajes que se pierden → el peor sitio de pub/sub. Si alimentas un worker, list o stream.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Misma petición, tres semánticas distintas:</p>
+        <pre><code class="language-redis"># 1) Broadcast (2 suscriptores lo reciben)
+SUBSCRIBE ch                                                # A
+PUBLISH ch hello        # A y B reciben; si no hay B, se pierde
+
+# 2) FIFO (uno se lo lleva)
+LPUSH q t1 t2
+RPOP q                  # t1; el siguiente RPOP lo lleva t2
+
+# 3) Stream con grupo (persistido + ack)
+XADD s * type job id 1
+XGROUP CREATE s workers 0 MKSTREAM
+XREADGROUP GROUP workers w STREAMS s >    # entrega a w
+XACK s workers 0-1                         # confirmado</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el hub, conviven los tres:</p>
+        <table>
+          <thead><tr><th>Flujo</th><th>Necesito</th><th>Estructura</th></tr></thead>
+          <tbody>
+            <tr><td>Broadcast de un mensaje por todos los nodos</td><td>Todos lo reciban, en vivo, sin historial</td><td>Pub/Sub <code>hub:events</code></td></tr>
+            <tr><td>Conectar/desconectar (rollout de presencia)</td><td>Señal push a todos</td><td>Pub/Sub <code>hub:presence</code></td></tr>
+            <tr><td>Enviar emails/notificaciones (tareas ligeras)</td><td>FIFO simple por nodo</td><td>List <code>queue:notify</code></td></tr>
+            <tr><td>Auditoría de trades + reproceso</td><td>Log persistido, grupos, ack</td><td>Stream <code>stream:trades</code></td></tr>
+          </tbody>
+        </table>
+        <p>Así, cada flujo usa la herramienta con las garantías que de verdad necesita.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Identificar broadcast vs. one-shot antes de elegir</td><td>Usar pub/sub para colas</td><td>Sin ack ni history, tendrías garantías fantasma</td></tr>
+            <tr><td>Poner retención (XTRIM) en streams</td><td>Streams eternos "para todo"</td><td>El log sin límite acaba con la RAM</td></tr>
+            <tr><td>Un canal/stream por dominio de evento</td><td>Un canal «cajón» para todo</td><td>Los suscriptores/consumidores se vuelven legibles</td></tr>
+            <tr><td>Documentar la decisión por flujo</td><td>Cambiar de plantilla según el humor</td><td>Quien herede el código sabrá por qué</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>«Quiero que el mensaje NO se pierda» usando pub/sub</h3>
+        <pre><code class="language-redis"># ❌ PUBLISH sin suscriptor = mensaje perdido
+PUBLISH job '{"id":1}'
+
+# ✅ XADD + XREADGROUP con ack
+XADD job * id 1
+XREADGROUP GROUP w c STREAMS job ></code></pre>
+
+        <h3>Mezclar la semántica en el mismo canal</h3>
+        <p>Publicar «tareas» y «broadcasts» en el mismo canal obliga a cada suscriptor a distinguir por tipo; mantén dominios separados.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Enumera los 5 flujos de mensajería de tu hub real (broadcast, notificaciones, auditoría, reproceso, presencia).</li>
+          <li><strong>Paso 2:</strong> Clasifica cada uno en pub/sub, list o stream y añade una garantía requerida.</li>
+          <li><strong>Paso 3:</strong> Resume en una tabla estilo «ejemplo real» y guárdala para M8.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Diseña sin razón</h3>
+          <p>Inventa un flujo nuevo de tu producto (p. ej. «replicar mensajes a un integrante externo») y decide: pub/sub, list o stream. Escribe 3 criterios que usaste (persistencia, ack, fan-out) y 1 condición bajo la cual cambiarías tu elección.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Pub/Sub: broadcast push, sin persistencia, sin ack.</li>
+          <li>List: FIFO simple, sin ack nativo, sin historial.</li>
+          <li>Stream: log persistido con grupos y ack (el robusto).</li>
+          <li>Regla: broadcast→pub/sub; one-shot simple→list; robusto/historia→stream.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar streams como broker de "muchos a muchos"?</summary>
+            <div><p>Sí: múltiples grupos (cada grupo = una audiencia) con su propio avance; el stream es el log compartido. Es más potente que una lista y más ordenado que pub/sub cuando hace falta re-jugar.</p></div>
+          </details>
+          <details>
+            <summary>¿Cuándo una lista es "suficiente"?</summary>
+            <div><p>Cuando el mensaje no necesita sobrevivir a un worker muerto (un cache de tareas de baja criticalidad, o el búfer de un worker de segundo plano).</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

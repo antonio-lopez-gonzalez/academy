@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-ciclo-de-vida-restart">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ciclo de vida y restart policies — Módulo 2 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Ciclo de vida y restart policies</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Contenedores en ejecución</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un contenedor no es un objeto estático que «está arriba o abajo»: es un <strong>proceso con un ciclo de vida</strong> — se crea, se pone en marcha, se pausa, muere y puede renacer. Entender esos estados (y las señales del sistema operativo que los provocan) es lo que separa a quien «sabe lanzar Docker» de quien puede <strong>operarlo de verdad</strong>, porque casi todos los problemas de producción son, en el fondo, problemas de ciclo de vida: «se paró», «no responde al apagado», «se reinicia en bucle».</p>
+        <p>En esta lección aprenderás los estados por los que pasa un contenedor, qué es el <strong>PID 1</strong> y por qué las señales (<code>SIGTERM</code>/<code>SIGKILL</code>) deciden si una parada es limpia o traumática, la diferencia entre ejecución interactiva (<code>-it</code>) y desacoplada (<code>-d</code>), las cuatro <strong>restart policies</strong> (<code>no</code>, <code>on-failure</code>, <code>unless-stopped</code>, <code>always</code>) y cómo controlar el apagado con <code>docker stop --time</code>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué importa tanto?</strong> Porque a Kubernetes (el módulo 5+) lo aprenderás como un «orquestador de ciclos de vida»: vigilando procesos muertos, reiniciándolos y gestionando señales a otra escala. Si no dominas el ciclo de vida en Docker local, toda la orquestación posterior será copiar comandos sin entenderlos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La máquina de estados de un contenedor</h3>
+        <p>Cada contenedor es un objeto persistente (con su ID, nombre y capa superior) que recorre estados. <code>docker create</code> y <code>docker run</code> producen <code>created</code>; el proceso en marcha produce <code>running</code>; puede congelarse en <code>paused</code> (todos sus hilos detenidos mediante <code>SIGSTOP</code>, conservando la memoria reservada); y cuando el proceso principal termina pasa a <code>exited</code>, que ya no consume CPU ni memoria pero conserva su filesystem y su configuración hasta que lo borres con <code>docker rm</code> (entonces <code>dead</code>, y desaparece).</p>
+        <pre class="diagram">                docker create  (o docker run sin arrancar aún)
+                         │
+                         ▼
+     ┌────────┐  docker start / docker run   ┌─────────┐
+     │ created│ ───────────────────────────► │ running │◄────┐
+     └────────┘                              └────┬────┘     │ docker unpause
+          ▲                                      │           │
+          │                      docker pause    │  docker   │
+          │                       (SIGSTOP)      │   start   │
+          │                                      ▼    /      │
+          │                                   ┌────────┐  restart
+          │        docker stop (SIGTERM─►SIGKILL)      │
+     docker rm │                       ┌─────│ exited │
+          │     (borra)                │     └────────┘
+          ▼        ┌───────────────────┐
+         dead ────►│ se elimina: fin   │
+        (removido) └───────────────────┘</pre>
+        <p>El estado <code>exited</code> es el protagonista del troubleshooting: con <code>docker inspect</code> puedes leer el <code>ExitCode</code> (0 = terminó con éxito, 137 = matado por señal SIGKILL, 143 = SIGTERM, etc.) y el momento, igual que haces <code>echo $?</code> con un comando de tu shell.</p>
+
+        <h3>PID 1 y las señales: la parada limpia vs la traumática</h3>
+        <p>Dentro de cada contenedor, el proceso principal es el <strong>PID 1</strong> de ese namespace. El daemon se comunica con él <strong>enviándole señales</strong>: <code>docker stop</code> envía <code>SIGTERM</code> (pedir cortésmente que acabe) y, si en un plazo (por defecto 10 s) no termina, envía <code>SIGKILL</code> (matar sin derecho a réplica). <code>docker kill</code> envía la señal que tú elijas de inmediato. El «porqué» del tiempo de gracia: es la oportunidad de tu app para <strong>cerrar conexiones, vaciar buffers y confirmar transacciones</strong> — exactamente lo que haría un servidor web bien educado al recibir SIGTERM.</p>
+        <pre class="diagram">   docker stop web
+   ─────────────► 1) SIGTERM  ──► PID 1 nginx: "apaga los listeners, guarda, sal"
+                     │
+                     │  ¿terminó en &lt;10 s&gt;?  ──sí──►  exited 0  (parada limpia)
+                     │
+                     └── no ──► 2) SIGKILL ──► el kernel lo mata sin aviso
+                                                                  (exit 137)
+
+   PID 1 además "adopta" huérfanos: si un proceso hijo muere y nadie lo recoge,
+   se convierte en zombie; un PID1 responsable (init, tini) los "reap". Por eso
+   algunas imágenes añaden --init/tini como PID 1 antes que la propia app.</pre>
+        <p>El <strong>overhead del proceso init</strong> que a veces verás mencionado: si tu aplicación lanza hijos (workers) que pueden morir, el PID 1 ideal no es tu app sino un mini-init (<code>tini</code>, integrado en Docker con <code>--init</code>) que (a) reenvía señales al proceso real y (b) hace <em>reaping</em> de zombies. Su coste es insignificante (unos pocos megabytes de RAM) y su beneficio, real en apps que hacen fork o no gestionan SIGTERM.</p>
+
+        <h3>-it vs -d: dos estilos de ejecución</h3>
+        <p><code>-i</code> mantiene el stdin abierto y <code>-t</code> asigna una pseudo-TTY; juntos dan <code>-it</code>, imprescindible para <em>usar</em> el contenedor (una shell, un REPL). Sin TTY, las apps que colorean su salida o leen de teclado se comportan distinto. <code>-d</code> (detached) ejecuta sin fijarse a tu terminal; útil porque el contenedor sigue vivo aunque cierres la ventana. No son rivales: son para momentos distintos. Y recuerda que «desacoplado» no significa «sin supervisión»: para eso existen las restart policies.</p>
+
+        <h3>Restart policies: quién devuelve la vida al contenedor</h3>
+        <p>En un servidor, cuando un proceso se cae, alguien debe levantarlo. Las restart policies lo delegan en el <strong>propio daemon de Docker</strong>. Importante: <em>restart policy</em> ≠ <em>reinicio manual</em> (<code>docker restart</code>); y la política solo actúa sobre <strong>caídas</strong> — si tú lanzas <code>docker stop</code>, Docker respeta tu decisión, salvo el matiz de <code>always</code> al reiniciar el daemon.</p>
+        <table>
+          <thead><tr><th>Política</th><th>¿Reinicia tras caída?</th><th>¿Tras reiniciar el daemon?</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td><code>--restart no</code> (por defecto)</td><td>No</td><td>No</td><td>Procesos de un solo uso, pruebas, jobs puntuales</td></tr>
+            <tr><td><code>--restart on-failure[:n]</code></td><td>Sí, solo si el código de salida ≠ 0 (hasta n veces)</td><td>No</td><td>Jobs y workers que deben reintentar fallos puntuales</td></tr>
+            <tr><td><code>--restart unless-stopped</code></td><td>Sí</td><td>Sí, pero <strong>solo</strong> si no lo paraste tú a mano</td><td>Servicios de aplicación en producción (API, web)</td></tr>
+            <tr><td><code>--restart always</code></td><td>Sí</td><td>Sí, tuviera el estado que tuviera</td><td>Infraestructura crítica: agentes, registrars, reverse proxies</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Matiz fino:</strong> con <code>always</code> también se reinicia un contenedor <em>stop manual</em>… al reiniciar el daemon (Docker lo levanta por diseño). Con <code>unless-stopped</code>, en cambio, si tú lo paraste a mano, el daemon lo deja parado. Por eso en producción el patrón recomendado para servicios es <code>unless-stopped</code>: te permite «apagar la máquina» manualmente sin que vuelva sola.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ciclo de vida en acción con un contenedor «de un solo uso», y la política de reinicio demostrada en un comando:</p>
+        <pre><code class="language-bash"># 1) El contenedor efímero: la app imprime y termina → el contenedor EXITED.
+docker run --name saluda alpine echo '¡hola!'
+# → "¡hola!" y, al instante, docker devuelve el prompt.
+# El contenedor NO ha desaparecido: sigue existiendo, en estado exited.
+
+# 2) Míralo en docker ps -a: sigue ahí, con STATUS "Exited (0)".
+docker ps -a --filter name=saluda
+
+# 3) Estado y código de salida con docker inspect (tu diagnóstico):
+docker inspect saluda --format '{{.State.Status}} · {{.State.ExitCode}}'
+# → exited · 0        (0 = terminó con éxito por diseño)
+
+# 4) Lo puedes volver a arrancar: mismo nombre, misma capa superior.
+docker start saluda            # vuelve a ejecutar el mismo `echo`
+
+# 5) Procesos interactivos que "pisan" la terminal: -it te da una shell.
+docker run -it --rm node:24-alpine sh        # dentro: node --version, luego exit
+
+# 6) Politica de reinicio en marcha: la app "muere" y Docker la revive.
+docker run -d --name worker --restart unless-stopped \
+  node:24-alpine node -e 'setTimeout(()=>process.exit(3), 3000)'
+# ↑ a los 3 s el proceso sale con código 3 (error)…
+docker ps --filter name=worker   # …y sigue "Up": Docker lo ha reiniciado sola.
+docker inspect worker --format '{{.RestartCount}} reinicios'
+</code></pre>
+        <p>Fíjate en el paso 6: <code>exit(3)</code> no es un fallo de Docker ni un config: es <strong>la aplicación pidiendo morir</strong>, y aun así la política la levanta. Traza exactamente el contrato de una restart policy: no decide <em>si</em> el proceso debe morir, decide <em>qué pasa después</em>.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API de HarborTasks en «producción local»: política correcta, apagado con tiempo controlado y una app que responde a <code>SIGTERM</code> de forma elegante para no perder ninguna petición en curso.</p>
+        <pre><code class="language-dockerfile"># --- Dockerfile de la API con un manejador de señales ---
+FROM node:24-alpine
+ENV PORT=3000
+WORKDIR /app
+COPY . .
+EXPOSE 3000
+# El proceso principal escucha señales y CERRARÁ CON GRACIA al recibir SIGTERM:
+# cierra el servidor HTTP y confirma antes de morir (ver server.js).
+CMD ["node", "server.js"]</code></pre>
+        <pre><code class="language-js">// server.js — fragmento: apagado elegante al recibir SIGTERM
+const server = require('http').createServer((req, res) => res.end('ok'));
+server.listen(process.env.PORT || 3000, () => console.log('API escuchando'));
+
+function shutdown(reason) {
+  console.log(`Recibido ${reason}: cerrando conexiones…`);
+  server.close(() => { console.log('Cerrado limpio ✓'); process.exit(0); });
+  setTimeout(() => process.exit(1), 4000); // garantía: nunca más de 4 s
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+</code></pre>
+        <pre><code class="language-bash"># Lanza en producción local: política unless-stopped (recomendada p/ servicios).
+docker build -t harbor-api:0.1.0 .
+docker run -d --name api --restart unless-stopped \
+  -p 8080:3000 -e PORT=3000 harbor-api:0.1.0
+
+# Apagado CONTROLADO: espera como máximo 10 s (por defecto) a que la app
+# termine su SIGTERM. Con el manejador anterior, el stop es casi instantáneo.
+time docker stop api            # → tarda milisegundos: la app cierra sola
+# (sin manejador, Docker esperaría los 10 s y luego SIGKILL traumático)
+
+# ¿Y si quieres darle tu propio plazo? La app es lenta cerrando:
+docker start api
+docker stop --time=20 api       # dale 20 s de margen antes del SIGKILL
+
+# Fuerza inmediata de una señal concreta (sin espera):
+docker start api
+docker kill --signal=SIGINT api # equivalente a Ctrl+C dentro
+
+# Estado detallado para el informe de incidentes:
+docker inspect api --format '{{.State.Status}} · exit={{.State.ExitCode}} · restarts={{.RestartCount}}'
+
+# "Restart en bucle": App que muere a los 2 s con código 1 y política on-failure:3.
+docker run -d --name crash --restart on-failure:3 \
+  node:24-alpine node -e 'setTimeout(()=>process.exit(1), 2000)'
+sleep 12 &amp;&amp; docker inspect crash --format '{{.RestartCount}} reinicios, última salida {{.State.ExitCode}}'
+# → tras 3 intentos, Docker deja de intentarlo. El problema es del código, no del motor.
+docker rm -f crash
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Para ojo de sysadmin:</strong> puedes <em>observar</em> los reinicios en vivo con <code>docker events --filter event=restart</code> o <code>docker events --filter container=api</code>. Es el primer paso mental hacia <code>kubectl get events</code> de Kubernetes.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>--restart unless-stopped</code> para servicios (API, web) en producción</td>
+              <td>Contenedores críticos sin política (default <code>no</code>)</td>
+              <td>Sin política, una caída a las 3 a.m. te baja el servicio para siempre; <code>unless-stopped</code> te permite pararlo a mano sin que vuelva solo</td>
+            </tr>
+            <tr>
+              <td><code>on-failure[:n]</code> para jobs y procesos que reintentan fallos puntuales</td>
+              <td><code>always</code> para jobs que deben ejecutarse UNA vez</td>
+              <td>Reiniciar un job en bucle infinito puede disparar efectos secundarios (pago duplicado, email repetido) cada relanzamiento</td>
+            </tr>
+            <tr>
+              <td>Hacer que la app gestione <code>SIGTERM</code> (cerrar conexiones, guardar)</td>
+              <td>Ignorar señales y dejar que Docker use siempre el SIGKILL</td>
+              <td>El apagado limpio es el que no pierde datos ni estado; el default de 10 s existe para que eso sea posible</td>
+            </tr>
+            <tr>
+              <td>Ajustar el plazo con <code>docker stop --time=N</code> cuando la app tarda más que el default</td>
+              <td>Subir el timeout global por defecto en todos los contenedores</td>
+              <td>Un contenedor que tarda lo justo merece su propio plazo; cambiar el global esconderá apps que no saben morir</td>
+            </tr>
+            <tr>
+              <td>Usar <code>docker run --init</code> en imágenes cuyas apps lanzan procesos hijos</td>
+              <td>Dejar zombie a toda una generación de workers huérfanos</td>
+              <td>El mini-init (tini) hace de PID 1: reenvía señales y <em>reap</em> huérfanos; su coste en RAM es despreciable frente al problema que evita</td>
+            </tr>
+            <tr>
+              <td>Diagnosticar con <code>docker inspect</code> (<code>Status</code>, <code>ExitCode</code>, <code>RestartCount</code>)</td>
+              <td>Adivinar el problema mirando <code>docker ps</code> a secas</td>
+              <td>El estado en una línea esconde el dato que importa: qué código de salida, cuántos reinicios, cuándo empezó o si está en un ciclo de reinicio.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar --restart always para una tarea que debe correr una sola vez</h3>
+        <pre><code class="language-bash"># ❌ Job de migración con always: si el job termina bien (exit 0),
+#    al reiniciar el daemon se volvería a ejecutar. El trabajo se duplica.
+docker run -d --restart always --name migracion imagen-migracion
+
+# ✅ Para trabajos puntuales, sin política o con on-failure limitado
+docker run --rm imagen-migracion                                # una vez y se limpia
+docker run -d --restart on-failure:5 --name migracion imagen-migracion
+#   reintentar solo fallos puntuales, salir cuando el puente de nuevo funciona</code></pre>
+
+        <h3>Confundir el docker stop de 10 s con «el contenedor se quedó colgado»</h3>
+        <pre><code class="language-bash"># ❌ `docker stop web` tarda y "no hace nada" durante 10 s: no es un fallo
+#    de Docker, es la app IGNORANDO el SIGTERM. Docker espera su turno.
+docker stop web            # 10 s muertos → SIGKILL → exit 137
+
+# ✅ Si la app no responde a señales, doy instrucciones certeras:
+docker stop --time=2 web   # 2 s de margen y SIGKILL
+# o, para depurar por qué no cierra: docker kill --signal=SIGQUIT web
+# (SIGQUIT suele volcar el stack trace del proceso — el mejor debugging)</code></pre>
+
+        <h3>Mandar SIGKILL directamente «porque es más rápido»</h3>
+        <pre><code class="language-bash"># ❌ kill con SIGKILL de entrada: la app muere sin cerrar conexiones.
+#    Postgres sin fsync, nginx con sockets a medio escribir… datos perdidos.
+docker kill web
+
+# ✅ stop es la vía educada; kill solo cuando hay urgencia real
+docker stop web                     # SIGTERM + tiempo de gracia
+docker kill --signal=SIGTERM web    # "stop" exprés equivalente sin espera</code></pre>
+
+        <h3>Elegir restart policies sin pensar en el reinicio del DAEMON</h3>
+        <pre><code class="language-bash"># ❌ always + daemon reinicia: TODOS los contenedores vuelven, aun los que
+#    paraste a mano "para frenar el incidente".
+docker run -d --restart always
+
+# ✅ unless-stopped respeta tu decisión manual: no vuelve si tú lo paraste
+docker run -d --restart unless-stopped</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> demostrar las tres verdades del ciclo de vida — (1) la política <code>on-failure</code> reinicia solo fallos y se agota, (2) <code>always</code> jamás se rinde, (3) <code>stop --time</code> controla el apagado — con salidas verificables en cada paso.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Lanza un contenedor que «muere» siempre.</strong>
+            <pre><code class="language-bash">docker run -d --name probe --restart on-failure:3 \
+  node:24-alpine node -e 'setTimeout(()=>process.exit(1), 1500)'</code></pre>
+            <p>La app sale con código 1 (fallo) a los 1.5 s. Recuerda: <code>on-failure:3</code> reintentará hasta 3 veces.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Observa el bucle y el agotamiento.</strong>
+            <pre><code class="language-bash">sleep 20
+docker inspect probe --format '{{.RestartCount}} reinicios · estado {{.State.Status}}'
+# ESPERADO: "3 reinicios · estado exited" (la política se ha rendido).
+# El ExitCode de la última salida sigue siendo 1: la app es la culpable.
+docker inspect probe --format '{{.State.ExitCode}}'</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Demuestra que always jamás se rinde.</strong>
+            <pre><code class="language-bash">docker run -d --name probe-always --restart always \
+  node:24-alpine node -e 'setTimeout(()=>process.exit(1), 1200)'
+sleep 8
+docker inspect probe-always --format '{{.RestartCount}} reinicios · estado {{.State.Status}}'
+# ESPERADO: 3+ reinicios y estado "running" (o en "restarting" el instante justo).
+# La diferencia con el paso 2 es solo el flag: política = comportamiento.</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Parada con tiempo controlado.</strong>
+            <pre><code class="language-bash"># App que NO gestiona SIGTERM: la parada forzada tarda el plazo que le des.
+docker stop --time=2 probe-always
+# ESPERADO: tarda ~2 s (espera el plazo) y luego SIGKILL.
+time docker stop --time=2 probe-always     # observa el segundo</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — El apagado elegante, en primera persona.</strong>
+            <pre><code class="language-bash"># Node escucha SIGTERM y cierra sus conexiones antes de salir:
+docker run -d --name gentle --restart unless-stopped node:24-alpine \
+  node -e 'process.on("SIGTERM",()=>{console.log("cerrando conexiones ✓");process.exit(0)});setInterval(()=>{},1000)'
+time docker stop gentle     # ESPERADO: ms, sin espera forzada. El "cerrando" llega a docker logs.
+docker logs --tail 2 gentle # → cerrando conexiones ✓
+docker rm -f probe probe-always gentle</code></pre>
+            <p><strong>Verificación final:</strong> diste tres respuestas distintas al mismo problema (una app que muere) cambiando solo la política o el plazo: eso es el ciclo de vida entendido, no memorizado.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Construye tu propio PID 1</h3>
+          <p>Crea una imagen propia donde el PID 1 <strong>no sea tu app</strong>, sino un mini-script (bash o Node) de ~10 líneas que debe: (1) recibir <code>SIGTERM</code> y reenviarlo a su hijo (la app), (2) esperar a que el hijo muera y entonces morir con su mismo código de salida, y (3) recoger los posibles <em>huérfanos</em> (<code>wait</code> en bucle). Pon como <code>ENTRYPOINT</code> ese script y lanzalo con <code>--restart on-failure:2</code> para comprobar: cuando la app falle, el exit code que ve Docker debe ser el <strong>de la app</strong>, no el del script. Pregunta para responder en un comentario: ¿por qué este patrón importa para contenedores con procesos hijos?</p>
+          <p><em>Pista: en bash, <code>trap 'kill $PID_HIJO' TERM</code> + un bucle <code>while true; do wait; done</code> (o <code>wait $PID_HIJO; exit $?)</code> es el esqueleto. Muchos proyectos usan <code>tini</code> (sin parámetros extra al build) precisamente para no reinventar esto — prueba <code>docker run --init</code> y compara la diferencia de comportamiento frente a SIGTERM.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un contenedor recorre estados: <code>created → running → paused / exited → dead</code>. <code>exited</code> conserva el filesystem y la configuración hasta el <code>docker rm</code>.</li>
+          <li>El <strong>PID 1</strong> del namespace recibe las señales del daemon: <code>SIGTERM</code> (cortesía) y, tras el plazo, <code>SIGKILL</code>. Un PID 1 responsable <em>reap</em>a huérfanos y reenvía señales.</li>
+          <li><code>-it</code> es ejecución interactiva con TTY; <code>-d</code> es desacoplada. No son rivales: momentos distintos.</li>
+          <li>Restart policies: <code>no</code> (default), <code>on-failure[:n]</code>, <code>unless-stopped</code> (recomendada p/ servicios), <code>always</code> (infraestructura). Actúan sobre caídas, no sobre tus <code>stop</code> manuales (con el matiz de <code>always</code> al reiniciar el daemon).</li>
+          <li><code>docker stop --time=N</code> controla el margen antes del SIGKILL; <code>docker kill --signal</code> fuerza una señal concreta.</li>
+          <li><code>docker inspect</code> expone <code>Status</code>, <code>ExitCode</code>, <code>RestartCount</code> y <code>StartedAt</code>: tu panel de diagnóstico.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando / flag</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker create / start / restart</code></td><td>Prepara / arranca / reinicia un contenedor existente</td></tr>
+            <tr><td><code>docker pause / unpause</code></td><td>Congela / descongela el proceso (SIGSTOP del cgroup)</td></tr>
+            <tr><td><code>docker stop &lt;c&gt;</code></td><td>SIGTERM al PID 1 y espera hasta 10 s antes del SIGKILL</td></tr>
+            <tr><td><code>docker stop --time=N</code></td><td>Ajusta el margen de gracia antes del SIGKILL</td></tr>
+            <tr><td><code>docker kill --signal=SIG nome</code></td><td>Envía una señal concreta sin esperar</td></tr>
+            <tr><td><code>--restart no|on-failure[:n]|unless-stopped|always</code></td><td>Política de reinicio automático del daemon</td></tr>
+            <tr><td><code>--init</code></td><td>Inyecta <code>tini</code> como PID 1 (señales + reaping de zombies)</td></tr>
+            <tr><td><code>docker inspect -f '{{.State.Status}}' &lt;c&gt;</code></td><td>Lee estado, ExitCode, RestartCount, StartedAt</td></tr>
+            <tr><td><code>docker events</code></td><td>Observa en vivo paradas, reinicios y demás eventos de la API</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuál es la diferencia entre docker stop y docker kill?</summary>
+            <div>
+              <p><code>docker stop</code> sigue un protocolo: envía <code>SIGTERM</code> (invitación a cerrarse con elegancia) y, si en el plazo configurado (default 10 s) el proceso no ha terminado, envía <code>SIGKILL</code> (muerte inmediata). <code>docker kill</code> envía <strong>ya</strong> la señal que elijas, sin margen: por defecto <code>SIGKILL</code>, pero puede ser cualquier otra (<code>--signal=SIGINT</code>…). Esta lección les dedica un seguido: stop es la parada civilizada; kill es para urgencias o para pruebas de señal.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué docker stop tarda exactamente unos 10 segundos algunas veces y otras no?</summary>
+            <div>
+              <p>Porque el plazo es un <strong>tiempo de espera máximo</strong>, no un tiempo fijo. Docker manda SIGTERM y espera: si tu app responde bien (por ejemplo gestiona la señal y cierra en 200 ms), el stop es instantáneo. Si la app lo ignora, Docker aguanta el plazo por defecto (10 s, ajustable con <code>--time</code>) y entonces aplica SIGKILL. Un stop «lento» es tu primera señal de que la aplicación no gestiona el cierre ordenado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es eso del PID 1 y por qué a veces se recomienda --init?</summary>
+            <div>
+              <p>Dentro del namespace del contenedor, el primer proceso (el CMD/ENTRYPOINT de la imagen) recibe el PID 1. El daemon le inyecta las señales a él, así que si tu app gestiona SIGTERM, todo funciona bien. El problema aparece con apps que <strong>lanzan procesos hijos</strong>: cuando un hijo muere, el PID 1 debe «recogerlo» (reaping) para que no quede zombie acumulándose. <code>docker run --init</code> coloca un mini-init (<code>tini</code>) como PID 1 que reenvía señales a la app real y barre huérfanos. Es también el motivo por el que imágenes oficiales (Postgres, Redis) traen su propio init o entrypoint.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi contenedor con --restart always vuelve a arrancar cuando reinicio Docker, aunque yo lo había parado?</summary>
+            <div>
+              <p>Porque <code>always</code> indica «vuelve a estar arriba <strong>pase lo que pase</strong>», incluso si tú lo detuviste manualmente. Al reiniciar el daemon, Docker aplica la política y lo levanta. Si quieres poder apagar manualmente un servicio «para frenar un incidente» y que el reinicio del daemon respete tu decisión, usa <code>unless-stopped</code>: la única diferencia entre ambas es exactamente ese comportamiento. Es la razón de que <code>unless-stopped</code> sea el patrón recomendado en producción para servicios.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Una restart policy sustituye a un orquestador tipo Kubernetes?</summary>
+            <div>
+              <p>No. La restart policy es local a la máquina donde corre el daemon: se limita a reiniciar <em>ese</em> contenedor en <em>esa</em> máquina. No te da alta disponibilidad (si el host muere, el contenedor muere), ni equilibrio de carga entre réplicas, ni re-despliegues. Kubernetes lleva la idea a otra escala: si el Pod falla, el kubelet (o el controlador) lo reinicia y, si además lo gestiona un Deployment, <strong>crea de cero</strong> una réplica nueva, quizá en otro nodo. Verás todo eso a partir del módulo 5; esta lección es la semilla local de esa idea.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

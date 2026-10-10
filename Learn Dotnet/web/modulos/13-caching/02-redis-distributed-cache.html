@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es" data-module="13" data-lesson="02-redis-distributed-cache">
+<head>
+  <meta charset="UTF-8">
+  <title>Caching distribuido con Redis — Módulo 13 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caching distribuido con Redis</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 13 · Caching y rendimiento</span><span>35 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En la lección anterior vimos <code>IMemoryCache</code>, un caché rápido pero limitado a un solo proceso. Cuando desplegamos una API en varias instancias, cada máquina tendría su propia caché y los usuarios podrían ver respuestas inconsistentes según a qué instancia lleguen.</p>
+        <p>En esta lección aprenderemos a usar <code>IDistributedCache</code>, la abstracción de caché distribuido de .NET, con Redis como backend. Veremos cómo instalar Redis, serializar objetos, invalidar entradas y comparar ventajas e inconvenientes respecto al caché en memoria.</p>
+
+        <div class="callout info">
+          <strong>¿Por qué Redis?</strong> Es un almacén de estructuras de datos en memoria extremadamente rápido, soportado por ASP.NET Core a través del paquete <code>Microsoft.Extensions.Caching.StackExchangeRedis</code>. Además de caché, lo usaremos para SignalR backplane y rate limiting en otros módulos.
+        </div>
+
+        <p>Al terminar sabrás configurar Redis en Docker, registrar <code>IDistributedCache</code>, crear métodos de extensión para leer y escribir objetos JSON, y decidir cuándo usar caché en memoria vs caché distribuido.</p>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 IDistributedCache</h3>
+        <p><code>IDistributedCache</code> es la interfaz común de .NET para cualquier caché distribuido. Los métodos principales son:</p>
+        <ul>
+          <li><code>GetStringAsync(string key)</code> / <code>SetStringAsync(string key, string value)</code>: para textos planos.</li>
+          <li><code>GetAsync(string key)</code> / <code>SetAsync(string key, byte[] value)</code>: para datos binarios.</li>
+          <li><code>RefreshAsync(string key)</code>: renueva la expiración deslizante si existe.</li>
+          <li><code>RemoveAsync(string key)</code>: elimina una entrada.</li>
+        </ul>
+        <p>La interfaz es intencionalmente simple: almacena bytes o strings, nunca objetos .NET directos. Por eso debemos serializar.</p>
+
+        <h3>2.2 Redis como backend</h3>
+        <p>Redis guarda todo en memoria y ofrece estructuras como strings, hashes, listas, sets y sorted sets. Para <code>IDistributedCache</code>, ASP.NET Core almacena cada clave como un string Redis con metadatos de expiración. Redis puede ejecutarse en contenedor, en la nube (Azure Cache for Redis, AWS ElastiCache) o localmente.</p>
+
+        <div class="callout warning">
+          <strong>Latencia de red:</strong> aunque Redis es muy rápido, añade una ida y vuelta de red. Datos muy pequeños y de alta frecuencia pueden beneficiarse de <code>IMemoryCache</code> local con Redis como invalidador, o de una combinación de ambos.
+        </div>
+
+        <h3>2.3 Serialización</h3>
+        <p><code>IDistributedCache</code> no conoce de JSON, protobuf ni XML. Es responsabilidad nuestra convertir el objeto a <code>byte[]</code> o <code>string</code>. Usaremos <code>System.Text.Json</code> por ser nativo, rápido y seguro.</p>
+        <p>Considera estas opciones de serialización:</p>
+        <ul>
+          <li><strong>System.Text.Json:</strong> nativo, rápido, buen soporte para UTF-8. Recomendado por defecto.</li>
+          <li><strong>MessagePack:</strong> más compacto y rápido, pero requiere un paquete adicional.</li>
+          <li><strong>Protobuf:</strong> útil si ya tienes contratos .proto.</li>
+        </ul>
+
+        <h3>2.4 Estrategias de expiración</h3>
+        <p>Con <code>IDistributedCache</code> no hay prioridades de memoria, pero sí expiración absoluta y deslizante. Al crear <code>DistributedCacheEntryOptions</code> indicamos:</p>
+        <ul>
+          <li><code>AbsoluteExpiration</code>: fecha/hora exacta de caducidad.</li>
+          <li><code>AbsoluteExpirationRelativeToNow</code>: tiempo relativo desde el almacenamiento.</li>
+          <li><code>SlidingExpiration</code>: tiempo que se renueva al consultar.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Primero levantamos Redis con Docker:</p>
+        <pre><code class="language-bash">docker run -d --name redis-cache -p 6379:6379 redis:7-alpine</code></pre>
+
+        <p>Creamos una aplicación de consola:</p>
+        <pre><code class="language-bash">dotnet new console -n RedisCacheDemo -o ejemplos/m13-caching/RedisCacheDemo/src/RedisCacheDemo
+dotnet add ejemplos/m13-caching/RedisCacheDemo/src/RedisCacheDemo package Microsoft.Extensions.Caching.StackExchangeRedis
+dotnet add ejemplos/m13-caching/RedisCacheDemo/src/RedisCacheDemo package Microsoft.Extensions.DependencyInjection</code></pre>
+
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.DependencyInjection;
+using System.Text.Json;
+
+namespace RedisCacheDemo;
+
+class Program
+{
+    static async Task Main()
+    {
+        var services = new ServiceCollection();
+        services.AddStackExchangeRedisCache(options =&gt;
+        {
+            options.Configuration = "localhost:6379";
+            options.InstanceName = "Demo_"; // prefijo para todas las claves
+        });
+
+        var provider = services.BuildServiceProvider();
+        var cache = provider.GetRequiredService&lt;IDistributedCache&gt;();
+
+        const string key = "weather: Madrid";
+
+        // Guardamos un objeto serializado.
+        var weather = new WeatherDto("Madrid", 28.5m, DateTime.UtcNow);
+        var options = new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),
+            SlidingExpiration = TimeSpan.FromSeconds(30)
+        };
+
+        await cache.SetStringAsync(
+            key,
+            JsonSerializer.Serialize(weather),
+            options);
+
+        Console.WriteLine("Guardado en Redis.");
+
+        // Recuperamos.
+        var json = await cache.GetStringAsync(key);
+        var cached = json is null
+            ? null
+            : JsonSerializer.Deserialize&lt;WeatherDto&gt;(json);
+
+        Console.WriteLine(cached);
+
+        // Eliminamos.
+        await cache.RemoveAsync(key);
+        Console.WriteLine("Eliminado de Redis.");
+    }
+}
+
+public sealed record WeatherDto(string City, decimal Temperature, DateTime Timestamp);</code></pre>
+
+        <p>Ejecuta con:</p>
+        <pre><code class="language-bash">dotnet run --project ejemplos/m13-caching/RedisCacheDemo/src/RedisCacheDemo</code></pre>
+
+        <div class="callout tip">
+          <strong>Tip:</strong> el <code>InstanceName</code> añade un prefijo a las claves en Redis. Es útil para compartir un mismo servidor Redis entre varias aplicaciones sin colisiones.
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Vamos a añadir métodos de extensión para guardar y recuperar objetos tipados de forma limpia, y un servicio de posts que use el caché distribuido.</p>
+
+        <h3>4.1 Extensiones de IDistributedCache</h3>
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Distributed;
+using System.Text.Json;
+
+namespace Cms.Infrastructure.Caching;
+
+public static class DistributedCacheExtensions
+{
+    public static async Task&lt;T?&gt; GetAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        CancellationToken ct = default)
+    {
+        var data = await cache.GetAsync(key, ct);
+        if (data is null) return default;
+
+        return JsonSerializer.Deserialize&lt;T&gt;(data);
+    }
+
+    public static async Task SetAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        T value,
+        DistributedCacheEntryOptions? options = null,
+        CancellationToken ct = default)
+    {
+        var data = JsonSerializer.SerializeToUtf8Bytes(value);
+        await cache.SetAsync(key, data, options ?? new DistributedCacheEntryOptions(), ct);
+    }
+}
+</code></pre>
+
+        <h3>4.2 Servicio de posts con caché distribuido</h3>
+        <pre><code class="language-csharp">using Cms.Infrastructure.Caching;
+using Microsoft.Extensions.Caching.Distributed;
+
+namespace Cms.Application.Posts;
+
+public sealed class CachedPostService
+{
+    private readonly IPostRepository _repository;
+    private readonly IDistributedCache _cache;
+    private readonly ILogger&lt;CachedPostService&gt; _logger;
+
+    public CachedPostService(
+        IPostRepository repository,
+        IDistributedCache cache,
+        ILogger&lt;CachedPostService&gt; logger)
+    {
+        _repository = repository;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public async Task&lt;PostDto?&gt; GetByIdAsync(Guid id, CancellationToken ct)
+    {
+        var key = $"post:{id}";
+        var cached = await _cache.GetAsync&lt;PostDto&gt;(key, ct);
+        if (cached is not null)
+        {
+            _logger.LogInformation("Cache hit para {PostId}", id);
+            return cached;
+        }
+
+        _logger.LogInformation("Cache miss para {PostId}; consultando BD", id);
+        var post = await _repository.GetByIdAsync(id, ct);
+        if (post is null) return null;
+
+        var dto = MapToDto(post);
+        await _cache.SetAsync(
+            key,
+            dto,
+            new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10)
+            },
+            ct);
+
+        return dto;
+    }
+
+    public async Task InvalidateAsync(Guid id)
+    {
+        await _cache.RemoveAsync($"post:{id}");
+    }
+
+    private static PostDto MapToDto(Post post) =&gt;
+        new(post.Id, post.Title, post.Slug, post.Status, post.PublishedAt);
+}
+
+public sealed record PostDto(
+    Guid Id,
+    string Title,
+    string Slug,
+    string Status,
+    DateTime? PublishedAt);
+
+public interface IPostRepository
+{
+    Task&lt;Post?&gt; GetByIdAsync(Guid id, CancellationToken ct);
+}
+
+public sealed class Post(Guid id, string title, string slug, string status, DateTime? publishedAt)
+{
+    public Guid Id { get; } = id;
+    public string Title { get; } = title;
+    public string Slug { get; } = slug;
+    public string Status { get; } = status;
+    public DateTime? PublishedAt { get; } = publishedAt;
+}</code></pre>
+
+        <h3>4.3 Registro en Program.cs</h3>
+        <pre><code class="language-csharp">builder.Services.AddStackExchangeRedisCache(options =&gt;
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis");
+    options.InstanceName = "Cms_";
+});
+
+builder.Services.AddScoped&lt;CachedPostService&gt;();</code></pre>
+
+        <div class="callout warning">
+          <strong>Serialización:</strong> <code>System.Text.Json</code> no serializa campos privados ni propiedades sin setter por defecto. Si tu entidad de dominio no es serializable, crea un DTO plano para el caché, como hicimos con <code>PostDto</code>.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Usa prefijos de instancia:</strong> <code>InstanceName</code> evita colisiones entre aplicaciones en un mismo servidor Redis.</li>
+          <li><strong>Claves con prefijo de dominio:</strong> <code>post:{id}</code>, <code>categories:all</code>. Nunca confíes en GUIDs sueltos sin contexto.</li>
+          <li><strong>Serializa DTOs, no entidades de dominio:</strong> las entidades pueden tener navegación, propiedades privadas o comportamiento que no se serializa bien.</li>
+          <li><strong>Define TTL siempre:</strong> una entrada sin expiración puede vivir para siempre y consumir memoria. Usa absoluta como mínimo.</li>
+          <li><strong>Invalida al mutar:</strong> igual que en memoria. Tras crear, actualizar o eliminar, borra las claves afectadas.</li>
+          <li><strong>Combina local + distribuido para lecturas intensivas:</strong> <code>IMemoryCache</code> local + <code>IDistributedCache</code> como fuente de verdad. Primero consulta local, luego distribuido, luego BD.</li>
+          <li><strong>Monitoriza Redis:</strong> usa <code>INFO</code>, <code>MONITOR</code> o dashboards de cloud para detectar claves sin TTL, memoria alta o latencia.</li>
+          <li><strong>Considera compresión para payloads grandes:</strong> JSON de grandes listas puede ocupar mucho. Comprimir con Brotli o GZip antes de guardar puede compensar.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1 No serializar correctamente</h3>
+        <pre><code class="language-csharp">// ❌ Mal: intentar guardar un objeto de dominio complejo
+await _cache.SetAsync(key, post); // no compila: SetAsync pide byte[] o string
+
+// ✅ Bien: guardar un DTO serializado
+await _cache.SetAsync(key, new PostDto(post.Id, post.Title, ...));</code></pre>
+
+        <h3>6.2 Claves sin prefijo</h3>
+        <pre><code class="language-csharp">// ❌ Mal: colisiones fáciles y difíciles de depurar
+var key = id.ToString();
+
+// ✅ Bien: prefijo de dominio + identificador
+var key = $"post:{id}";
+</code></pre>
+
+        <h3>6.3 Depender de Redis sin connection retry</h3>
+        <pre><code class="language-bash"># ❌ Mal: Redis caído tumba la aplicación
+# options.Configuration = "localhost:6379"
+
+# ✅ Bien: configura abortOnConnectFail=false para permitir reintentos
+# La app seguirá funcionando con cache miss caído a base de datos
+</code></pre>
+        <pre><code class="language-csharp">builder.Services.AddStackExchangeRedisCache(options =&gt;
+{
+    options.Configuration = "localhost:6379,abortConnect=false";
+});</code></pre>
+
+        <h3>6.4 Usar Redis para todo</h3>
+        <pre><code class="language-csharp">// ❌ Mal: caché distribuido para datos de sesión de usuario con alta frecuencia
+// y TTL muy corto. Cada petición viaja a Redis.
+
+// ✅ Bien: datos de sesión en memoria o en cookie, y caché distribuido
+// para catálogos, configuraciones y resultados de consultas costosas.</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Ampliaremos el ejemplo de consola para cachear una lista de ciudades con TTL absoluto.</p>
+
+        <h3>Paso 1: extensión genérica</h3>
+        <pre><code class="language-csharp">public static class DistributedCacheExtensions
+{
+    public static async Task SetListAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        IReadOnlyList&lt;T&gt; list,
+        TimeSpan absoluteExpiration,
+        CancellationToken ct = default)
+    {
+        var data = JsonSerializer.SerializeToUtf8Bytes(list);
+        await cache.SetAsync(key, data, new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = absoluteExpiration
+        }, ct);
+    }
+
+    public static async Task&lt;IReadOnlyList&lt;T&gt;?&gt; GetListAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        CancellationToken ct = default)
+    {
+        var data = await cache.GetAsync(key, ct);
+        return data is null
+            ? null
+            : JsonSerializer.Deserialize&lt;List&lt;T&gt;&gt;(data);
+    }
+}</code></pre>
+
+        <h3>Paso 2: programa</h3>
+        <pre><code class="language-csharp">var services = new ServiceCollection();
+services.AddStackExchangeRedisCache(options =&gt;
+{
+    options.Configuration = "localhost:6379";
+    options.InstanceName = "Cities_";
+});
+
+var provider = services.BuildServiceProvider();
+var cache = provider.GetRequiredService&lt;IDistributedCache&gt;();
+
+var cities = await cache.GetListAsync&lt;City&gt;("cities:all");
+if (cities is null)
+{
+    cities = new List&lt;City&gt;
+    {
+        new("Madrid", "ES"),
+        new("Lisboa", "PT"),
+        new("París", "FR")
+    };
+    await cache.SetListAsync("cities:all", cities, TimeSpan.FromMinutes(2));
+}
+
+foreach (var city in cities)
+    Console.WriteLine(city);
+
+public sealed record City(string Name, string CountryCode);</code></pre>
+
+        <p>Comprueba con <code>redis-cli</code> que la clave existe y expira:</p>
+        <pre><code class="language-bash">docker exec -it redis-cache redis-cli KEYS '*cities:all*'
+docker exec -it redis-cache redis-cli TTL "Cities_cities:all"</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa una capa híbrida <code>HybridCache</code> (puedes usar el paquete <code>Microsoft.Extensions.Caching.Hybrid</code> de .NET 8 si está disponible, o simularla manualmente):</p>
+        <ul>
+          <li>Primero consulta <code>IMemoryCache</code> local.</li>
+          <li>Si no está, consulta <code>IDistributedCache</code> (Redis).</li>
+          <li>Si tampoco está, consulta base de datos y guarda en ambos niveles.</li>
+          <li>Al invalidar, borra de ambos niveles.</li>
+        </ul>
+        <p><strong>No resuelvas el reto ahora.</strong> Piensa en la implementación, sus ventajas y sus riesgos, y lo revisaremos en la siguiente sesión.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>IDistributedCache</code> es la abstracción de .NET para caché compartido entre procesos.</li>
+          <li>Redis se registra con <code>AddStackExchangeRedisCache</code> y se configura con la cadena de conexión.</li>
+          <li>Los valores se almacenan como bytes o string; debemos serializar, normalmente con <code>System.Text.Json</code>.</li>
+          <li>Usa <code>InstanceName</code> y claves con prefijo para evitar colisiones.</li>
+          <li>Invalida entradas al modificar los datos subyacentes.</li>
+          <li>Redis es ideal para entornos multi-instancia; <code>IMemoryCache</code> es más rápido para una sola instancia.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Puedo usar Redis sin Docker?</summary>
+          <p>Sí, puedes instalar Redis nativamente o usar un servicio gestionado en la nube. Para desarrollo, Docker es la opción más limpia y reproducible.</p>
+        </details>
+
+        <details>
+          <summary>¿Qué ocurre si Redis no está disponible?</summary>
+          <p>Depende de la configuración. Con <code>abortConnect=false</code> la librería intenta reconectar y las operaciones fallan con excepciones que puedes capturar. Es buena práctica rodear el caché de un try/catch y caer a la fuente de datos.</p>
+        </details>
+
+        <details>
+          <summary>¿Es más lento que IMemoryCache?</summary>
+          <p>Sí, añade latencia de red. Sin embargo, sigue siendo mucho más rápido que una base de datos. Para datos de alta frecuencia y muy pequeños, considera una combinación de caché local + distribuido.</p>
+        </details>
+
+        <details>
+          <summary>¿Puedo guardar objetos complejos directamente?</summary>
+          <p>No. <code>IDistributedCache</code> trabaja con bytes o strings. Debes serializar. Si el objeto tiene navegaciones circulares, usa <code>ReferenceHandler.IgnoreCycles</code> o un DTO plano.</p>
+        </details>
+
+        <details>
+          <summary>¿Cómo invalido el caché de todas las instancias?</summary>
+          <p>Usa una clave de versión o un <code>ChangeToken</code> compartido. Por ejemplo, almacena <code>cache:version</code> en Redis; al cambiarla, todos los servicios invalidan sus claves locales. También puedes usar Redis pub/sub para notificaciones.</p>
+        </details>
+
+        <details>
+          <summary>¿<code>InstanceName</code> es obligatorio?</summary>
+          <p>No, pero es muy recomendable si compartes el servidor Redis entre aplicaciones. Sin prefijo, dos apps distintas podrían sobrescribirse con la misma clave.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

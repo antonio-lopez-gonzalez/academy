@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="es" data-module="10" data-lesson="03-rate-limiting-cors">
+<head>
+  <meta charset="UTF-8">
+  <title>Rate Limiting y CORS — Módulo 10 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Rate Limiting y CORS</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 10 · Middleware y pipelines</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>Una API expuesta a internet debe protegerse contra el abuso y respetar las reglas de los navegadores. El <strong>rate limiting</strong> limita cuántas peticiones puede hacer un cliente en un intervalo. El <strong>CORS</strong> (Cross-Origin Resource Sharing) controla qué orígenes web pueden consumir la API desde el navegador.</p>
+        <p>En .NET 8, el rate limiting es un middleware de primer nivel, no un paquete externo. En esta lección aprenderemos a configurar ambos y a colocarlos correctamente en el pipeline.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelven?</h4>
+          <p>El rate limiting evita la degradación del servicio por tráfico excesivo o ataques. El CORS evita que sitios web maliciosos hagan peticiones a tu API en nombre de un usuario autenticado sin permiso.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Colocar CORS después de <code>UseAuthentication</code>, lo que hace que los preflight <code>OPTIONS</code> fallen.</li>
+          <li>Permitir <code>AllowAnyOrigin()</code> con credenciales en producción, rompiendo la seguridad.</li>
+          <li>Aplicar rate limiting sin definir un <code>RejectionStatusCode</code>, devolviendo 503 por defecto sin información.</li>
+          <li>Usar el limitador <code>FixedWindow</code> para tráfico que necesita suavidad (pico al inicio de cada ventana).</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>Rate limiting en .NET 8</h3>
+        <p>El middleware de rate limiting incluye cuatro algoritmos principales:</p>
+        <ul>
+          <li><strong>FixedWindow</strong>: permite N peticiones en un intervalo fijo. Sencillo pero genera picos al reiniciar la ventana.</li>
+          <li><strong>SlidingWindow</strong>: permite N peticiones en una ventana que se desliza. Suaviza los picos.</li>
+          <li><strong>TokenBucket</strong>: permite peticiones mientras haya tokens disponibles; se rellenan a una tasa constante. Útil para tráfico irregular con picos.</li>
+          <li><strong>Concurrency</strong>: limita el número de peticiones concurrentes, sin importar el tiempo transcurrido.</li>
+        </ul>
+
+        <h3>Clasificación de peticiones</h3>
+        <p>Para limitar por cliente, debes decirle al middleware cómo identificar al cliente. Puedes usar la IP, el usuario autenticado, un header personalizado, o una combinación:</p>
+        <pre><code class="language-csharp">options.AddPolicy("per-ip", context =>
+{
+    var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    return RateLimitPartition.GetFixedWindowLimiter(remoteIp, _ => new FixedWindowRateLimiterOptions
+    {
+        PermitLimit = 100,
+        Window = TimeSpan.FromMinutes(1)
+    });
+});</code></pre>
+
+        <h3>CORS</h3>
+        <p>CORS es un mecanismo de seguridad del navegador, no del servidor. El servidor indica qué orígenes, métodos y cabeceras están permitidos. Los navegadores envían preflight <code>OPTIONS</code> para verificar. Si CORS no está bien configurado, el navegador bloquea la petición aunque el servidor la acepte.</p>
+
+        <table>
+          <thead><tr><th>Algoritmo</th><th>Ventaja</th><th>Desventaja</th></tr></thead>
+          <tbody>
+            <tr><td>FixedWindow</td><td>Simple de entender</td><td>Picos al inicio de ventana</td></tr>
+            <tr><td>SlidingWindow</td><td>Suaviza el tráfico</td><td>Ligeramente más complejo</td></tr>
+            <tr><td>TokenBucket</td><td>Permite ráfagas controladas</td><td>Requiere ajustar tasa y capacidad</td></tr>
+            <tr><td>Concurrency</td><td>Limita carga simultánea</td><td>No protege por tiempo</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--tip">
+          <h4>Consejo de orden</h4>
+          <p>CORS debe ir antes de autenticación porque el preflight <code>OPTIONS</code> no incluye credenciales. Rate limiting puede ir antes del routing si quieres proteger incluso rutas desconocidas, o después si quieres que no afecte a endpoints de salud.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Crearemos una API con rate limiting <code>FixedWindow</code> y CORS restringido.</p>
+
+        <pre><code class="language-bash">dotnet new webapi -n RateLimitingCors -o RateLimitingCors
+cd RateLimitingCors
+dotnet run --project .</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("frontend", policy =>
+    {
+        policy.WithOrigins("https://localhost:3000")
+              .WithMethods("GET", "POST")
+              .WithHeaders("Content-Type", "Authorization")
+              .AllowCredentials();
+    });
+});
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = 429;
+
+    options.AddFixedWindowLimiter("fixed", policy =>
+    {
+        policy.PermitLimit = 5;
+        policy.Window = TimeSpan.FromSeconds(10);
+        policy.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        policy.QueueLimit = 0;
+    });
+
+    options.AddPolicy("per-ip", context =>
+    {
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 20,
+            Window = TimeSpan.FromMinutes(1)
+        });
+    });
+});
+
+var app = builder.Build();
+
+app.UseHttpsRedirection();
+
+// CORS antes de autenticación
+app.UseCors("frontend");
+
+app.UseRateLimiter();
+
+app.UseAuthorization();
+app.MapControllers();
+
+app.Run();</code></pre>
+
+        <pre><code class="language-csharp">// Controllers/ValuesController.cs
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+
+[ApiController]
+[Route("api/[controller]")]
+[EnableRateLimiting("fixed")]
+public class ValuesController : ControllerBase
+{
+    [HttpGet]
+    public IActionResult Get() => Ok(new[] { "a", "b", "c" });
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El endpoint <code>/api/values</code> usa la política <code>fixed</code> de 5 peticiones cada 10 segundos. Si superas el límite, el middleware devuelve 429. CORS aplica la política <code>frontend</code> a todas las peticiones.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una API con usuarios autenticados, limitar por IP no es suficiente: varios usuarios pueden compartir una IP. Limitaremos por usuario usando claims.</p>
+
+        <pre><code class="language-csharp">builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = 429;
+    options.AddPolicy("per-user", context =>
+    {
+        var userId = context.User.Identity?.IsAuthenticated == true
+            ? context.User.FindFirst(ClaimTypes.NameIdentifier)!.Value
+            : "anonymous";
+
+        return RateLimitPartition.GetSlidingWindowLimiter(userId, _ => new SlidingWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            SegmentsPerWindow = 6,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0
+        });
+    });
+});
+
+// Para aplicar globalmente:
+app.UseRateLimiter();</code></pre>
+
+        <p>Para aplicar por endpoint, usa <code>[EnableRateLimiting("per-user")]</code> en el controlador o el método.</p>
+
+        <h3>CORS con origen dinámico</h3>
+        <pre><code class="language-csharp">builder.Services.AddCors(options =>
+{
+    options.AddPolicy("dynamic", policy =>
+    {
+        policy.SetIsOriginAllowed(origin =>
+            origin.StartsWith("https://app", StringComparison.OrdinalIgnoreCase))
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});</code></pre>
+
+        <div class="callout callout--warning">
+          <h4>No combines AllowAnyOrigin con AllowCredentials</h4>
+          <p>El navegador rechaza la respuesta CORS si el origen es <code>*</code> y se envían credenciales. En producción, lista los orígenes permitidos explícitamente.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Define límites realistas.</strong> Limites muy bajos rompen clientes legítimos; límites muy altos no protegen.</li>
+          <li><strong>Devuelve 429</strong> con una cabecera <code>Retry-After</code> cuando sea posible. El middleware de .NET 8 no lo hace automáticamente, pero puedes personalizarlo.</li>
+          <li><strong>Excluye endpoints de salud</strong> del rate limiting para no confundir a los balanceadores de carga.</li>
+          <li><strong>Registra intentos rechazados</strong> con <code>ILogger</code> para detectar ataques o clientes mal configurados.</li>
+          <li><strong>En CORS, nunca uses <code>AllowAnyOrigin</code> + <code>AllowCredentials</code> en producción.</strong></li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. CORS después de autenticación</h3>
+        <pre><code class="language-csharp">// ❌ MAL: preflight sin credenciales falla antes de CORS
+app.UseAuthentication();
+app.UseCors("frontend");
+
+// ✅ CORRECTO
+app.UseCors("frontend");
+app.UseAuthentication();</code></pre>
+
+        <h3>6.2. Rate limit sin mensaje útil</h3>
+        <pre><code class="language-csharp">// ❌ MAL: devuelve 503 sin explicación
+options.RejectionStatusCode = StatusCodes.Status503ServiceUnavailable;</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO
+options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+options.OnRejected = (context, token) =>
+{
+    context.Response.WriteAsync("Demasiadas peticiones. Inténtalo más tarde.", token);
+    return new ValueTask();
+};</code></pre>
+
+        <h3>6.3. FixedWindow para tráfico suave</h3>
+        <pre><code class="language-csharp">// ❌ MAL: pico al inicio de cada minuto
+options.AddFixedWindowLimiter("api", policy =>
+{
+    policy.PermitLimit = 100;
+    policy.Window = TimeSpan.FromMinutes(1);
+});</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO: SlidingWindow reparte mejor
+options.AddSlidingWindowLimiter("api", policy =>
+{
+    policy.PermitLimit = 100;
+    policy.Window = TimeSpan.FromMinutes(1);
+    policy.SegmentsPerWindow = 6;
+});</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Configura un <code>TokenBucket</code> que permita 10 peticiones de golpe y se recargue a 2 peticiones por segundo.</p>
+
+        <pre><code class="language-csharp">builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = 429;
+    options.AddTokenBucketLimiter("token", policy =>
+    {
+        policy.TokenLimit = 10;
+        policy.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        policy.QueueLimit = 2;
+        policy.ReplenishmentPeriod = TimeSpan.FromSeconds(1);
+        policy.TokensPerPeriod = 2;
+        policy.AutoReplenishment = true;
+    });
+});
+
+app.UseRateLimiter();
+app.MapGet("/limited", [EnableRateLimiting("token")] () => "OK");</code></pre>
+
+        <p>Prueba con un bucle <code>for i in {1..15}; do curl -i http://localhost:5000/limited; done</code> y observa cómo algunas peticiones devuelven 429 hasta que se recargan tokens.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Crea una política de rate limiting que combine dos reglas: autenticados tienen 100 peticiones/minuto; anónimos tienen 20 peticiones/minuto. Además, excluye del rate limiting la ruta <code>/health</code> pero sí aplica CORS a ella. Usa <code>[DisableRateLimiting]</code> y un <code>Map</code> separado si es necesario.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>.NET 8 incluye rate limiting con <code>FixedWindow</code>, <code>SlidingWindow</code>, <code>TokenBucket</code> y <code>Concurrency</code>.</li>
+          <li>Usa <code>AddRateLimiter</code>, <code>UseRateLimiter</code>, <code>[EnableRateLimiting]</code> y <code>[DisableRateLimiting]</code>.</li>
+          <li>Configura <code>RejectionStatusCode</code> y, si quieres, <code>OnRejected</code> para mensajes útiles.</li>
+          <li>CORS debe ir antes de autenticación y nunca combinarse <code>AllowAnyOrigin</code> con <code>AllowCredentials</code>.</li>
+          <li>El rate limiting se debe ajustar a autenticados y anónimos, y excluir endpoints de salud.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿El rate limiting de .NET 8 reemplaza a AspNetCoreRateLimit?</h3>
+        <p>Para muchos casos sí. Si necesitas reglas configurables desde una base de datos, integración con Redis o métricas avanzadas, <code>AspNetCoreRateLimit</code> o una solución con Redis siguen siendo útiles.</p>
+
+        <h3>¿El rate limit se aplica por instancia o por cluster?</h3>
+        <p>Por instancia. Si tienes varias réplicas, el límite se multiplica por el número de instancias. Para cluster, usa Redis o una base de datos central como contador.</p>
+
+        <h3>¿CORS protege al servidor?</h3>
+        <p>No. CORS protege al cliente (navegador). Un atacante puede hacer peticiones desde otros orígenes con herramientas como curl o Postman. La protección del servidor viene de autenticación, rate limiting y validación de inputs.</p>
+
+        <h3>¿Por qué <code>OPTIONS</code> falla aunque la petición real funciona?</h3>
+        <p>El navegador envía un preflight <code>OPTIONS</code> sin credenciales. Si el middleware de autenticación lo intercepta antes de CORS, el preflight se rechaza. Coloca <code>UseCors</code> antes de <code>UseAuthentication</code>.</p>
+
+        <h3>¿Puedo usar rate limiting en Minimal APIs?</h3>
+        <p>Sí. Tanto <code>[EnableRateLimiting]</code> como <code>[DisableRateLimiting]</code> funcionan en endpoints de Minimal APIs porque son atributos de metadatos que lee el sistema de endpoints.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-arquitectura-del-hub">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura: registro + backplane — Módulo 7 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura: registro + backplane</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · El Hub de Conexiones WebSocket con Redis</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Es el momento de juntar todo lo aprendido en una sola arquitectura para tu servidor WebSocket. La idea central: <strong>Redis como «directorio de conexiones» (registro) + canal común (backplane)</strong>. Cada nodo es igual, comparte estado y se escala solo añadiendo nodos.</p>
+        <p>Aquí defines el dibujo definitivo; en las siguientes lecciones lo llenamos de código.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Los roles</h3>
+        <table>
+          <thead><tr><th>Pieza</th><th>Qué guarda</th><th>Estructura</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Registro</strong></td><td>Conexión → nodo dueño (+ detalle usuario)</td><td>Hash por conexión <code>hub:conn:&lt;id&gt;</code></td></tr>
+            <tr><td><strong>Presencia</strong></td><td>Quién está conectado y cuándo</td><td>Sorted set <code>hub:presence</code> (score = ts)</td></tr>
+            <tr><td><strong>Backplane</strong></td><td>Broadcast/eventos entre nodos</td><td>Pub/Sub <code>hub:events</code>, <code>hub:presence</code></td></tr>
+            <tr><td><strong>Indices</strong></td><td>«usuarios de un canal», nodos vivos</td><td>Sets <code>chan:*</code>, <code>hub:nodes</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>El flujo de un nodo</h3>
+        <pre><code class="language-text">Nodo .NET (node-1)                    Redis
+   │  startup: se suscribe             SUBSCRIBE hub:events, hub:presence
+   │  register en hub:nodes            SADD hub:nodes node-1
+   │                                   (TTL de seguridad)
+   │
+cliente → /ws (upgrade)
+   │  conn = conexión local (socket)    ← vive en la RAM del nodo
+   │  registra:                        HSET hub:conn:&lt;id&gt; node node-1 userId u
+   │                                   EXPIRE … 30
+   │                                   ZADD hub:presence &lt;ts&gt; user:u
+   │  publica evento                   PUBLISH hub:presence {"type":"connect"...}
+   │
+   │  recibe mensaje "broadcast"       PUBLISH hub:events {...}
+   ▼
+(cliente) ─────────────────────────────► (los otros nodos reciben y reenvían)</code></pre>
+
+        <h3>Decisiones de diseño</h3>
+        <ul>
+          <li><strong>El socket vive en su nodo;</strong> Redis solo guarda «dónde está» y las señales. (M0-04: no guardamos el WebSocket en Redis.)</li>
+          <li><strong>Todo evento relevante se publica</strong> para que cada nodo decida si le toca.</li>
+          <li><strong>Nodos idénticos</strong>: sin nodo «especial»; redescubrimiento por Redis.</li>
+          <li><strong>Caída de Redis</strong>: modo local degradado (M6-04) y reconciliación al volver.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># El patrón mínimo del registro en redis-cli
+SADD hub:nodes node-1            # anuncia el nodo
+EXPIRE hub:nodes 30             # (con renovación en el heartbeat)
+HSET hub:conn:8632 node node-1 userId 42 EXPIRE hub:conn:8632 30
+ZADD hub:presence 1750000000 user:42
+PUBLISH hub:presence '{"type":"connect","conn":"8632","node":"node-1"}'</code></pre>
+        <p>Con esto, «otro nodo» ya puede averiguar dónde está 8632 y anunciar su nacimiento.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El diagrama completo del proyecto <code>redis-ws-hub</code> (que construirás en M8), en una imagen:</p>
+        <pre><code class="language-text">                 +----------------------- REDIS (registro + backplane) -------+
+                 |  hub:conn:* (hash)  hub:presence (zset)  chan:* (sets)    |
+                 |  hub:events (pub/sub)  hub:presence (pub/sub)             |
+                 +----------------------------▲------------------------------+
+                                              │ subscribe + publish
+   +----------------+        +---------------+│+---------------+          │
+   |  Nodo A        |        |  Nodo B       │               ...          │
+   | /ws (sockets)  |        | /ws (sockets) │                             │
+   | /api/*         |        | /api/*        |                             │
+   +----------------+        +---------------+-----------------------------+
+        │ conectar / registrar / publicar / suscribir / reenviar</code></pre>
+        <p>Pilares que ya dominas: hash+TTL (M1/M2/M6), zset de presencia (M2), pub/sub (M3), multiplexer (M6). Aquí solo se ensamblan.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Pensar en «estado en Redis, socket en el nodo»</td><td>Guardar sockets/conexiones en Redis</td><td>Redis no puede reenviar por socket; solo sabe dónde está</td></tr>
+            <tr><td>Publicar eventos de ciclo de vida (connect/disconnect)</td><td>Que cada nodo «adivine» a los demás</td><td>El backplane es la única fuente fiable de avisos entre nodos</td></tr>
+            <tr><td>Un solo canal por dominio de señal</td><td>Mezclar trades, presencia y salud en un canal</td><td>Un suscriptor ligero se suscribe a lo que le importa</td></tr>
+            <tr><td>Documentar el «modo sin Redis»</td><td>Depender de Redis para la vida de un nodo</td><td>La resiliencia (M6-04) es parte del diseño</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Broadcast solo a las conexiones del proceso local</h3>
+        <pre><code class="language-csharp">// ❌ Envía solo a "mis" sockets; los del otro nodo nunca lo ven
+foreach (var c in _localSockets) await c.SendAsync(msg);
+
+// ✅ Publica (todos los nodos lo reenvían a sus sockets)
+await _sub.PublishAsync("hub:events", msg);
+// + el suscriptor local reenvía también (o confía en cada nodo)</code></pre>
+
+        <h3>Usar el ID de nodo «hardcodeado» que choca entre réplicas</h3>
+        <p>Si dos réplicas usan el mismo <code>node-1</code> como suyos, el registro se pisa. Usa un identificador único (guid por proceso, o nombre de pod con sufijo).</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Dibuja la arquitectura de tu hub real (nodos, Redis, canales) en tu README.</li>
+          <li><strong>Paso 2:</strong> Lista los «canales de pub/sub» que crearías y sus mensajes (type, node, conn).</li>
+          <li><strong>Paso 3:</strong> Decide cómo identificas cada nodo (unique id).</li>
+          <li><strong>Paso 4:</strong> Anota el «modo sin Redis» de cada operación.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 ¿Quién reenvía el broadcast?</h3>
+          <p>Decide y justifica: cuando un nodo publica «broadcast», ¿debe reenviar a sus propias sockets además de publicar (doble trabajo) o confiar solo en el suscriptor? Analiza las dos opciones (latencia, duplicación) y elige para tu caso.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Registro (hash/TTL) + presencia (zset) + backplane (pub/sub).</li>
+          <li>El socket vive en su nodo; Redis guarda «dónde está».</li>
+          <li>Eventos de ciclo de vida para que los nodos se enteren.</li>
+          <li>Nodo con identidad única y modo sin Redis definido.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito Sentinel si solo tengo 1 nodo de Redis?</summary>
+            <div><p>Para desarrollo, no. Para producción real (aunque tu hub funcione degradado), un par con Sentinel te ahorra rescates manuales. M4 tienes el criterio.</p></div>
+          </details>
+          <details>
+            <summary>¿Este diseño vale para SignalR?</summary>
+            <div><p>Sí: SignalR + Redis backplane hace exactamente «publica en Redis y cada hub reenvía». Con StackExchange.Redis lo implementas tú y ves qué ocurre debajo.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

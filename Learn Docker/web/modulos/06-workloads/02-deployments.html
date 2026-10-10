@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-deployments">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deployments y rolling updates — Módulo 6 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Deployments y rolling updates</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Workloads</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior creaste Pods sueltos y descubriste su carácter efímero: si mueren, nadie los devuelve a la vida. El <strong>Deployment</strong> es el controlador que soluciona eso para aplicaciones <em>de larga duración</em>: mantiene un número fijo de réplicas funcionando, se auto-repara cuando una cae y te permite <strong>actualizar la versión de tu aplicación sin cortar el servicio</strong>.</p>
+        <p>En esta lección entenderás la jerarquía <strong>Deployment → ReplicaSet → Pod</strong>, por qué el Deployment existe "encima" del ReplicaSet, cómo se hacen los <em>rolling updates</em> (actualización gradual), qué parámetros controlan la velocidad y el riesgo (<code>maxSurge</code>, <code>maxUnavailable</code>, <code>revisionHistoryLimit</code>) y los comandos <code>kubectl rollout</code> para controlar un despliegue.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque desplegar una aplicación moderna sin downtime y poder volver atrás si algo sale mal es la diferencia entre "subir código" y "operar software". El Deployment es la herramienta número 1 que usarás en cualquier clúster.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> aplicar un manifiesto de ReplicaSet creyendo que es un Deployment, escalar a mano en lugar de tocar <code>replicas</code> en el manifiesto, editar objetos vivos con <code>kubectl edit</code> en producción y confundir <code>maxSurge</code> con <code>maxUnavailable</code>.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Analogía: el encargado y la brigada</h3>
+        <p>Imagina una flota de reparto. El <strong>Pod</strong> es un repartidor individual (efímero, puede irse, enfermarse). El <strong>ReplicaSet</strong> es la brigada: su único trabajo es garantizar que haya <strong>exactamente N repartidores</strong> trabajando. El <strong>Deployment</strong> es el encargado: decide qué tamaño debe tener la brigada (10 repartidores), qué reglas de contratación usa y, cuando llega un protocolo nuevo (una versión), organiza <em>cómo</em> sustituir a toda la brigada sin dejar de repartir un solo día.</p>
+
+        <h3>La jerarquía: Deployment → ReplicaSet → Pod</h3>
+        <div class="diagram">DEPLOYMENT "api"  (replicas: 3, estrategia rollingUpdate)
+   │  pertenece (ownerReference) a ...
+   ▼
+REPLICASET "api-74fb9d9c6b"   (nueva revisión tras cada cambio de plantilla)
+   │  selecciona pods con matchLabels app: api + pod-template-hash
+   ▼
+POD "api-74fb9d9c6b-Xy7zc"  ──► Pod "api-74fb9d9c6b-Ab9ws"  ──► Pod "api-74fb9d9c6b-Qw2er"
+   (3 réplicas vivas; si una muere, el ReplicaSet crea una nueva)</div>
+
+        <p>El <strong>ReplicaSet</strong> es un controlador del modelo declarativo: lee su campo <code>spec.replicas</code> y compara con los <code>Pods</code> que existen con sus etiquetas. Si hay menos, crea; si hay más, borra. Su bucle interno se llama <strong>reconciliación</strong> y se ejecuta continuamente.</p>
+
+        <p>El <strong>Deployment</strong> envuelve a los ReplicaSets y añade dos capacidades que el ReplicaSet no tiene:</p>
+        <ol>
+          <li><strong>Rollouts versionados:</strong> cada cambio en la plantilla del Pod (<code>spec.template</code>) crea un ReplicaSet <em>nuevo</em> y el Deployment orquesta la transición del viejo al nuevo.</li>
+          <li><strong>Historial y rollback:</strong> guarda las N revisiones anteriores (<code>revisionHistoryLimit</code>, default 10) para poder volver atrás con <code>kubectl rollout undo</code>.</li>
+        </ol>
+
+        <h3>Estrategias de actualización</h3>
+        <p>El campo <code>spec.strategy</code> decide <em>cómo</em> se sustituyen los Pods:</p>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Comportamiento</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td><code>Recreate</code></td><td>Borra TODOS los Pods viejos y luego crea los nuevos</td><td>Solo cuando el servicio puede tener downtime (tareas por lotes, casos sin tráfico en vivo)</td></tr>
+            <tr><td><code>RollingUpdate</code> (default)</td><td>Sustituye gradualmente: escala el ReplicaSet nuevo mientras escala el viejo</td><td>Casi siempre: aplicaciones con tráfico real</td></tr>
+          </tbody>
+        </table>
+
+        <p><code>RollingUpdate</code> se controla con dos porcentajes:</p>
+        <ul>
+          <li><code>maxUnavailable</code> (default <code>25%</code>): cuántas réplicas pueden estar caídas <strong>a la vez</strong> durante el rollout. Garantiza que nunca haya menos de <code>replicas - maxUnavailable</code> Pods listos.</li>
+          <li><code>maxSurge</code> (default <code>25%</code>): cuántas réplicas <strong>extra</strong> por encima del objetivo pueden existir. Garantiza que el rollout avance incluso si el nuevo ReplicaSet no escala desapareciendo al viejo.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> renovar la flota. <code>maxUnavailable: 0</code> significa "no dejes ni un repartidor menos de servicio"; <code>maxSurge: 1</code> dice "contrata primero un repartidor nuevo, aprende, y luego jubila a uno viejo". Con un solo activo neutro, la renovación nunca deja de repartir.</p>
+        </div>
+
+        <h3>Proporcionalidad y revisiones</h3>
+        <p>Desde Kubernetes 1.28+, <code>Progressing</code> usa <em>scaling proporcional</em>: al subir <code>replicas</code> en pleno rollout, la proporción de Pods nuevos vs viejos se mantiene. Además, cada <code>kubectl apply</code> que cambie la plantilla genera una <strong>revisión</strong> (REVISION 1, 2, 3…). Cambiar solo <code>replicas</code> NO crea revisión, porque la plantilla no cambia.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La vía rápida para tener un Deployment sin escribir YAML (útil para probar, no para producción), y luego todo el ciclo de rollout con comandos:</p>
+        <pre><code class="language-bash"># 1. Crear un Deployment "web" con 1 réplica de nginx.
+kubectl create deployment web --image=nginx:1.27-alpine
+
+# 2. Ver la jerarquía completa: deployment, replicaset y pods con su hash.
+kubectl get deploy,rs,pods -l app=web
+#    NAME             READY   ...
+#    deployment.apps/web   1/1
+#    replicaset.apps/web-xxx   1/1      <- el replicaset que gestiona el deployment
+#    pod/web-xxx-zzz   1/1     Running  <- el pod del replicaset
+
+# 3. Escalar: el Deployment declara el objetivo; el ReplicaSet lo cumple.
+kubectl scale deployment web --replicas=3
+kubectl get pods -l app=web      # 3 pods
+
+# 4. Disparar un rollout: cambiar la imagen de la plantilla = nueva revisión.
+kubectl set image deployment/web web=nginx:1.27.4-alpine
+
+# 5. Seguir el rollout en vivo (muestra "Waiting"/"Successfully rolled out").
+kubectl rollout status deployment/web
+
+# 6. Ver el historial de revisiones.
+kubectl rollout history deployment/web</code></pre>
+        <p>Observa el paso 4: <code>kubectl set image</code> modifica <code>spec.template</code>, y eso es exactamente lo que el Deployment interpreta como "nueva versión → nuevo ReplicaSet → rollout". El comando <code>kubectl apply</code> haría lo mismo cuando el archivo YAML cambia.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Así sería el Deployment de la <strong>API de HarborTasks</strong> en producción local con kind. Nota que aquí ya no manejamos Pods sueltos: declaramos el estado deseado y el controlador hace el resto.</p>
+        <div class="code-file">deployment-api.yaml</div>
+        <pre><code class="language-yaml"># apiVersion: grupo de API > versión. apps/v1 es el grupo estable para Deployments.
+apiVersion: apps/v1
+# kind: Deployment (controlador de nivel superior sobre ReplicaSets).
+kind: Deployment
+metadata:
+  name: api
+  # namespace: aislamiento del proyecto (se crea en la lección de namespaces).
+  namespace: harbortasks
+  # labels del propio Deployment (no confundir con las del Pod).
+  labels:
+    app: api
+    project: harbortasks
+spec:
+  # replicas: estado deseado -> el ReplicaSet reconciliará hasta alcanzarlo.
+  replicas: 3
+  # selector: el Deployment SOLO gestiona Pods que tengan ESTAS labels.
+  # Debe coincidir con las labels del template (error típico si no).
+  selector:
+    matchLabels:
+      app: api
+  # revisionHistoryLimit: cuántos ReplicaSets antiguos conserva para el rollback.
+  revisionHistoryLimit: 10
+  # strategy: cómo se sustituyen los Pods al cambiar la plantilla.
+  strategy:
+    # RollingUpdate: nunca cortar el servicio (máx 2 réplicas extra, 0 caídas). 
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 -> NUNCA hay menos réplicas de las deseadas listas.
+      # Los Pods nuevos deben estar READY antes de retirar los viejos.
+      maxUnavailable: 0
+      # maxSurge: "25%" -> en el punto álgido pueden existir 25% de réplicas extra.
+      maxSurge: 25%
+  # template: "la receta del Pod". Cualquier cambio aquí dispara un rollout.
+  template:
+    metadata:
+      # labels del POD: el ReplicaSet las usa para contar y seleccionar.
+      labels:
+        app: api
+      # namespace se hereda de arriba (no se repite en el template).
+    spec:
+      # containers: idénticos a los que viste en la lección de Pods.
+      containers:
+        - name: api
+          # image apunta a la imagen construida en Módulos 1-4. Para kind:
+          # kind load docker-image harbortasks-api:1.0.0  (la carga al clúster).
+          image: harbortasks-api:1.0.0
+          ports:
+            - containerPort: 3000
+          env:
+            # Las variables de entorno reales vendrán de ConfigMap/Secret (Módulo 7).
+            - name: PORT
+              value: "3000"
+            - name: PGHOST
+              value: postgres.harbortasks.svc.cluster.local</code></pre>
+        <p>Operación del ciclo completo con este manifiesto:</p>
+        <pre><code class="language-bash"># Aplicar el estado deseado (idempotente: puedes aplicarlo N veces).
+kubectl apply -f deployment-api.yaml
+
+# Esperar a que el rollout termine y ver las 3 réplicas listas.
+kubectl rollout status deployment api -n harbortasks
+kubectl get deploy,rs,pods -n harbortasks
+
+# LANZAR v1.0.1: se edita la imagen en el manifiesto y se re-aplica.
+# (Aquí, hipotéticamente, la imagen nueva es harbortasks-api:1.0.1)
+sed -i 's/harbortasks-api:1.0.0/harbortasks-api:1.0.1/' deployment-api.yaml
+kubectl apply -f deployment-api.yaml
+
+# Cinética en vivo y estado. Consulta de las revisiones.
+kubectl rollout status deployment api -n harbortasks
+kubectl rollout history deployment api -n harbortasks
+
+# Si algo salió mal en la v1.0.1: volver a la anterior al instante.
+kubectl rollout undo deployment api -n harbortasks
+kubectl rollout status deployment api -n harbortasks</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Tip:</strong> <code>maxUnavailable: 0</code> con <code>maxSurge: 25%</code> para 3 réplicas significa que el rollout creará primero 1 Pod nuevo (25% de 3), esperará a que esté <code>Ready</code> y recién entonces retirará un Pod viejo. Coste: el rollout es más lento. Con tráfico real, <code>maxUnavailable: 25%</code> te da velocidad a cambio de menos redundancia momentánea.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Versiona los manifiestos en Git y aplica con <code>kubectl apply</code></td>
+              <td>Editar objetos vivos con <code>kubectl edit</code></td>
+              <td>El manifiesto en Git es tu fuente de verdad y tu historial; el live object es un trozo mutable de estado</td>
+            </tr>
+            <tr>
+              <td>Usa imágenes con tag de versión (<code>api:1.0.1</code>)</td>
+              <td><code>imagePullPolicy: Always</code> con tag fijo o tag <code>latest</code></td>
+              <td>Con tags flotantes "el mismo YAML" puede desplegar imágenes distintas sin que lo sepas</td>
+            </tr>
+            <tr>
+              <td>Define <code>replicas</code> y estrategia explícitas</td>
+              <td>Escalar a mano con <code>kubectl scale</code> en producción</td>
+              <td>El estado deseado debe vivír en el manifiesto; HPA (Módulo 8) ajusta replicas de forma declarativa</td>
+            </tr>
+            <tr>
+              <td>Configura <code>maxUnavailable: 0</code> para servicios críticos</td>
+              <td>Estrategia <code>Recreate</code> con tráfico real</td>
+              <td><code>Recreate</code> mata todas las réplicas a la vez: downtime garantizado</td>
+            </tr>
+            <tr>
+              <td>Ajusta <code>revisionHistoryLimit</code> a tu cultura de rollback</td>
+              <td>Borrarlo a 0 "para ahorrar recursos"</td>
+              <td>Sin historial no hay <code>rollout undo</code>; los ReplicaSets viejos son casi gratis</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Selector que no coincide con las labels del template</h3>
+        <pre><code class="language-yaml"># ❌ selector pide app: api pero el template etiqueta app: backend.
+# El Deployment crea los ReplicaSets, pero su contador no encuentra PODS,
+# así que escala sin parar (crear/borrar en bucle) y nunca llega a Ready.
+selector:
+  matchLabels:
+    app: api
+template:
+  metadata:
+    labels:
+      app: backend        # ❌ NO COINCIDE con el selector
+
+# ✅ Una misma pareja app: api en selector Y en template.
+selector:
+  matchLabels:
+    app: api
+template:
+  metadata:
+    labels:
+      app: api</code></pre>
+
+        <h3>Aplicar un ReplicaSet creyendo que es un Deployment</h3>
+        <pre><code class="language-yaml"># ❌ kind: ReplicaSet => sin rollouts, sin historial, sin rollback.
+# Si cambias su plantilla, apenas actualiza los pods; no hay "version de la app".
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+
+# ✅ El mismo manifiesto con kind: Deployment da rolling updates + undo.</code></pre>
+
+        <h3>Confundir maxSurge y maxUnavailable</h3>
+        <pre><code class="language-yaml"># ❌ "No quiero caídas" y se ponen ambos al revés:
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 0        # ❌ no permite réplicas extra: el rollout puede atascarse
+    maxUnavailable: 1  # ❌ admite 1 réplica caída mientras arranca la nueva
+
+# ✅ Para cero caídas: maxUnavailable 0 y maxSurge mayor que 0.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0</code></pre>
+
+        <h3>Usar kubectl create deployment para producción</h3>
+        <pre><code class="language-bash"># ❌ Un comando "a pelo" no queda registrado en Git y pierde estrategia/labels.
+kubectl create deployment api --image=harbortasks-api:1.0.0 --replicas=3
+
+# ✅ El manifiesto versionado es la herramienta reproducible de producción.
+kubectl apply -f deployment-api.yaml</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> desplegar un Deployment de nginx en kind, escalarlo, lanzar un rollout de imagen y volver atrás con rollback.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea <code>deployment-web.yaml</code> con 3 réplicas de <code>nginx:1.27-alpine</code>, <code>selector/labels app: web</code>, estrategia <code>RollingUpdate</code> con <code>maxSurge: 1</code> y <code>maxUnavailable: 0</code>:
+            <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80</code></pre>
+          </li>
+          <li><strong>Paso 2:</strong> aplícalo y espera el rollout: <code>kubectl apply -f deployment-web.yaml</code> y <code>kubectl rollout status deployment/web</code> (debe imprimir algo como <em>"deployment web successfully rolled out"</em>).</li>
+          <li><strong>Paso 3:</strong> verifica la jerarquía y las réplicas: <code>kubectl get deploy,rs,pods -l app=web</code>. Espera 3 Pods <code>Running</code>.</li>
+          <li><strong>Paso 4:</strong> lanza una nueva versión <code>nginx:1.27.4-alpine</code> y observa la transición:
+            <pre><code class="language-bash"># Cambiamos la imagen de forma declarativa en el archivo...
+kubectl set image deployment/web web=nginx:1.27.4-alpine
+
+# ...y vemos cómo el rollout avanza POD A POD (nunca caen las 3 a la vez).
+kubectl rollout status deployment/web --watch=true
+kubectl get pods -l app=web -w    # en otra terminal: verás pods nacer y morir</code></pre>
+          </li>
+          <li><strong>Paso 5:</strong> comprueba el historial: <code>kubectl rollout history deployment/web</code>. Debes ver REVISION 1 (nginx:1.27-alpine) y REVISION 2 (nginx:1.27.4-alpine).</li>
+          <li><strong>Paso 6:</strong> haz rollback a la revisión 1 y verifica el estado final:
+            <pre><code class="language-bash">kubectl rollout undo deployment/web --to-revision=1
+kubectl rollout status deployment/web
+kubectl get pods -l app=web    # 3 Pods Running con la imagen anterior</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación final:</strong> el paso 4 es la parte mágica: con <code>kubectl get pods -w</code> deberías ver cómo NUNCA hay menos de 3 Pods <code>Running</code> (por <code>maxUnavailable: 0</code>) y cómo el ReplicaSet nuevo y el viejo conviven durante la transición.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rollout fallido: aprendiendo a volver atrás</h3>
+          <p>Lanza deliberadamente una actualización con una imagen que no existe (<code>nginx:no-existe-999</code>) en tu Deployment <code>web</code> y observa qué pasa: <code>kubectl rollout status</code>, el estado del rollout en <code>kubectl describe deployment web</code> y los eventos de los Pods. Después, recupera la revisión anterior.</p>
+          <p><em>Pista: con una imagen inexistente el kubelet nunca consigue arrancar el Pod nuevo, así que el rollout se queda esperando; fíjate en <code>progressDeadlineSeconds</code> (default 600s) y en <code>kubectl rollout undo deployment/web</code> para salir del atasco. También puedes forzar la salida con <code>kubectl rollout status deployment/web --watch=false</code> para ver el mensaje de timeout.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>Deployment</strong> orquesta <strong>ReplicaSets</strong>, y el ReplicaSet orquesta <strong>Pods</strong>: tres capas con una responsabilidad clara.</li>
+          <li>El Deployment garantiza <strong>N réplicas vivas</strong> (reconciliación) y sobrevive a fallos de Pod.</li>
+          <li>Cambiar <code>spec.template</code> genera un <strong>nuevo ReplicaSet y una nueva REVISION</strong>; ahí arranca el <em>rolling update</em>.</li>
+          <li><code>rollingUpdate</code> con <code>maxSurge</code>/<code>maxUnavailable</code> controla velocidad vs riesgo; <code>Recreate</code> implica downtime.</li>
+          <li>El <strong>historial</strong> (<code>revisionHistoryLimit</code>, default 10) habilita <code>kubectl rollout undo</code>.</li>
+          <li>El manifiesto (declarativo y versionado) es el patrón de producción; los comandos <code>kubectl</code> solo para operar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando/Manifiesto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -f deployment.yaml</code></td><td>Crea/actualiza el Deployment y dispara rollout si cambió la plantilla</td></tr>
+            <tr><td><code>kubectl scale deployment X --replicas=N</code></td><td>Cambia el número deseado de réplicas</td></tr>
+            <tr><td><code>kubectl set image deployment X C=IMG</code></td><td>Cambia la imagen de un contenedor y genera nueva revisión</td></tr>
+            <tr><td><code>kubectl rollout status deployment X</code></td><td>Bloquea hasta que el rollout termine (o expire)</td></tr>
+            <tr><td><code>kubectl rollout history deployment X</code></td><td>Muestra las revisiones del Deployment</td></tr>
+            <tr><td><code>kubectl rollout undo deployment X</code></td><td>Vuelve a la revisión anterior (rollback)</td></tr>
+            <tr><td><code>spec.strategy.rollingUpdate.{maxSurge,maxUnavailable}</code></td><td>Controlan cuántas réplicas extra/caídas se toleran durante el rollout</td></tr>
+            <tr><td><code>spec.revisionHistoryLimit</code></td><td>Cuántos ReplicaSets viejos conserva para poder hacer rollback</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuál es la diferencia entre Deployment y ReplicaSet?</summary>
+            <div>
+              <p>El ReplicaSet solo garantiza un número de réplicas. El Deployment añade rollout versionado, historial de revisiones y rollback. En la práctica siempre usarás Deployment: el ReplicaSet es un detalle interno que el Deployment gestiona por ti (aunque aparece en <code>kubectl get rs</code>).</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si borro a mano un Pod de un Deployment, ¿qué pasa?</summary>
+            <div>
+              <p>El ReplicaSet lo detecta en su siguiente reconciliación (segundos) y crea un Pod nuevo desde la misma plantilla. La "población" de Pods es lo que importa, no los individuos. Exactamente el comportamiento opuesto al Pod suelto de la lección 01.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿maxSurge y maxUnavailable se suman para saber las réplicas máximas?</summary>
+            <div>
+              <p>Sí: durante un rollout con 3 réplicas, <code>maxSurge</code> y <code>maxUnavailable</code> definen un <strong>rango permitido</strong>: puedes llegar a tener replica count + maxSurge Pods (por exceso) y replica count − maxUnavailable (por defecto). El controlador elige el plan de escalado del ReplicaSet dentro de ese rango.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo hacer un rollout sin downtime si la app nueva necesita migración de datos?</summary>
+            <div>
+              <p>Sí, pero la migración debe hacerse <strong>compatible hacia atrás</strong> (backward compatible): la versión vieja debe seguir funcionando contra el esquema nuevo. Si no puede ser compatible, la alternativa profesional es <em>blue/green</em> o <em>canary</em>: dos Deployments separados con etiquetas distintas y un Service que apunta a uno u otro (tema del reto... y del Módulo 9).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

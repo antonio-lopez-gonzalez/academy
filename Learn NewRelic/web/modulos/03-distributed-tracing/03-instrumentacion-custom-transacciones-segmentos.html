@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-instrumentacion-custom-transacciones-segmentos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Instrumentación custom: atributos [Transaction] y [Trace] — Módulo 3 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Instrumentación custom: atributos [Transaction] y [Trace]</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Distributed Tracing y traceId</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Aquí empieza de verdad la «tuya»: la instrumentación que el agente no hace sola. El agente .NET ofrece dos mecanismos: <strong>atributos</strong> en tu código (<code>[Transaction]</code>, <code>[Trace]</code>) e <strong>instrumentación XML</strong> sin tocar código. Empezamos por los atributos, que son la vía natural en un WebSocket en C#.</p>
+        <p>Verás cuándo crear una transacción y cuándo añadir <em>detalle</em> a una existente, cómo clasificarla web/no-web y las reglas de oro (métodos concretos, no Main, no interfaces).</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos preguntas antes de instrumentar</h3>
+        <table>
+          <thead><tr><th>¿Tu método NO aparece en la UI?</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>Sí, aparece pero tiene huecos sin detalle</td><td><strong>Crear detalle</strong> → <code>[Trace]</code></td></tr>
+            <tr><td>No aparece en absoluto (tu WebSocket)</td><td><strong>Crear transacción</strong> → <code>[Transaction]</code></td></tr>
+          </tbody>
+        </table>
+        <p>Un método con <code>[Transaction]</code> crea transacción <strong>solo si no hay ninguna en curso</strong>; si se llama dentro de otra transacción, se comporta como <code>[Trace]</code> (detalle). Este comportamiento es perfecto para tu handler: si lo llamas desde el middleware del mensaje (sin transacción HTTP), crea su propia transacción «non-web».</p>
+
+        <h3>Cómo se ve</h3>
+        <pre><code class="language-csharp">using NewRelic.Api.Agent;   // atributos viven aquí (en NewRelic.Agent.Api)
+
+// Crea UNA TRANSACCIÓN non-web cuando no haya ninguna en curso
+[Transaction]
+public void ProcessOrderMessage(MessageEnvelope msg) { ... }
+
+// Crea transacción web (por ejemplo un endpoint que quieras medir como web)
+[Transaction(Web = true)]
+public void RunHealthCheck() { ... }
+
+// Añade DETALLE (segmento) dentro de una transacción ya existente
+[Trace]
+private void ParsePayload(JsonElement payload) { ... }</code></pre>
+
+        <h3>Reglas y requisitos</h3>
+        <ul>
+          <li>Requiere el paquete <code>NewRelic.Agent.Api</code> y <code>using NewRelic.Api.Agent;</code>.</li>
+          <li>Los atributos van en <strong>implementaciones concretas</strong>, no en interfaces ni definiciones de clase base.</li>
+          <li>Evita instrumentar <code>Main()</code>/métodos de vida larga: como no terminan, podrían retrasar el envío de datos.</li>
+          <li>Si un <code>[Trace]</code> no aparece, prueba <code>[MethodImpl(MethodImplOptions.NoInlining)]</code> (evita que el JIT inline lo haga invisible al profiler).</li>
+          <li>Ejecuta en <strong>Release</strong>, no Debug: el modo debug puede ocultar métodos al profiler.</li>
+        </ul>
+
+        <h3>¿Y los nombres?</h3>
+        <p>El nombre de transacción sale del método. Si quieres agruparlo por dominio, usa <code>SetTransactionName</code> dentro (M2-01) o XML de instrumentación para renombrados potentes.</p>
+
+        <div class="callout callout--note">
+          <p><strong>Alternativa XML:</strong> si no quieres tocar código, el agente acepta un archivo XML en <code>newrelic.config</code> que marca métodos. Los XML-created transactions son <strong>siempre non-web</strong>. Para este curso usaremos atributos (más legibles y testables).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">using NewRelic.Api.Agent;
+
+public class TradeProcessor
+{
+    // Cada llamada crea una OtherTransaction/.../ProcessTrade
+    [Transaction]
+    public void ProcessTrade(TradeMessage trade)
+    {
+        Parse(trade);          // [Trace] → segmento ProcessDetail?
+        Apply(trade);
+    }
+
+    // Detalle dentro de la transacción
+    [Trace]
+    private void Apply(TradeMessage trade)
+    {
+        // ... lógica de negocio ...
+    }
+}</code></pre>
+        <p>Al mirar APM verás una transacción <code>OtherTransaction/.../ProcessTrade</code> con su segmento <code>Apply</code>. Ese es el «corazón del mensaje» que antes era invisible.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Modelo típico para un WebSocket: transacción por mensaje, detalle en las fases:</p>
+        <pre><code class="language-csharp">public class MessageDispatcher
+{
+    [Transaction]                       // 1 mensaje = 1 transacción
+    public void Dispatch(MessageEnvelope msg)
+    {
+        _agent.CurrentTransaction
+            .AddCustomAttribute("messageType", msg.Type)
+            .AddCustomAttribute("messageId", msg.MessageId);
+
+        switch (msg.Type)
+        {
+            case "trade": _tradeProcessor.ProcessTrade(msg);   break;
+            case "ping":  _pingProcessor.Respond(msg);         break;
+            default:      _logger.LogWarning("unknown {Type}", msg.Type); break;
+        }
+    }
+}
+
+public class TradeProcessor
+{
+    [Trace]
+    public void ProcessTrade(MessageEnvelope msg) { /* ... */ }
+}</code></pre>
+        <p>Ahora la pregunta «p95 de procesar un trade» es una consulta NRQL que agrupa por <code>name</code> o por <code>messageType</code>.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una transacción por unidad de trabajo; <code>[Trace]</code> para fases</td><td>Instrumentar cada método (ruido)</td><td>El árbol de la traza se vuelve legible y las agregaciones útiles</td></tr>
+            <tr><td>Métodos concretos y estables</td><td>Interfaces, métodos inline de vida larga, Main()</td><td>Compatibilidad del profiler y envío a tiempo</td></tr>
+            <tr><td>Release build en producción</td><td>Ejecutar en Debug en prod</td><td>Debug puede ocultar métodos al profiler</td></tr>
+            <tr><td>Enriquecer con atributos dentro de la transacción</td><td>Nombres de método con valores</td><td>Los atributos dan facet; los nombres deben ser estables</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Atributo en una interfaz</h3>
+        <pre><code class="language-csharp">// ❌ No funciona: el agente instrumenta implementaciones concretas
+public interface ITradeProcessor
+{
+    [Transaction]
+    void ProcessTrade(TradeMessage t);
+}
+
+// ✅ En la clase concreta
+public sealed class TradeProcessor : ITradeProcessor
+{
+    [Transaction]
+    public void ProcessTrade(TradeMessage t) { ... }
+}</code></pre>
+
+        <h3>Instrumentar Main()</h3>
+        <pre><code class="language-csharp">// ❌ Main() vive hasta terminar el proceso: retrasa el envío
+[Transaction]
+public static void Main(string[] args) { ... }
+
+// ✅ Transacción en los métodos de trabajo (loop de mensajes)</code></pre>
+
+        <h3>Esperar que aparezca «ya» en la UI</h3>
+        <p>Los atributos solo funcionan si el profiler está adjunto (NewRelic.Agent + env vars). Sin agente, no se reporta nada — la API es no-op.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Añade <code>NewRelic.Agent.Api</code> y crea una clase <code>TradeProcessor</code> con el ejemplo real (Dispatcher + Processor).</li>
+          <li><strong>Paso 2:</strong> Ejecuta en Release con el agente y envía mensajes de prueba.</li>
+          <li><strong>Paso 3:</strong> Consulta:
+          <pre><code class="language-nrql">SELECT count(*), average(duration) FROM Transaction
+WHERE name LIKE '%ProcessTrade%'
+FACET messageType SINCE 15 minutes ago</code></pre>
+          </li>
+          <li><strong>Paso 4:</strong> Abre la traza de una de esas transacciones: ¿ves el segmento <code>Apply</code> con <code>[Trace]</code>?</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 [Transaction] vs [Trace]</h3>
+          <p>Explica con tus palabras cuándo crearías una transacción y cuándo solo detalle, y pon dos ejemplos reales de tu app. Además, investiga el <code>SetTransactionUri()</code> de la API y para qué se usa con <code>[Transaction(Web = true)]</code>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>[Transaction]</code> crea transacción si no existe (web con <code>Web = true</code>); en una existente actúa como <code>[Trace]</code>.</li>
+          <li><code>[Trace]</code> añade detalle (segmento) a la transacción en curso.</li>
+          <li>Solo en métodos concretos; no Main(); Release build.</li>
+          <li>Atributos + <code>AddCustomAttribute</code> = transacción de negocio con contexto.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no aparece mi [Trace] en los traces?</summary>
+            <div><p>Comprueba: Release, NoInlining si hace falta, método concreto, agente adjunto, y que la transacción que lo contiene sea muestreada (sampleada).</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo aplicar atributos a métodos async?</summary>
+            <div><p>El agente sigue a los methodoes marcados con los atributos; para async/await el timing se mide sobre el método. Para trabajo muy concurrente (Task.Run) revisa que la transacción «actual» siga siendo la del hilo correcto; en esos casos se usa la API de headers (M3-04) o con cuidado el contexto.</p></div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay con el XML?</summary>
+            <div><p>El XML no exige tocar código ni recompilar, pero es frágil (nombres exactos) y sus transacciones siempre son non-web. Los atributos son la vía recomendada en el curso.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

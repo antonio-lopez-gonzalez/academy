@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="es" data-module="10" data-lesson="01-pipeline-http">
+<head>
+  <meta charset="UTF-8">
+  <title>Pipeline HTTP de ASP.NET Core — Módulo 10 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Pipeline HTTP de ASP.NET Core</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 10 · Middleware y pipelines</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>Cada petición HTTP que llega a una aplicación ASP.NET Core atraviesa una <strong>cadena de middleware</strong> antes de llegar al endpoint final. Esa cadena se llama <strong>pipeline HTTP</strong>. Es el equivalente en .NET a las cadenas de filtros de Express.js o a los interceptores de Spring.</p>
+        <p>En esta lección aprenderemos qué es un middleware, cómo se construye el pipeline, por qué el orden importa y qué hacen métodos como <code>app.Use()</code>, <code>app.Run()</code> y <code>app.Map()</code>.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelve?</h4>
+          <p>El pipeline permite aplicar comportamiento transversal a todas las peticiones (logging, seguridad, compresión, rate limiting, tracing) sin ensuciar cada endpoint. Es como una línea de montaje donde cada operario hace una tarea y pasa el paquete al siguiente.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Registrar el middleware de autenticación después del de autorización, dejando a los endpoints sin identidad.</li>
+          <li>Colocar <code>app.Run()</code> en medio del pipeline y cortar el flujo de todas las peticiones.</li>
+          <li>Invocar <code>next()</code> dos veces en el mismo middleware, duplicando el trabajo y alterando la respuesta.</li>
+          <li>Olvidar que el pipeline es bidireccional: el código que va hacia el endpoint se ejecuta en el orden de registro, pero el que vuelve se ejecuta al revés.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>¿Qué es un middleware?</h3>
+        <p>Un middleware es un componente que recibe un <code>HttpContext</code>, hace algo con él y decide si llama al siguiente componente de la cadena o no. Está representado por un delegado <code>RequestDelegate</code> con forma <code>Func&lt;HttpContext, Task&gt;</code>.</p>
+        <p>Conceptualmente es una cebolla: cada capa puede actuar antes de entrar, después de volver o ambas. Si una capa decide no llamar a <code>next()</code>, la petición se corta (<em>short-circuit</em>) y las capas interiores no se ejecutan.</p>
+
+        <h3>Componentes del pipeline</h3>
+        <ul>
+          <li><code>app.Use()</code>: añade un middleware que puede llamar a <code>next()</code> y continuar.</li>
+          <li><code>app.Run()</code>: añade un middleware terminal que no llama a <code>next()</code>. Si se ejecuta, termina la cadena.</li>
+          <li><code>app.Map()</code>: bifurca el pipeline según una ruta. No vuelve a la cadena principal; es un subpipeline.</li>
+          <li><code>app.UseWhen()</code>: añade un middleware condicionalmente para un subconjunto de rutas pero sí vuelve.</li>
+        </ul>
+
+        <h3>El orden importa</h3>
+        <p>El orden de registro en <code>Program.cs</code> es el orden de ejecución hacia el endpoint. Cuando la respuesta vuelve, el orden se invierte. Un middleware de excepciones debe ir al principio para capturar errores de todos los demás; un middleware de compresión debe ir después de los que escriben la respuesta.</p>
+
+        <pre><code>Petición → [ExceptionHandler] → [HttpsRedirection] → [CORS] → [Authentication] → [Authorization] → [Endpoint] →
+         ← [ExceptionHandler] ← [HttpsRedirection] ← [CORS] ← [Authentication] ← [Authorization] ← [Respuesta]</code></pre>
+
+        <h3>Comparación con otros ecosistemas</h3>
+        <table>
+          <thead><tr><th>.NET</th><th>Express.js</th><th>Spring Boot</th><th>Nginx</th></tr></thead>
+          <tbody>
+            <tr><td>Middleware</td><td><code>app.use()</code></td><td>Filter / Interceptor</td><td>location / try_files</td></tr>
+            <tr><td><code>RequestDelegate</code></td><td><code>req, res, next</code></td><td><code>FilterChain</code></td><td>phases</td></tr>
+            <tr><td><code>HttpContext</code></td><td><code>req / res</code></td><td><code>HttpServletRequest</code></td><td>variables</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--tip">
+          <h4>Regla mnemotécnica</h4>
+          <p>Orden recomendado: <strong>Excepciones → HSTS → Redirección HTTPS → Static Files → Routing → CORS → Autenticación → Autorización → Endpoints</strong>. Si un middleware depende de algo, ese algo debe ir antes.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Crearemos un proyecto web que muestre el recorrido de la petición con trazas en consola.</p>
+
+        <pre><code class="language-bash"># Creamos un proyecto web vacío (sin controllers por defecto)
+dotnet new web -n PipelineDemo -o PipelineDemo
+cd PipelineDemo
+
+dotnet run --project .
+# Probar: http://localhost:5000</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+// Middleware A: antes y después de la siguiente etapa
+app.Use(async (context, next) =>
+{
+    Console.WriteLine("A: antes de next");
+    await next(); // cede el control al siguiente middleware
+    Console.WriteLine("A: después de next");
+});
+
+// Middleware B
+app.Use(async (context, next) =>
+{
+    Console.WriteLine("B: antes de next");
+    await next();
+    Console.WriteLine("B: después de next");
+});
+
+// Middleware terminal: no llama a next
+app.Run(async context =>
+{
+    Console.WriteLine("Terminal: respondiendo");
+    await context.Response.WriteAsync("Hola desde el pipeline");
+});
+
+app.Run();</code></pre>
+
+        <p>Si llamas a la raíz, verás en consola:</p>
+        <pre><code>A: antes de next
+B: antes de next
+Terminal: respondiendo
+B: después de next
+A: después de next</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El <code>await next()</code> es el punto de inflexión. Todo lo que escribas antes se ejecuta al bajar hacia el endpoint; todo lo que escribas después se ejecuta al subir con la respuesta.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una API real el pipeline suele ser más largo. Vamos a simular un pipeline con excepciones, redirección HTTPS, CORS y endpoints.</p>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+// 1. Captura de excepciones al inicio para cubrir todo lo demás
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler("/error");
+    app.UseHsts();
+}
+
+app.UseHttpsRedirection();
+
+// 2. CORS antes de autenticación, porque el preflight OPTIONS no lleva credenciales
+app.UseCors(policy =>
+    policy.AllowAnyOrigin()
+          .AllowAnyMethod()
+          .AllowAnyHeader());
+
+// 3. Autenticación y autorización en el orden correcto
+app.UseAuthentication();
+app.UseAuthorization();
+
+// 4. Middleware personalizado de trazas
+app.Use(async (context, next) =>
+{
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    logger.LogInformation("Request {Method} {Path} started", context.Request.Method, context.Request.Path);
+    await next();
+    logger.LogInformation("Request finished with status {StatusCode}", context.Response.StatusCode);
+});
+
+// 5. Endpoints
+app.MapGet("/", () => "OK");
+app.MapGet("/error", () => Results.Problem("Ocurrió un error inesperado."));
+
+app.Run();</code></pre>
+
+        <div class="callout callout--warning">
+          <h4>Cuidado con HSTS en desarrollo</h4>
+          <p><code>UseHsts()</code> añade la cabecera <code>Strict-Transport-Security</code>. En desarrollo no se aplica porque puede forzar a navegadores a recordar HTTPS para localhost, lo que dificulta las pruebas.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Ordena el pipeline con intención.</strong> Los middleware de cortocircuito (<code>Map</code>, <code>UseStaticFiles</code>) deben ir temprano si quieres evitar trabajo innecesario.</li>
+          <li><strong>No bloquees.</strong> Siempre usa <code>async/await</code> en el pipeline; no llames a <code>.Result</code> o <code>.Wait()</code>.</li>
+          <li><strong>Evita duplicar trabajo.</strong> Si necesitas leer el body de la respuesta, usa <code>Stream</code> con cuidado porque los streams pueden no ser re-lectables.</li>
+          <li><strong>Usa extensiones con nombre.</strong> Registra tus middlewares con métodos <code>UseXxx</code> para que <code>Program.cs</code> sea legible.</li>
+          <li><strong>Documenta las dependencias.</strong> Si un middleware necesita autenticación, escribe un comentario indicando que <code>UseAuthentication</code> debe ir antes.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <h4>Consejo de rendimiento</h4>
+          <p>El middleware de <code>ExceptionHandler</code> y el de <code>StatusCodePages</code> añaden overhead. En APIs de alto rendimiento, evalúa manejar errores con <code>IExceptionHandler</code> (a partir de .NET 8) para respuestas más ligeras y testables.</p>
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Llamar a <code>next</code> después de escribir en la respuesta</h3>
+        <pre><code class="language-csharp">// ❌ MAL: escribe la respuesta y luego continúa
+app.Use(async (context, next) =>
+{
+    await context.Response.WriteAsync("Primero");
+    await next(); // siguiente middleware puede escribir y romper el body
+});</code></pre>
+        <p>El problema: si el siguiente middleware también escribe, la respuesta queda corrupta. Si escribes, generalmente no debes llamar a <code>next</code>.</p>
+
+        <h3>6.2. <code>app.Run()</code> no es el último</h3>
+        <pre><code class="language-csharp">// ❌ MAL: todo lo que va después de Run nunca se ejecuta
+app.Run(async context => await context.Response.WriteAsync("A"));
+app.Use(async (context, next) => await next()); // nunca llega</code></pre>
+        <p>La versión correcta es usar <code>app.Run()</code> solo al final del pipeline o usar <code>app.Use()</code> si se necesita continuar.</p>
+
+        <h3>6.3. Autenticación después de autorización</h3>
+        <pre><code class="language-csharp">// ❌ MAL: sin identidad no se puede autorizar
+app.UseAuthorization();
+app.UseAuthentication();</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO
+app.UseAuthentication();
+app.UseAuthorization();</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Crea un middleware que mida el tiempo de cada petición y lo añada como cabecera <code>X-Response-Time-ms</code>.</p>
+
+        <pre><code class="language-csharp">// Program.cs
+using System.Diagnostics;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+app.Use(async (context, next) =>
+{
+    var stopwatch = Stopwatch.StartNew();
+    await next();
+    stopwatch.Stop();
+
+    var elapsedMs = stopwatch.ElapsedMilliseconds;
+    context.Response.Headers.Append("X-Response-Time-ms", elapsedMs.ToString());
+});
+
+app.MapGet("/slow", async () =>
+{
+    await Task.Delay(120);
+    return "Listo";
+});
+
+app.MapGet("/fast", () => "Rápido");
+
+app.Run();</code></pre>
+
+        <p>Prueba con <code>curl -i http://localhost:5000/slow</code> y observa la cabecera.</p>
+        <div class="callout callout--info">
+          <h4>¿Por qué detenemos el <code>Stopwatch</code> después de <code>next</code>?</h4>
+          <p>Porque queremos medir todo el tiempo de procesamiento, incluyendo la ejecución del endpoint y el middleware interiores. El <code>await</code> nos devuelve el control cuando la respuesta ya está lista.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Construye un middleware de <strong>branching</strong>: si la petición va a <code>/api/v2/*</code>, añade una cabecera <code>X-Api-Version: 2</code>; si va a <code>/api/v1/*</code>, añade <code>X-Api-Version: 1</code>. Usa <code>app.UseWhen</code> para no duplicar el resto del pipeline.</p>
+        <p>Intenta resolverlo antes de ver la solución. Pistas: <code>context.Request.Path.StartsWithSegments</code> y <code>app.UseWhen</code>.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El pipeline HTTP es una cadena de middleware que procesa la petición y la respuesta.</li>
+          <li><code>app.Use()</code> continúa, <code>app.Run()</code> termina, <code>app.Map()</code> bifurca.</li>
+          <li>El orden de registro determina el orden de ejecución; la vuelta es inversa.</li>
+          <li>El orden correcto de middleware comunes: excepciones, HSTS, HTTPS, estáticos, routing, CORS, autenticación, autorización, endpoints.</li>
+          <li>El pipeline es un patrón común a muchos frameworks, lo que facilita la comparación entre ecosistemas.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿El middleware se ejecuta para cada petición o solo al arrancar?</h3>
+        <p>El <strong>registro</strong> se hace al arrancar. El <strong>middleware</strong> se ejecuta para cada petición. La parte del constructor de un middleware personalizado se ejecuta al crear la instancia (singleton, scoped o transient según su registro).</p>
+
+        <h3>¿Puedo modificar la respuesta una vez que el endpoint ha escrito?</h3>
+        <p>Generalmente no. Si el endpoint ha empezado a enviar bytes al cliente, no puedes cambiar cabeceras. Si necesitas interceptar el body, reemplaza el <code>Response.Body</code> por un <code>MemoryStream</code> temporal, invoca <code>next()</code> y luego copias el resultado.</p>
+
+        <h3>¿Qué pasa si no llamo a <code>next()</code> en un middleware?</h3>
+        <p>La petición se corta (<em>short-circuit</em>). Ningún middleware posterior ni el endpoint se ejecutará. Es útil para devolver 401 o 404 antes de gastar recursos.</p>
+
+        <h3>¿Es lo mismo <code>app.Map</code> que <code>app.UseWhen</code>?</h3>
+        <p>No. <code>Map</code> crea una bifurcación que no vuelve a la rama principal. <code>UseWhen</code> añade un middleware condicional que, después de ejecutarse, devuelve el control a la cadena principal.</p>
+
+        <h3>¿Puedo usar middleware en Minimal APIs y Controllers?</h3>
+        <p>Sí. El pipeline es compartido por ambos. La diferencia es que Minimal APIs no tienen filtros de MVC como <code>IActionFilter</code>, pero sí <code>IEndpointFilter</code>.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

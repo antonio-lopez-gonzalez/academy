@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="00" data-lesson="04-caso-de-estudio-hub-conexiones">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso de estudio: hub de conexiones WebSocket — Módulo 0 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso de estudio: hub de conexiones WebSocket</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 0 · Qué es Redis y el caso de uso</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo el curso lo aplicamos a un solo sistema real: el <strong>hub de conexiones</strong> de tu servidor WebSocket. Hoy defines con precisión qué problema resuelve Redis ahí, y por qué una solución «en memoria del proceso» deja de servir cuando escalas.</p>
+        <p>Esta lección es la brújula del curso: si entiendes el problema del hub, cada estructura de datos que verás luego tendrá dónde aterrizar.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema de un solo proceso</h3>
+        <p>Con un nodo, guardas las conexiones en un <code>ConcurrentDictionary&lt;guid, WebSocket&gt;</code>: rápido y suficiente. El problema aparece con <strong>2+ nodos</strong>:</p>
+        <pre><code class="language-text">Sin Redis:
+Nodo A guarda conn 1..5000   ·   Nodo B guarda conn 5001..10000
+   Pregunta "¿dónde está el usuario 42?"  →  A no lo sabe, B no lo sabe
+   Broadcast a "todos"        →  A solo a sus 5000, B solo a los suyos
+   Reinicio de A              →  se pierde su registro de conexiones
+
+Con Redis (registro + backplane):
+Redis guarda el "directorio" y los mensajes comunes:
+   hub:conn:&lt;id&gt; = nodo  →  cualquier nodo sabe dónde vive el cliente
+   hub:events     = canal  →  A publica, B recibe y reenvía a sus clientes</code></pre>
+
+        <h3>Las responsabilidades del hub con Redis</h3>
+        <table>
+          <thead><tr><th>Responsabilidad</th><th>Dónde vive</th><th>Estructura</th></tr></thead>
+          <tbody>
+            <tr><td>¿A qué nodo pertenece la conexión X?</td><td>Redis</td><td>Hash <code>hub:conn:&lt;id&gt;</code> (o string)</td></tr>
+            <tr><td>¿Quién está conectado (presencia)?</td><td>Redis</td><td>Sorted set con timestamp + TTL/limpieza</td></tr>
+            <tr><td>¿Quién lee el canal gaming?</td><td>Redis</td><td>Set <code>chan:gaming</code></td></tr>
+            <tr><td>Broadcast de un mensaje a todos los nodos</td><td>Redis</td><td>Pub/Sub <code>hub:events</code></td></tr>
+            <tr><td>Enviar a un cliente concreto</td><td>El nodo dueño</td><td>Buscar en Redis el nodo y hacer <code>SendAsync</code></td></tr>
+            <tr><td>Mensajes que no pueden perderse</td><td>Redis</td><td>Stream <code>stream:&lt;type&gt;</code> con grupos</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Un recorrido típico sin dolor</h3>
+        <pre><code class="language-text">usuario 42 conecta a Nodo A
+  A: HSET hub:conn:8632 node A userId 42
+     ZADD hub:presence &lt;ts&gt; user:42
+     SADD chan:general user:42
+     PUBLISH hub:events {"type":"connect","user":42}
+
+usuario 7 conecta a Nodo B
+  ... ídem con B ...
+
+"Nodo A" quiere enviar a TODOS (incluye los del B)
+  A: PUBLISH hub:events {"type":"broadcast","payload":...}
+  B: (suscrito) recibe → reenvía a sus clientes</code></pre>
+
+        <div class="callout callout--why">
+          <p><strong>Decisión clave:</strong> nada del estado del hub vive «solo en RAM del proceso». Incluso en un solo nodo, usar Redis desde el principio normaliza el modelo y facilita escalar mañana sin refactor.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El latido de un hub con Redis, todo en redis-cli:</p>
+        <pre><code class="language-redis"># conectar a un nodo
+HSET hub:conn:8632 node node-1 state open
+EXPIRE hub:conn:8632 30        # presencia temporal
+
+# otro nodo consulta "¿dónde está 8632?"
+HGET hub:conn:8632 node        # → "node-1"
+
+# desconexión o expiración
+DEL hub:conn:8632</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La versión «de verdad» añade la atomicidad y el pub/sub. Un fragmento del proyecto final (adelanto, M6/M7 lo detalla):</p>
+        <pre><code class="language-csharp">// ConnectionHub (el proyecto redis-ws-hub hará esto)
+var db = mux.GetDatabase();
+var sub = mux.GetSubscriber();
+
+// Registrar conexión en el nodo local
+var key = $"hub:conn:{connectionId}";
+await db.HashSetAsync(key,
+    [new HashEntry("node", _nodeId), new HashEntry("userId", userId)]);
+await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30));   // TTL = presencia
+
+// Publicar el evento al resto de nodos
+await sub.PublishAsync("hub:events",
+    JsonSerializer.Serialize(new { type = "connect", userId, node = _nodeId }));</code></pre>
+        <p>Fíjate: hash + TTL + pub/sub. Son las tres piezas que el resto del curso enseña una a una.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Modelar el hub «como distribuido» desde el día uno</td><td>Pasar de un Dictionary a Redis «cuando duela»</td><td>Igual entre 1 o 10 nodos; sin refactor de choque</td></tr>
+            <tr><td>Fixer TTL a toda presencia</td><td>Registros que nunca expiran</td><td>La limpieza de muertes llega sola (M1-03)</td></tr>
+            <tr><td>Publicar eventos de vida («connect»/«disconnect»)</td><td>Que cada nodo adivine el estado de los demás</td><td>Los eventos son la fuente de los otros nodos</td></tr>
+            <tr><td>Degradar con gracia si Redis cae</td><td>Que la caída de Redis tumbe todo el hub</td><td>El hub debe poder «modo local» temporal (M7)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Guardar el WebSocket en Redis</h3>
+        <pre><code class="language-csharp">// ❌ Intento (imposible): Redis no guarda sockets ni objetos live
+_ = db.StringSetAsync("conn:1", socket);   // no funciona así
+
+// ✅ Redis guarda el DIRECTORIO (¿en qué nodo está?) y
+//    el socket vive en la RAM de su nodo
+await db.StringSetAsync("conn:1", "node-1", TimeSpan.FromSeconds(30));</code></pre>
+
+        <h3>Broadcast solo local (se le olvidan los demás nodos)</h3>
+        <p>Dar «broadcast» reenviando solo a las conexiones del proceso actual deja sin mensaje a los clientes de otros nodos. Siempre publica en el canal común y que cada nodo reenvíe a sus sockets.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Escribe en una nota los 6 «momentos» de una conexión en tu hub: connect, subscribe, message, unsubscribe, disconnect y failover.</li>
+          <li><strong>Paso 2:</strong> Para cada uno, anota qué escribes en Redis y qué publicas (o no) por pub/sub.</li>
+          <li><strong>Paso 3:</strong> Guárdalo: es el diagrama de flujo sobre el que construiremos en M7/M8.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El mapa del hub</h3>
+          <p>Diseña el plano de keys de tu hub: qué keys crearás para el registro (por conexión y por nodo), la presencia, los canales y las métricas. Incluye el TTL de cada una. Al terminar el curso, valida tu plano contra el proyecto final.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El hub necesita estado compartido que no vive en la RAM de un proceso.</li>
+          <li>Trío de piezas: <strong>string/hash</strong> (directorio), <strong>TTL</strong> (presencia), <strong>pub/sub</strong> (backplane).</li>
+          <li>Redis guarda «dónde está» y «quién lo sabrá», no el socket.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Y si solo tengo UN nodo? ¿Merece la pena Redis?</summary>
+            <div><p>Sí como diseño: modelo igual, y cuando crezca no reescribes. Pero si tu hub es pequeño y no planeas escalar, un Dictionary + reintentos en cache es aceptable. El criterio es <em>escala y disponibilidad</em>.</p></div>
+          </details>
+          <details>
+            <summary>¿No vale SignalR + backplane para esto?</summary>
+            <div><p>SignalR con Redis backplane te da un hub gestionado; nuestro curso te da el «por qué» y el control de bajo nivel con StackExchange.Redis para que entiendas qué ocurre debajo (y puedas implementarlo sin SignalR).</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

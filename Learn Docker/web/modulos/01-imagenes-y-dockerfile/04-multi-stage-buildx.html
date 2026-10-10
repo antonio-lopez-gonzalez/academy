@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="04-multi-stage-buildx">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-stage, .dockerignore y Buildx — Módulo 1 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Multi-stage, .dockerignore y Buildx</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Imágenes y Dockerfile</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección 02 viste el Dockerfile «de una etapa»: una sola imagen que lo contiene todo. Funciona, pero cuando tu aplicación <em>compila</em> (TypeScript, Tailwind, un bundler, binarios), el proceso de build deja dentro de la imagen <strong>máquinas de construcción completas</strong>: compiladores, dependencias de desarrollo, código fuente, caches… y eso engorda tu imagen de producción y amplía su superficie de ataque.</p>
+        <p>En esta lección aprenderás las tres herramientas que transforman ese problema: los <strong>builds multi-stage</strong> (compilar en una etapa, producir la imagen final mínima en otra), el <strong>.dockerignore</strong> (no enviar basura al builder) y <strong>Docker Buildx</strong> (el builder moderno, con BuildKit, cache en remoto, <code>--target</code> y multi-plataforma).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existen estas tres cosas?</strong> Porque «tamaño pequeño» y «misma receta» son objetivos en tensión: quieres una imagen con <em>solo lo que corre en runtime</em>, pero necesitas herramientas pesadas <em>para construirla</em>. Multi-stage separa el «taller» (build) de la «tienda» (runtime); .dockerignore no mete la basura del contexto; Buildx hace todo eso rápido, paralelo, con caché y para varias arquitecturas.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema: la imagen engorda con la herramienta</h3>
+        <p>Un Dockerfile clásico para una app Node con TypeScript haría algo parecido a: <code>FROM node:20-alpine</code> → <code>npm ci</code> (con dependencias de dev) → <code>npm run build</code> (compila TS a <code>dist/</code>) → <code>CMD node dist/server.js</code>. El resultado contiene <strong>el compilador de TypeScript, Babel, eslint, sourcemaps… y el código fuente</strong>, aunque en producción solo necesita Node y el <code>dist/</code> ya compilado. En proyectos grandes eso son cientos de MB y «juguetes» dentro de la imagen que nadie pidió (y que un atacante sí sabría usar).</p>
+
+        <h3>Multi-stage: varias etapas FROM, una imagen final</h3>
+        <p>Un Dockerfile puede tener <strong>varias instrucciones <code>FROM</code></strong>. Cada una abre una <em>etapa</em> (stage) con su propio sistema de archivos. Puedes nombrarlas (<code>FROM node:20-alpine AS build</code>) y, al final, de esa etapa <strong>solo viajan a la imagen final los artefactos que explícitamente copies con <code>COPY --from=build ...</code></strong>.</p>
+        <div class="diagram">
+ETAPA 1 "build" (taller)              ETAPA 2 "runtime" (tienda) = IMAGEN FINAL
+---------------------------           ---------------------------------------
+FROM node:20-alpine AS build          FROM node:20-alpine
+WORKDIR /app                          WORKDIR /app
+COPY package*.json ./                 ENV NODE_ENV=production
+RUN npm ci            <- dev+prod     COPY package*.json ./
+COPY src ./src                        RUN npm ci --omit=dev
+RUN npm run build     <- compila      COPY --from=build /app/dist ./dist
+                                      EXPOSE 3000
+   ^                                   CMD ["node", "dist/server.js"]
+   | COPY --from=build /app/dist ./dist (solo el dist compilado)
+   | ────────── Los nodos de "build" NO van a la imagen final ──────
+        </div>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — el taller y la tienda:</strong> la etapa build es el taller donde fabrican el mueble (sierra, barniz, serrín); la etapa runtime es la tienda que muestra el mueble terminado. A la tienda no subes la sierra ni el serrín: solo el mueble. Multi-stage hace exactamente eso con tu aplicación.</p>
+        </div>
+        <ul>
+          <li><strong>Beneficio 1 — Tamaño:</strong> la imagen final solo contiene lo que corre en runtime.</li>
+          <li><strong>Beneficio 2 — Seguridad:</strong> sin compiladores, sin credenciales de build ni caches de dependencias en producción.</li>
+          <li><strong>Beneficio 3 — Velocidad:</strong> con BuildKit, las etapas se ejecutan en paralelo cuando no dependen entre sí.</li>
+        </ul>
+
+        <h3>.dockerignore: qué NO enviar al builder</h3>
+        <p>Recuerda la lección 02: el <strong>contexto</strong> se empaqueta completo y viaja al builder. Un <code>.gitignore</code> no sirve aquí — el builder no conoce tu Git—. La herramienta es <code>.dockerignore</code>, en la raíz del contexto, con sintaxis de patrones (parecida a los globs). Excluye:</p>
+        <ul>
+          <li><code>node_modules/</code> — tu caché de dependencias local, enormemente inútil en el builder.</li>
+          <li><code>.git/</code> — historia completa del repo.</li>
+          <li><code>dist/</code>, <code>coverage/</code>, lo que regeneraras — se regenera dentro del build.</li>
+          <li>Archivos locales: <code>.env</code> (¡secretos!), *.log, .DS_Store…</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Ojo:</strong> <code>.dockerignore</code> no protege secretos que ya hayas metido en una capa con <code>COPY</code> o <code>RUN</code>: solo evita que viajen en el contexto. Los secretos de build se inyectan de forma segura con <code>--secret</code> de BuildKit (fuera del alcance de esta lección).</p>
+        </div>
+
+        <h3>Docker Buildx y BuildKit</h3>
+        <p>Desde hace años, el builder por defecto de Docker es <strong>BuildKit</strong>, un motor de build moderno y reescrito. La forma cómoda de usarlo es <strong>Buildx</strong>: un plugin de la CLI (<code>docker buildx</code>) que además permite <strong>builders remotos</strong> y <strong>multi-plataforma</strong> (dar a la misma receta imágenes para <code>linux/amd64</code> y <code>linux/arm64</code> con <code>--platform</code>). Gracias a BuildKit, además tienes:</p>
+        <ul>
+          <li>Construcciones <strong>paralelas</strong> entre etapas independientes.</li>
+          <li><strong>Caché efectiva</strong> (local y remota, por capa y por digest).</li>
+          <li>Montajes efímeros de caché (<code>--mount=type=cache</code>) para npm/pnpm.</li>
+          <li><code>--target</code>: construir <strong>solo una etapa</strong> concreta. Lección 4.</li>
+          <li>Imágenes multi-arquitectura con un solo <code>--platform</code> (lección 05).</li>
+        </ul>
+        <pre><code class="language-bash"># Estado del builder (por defecto hay uno: "default", vía BuildKit)
+docker buildx ls
+# NAME/NODE    DRIVER/ENDPOINT     STATUS   BUILDKIT/PLATFORMS
+# default *    docker             running  v0.xx  linux/amd64, linux/arm64...
+#
+# Cuando usas el builder por defecto, "docker build" y "docker buildx
+# build" son equivalentes. En esta lección usamos ese builder; el
+# multi-plataforma con un builder "docker-container" lo verás en la
+# lección 05.
+        </code></pre>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El multi-stage mínimo útil: una «app web» generada con Node que se sirve con nginx. En el proceso compilamos a <code>dist/</code> en una etapa y servimos solo el resultado. El proyecto tiene solo <code>.dockerignore</code>, <code>Dockerfile</code>, <code>package.json</code> (con un script <code>build</code>) y <code>src/</code>.</p>
+        <div class="code-file">.dockerignore</div>
+        <pre><code class="language-text"># Lo que JAMÁS debe viajar al builder (contexto pequeño y limpio)
+node_modules/        # caché de dependencias local: inútil e inmensa
+.git/                # historia del repositorio
+dist/                # se genera dentro del build
+*.log                # directorios de log locales
+.env                 # secretos y configuración local
+        </code></pre>
+        <div class="code-file">Dockerfile (multi-stage mínimo)</div>
+        <pre><code class="language-dockerfile"># ===== Etapa 1: BUILD =====
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json ./
+RUN npm run build            # genera dist/index.html (script local)
+
+# ===== Etapa 2: RUNTIME (la imagen final) =====
+FROM nginx:1.27-alpine
+# SOLO copiamos el artefacto compilado de la etapa build
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+        </code></pre>
+        <pre><code class="language-bash">cd proyecto
+docker build -t mini-ms:1.0 .
+# Con BuildKit verás algo así por cada etapa:
+#  #1 [build 1/2] FROM node:20-alpine
+#  #5 [runtime 1/2] FROM nginx:1.27-alpine
+#  #8 [build 2/2] RUN npm run build
+#  #9 [runtime 2/2] COPY --from=build /app/dist ...
+#  DONE ...    ← la imagen final es SOLO la etapa "runtime"
+
+docker run -d --rm -p 8080:80 mini-ms:1.0
+curl http://localhost:8080            # --&gt; la página generada en la etapa build
+        </code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Ver el viaje completo:</strong> <code>docker history mini-ms:1.0</code> te muestra que la imagen final procede entera de la etapa runtime. El tamaño «desaparecido» (compilador, src, devdeps) nunca entró en la imagen: <em>esa</em> es la magia del multi-stage.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El Dockerfile de producción de la API de HarborTasks, refactorizado a dos etapas, con <code>--target</code> y comparación de tamaños. Aquí la compilación es <em>de empaquetado</em>: la etapa build instala <strong>todas</strong> las dependencias (dev incluidas) para poder <code>npm run build</code> si hiciera falta, y la etapa runtime instala solo las de producción y copia el código.</p>
+        <div class="code-file">proyectos/harbortasks/docker/api.Dockerfile (multi-stage)</div>
+        <pre><code class="language-dockerfile"># ============ HarborTasks API — Dockerfile multi-stage ============
+
+# ---- Etapa 1: integración de dependencias + posible build ----
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+# Manifiestos primero para explotar la caché (lección 02)
+COPY package.json package-lock.json ./
+
+# En la etapa de construcción instalamos TODO (dev + prod): aquí es donde
+# haríamos `npm run build` (compilar TS, bundlers, etc.)
+RUN npm ci
+
+COPY src ./src
+
+# ---- Etapa 2: RUNTIME — esta es la imagen final ----
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Copiamos los manifiestos desde la etapa build (caché de la lección 02)
+COPY --from=build /app/package.json /app/package-lock.json ./
+
+# …y aquí SOLO dependencias de producción, en la imagen final.
+RUN npm ci --omit=dev
+
+COPY --from=build /app/src ./src
+
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+        </code></pre>
+        <div class="code-file">proyectos/harbortasks/.dockerignore</div>
+        <pre><code class="language-text"># Entorno de trabajo Docker/K8s: no enviar al builder nada de esto
+node_modules/
+.git/
+.env
+*.log
+Dockerfile*
+.dockerignore
+dist/            # se regenera dentro de la etapa build (si algún día compilas)
+        </code></pre>
+        <p>Construye y mira la víscera:</p>
+        <pre><code class="language-bash"># Construir la imagen final (por defecto, la última etapa)
+docker build -f docker/api.Dockerfile -t harbortasks-api:1.0 .
+
+# ¿Y si quieres ver solo la etapa de build? --target
+docker build -f docker/api.Dockerfile --target build -t harbortasks-api:build .
+
+# Compara tamaños: la de build incluye devdeps; la final (runtime) no.
+docker images | grep harbortasks-api
+# harbortasks-api   build    ...   ~350 MB   (npm ci CON dev
+# harbortasks-api   1.0      ...   ~120 MB   (solo --omit=dev)
+
+# Verificación funcional
+docker run -d -p 3000:3000 --name api harbortasks-api:1.0
+curl http://localhost:3000/api/tasks
+docker history harbortasks-api:1.0      # la imagen final conserva solo
+                                        # capas de "runtime" + COPYs
+        </code></pre>
+        <div class="callout callout--why">
+          <p><strong>Por qué los dos <code>npm ci</code> (no «uno con <code>--omit=dev</code> solo»):</strong> la etapa build necesita devdeps para compilar y ejecutar scripts de build. La etapa runtime, al ser la imagen final, quiere la instalación mínima. Multi-stage te permite tener <em>ambas realidades</em> en un solo Dockerfile sin sacrificar la caché: una imagen de build «gorda» para desarrollar y una imagen de producción raquítica, con el mismo código fuente como única fuente de verdad.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Nombra SIEMPRE las etapas (<code>AS build</code>, <code>AS runtime</code>)</td>
+              <td>Referencias numéricas <code>COPY --from=0</code></td>
+              <td>Si insertas una etapa nueva, los índices se rompen silenciosamente; los nombres hacen el Dockerfile autodocumentado.</td>
+            </tr>
+            <tr>
+              <td>Crea siempre <code>.dockerignore</code>, incluso en proyectos pequeños</td>
+              <td>Solo <code>.gitignore</code> y el contexto «igualito»</td>
+              <td>El builder ve tu carpeta completa; <code>node_modules</code> de 300&nbsp;MB con cada build ralentiza todo y puede acabar dentro de la imagen.</td>
+            </tr>
+            <tr>
+              <td>La imagen final: runtime <strong>solo con lo que corre</strong> (prod deps, sin compiladores)</td>
+              <td>Terminar el Dockerfile en la etapa de build</td>
+              <td>Tamaño, superficie de ataque y coste de escaneo: la imagen de producción debe ser un artefacto mínimo y auditable.</td>
+            </tr>
+            <tr>
+              <td>Usa <code>--target</code> para construir etapas de desarrollo/prueba</td>
+              <td>Duplicar Dockerfiles (uno dev, uno prod)</td>
+              <td>Un único Dockerfile con varias etapas sirve para CI, para debug y para producción sin mantener recetas repetidas.</td>
+            </tr>
+            <tr>
+              <td>Aprovecha el caché de BuildKit (<code>--mount=type=cache,target=/root/.npm</code>) en npm/pnpm de proyectos grandes</td>
+              <td>Limpiar los caches dentro de la etapa build con <code>rm -rf</code> en el mismo RUN</td>
+              <td>El mount de caché persiste entre builds SIN engordar la imagen; el <code>rm -rf</code> dentro del RUN engorda una capa intermedia y ensucia el diff.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Olvidar .dockerignore (o borrar con la escopeta)</h3>
+        <pre><code class="language-text"># ❌ Sin .dockerignore: cada build envía node_modules, .git y todo logs
+# (mira el tamaño del contexto en la primera línea del build:
+#  "context" tarda, sube MB, y con COPY . . acaba DENTRO de la imagen)
+
+# ✅ Mínimo viable que ya soluciona el 90% del problema
+node_modules/
+.git/
+.env
+*.log
+        </code></pre>
+
+        <h3>Pensar que un multi-stage «copia todo»</h3>
+        <pre><code class="language-dockerfile"># ❌ Confundir etapas: esto NO sirve nada en runtime
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+# ¡nada de COPY --from=build! La imagen final es nginx VACÍO
+# (sin tu web). Compila bien, funciona mal.
+
+# ✅ Incluir el paso del taller a la tienda
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+        </code></pre>
+
+        <h3>Copiar el runtime sin source de producción</h3>
+        <pre><code class="language-dockerfile"># ❌ Instalar dependencias de producción DESPUÉS de copiar todo
+FROM node:20-alpine AS runtime
+WORKDIR /app
+COPY --from=build /app /app     # trae TODA la etapa build (dev+prod)
+RUN npm ci --omit=dev           # ya es demasiado tarde: la basura está dentro
+CMD ["node", "src/server.js"]
+
+# ✅ Orden correcto en runtime: manifiesto, deps prod, y SOLO el artefacto
+FROM node:20-alpine AS runtime
+WORKDIR /app
+COPY --from=build /app/package.json /app/package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/src ./src
+CMD ["node", "src/server.js"]
+        </code></pre>
+
+        <h3>Sorpresa: --target construye la etapa y NO la final</h3>
+        <pre><code class="language-bash"># ❌ "¿Por qué mi imagen del --target build no tiene mi CMD?"
+# Porque --target build ES la etapa de build: sin EXPOSE ni CMD finales.
+# Es un artefacto de desarrollo/CI, no la imagen de producción.
+
+# ✅ Uso correcto: usa --target para DEPURAR la etapa de construcción
+docker build --target build -t api:build .
+docker run --rm -it api:build sh      # -&gt; miras qué se compiló ahí
+        </code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir la API de HarborTasks en dos etapas y comprobar <em>empíricamente</em> cuánto adelgaza la imagen final, con verificación por comandos.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Prepara el mini-proyecto.</strong>
+            <pre><code class="language-bash">mkdir -p ~/proyectos/harbortasks-api/src
+cd ~/proyectos/harbortasks-api
+            </code></pre>
+            <div class="code-file">package.json</div>
+            <pre><code class="language-json">{
+  "name": "harbortasks-api",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "echo 'inicio API HarborTasks' &gt; build.txt",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
+            </code></pre>
+            <div class="code-file">src/server.js</div>
+            <pre><code class="language-javascript">// API mínima de HarborTasks: un hello para el ejercicio
+const express = require('express');
+const app = express();
+
+app.get('/api/tasks', (req, res) =&gt; {
+  res.json({ tasks: [] });        // sin BD todavía: llega en el Módulo 3
+});
+
+app.listen(3000, () =&gt; console.log('API escuchando en :3000'));
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — .dockerignore y Dockerfile multi-stage.</strong>
+            <div class="code-file">.dockerignore</div>
+            <pre><code class="language-text">node_modules/
+.git/
+.env
+*.log
+            </code></pre>
+            <div class="code-file">Dockerfile</div>
+            <pre><code class="language-dockerfile"># Etapa build
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src ./src
+RUN npm run build              # genera build.txt (simula compilación)
+
+# Etapa runtime (final)
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/package.json /app/package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/src ./src
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+            </code></pre>
+            <pre><code class="language-bash"># package-lock.json debe existir para npm ci. Genéralo:
+npm install --package-lock-only --ignore-scripts   # o npm install normal
+
+# La devDependency "typescript" es deliberada: en la etapa de build
+# npm ci la instala (capa gorda), pero la etapa runtime con
+# --omit=dev la omite. Así el contraste de tamaños del Paso 3 es real.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Construye ambas variantes y compara tamaños.</strong>
+            <pre><code class="language-bash">docker build -t api:build . --target build
+docker build -t api:prod .                       # sin --target: la última
+docker images | grep -E 'REPOSITORY|api:'
+#   api   build   ...   ~XXX MB    (npm ci SIN --omit=dev)
+#   api   prod    ...   ~YYY MB    (solo --omit=dev)
+# La de prod debe ser sensiblemente menor.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Verificación funcional.</strong>
+            <pre><code class="language-bash">docker run -d --name api-prod -p 3000:3000 api:prod
+curl http://localhost:3000/api/tasks      # --&gt; {"tasks":[]}
+docker exec api-prod test -f build.txt &amp;&amp; echo existe_build.txt || echo no_hay_build.txt
+# NOTA: esperamos "no_hay_build.txt": build.txt solo existe en la etapa
+# build (build.txt de npm run build). La imagen de producción NO lo
+# contiene: así de limpia se queda.
+docker logs api-prod                       # "API escuchando en :3000"
+docker stop api-prod &amp;&amp; docker rm api-prod
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Verificación con el historial.</strong>
+            <pre><code class="language-bash">docker history api:prod
+# Verás: /bin/sh -c npm ci --omit=dev ...   y   COPY --from=build ...
+docker history api:build
+# Verás: la etapa build completa, con npm ci (dev incluida) y el build.
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>El truco del <code>test -f</code> del Paso 4:</strong> es la prueba empírica del multi-stage. Si <code>build.txt</code> (fruto de la etapa build) NO está en la imagen final, es porque lo no-copiado no viaja. Con eso has verificado el concepto sin leer teoría: <em>tú lo viste con tus comandos</em>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Acelera el rebuild con el caché de BuildKit</h3>
+          <p>En el ejercicio has notado que <code>npm ci</code> de la etapa runtime se repite íntegro en cada build. Tu reto: reducir el tiempo de rebuild a «segundos» cuando no cambian las dependencias usando el <strong>cache mount</strong> de BuildKit:</p>
+          <pre><code class="language-dockerfile"># PISTA — la sintaxis exacta es un comentario "especial" de BuildKit:
+# RUN --mount=type=cache,target=/root/.npm,npm ci --omit=dev
+#   ^  el target apunta al directorio de la caché DE npm DENTRO del
+#   contenedor (para Node: /root/.npm). El directorio persiste entre
+#   builds fuera de las capas de la imagen.
+          </code></pre>
+          <p>Tareas: aplica el mount a ambas etapas, cronometra un build limpio (<code>docker build --no-cache -t api:prod .</code>) y el siguiente build modificando solo <code>src/server.js</code>: la descarga de npm debe saltársela. <strong>No resuelvas la «solución» aquí</strong>: experimenta, y si algo no cuadra, revisa que el builder sea BuildKit (debe parecer <code>#1 ...</code> con <code>FROM</code> inline, no el formato antiguo `Step 1/N`).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Multi-stage:</strong> varias <code>FROM</code> en un Dockerfile; se nombran (<code>AS build</code>) y se copia lo necesario con <code>COPY --from=etapa</code>. Solo la última etapa se convierte en imagen final.</li>
+          <li><strong>Por qué:</strong> tamaño mínimo, sin toolchains ni código fuente en producción, y builds paralelas con BuildKit.</li>
+          <li><strong>.dockerignore:</strong> filtra el contexto: <code>node_modules/</code>, <code>.git/</code>, <code>*.log</code>, <code>.env</code>…</li>
+          <li><strong>Buildx/BuildKit:</strong> builder moderno, paralelo, con caché (local y remota) y multi-plataforma; <code>docker build</code> es un alias de <code>docker buildx build</code> en el builder por defecto.</li>
+          <li><strong>--target:</strong> construye solo una etapa (útil para dev/CI/debug).</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker build -t &lt;nombre&gt; .</code></td><td>Build estándar (BuildKit/Buildx por defecto), última etapa = imagen.</td></tr>
+            <tr><td><code>docker build --target &lt;etapa&gt; -t ... .</code></td><td>Construye SOLO la etapa indicada.</td></tr>
+            <tr><td><code>COPY --from=&lt;etapa&gt; /org /dest</code></td><td>Copia artefactos de una etapa a otra (el puente del multi-stage).</td></tr>
+            <tr><td><code>docker buildx ls</code></td><td>Lista builders y plataformas disponibles.</td></tr>
+            <tr><td><code>docker buildx build --platform=...</code></td><td>Build multi-plataforma (lo usamos en la lección 05).</td></tr>
+            <tr><td><code>docker history &lt;imagen&gt;</code></td><td>Muestra las capas REALES de la imagen final: confirma el multi-stage.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Multi-stage hace que el build sea más lento?</summary>
+            <div>
+              <p>Al contrario: con BuildKit las etapas <em>independientes</em> se ejecutan en paralelo, y su caché por etapas (no por «pasos») hace que los rebuilds descarten solo lo que cambió. El escenario donde «parece» más lento es el primer build con muchos <code>npm ci</code>; compensas con diferencia en la imagen final y en los siguientes builds.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre BuildKit y Buildx?</summary>
+            <div>
+              <p><strong>BuildKit</strong> es el motor (el «daemon» de build, moderno, con caché y paralelismo); <strong>Buildx</strong> es el plugin de la CLI que lo expone y que además gestiona builders <em>multi-plataforma</em> (incluidos los remotos tipo <code>docker-container</code>, que verás en la lección 05). En la práctica escribes <code>docker build</code> y tu Docker ya usa BuildKit+Buildx por defecto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si mi app NO compila, ¿necesito multi-stage?</summary>
+            <div>
+              <p>A veces sí, y por otros motivos: separar deps de dev y de prod (como hicimos con la API) es ya un caso de multi-stage sin «compilar» nada. Si tu app es JS puro sin build y sin devdeps, un solo <code>FROM node:20-alpine</code> te basta; guarda el multi-stage para cuando «construir» deje residuos o necesites dos lentes (build y runtime) a la vez.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no me llegan las variables de entorno del build a la imagen?</summary>
+            <div>
+              <p>Porque las etapas son entornos <strong>aislados</strong>: un <code>ENV</code> en la etapa build no existe en la runtime. Si necesitas un valor de build en runtime, decláralo en la etapa final (o páselo como argumento de build con <code>ARG</code> + <code>--build-arg</code>); lo que <code>COPY --from</code> no transporta son variables de entorno. La separación por etapas es deliberada, y confundirla es un clásico del multi-stage.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El .dockerignore afecta al .dockerignore del contexto git?</summary>
+            <div>
+              <p>Son dos archivos y dos mundos: <code>.gitignore</code> lo usa Git para no versionar; <code>.dockerignore</code> lo usa Docker para no empaquetar el contexto. Puede darse que quieras ignorar algo en Docker pero versionarlo en Git (p. ej. un <code>Dockerfile*</code> de build local), o al revés. Aplica <code>.gitattributes</code> con LF (lección 02) a ambos para que Git no te «arregle» saltos de línea en tu <code>.dockerignore</code> ni en scripts.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

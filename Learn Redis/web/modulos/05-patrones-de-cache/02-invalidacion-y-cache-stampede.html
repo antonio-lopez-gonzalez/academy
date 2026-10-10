@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-invalidacion-y-cache-stampede">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Invalidación, cache stampede y TTL/jitter — Módulo 5 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Invalidación, cache stampede y TTL/jitter</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Patrones de Caché</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Cache-aside sin estrategia de invalidación es un desastre a plazos: datos viejos, «estampadas» (cache stampede) y picos de carga en la fuente cuando cae una key masiva.</p>
+        <p>Aquí verás <strong>qué es el cache stampede</strong>, por qué la invalidación con DEL + aviso es mejor que «actualizar en el aire», y cómo el <strong>TTL con jitter</strong> y un <strong>lock</strong> mitigan lo peor.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El cache stampede (thundering herd)</h3>
+        <pre><code class="language-text">t0: una key muy popular expira (su TTL llega a 0)
+t1: 10.000 peticiones → TODAS ven MISS
+t2: TODAS llaman a la fuente de verdad a la vez (embudo de DB)
+t3: la fuente colapsa → falla el sistema, aunque Redis estaba sano</code></pre>
+        <p>El bloqueo no está en «Redis aguantando», sino en el <strong>efecto amplificador</strong> sobre la fuente. Los mitigadores:</p>
+        <ul>
+          <li><strong>TTL + jitter:</strong> que no todas las keys expiren al mismo segundo.</li>
+          <li><strong>Lock (SET NX + TTL):</strong> solo un proceso recalcula y escribe; los demás esperan (o sirven stale).</li>
+          <li><strong>Soft/hard TTL:</strong> cuando expira el «hard», se sigue sirviendo el dato viejo (stale-while-revalidate) mientras se refresca.</li>
+        </ul>
+
+        <h3>Invalidación: DEL con notificación</h3>
+        <p>Al escribir en la fuente de verdad:</p>
+        <pre><code class="language-redis">DEL cache:price:msft
+PUBLISH cache:invalidations 'msft'     # aviso a otros cachés locales</code></pre>
+        <p>El DEL es la señal universal; el PUBLISH informa a los demás nodos. Alternativa: «escribir el valor nuevo» (write-through) pero con cuidado (M5-03).</p>
+
+        <h3>Dos técnicas estrella en redis-cli</h3>
+        <pre><code class="language-redis"># 1) Jitter: variar el TTL (5 ± 2 s)
+SET cache:dd key EX 300
+# (punto: en .NET usas Random.Next(240, 360))
+
+# 2) Lock para recálculo:
+SET lock:recalc:msft NX PX 5000      # solo 1 ganador
+if (ok) { recalcula(); DEL lock; SET cache:... EX 300; }</code></pre>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># léeme y observa el flujo del lock
+SET lock:hotkey NX PX 3000          # gané el lock
+SET hotkey 'precio de verdad' EX 300   # recalculo y guardo
+DEL lock:hotkey                     # libero el lock
+GET hotkey                          # el resto ya tiene dato</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En .NET, el GetProfile “con guardia anti-stampede”:</p>
+        <pre><code class="language-csharp">public async Task&lt;Profile&gt; GetProfileGuardedAsync(string userId)
+{
+    string key = $"cache:profile:{userId}";
+    string lockKey = $"lock:profile:{userId}";
+
+    // 1) HIT
+    var cached = await _db.StringGetAsync(key);
+    if (!cached.IsNull) return Deserialize(cached!);
+
+    // 2) MISS → lock con TTL corto (aunque el dueño muera, se libera solo)
+    bool got = await _db.StringSetAsync(lockKey, Environment.MachineName,
+        TimeSpan.FromMilliseconds(5000), When.NotExists);
+    if (!got)
+    {
+        // otro proceso recalcula: espera un poco y relee (con timeout)
+        await Task.Delay(50);
+        return (await _db.StringGetAsync(key)).IsNull
+            ? throw new TimeoutException("cache miss prolongado") : Deserialize(await _db.StringGetAsync(key));
+    }
+
+    try
+    {
+        var profile = await _repo.GetAsync(userId);      // SOLO 1 golpea la fuente
+        await _db.StringSetAsync(key, Serialize(profile), RandomTtl());  // jitter
+        return profile;
+    }
+    finally
+    {
+        await _db.KeyDeleteAsync(lockKey);   // libera el lock (modo ideal con Lua+token)
+    }
+}
+
+private static TimeSpan RandomTtl() => TimeSpan.FromMinutes(Random.Shared.Next(4, 6));</code></pre>
+        <p>Con el lock, el resto de peticiones espera un instante y relee; la fuente recibe 1 golpe en lugar de N.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Jitter en los TTL de keys masivas</td><td>TTL idéntico en todas</td><td>Evita oleadas de expiración sincronizada</td></tr>
+            <tr><td>Lock con TTL corto y token propio</td><td>Lock sin TTL que se cuelga</td><td>Si el dueño muere, el lock no bloquea para siempre</td></tr>
+            <tr><td>Invalidar con DEL (y avisar por pub/sub si hay cachés locales)</td><td>«Actualizar» sin coordenar nodos</td><td>DEL es simple y universal; la notificación mantiene consistencia entre nodos</td></tr>
+            <tr><td>Stale-while-revalidate para casos «mejor viejo que caído»</td><td>Devolver error si la fuente falla y hay copia vieja</td><td>La disponibilidad a veces pesa más que la frescura</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Lock sin expiración (deadlock en vivo)</h3>
+        <pre><code class="language-csharp">// ❌ SET NX sin TTL: si el proceso muere a mitad, el lock queda vivo
+await _db.StringSetAsync(lk, "me", When.NotExists);
+
+// ✅ Siempre con TTL (y token para liberación en Lua, M6-03)
+await _db.StringSetAsync(lk, "me", TimeSpan.FromSeconds(5), When.NotExists);</code></pre>
+
+        <h3>Invalidar solo «a veces»</h3>
+        <p>Un solo camino de escritura sin DEL deja cachés zombies. Invalida en todos los writers o acorta el TTL.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> En redis-cli simula el lock: SET NX PX con éxito y con fallo para otro «concurrente».</li>
+          <li><strong>Paso 2:</strong> Prueba el jitter: crea 10 keys con TTL 300±60 (y verifica que no expiran al unísono).</li>
+          <li><strong>Paso 3:</strong> Implementa la versión «guardada» de GetProfile en tu código.</li>
+          <li><strong>Paso 4:</strong> Publica el aviso de invalidación en un canal y escúchalo con redis-cli.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Dilema del lock</h3>
+          <p>El lock con TTL corto tiene un precio: puede expirar mientras el dueño sigue calculando, y otro proceso recalcula en paralelo. Valora para tu hub: ¿prefieres «duplicados ocasionales de recálculo» (lock corto) o «servir stale» (revalidate)? Argumenta con tu caso.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Cache stampede = MISS masivo → sobrecarga de la fuente.</li>
+          <li>Mitigadores: jitter, lock (SET NX + TTL), stale-while-revalidate.</li>
+          <li>Invalidación: DEL (y pub/sub para nodos con caché local).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo NO me preocupo por el stampede?</summary>
+            <div><p>Cuando la fuente aguanta el pico (cache fría es rara o el MISS es raro). El stampede duele en keys popularísimas que expiran a la vez.</p></div>
+          </details>
+          <details>
+            <summary>¿El lock debe ser Lua o basta SET NX?</summary>
+            <div><p>SET NX + TTL basta para el caso básico. La «liberación segura solo-si-soy-el-dueño» y el refresh quieren Lua (M6-03). El curso te enseña ambos.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

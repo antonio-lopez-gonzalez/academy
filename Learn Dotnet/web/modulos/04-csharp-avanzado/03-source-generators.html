@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="es" data-module="04" data-lesson="03-source-generators">
+<head>
+  <meta charset="UTF-8">
+  <title>Source Generators — Módulo 4 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Source Generators</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 4 · C# Avanzado</span><span>40 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aprenderemos a crear Source Generators: analizadores que se ejecutan durante la compilación y generan código C# automáticamente. Veremos el generador incremental (<code>IIncrementalGenerator</code>), la API de Roslyn para inspeccionar sintaxis y símbolos, y generaremos DTOs a partir de entidades de dominio usando un atributo personalizado.</p>
+        <p>¿Por qué existen? Porque mucho código repetitivo (DTOs, serializadores, mapeadores, ORMs, INotifyPropertyChanged) puede deducirse del código fuente. En lugar de escribirlo a mano o usar reflection en runtime, lo generamos en tiempo de compilación. Eso mejora el rendimiento, reduce errores y permite que el compilador verifique el código generado.</p>
+        <p>¿Cuándo se utilizan? Cuando:</p>
+        <ul>
+          <li>Necesitas evitar reflection en runtime.</li>
+          <li>Tienes mucho código boilerplate que sigue un patrón.</li>
+          <li>Quieres que el IDE muestre el código generado y los errores de compilación.</li>
+          <li>Quieres serializar, validar o mapear objetos de forma eficiente.</li>
+        </ul>
+        <p>Errores típicos: confundir generadores con T4, no marcar los paquetes como analizadores, no entender la diferencia entre syntax y semantic models, generar código que no compila.</p>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>2.1. ¿Qué es un Source Generator?</h3>
+        <p>Un Source Generator es una clase que implementa <code>IIncrementalGenerator</code> y se ejecuta en el proceso de compilación. Recibe la sintaxis y los símbolos del código fuente y puede añadir nuevos archivos <code>.cs</code> al proyecto. A diferencia de T4, no genera archivos en disco que luego compiles; el código aparece directamente en la compilación.</p>
+
+        <h3>2.2. IIncrementalGenerator</h3>
+        <p>El generador incremental es la API recomendada desde .NET 6. En lugar de recibir todo el árbol de sintaxis en cada pulsación de tecla, define un pipeline de transformaciones. Solo se re-ejecuta cuando cambian los nodos relevantes. Esto hace que el IDE sea más rápido y consuma menos memoria.</p>
+
+        <h3>2.3. Roslyn: Syntax Tree y Semantic Model</h3>
+        <p>Roslyn es el compilador de C# expuesto como API. El <strong>syntax tree</strong> representa el código fuente tal cual está escrito (palabras clave, llaves, nombres). El <strong>semantic model</strong> añade información semántica: qué tipo tiene cada símbolo, qué métodos existen, qué atributos están aplicados. Un generador robusto usa ambos: syntax para detectar candidatos y semantic para entenderlos.</p>
+
+        <h3>2.4. Diagrama del pipeline incremental</h3>
+        <pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                        COMPILACIÓN                                  │
+│                                                                     │
+│  Código fuente (Entidades + [GenerateDto])                          │
+│         │                                                           │
+│         ▼                                                           │
+│  SyntaxProvider: filtrar clases con el atributo                     │
+│         │                                                           │
+│         ▼                                                           │
+│  ForAttributeWithMetadataName&lt;ClassDeclarationSyntax&gt;               │
+│         │                                                           │
+│         ▼                                                           │
+│  Transformación: obtener ISymbol, propiedades, tipos                │
+│         │                                                           │
+│         ▼                                                           │
+│  Generación de código (SourceText)                                  │
+│         │                                                           │
+│         ▼                                                           │
+│  Código generado añadido a la compilación                           │
+│         │                                                           │
+│         ▼                                                           │
+│  Compilador verifica y emite ensamblado final                       │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>2.5. Comparación con alternativas</h3>
+        <p>Reflection en runtime es flexible pero lenta y no segura ante refactorings. T4 genera archivos físicos pero requiere ejecutar manualmente una plantilla. Source Generators son automáticos, integrados en el IDE y producen código C# verificable. AIs like AutoMapper o ReflectionMapper generan código en runtime con expression trees; los source generators hacen lo mismo pero en tiempo de compilación, sin startup cost.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Creamos una solución con dos proyectos: el generador y una consola que lo consume.</p>
+        <pre><code>mkdir ejemplos/m04-csharp-avanzado/source-generator-demo && cd ejemplos/m04-csharp-avanzado/source-generator-demo
+dotnet new classlib -n HelloGenerator -o src/HelloGenerator -f netstandard2.0
+dotnet new console -n HelloGenerator.Consumer -o src/HelloGenerator.Consumer -f net8.0
+dotnet new sln -n SourceGeneratorDemo
+dotnet sln add src/HelloGenerator/HelloGenerator.csproj
+dotnet sln add src/HelloGenerator.Consumer/HelloGenerator.Consumer.csproj</code></pre>
+        <p>En el generador añadimos los paquetes de Roslyn:</p>
+        <pre><code>cd src/HelloGenerator
+dotnet add package Microsoft.CodeAnalysis.Analyzers
+dotnet add package Microsoft.CodeAnalysis.CSharp</code></pre>
+        <p><code>HelloGenerator.csproj</code>:</p>
+        <pre><code>&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;PropertyGroup&gt;
+    &lt;TargetFramework&gt;netstandard2.0&lt;/TargetFramework&gt;
+    &lt;LangVersion&gt;12.0&lt;/LangVersion&gt;
+    &lt;Nullable&gt;enable&lt;/Nullable&gt;
+    &lt;EnforceExtendedAnalyzerRules&gt;true&lt;/EnforceExtendedAnalyzerRules&gt;
+    &lt;IsPackable&gt;false&lt;/IsPackable&gt;
+  &lt;/PropertyGroup&gt;
+
+  &lt;ItemGroup&gt;
+    &lt;PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.3.4" PrivateAssets="all" /&gt;
+    &lt;PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.9.2" PrivateAssets="all" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;</code></pre>
+        <p>Código del generador:</p>
+        <pre><code>using Microsoft.CodeAnalysis;
+
+namespace HelloGenerator;
+
+[Generator]
+public class HelloWorldGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        // Genera un archivo fijo independientemente del código fuente
+        context.RegisterPostInitializationOutput(ctx =>
+        {
+            ctx.AddSource("HelloWorld.g.cs", SourceText.From(@"
+namespace HelloGenerator.Generated;
+
+public static class HelloWorld
+{
+    public static string SayHello() => \"Hola desde el generador!\";
+}
+", Encoding.UTF8));
+        });
+    }
+}</code></pre>
+        <p>En el consumidor referenciamos el generador como analyzer:</p>
+        <pre><code>&lt;Project Sdk="Microsoft.NET.Sdk"&gt;
+  &lt;PropertyGroup&gt;
+    &lt;OutputType&gt;Exe&lt;/OutputType&gt;
+    &lt;TargetFramework&gt;net8.0&lt;/TargetFramework&gt;
+    &lt;ImplicitUsings&gt;enable&lt;/ImplicitUsings&gt;
+    &lt;Nullable&gt;enable&lt;/Nullable&gt;
+  &lt;/PropertyGroup&gt;
+
+  &lt;ItemGroup&gt;
+    &lt;ProjectReference Include="..\HelloGenerator\HelloGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" /&gt;
+  &lt;/ItemGroup&gt;
+&lt;/Project&gt;</code></pre>
+        <p><code>Program.cs</code> del consumidor:</p>
+        <pre><code>using HelloGenerator.Generated;
+
+Console.WriteLine(HelloWorld.SayHello());</code></pre>
+        <p>Compilamos y ejecutamos:</p>
+        <pre><code>dotnet run --project src/HelloGenerator.Consumer</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Creamos un generador que, a partir de clases marcadas con <code>[GenerateDto]</code>, genere una clase DTO con las mismas propiedades públicas.</p>
+        <p>Atributo (lo generamos también para no depender de un ensamblado compartido):</p>
+        <pre><code>// Generamos el atributo en tiempo de compilación
+context.RegisterPostInitializationOutput(ctx =>
+{
+    ctx.AddSource("GenerateDtoAttribute.g.cs", SourceText.From(@"
+namespace DtoGenerator;
+
+[AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+public sealed class GenerateDtoAttribute : Attribute
+{
+    public string Suffix { get; } = ""Dto"";
+
+    public GenerateDtoAttribute(string suffix = ""Dto"") =&gt; Suffix = suffix;
+}
+", Encoding.UTF8));
+});</code></pre>
+        <p>Generador DTO:</p>
+        <pre><code>using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Text;
+
+namespace DtoGenerator;
+
+[Generator]
+public class DtoGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        context.RegisterPostInitializationOutput(ctx =>
+        {
+            ctx.AddSource("GenerateDtoAttribute.g.cs", SourceText.From(AttributeSource, Encoding.UTF8));
+        });
+
+        IncrementalValuesProvider&lt;ClassDeclarationSyntax&gt; classes = context.SyntaxProvider
+            .ForAttributeWithMetadataName(
+                fullyQualifiedMetadataName: "DtoGenerator.GenerateDtoAttribute",
+                predicate: (node, _) => node is ClassDeclarationSyntax,
+                transform: (ctx, _) => (ClassDeclarationSyntax)ctx.TargetNode);
+
+        context.RegisterSourceOutput(classes, (spc, source) =>
+        {
+            GenerateDto(spc, source);
+        });
+    }
+
+    private static void GenerateDto(SourceProductionContext context, ClassDeclarationSyntax classSyntax)
+    {
+        var className = classSyntax.Identifier.Text;
+        var dtoName = $"{className}Dto";
+
+        var properties = classSyntax.Members
+            .OfType&lt;PropertyDeclarationSyntax&gt;()
+            .Where(p => p.Modifiers.Any(SyntaxKind.PublicKeyword))
+            .Select(p => p.Identifier.Text);
+
+        var builder = new StringBuilder();
+        builder.AppendLine("namespace DtoGenerator.Generated;");
+        builder.AppendLine($"public sealed class {dtoName}");
+        builder.AppendLine("{");
+        foreach (var prop in properties)
+        {
+            builder.AppendLine($"    public string {prop} {{ get; set; }} = string.Empty;");
+        }
+        builder.AppendLine("}");
+
+        context.AddSource($"{dtoName}.g.cs", SourceText.From(builder.ToString(), Encoding.UTF8));
+    }
+
+    private const string AttributeSource = @"
+namespace DtoGenerator;
+
+[AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+public sealed class GenerateDtoAttribute : Attribute { }
+";
+}</code></pre>
+        <p>Entidad de ejemplo:</p>
+        <pre><code>using DtoGenerator;
+
+namespace DtoGenerator.Sample;
+
+[GenerateDto]
+public class Product
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+}</code></pre>
+        <p>Código generado:</p>
+        <pre><code>namespace DtoGenerator.Generated;
+
+public sealed class ProductDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string Price { get; set; } = string.Empty;
+}</code></pre>
+        <p>Nota: este ejemplo usa sintaxis para simplificar. En producción deberías usar el modelo semántico para obtener los tipos reales de las propiedades y generar propiedades tipadas correctamente.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li>Usa <code>IIncrementalGenerator</code>, no el generador antiguo <code>ISourceGenerator</code>.</li>
+          <li>Define un pipeline claro: filtrado sintáctico → transformación semántica → generación.</li>
+          <li>Usa <code>ForAttributeWithMetadataName</code> para detectar atributos de forma eficiente.</li>
+          <li>Genera el propio atributo para evitar dependencias de ensamblado.</li>
+          <li>Usa <code>StringBuilder</code> o interpolación de cadenas para generar código; evita concatenaciones masivas.</li>
+          <li>Marca el proyecto del generador con <code>OutputItemType="Analyzer"</code> en el consumidor.</li>
+          <li>Prueba el generador con Roslyn test utilities o compilando proyectos de ejemplo.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>6.1. No marcar el generador como Analyzer</h3>
+        <pre><code>// ❌ MAL: el generador se compila como referencia normal
+&lt;ProjectReference Include="..\Generator\Generator.csproj" /&gt;</code></pre>
+        <p>Correcto:</p>
+        <pre><code>// ✅ BIEN: el generador actúa como analizador
+&lt;ProjectReference Include="..\Generator\Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" /&gt;</code></pre>
+
+        <h3>6.2. Usar reflection en el generador</h3>
+        <p>El generador se ejecuta en el proceso de compilación, no en runtime. No puedes usar reflection sobre el ensamblado del usuario. Debes usar la API de Roslyn.</p>
+
+        <h3>6.3. Generar código con nombres duplicados</h3>
+        <p>Cada archivo añadido con <code>AddSource</code> debe tener un nombre único. Si dos clases generan el mismo nombre de archivo, la compilación falla.</p>
+        <pre><code>// ✅ BIEN: incluir namespace o nombre de clase en el hint name
+context.AddSource($"{namespaceName}.{className}.g.cs", sourceText);</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Extiende el generador DTO para que respete el tipo original de cada propiedad usando el modelo semántico. Pasos:</p>
+        <ol>
+          <li>En la transformación, obtén el <code>SemanticModel</code> y el <code>ITypeSymbol</code> de cada propiedad.</li>
+          <li>Usa <code>p.Type.ToString()</code> para obtener el nombre del tipo.</li>
+          <li>Genera la propiedad con ese tipo y su inicialización por defecto.</li>
+        </ol>
+        <p>Fragmento clave:</p>
+        <pre><code>var model = context.SemanticModel;
+var propertyType = model.GetTypeInfo(property.Type).Type;
+string typeName = propertyType?.ToString() ?? "object";
+string defaultValue = propertyType?.SpecialType switch
+{
+    SpecialType.System_Int32 => "0",
+    SpecialType.System_String => "string.Empty",
+    _ => "default!"
+};
+builder.AppendLine($"    public {typeName} {property.Identifier.Text} {{ get; set; }} = {defaultValue};");</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Crea un generador que, a partir de clases marcadas con <code>[ToString]</code>, genere un método <code>override string ToString()</code> que incluya todas las propiedades públicas con formato <code>Propiedad=Valor</code>. Usa el modelo semántico para tipos complejos y anida propiedades si detectas otra clase con <code>[ToString]</code>.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>Los Source Generators producen código en tiempo de compilación.</li>
+          <li><code>IIncrementalGenerator</code> permite pipelines eficientes que solo re-ejecutan lo necesario.</li>
+          <li>Roslyn ofrece syntax trees (estructura) y semantic models (significado).</li>
+          <li>Usa <code>ForAttributeWithMetadataName</code> para detectar clases con atributos.</li>
+          <li>El proyecto consumidor debe referenciar el generador como <code>Analyzer</code>.</li>
+          <li>Es ideal para DTOs, serializadores, mapeadores y cualquier boilerplate mecánico.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <dl>
+          <dt>¿Dónde veo el código generado?</dt>
+          <dd>En Visual Studio o Rider puedes expandir "Analizadores" → "Generador" → "Generated Files". En VS Code, busca en la carpeta <code>obj/Debug/net8.0/generated</code>.</dd>
+          <dt>¿Puedo depurar un Source Generator?</dt>
+          <dd>Sí, puedes lanzar una segunda instancia de Visual Studio con el proyecto del generador y atacar al proceso de compilación del consumidor.</dd>
+          <dt>¿Son los Source Generators lo mismo que T4?</dt>
+          <dd>No. T4 genera archivos físicos que luego compiles. Los source generators generan código en memoria durante la compilación, sin archivos intermedios.</dd>
+          <dt>¿Puedo usar LINQ en un generador?</dt>
+          <dd>Sí, pero el generador debe compilarse para <code>netstandard2.0</code>. Asegúrate de que las librerías que usas sean compatibles con ese target.</dd>
+          <dt>¿Qué pasa si el código generado no compila?</dt>
+          <dd>El error aparece como un error de compilación normal en el proyecto consumidor. Verifica que los namespaces, nombres y tipos sean correctos.</dd>
+        </dl>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

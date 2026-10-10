@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="es" data-module="13" data-lesson="05-proyecto-cms-caching" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: caching con Redis — Módulo 13 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: caching con Redis</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 13 · Caching y rendimiento</span><span>45 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En este proyecto del módulo vamos a aplicar todo lo aprendido sobre caching al CMS. Añadiremos una capa de caché distribuido con Redis para las consultas de posts y categorías, invalidaremos las entradas cuando se modifiquen los datos y compararemos el rendimiento con y sin caché usando BenchmarkDotNet.</p>
+        <p>También configuraremos Redis en el <code>docker-compose.yml</code> del proyecto final para que el entorno de desarrollo sea reproducible.</p>
+
+        <div class="callout info">
+          <strong>Objetivo del proyecto:</strong> cachear las lecturas públicas de posts y categorías sin afectar la lógica de negocio. Las escrituras (crear, actualizar, eliminar) invalidarán el caché correspondiente. Usaremos Redis para que la solución funcione al escalar a múltiples instancias.
+        </div>
+
+        <p>Al terminar tendrás el CMS con una capa de caché lista para producción, tests de integración que verifican la invalidación y benchmarks que demuestran la mejora.</p>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 Estrategia de caché en el CMS</h3>
+        <p>El CMS tiene dos tipos de lecturas que benefician mucho del caché:</p>
+        <ul>
+          <li><strong>Categorías:</strong> lista pequeña, cambia raramente. TTL largo (10 minutos).</li>
+          <li><strong>Posts publicados:</strong> lista grande, cambia con frecuencia moderada. TTL corto (2 minutos) y variación por paginación.</li>
+          <li><strong>Post individual:</strong> consulta directa por <code>id</code> o <code>slug</code>. TTL medio (5 minutos).</li>
+        </ul>
+
+        <p>Invalidaciones:</p>
+        <ul>
+          <li>Al crear un post: invalidar lista de posts publicados y tags relacionadas.</li>
+          <li>Al actualizar un post: invalidar el post individual y la lista de publicados.</li>
+          <li>Al crear/actualizar/eliminar una categoría: invalidar lista de categorías.</li>
+        </ul>
+
+        <h3>2.2 Arquitectura</h3>
+        <p>Colocamos el caché en la capa de aplicación, justo antes de los repositorios. Así la infraestructura no conoce de caché y la capa de aplicación decide qué cachear y cuándo invalidar.</p>
+        <pre><code class="language-text">API ──▶ Handler (Application)
+           │
+           ▼
+        CachedService (Application)
+           │
+           ├─▶ IDistributedCache (Redis)
+           │
+           ▼
+        Repository (Infrastructure)
+           │
+           ▼
+        EF Core + PostgreSQL</code></pre>
+
+        <h3>2.3 Convención de claves</h3>
+        <p>Usamos un generador central para evitar duplicar strings y errores:</p>
+        <ul>
+          <li><code>cms:category:all</code></li>
+          <li><code>cms:post:published:page:{page}:size:{size}</code></li>
+          <li><code>cms:post:{id}</code></li>
+          <li><code>cms:post:slug:{slug}</code></li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Vamos a añadir Redis al proyecto final del CMS. Suponemos que ya tienes la estructura Clean Architecture con las capas <code>Cms.Domain</code>, <code>Cms.Application</code>, <code>Cms.Infrastructure</code> y <code>Cms.Api</code>.</p>
+
+        <h3>Paso 1: instalar paquetes</h3>
+        <pre><code class="language-bash">dotnet add proyecto-final/src/Cms.Api package Microsoft.Extensions.Caching.StackExchangeRedis
+
+dotnet add proyecto-final/src/Cms.Application package Microsoft.Extensions.Caching.Abstractions
+
+dotnet add proyecto-final/tests/Cms.Tests package Microsoft.Extensions.Caching.StackExchangeRedis
+</code></pre>
+
+        <h3>Paso 2: configurar Redis en Program.cs</h3>
+        <pre><code class="language-csharp">builder.Services.AddStackExchangeRedisCache(options =&gt;
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis");
+    options.InstanceName = "Cms_";
+});</code></pre>
+
+        <h3>Paso 3: añadir la cadena de conexión</h3>
+        <pre><code class="language-json">{
+  "ConnectionStrings": {
+    "Default": "Host=localhost;Database=cms;Username=cms;Password=cms_secret",
+    "Redis": "localhost:6379,abortConnect=false"
+  }
+}</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+
+        <h3>4.1 Generador de claves</h3>
+        <pre><code class="language-csharp">namespace Cms.Application.Caching;
+
+public static class CacheKeys
+{
+    public const string Prefix = "cms";
+    public const string CategoriesAll = "cms:category:all";
+
+    public static string Post(Guid id) =&gt; $"cms:post:{id}";
+    public static string PostBySlug(string slug) =&gt; $"cms:post:slug:{slug}";
+    public static string PublishedPosts(int page, int pageSize) =&gt;
+        $"cms:post:published:page:{page}:size:{pageSize}";
+}</code></pre>
+
+        <h3>4.2 Extensiones de IDistributedCache</h3>
+        <pre><code class="language-csharp">using Microsoft.Extensions.Caching.Distributed;
+using System.Text.Json;
+
+namespace Cms.Application.Caching;
+
+public static class DistributedCacheExtensions
+{
+    public static async Task&lt;T?&gt; GetAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        CancellationToken ct = default)
+    {
+        var data = await cache.GetAsync(key, ct);
+        if (data is null) return default;
+        return JsonSerializer.Deserialize&lt;T&gt;(data);
+    }
+
+    public static async Task SetAsync&lt;T&gt;(
+        this IDistributedCache cache,
+        string key,
+        T value,
+        TimeSpan absoluteExpiration,
+        CancellationToken ct = default)
+    {
+        var data = JsonSerializer.SerializeToUtf8Bytes(value);
+        await cache.SetAsync(key, data, new DistributedCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = absoluteExpiration
+        }, ct);
+    }
+}</code></pre>
+
+        <h3>4.3 Servicio de categorías cacheado</h3>
+        <pre><code class="language-csharp">using Cms.Application.Caching;
+using Microsoft.Extensions.Caching.Distributed;
+
+namespace Cms.Application.Categories;
+
+public sealed class CategoryService
+{
+    private readonly ICategoryRepository _repository;
+    private readonly IDistributedCache _cache;
+    private readonly ILogger&lt;CategoryService&gt; _logger;
+
+    public CategoryService(
+        ICategoryRepository repository,
+        IDistributedCache cache,
+        ILogger&lt;CategoryService&gt; logger)
+    {
+        _repository = repository;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public async Task&lt;IReadOnlyList&lt;CategoryDto&gt;&gt; GetAllAsync(CancellationToken ct)
+    {
+        var cached = await _cache.GetAsync&lt;IReadOnlyList&lt;CategoryDto&gt;&gt;(CacheKeys.CategoriesAll, ct);
+        if (cached is not null)
+        {
+            _logger.LogInformation("Cache hit: categorías");
+            return cached;
+        }
+
+        _logger.LogInformation("Cache miss: categorías");
+        var categories = await _repository.GetAllAsync(ct);
+        var dtos = categories.Select(c =&gt; new CategoryDto(c.Id, c.Name, c.Slug)).ToList();
+
+        await _cache.SetAsync(CacheKeys.CategoriesAll, dtos, TimeSpan.FromMinutes(10), ct);
+        return dtos;
+    }
+
+    public async Task InvalidateAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("Invalidando caché de categorías");
+        await _cache.RemoveAsync(CacheKeys.CategoriesAll, ct);
+    }
+}
+
+public sealed record CategoryDto(Guid Id, string Name, string Slug);
+
+public interface ICategoryRepository
+{
+    Task&lt;IReadOnlyList&lt;Category&gt;&gt; GetAllAsync(CancellationToken ct);
+}</code></pre>
+
+        <h3>4.4 Servicio de posts cacheado</h3>
+        <pre><code class="language-csharp">using Cms.Application.Caching;
+using Microsoft.Extensions.Caching.Distributed;
+
+namespace Cms.Application.Posts;
+
+public sealed class CachedPostService
+{
+    private readonly IPostRepository _repository;
+    private readonly IDistributedCache _cache;
+    private readonly ILogger&lt;CachedPostService&gt; _logger;
+
+    public CachedPostService(
+        IPostRepository repository,
+        IDistributedCache cache,
+        ILogger&lt;CachedPostService&gt; logger)
+    {
+        _repository = repository;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public async Task&lt;PostDto?&gt; GetByIdAsync(Guid id, CancellationToken ct)
+    {
+        var key = CacheKeys.Post(id);
+        var cached = await _cache.GetAsync&lt;PostDto&gt;(key, ct);
+        if (cached is not null)
+        {
+            _logger.LogInformation("Cache hit: post {PostId}", id);
+            return cached;
+        }
+
+        _logger.LogInformation("Cache miss: post {PostId}", id);
+        var post = await _repository.GetByIdAsync(id, ct);
+        if (post is null) return null;
+
+        var dto = MapToDto(post);
+        await _cache.SetAsync(key, dto, TimeSpan.FromMinutes(5), ct);
+        return dto;
+    }
+
+    public async Task&lt;IReadOnlyList&lt;PostSummaryDto&gt;&gt; GetPublishedAsync(
+        int page, int pageSize, CancellationToken ct)
+    {
+        var key = CacheKeys.PublishedPosts(page, pageSize);
+        var cached = await _cache.GetAsync&lt;IReadOnlyList&lt;PostSummaryDto&gt;&gt;(key, ct);
+        if (cached is not null)
+        {
+            _logger.LogInformation("Cache hit: posts publicados página {Page}", page);
+            return cached;
+        }
+
+        _logger.LogInformation("Cache miss: posts publicados página {Page}", page);
+        var posts = await _repository.GetPublishedAsync(page, pageSize, ct);
+        var dtos = posts.Select(MapToSummary).ToList();
+
+        await _cache.SetAsync(key, dtos, TimeSpan.FromMinutes(2), ct);
+        return dtos;
+    }
+
+    public async Task InvalidateAsync(Guid id, CancellationToken ct)
+    {
+        await _cache.RemoveAsync(CacheKeys.Post(id), ct);
+
+        // Invalidamos todas las páginas de posts publicados. En producción podríamos
+        // usar un tag o un patrón de invalidación más sofisticado.
+        for (int page = 1; page &lt;= 10; page++)
+        {
+            for (int size = 10; size &lt;= 50; size += 10)
+            {
+                await _cache.RemoveAsync(CacheKeys.PublishedPosts(page, size), ct);
+            }
+        }
+    }
+
+    private static PostDto MapToDto(Post post) =&gt;
+        new(post.Id, post.Title, post.Slug, post.Status, post.PublishedAt);
+
+    private static PostSummaryDto MapToSummary(Post post) =&gt;
+        new(post.Id, post.Title, post.PublishedAt!.Value);
+}
+
+public sealed record PostDto(Guid Id, string Title, string Slug, string Status, DateTime? PublishedAt);
+public sealed record PostSummaryDto(Guid Id, string Title, DateTime PublishedAt);
+
+public interface IPostRepository
+{
+    Task&lt;Post?&gt; GetByIdAsync(Guid id, CancellationToken ct);
+    Task&lt;IReadOnlyList&lt;Post&gt;&gt; GetPublishedAsync(int page, int pageSize, CancellationToken ct);
+}
+
+public sealed class Post(Guid id, string title, string slug, string status, DateTime? publishedAt)
+{
+    public Guid Id { get; } = id;
+    public string Title { get; } = title;
+    public string Slug { get; } = slug;
+    public string Status { get; } = status;
+    public DateTime? PublishedAt { get; } = publishedAt;
+}</code></pre>
+
+        <h3>4.5 Invalidación en handlers de escritura</h3>
+        <pre><code class="language-csharp">public sealed class CreateCategoryHandler(
+    ICategoryRepository repository,
+    CategoryService service,
+    IUnitOfWork unitOfWork)
+{
+    public async Task&lt;Result&lt;Guid&gt;&gt; HandleAsync(CreateCategoryCommand command, CancellationToken ct)
+    {
+        var category = new Category(command.Name, command.Slug);
+        await repository.AddAsync(category, ct);
+        await unitOfWork.SaveChangesAsync(ct);
+
+        await service.InvalidateAsync(ct);
+        return Result&lt;Guid&gt;.Success(category.Id);
+    }
+}
+
+public sealed class UpdatePostHandler(
+    IPostRepository repository,
+    CachedPostService service,
+    IUnitOfWork unitOfWork)
+{
+    public async Task&lt;Result&gt; HandleAsync(UpdatePostCommand command, CancellationToken ct)
+    {
+        var post = await repository.GetByIdAsync(command.Id, ct);
+        if (post is null) return Result.Failure("Post.NotFound", "Post no encontrado");
+
+        post.Update(command.Title, command.Content);
+        await unitOfWork.SaveChangesAsync(ct);
+
+        await service.InvalidateAsync(command.Id, ct);
+        return Result.Success();
+    }
+}</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Capa de aplicación:</strong> el caché debe vivir en aplicación, no en infraestructura. Así el dominio sigue puro y la API no conoce detalles.</li>
+          <li><strong>Claves centralizadas:</strong> usa una clase <code>CacheKeys</code> para evitar duplicar strings y errores de formato.</li>
+          <li><strong>TTLs según el tipo de dato:</strong> categorías 10 minutos, posts individuales 5 minutos, listas 2 minutos.</li>
+          <li><strong>Invalidación explícita:</strong> cada escritura debe invalidar las claves afectadas. Es preferible invalidar de más que servir datos obsoletos.</li>
+          <li><strong>Evita invalidación en masa sin control:</strong> invalidar todas las páginas con bucles puede ser costoso. Considera tags o versiones cuando el número de claves sea grande.</li>
+          <li><strong>Tests de integración:</strong> verifica que tras una escritura, la siguiente lectura no devuelve datos cacheados.</li>
+          <li><strong>Benchmarks:</strong> mide consultas con y sin caché para demostrar la mejora y detectar regresiones.</li>
+          <li><strong>Monitoreo:</strong> añade logs de <code>Cache hit</code> y <code>Cache miss</code> para calcular hit rate en producción.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1 Cachear endpoints de escritura</h3>
+        <pre><code class="language-csharp">// ❌ Mal: POST nunca debe cachearse
+app.MapPost("/api/v1/posts", ...)
+   .CacheOutput("Default");
+
+// ✅ Bien: solo cachear GET y HEAD, e invalidar en escritura
+app.MapGet("/api/v1/posts", ...)
+   .CacheOutput("PublicPosts");</code></pre>
+
+        <h3>6.2 No invalidar al actualizar</h3>
+        <pre><code class="language-csharp">// ❌ Mal: el post modificado sigue apareciendo antiguo
+public async Task HandleAsync(UpdatePostCommand command, CancellationToken ct)
+{
+    var post = await repository.GetByIdAsync(command.Id, ct);
+    post.Update(command.Title, command.Content);
+    await unitOfWork.SaveChangesAsync(ct);
+}
+
+// ✅ Bien: invalidar la caché del recurso
+await service.InvalidateAsync(command.Id, ct);</code></pre>
+
+        <h3>6.3 Depender de Redis en tests sin contenedor</h3>
+        <pre><code class="language-csharp">// ❌ Mal: los tests fallan si Redis no está corriendo
+services.AddStackExchangeRedisCache(options =&gt;
+    options.Configuration = "localhost:6379");
+
+// ✅ Bien: usar Testcontainers para Redis o un in-memory IDistributedCache en tests
+services.AddDistributedMemoryCache();</code></pre>
+
+        <h3>6.4 TTL infinito</h3>
+        <pre><code class="language-csharp">// ❌ Mal: sin expiración, un error de invalidación deja datos obsoletos para siempre
+await _cache.SetAsync(key, dto, new DistributedCacheEntryOptions(), ct);
+
+// ✅ Bien: siempre expiración absoluta como mínimo
+await _cache.SetAsync(key, dto, TimeSpan.FromMinutes(5), ct);</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Vamos a añadir el contenedor Redis al <code>docker-compose.yml</code> del proyecto final y verificar que todo funciona.</p>
+
+        <h3>Paso 1: docker-compose.yml</h3>
+        <pre><code class="language-yaml">services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cms
+      POSTGRES_USER: cms
+      POSTGRES_PASSWORD: cms_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  api:
+    build:
+      context: ../
+      dockerfile: proyecto-final/src/Cms.Api/Dockerfile
+    environment:
+      - ConnectionStrings__Default=Host=postgres;Database=cms;Username=cms;Password=cms_secret
+      - ConnectionStrings__Redis=redis:6379,abortConnect=false
+    ports:
+      - "5000:8080"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres-data:
+  redis-data:</code></pre>
+
+        <h3>Paso 2: levantar el entorno</h3>
+        <pre><code class="language-bash">docker compose -f proyecto-final/docker-compose.yml up -d
+
+# Verificar que Redis responde
+docker compose -f proyecto-final/docker-compose.yml exec redis redis-cli ping
+# Debe responder: PONG</code></pre>
+
+        <h3>Paso 3: probar el flujo</h3>
+        <pre><code class="language-bash"># Primera petición: cache miss
+curl http://localhost:5000/api/v1/categories
+
+# Segunda petición: cache hit
+curl http://localhost:5000/api/v1/categories
+
+# Crear una categoría invalida el caché
+curl -X POST http://localhost:5000/api/v1/categories \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Nueva","slug":"nueva"}'
+
+# Siguiente petición: cache miss
+curl http://localhost:5000/api/v1/categories</code></pre>
+
+        <p>Revisa los logs de la API para ver los mensajes de <code>Cache hit</code> y <code>Cache miss</code>.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Completa el proyecto del módulo con estas mejoras:</p>
+        <ul>
+          <li>Añade <strong>Output Caching</strong> a los endpoints públicos de posts y categorías, almacenando en Redis para compartir entre instancias.</li>
+          <li>Crea un benchmark con BenchmarkDotNet que compare <code>GetPublishedAsync</code> con y sin Redis. Mide al menos 100 lecturas y calcula el ratio de mejora.</li>
+          <li>Implementa un test de integración que verifique que tras crear un post, el caché de <code>GET /api/v1/posts</code> se invalida. Usa <code>IDistributedCache</code> en memoria o Testcontainers para Redis.</li>
+          <li>Diseña un mecanismo de invalidación por tags: asigna <code>tag:posts</code> a todas las entradas de posts y expón un endpoint de administración para invalidar por tag.</li>
+        </ul>
+        <p><strong>No resuelvas el reto ahora.</strong> Trabaja en tu rama del CMS y lo revisaremos en la siguiente sesión.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El CMS ahora usa Redis como caché distribuido para posts y categorías.</li>
+          <li>La capa de aplicación contiene la lógica de caché, manteniendo el dominio puro.</li>
+          <li>Usamos un generador central de claves y TTLs según el tipo de dato.</li>
+          <li>Los handlers de escritura invalidan las claves afectadas para evitar datos obsoletos.</li>
+          <li>Configuramos Redis en Docker Compose para un entorno reproducible.</li>
+          <li>BenchmarkDotNet y tests de integración validan que el caché mejora el rendimiento y se invalida correctamente.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Dónde coloco la lógica de caché en Clean Architecture?</summary>
+          <p>En la capa de aplicación, justo antes de los repositorios. Nunca en Domain (debe ser pura) ni en Infrastructure (la infra no debe decidir qué cachear).</p>
+        </details>
+
+        <details>
+          <summary>¿Por qué no usar Output Caching en lugar de IDistributedCache?</summary>
+          <p>Output Caching cachea respuestas HTTP completas; <code>IDistributedCache</code> cachea datos. Ambos se complementan. Output Caching evita ejecutar endpoints; el caché de datos evita consultar la BD. Puedes usar ambos en el mismo CMS.</p>
+        </details>
+
+        <details>
+          <summary>¿Cómo invalido todas las páginas de posts sin bucles?</summary>
+          <p>Usa un token de versión compartido: almacena <code>cms:posts:version</code> y varía las claves incluyendo la versión. Al cambiar la versión, todas las entradas antiguas quedan obsoletas y se rellenan con la nueva. También puedes usar tags de Output Caching con <code>EvictByTagAsync</code>.</p>
+        </details>
+
+        <details>
+          <summary>¿Qué pasa si Redis cae en producción?</summary>
+          <p>Con <code>abortConnect=false</code> la librería intenta reconectar. Rodea el caché de try/catch y cae a la base de datos. Considera un circuit breaker para no saturar la BD si Redis está caído mucho tiempo.</p>
+        </details>
+
+        <details>
+          <summary>¿Debo cachear siempre los posts individuales?</summary>
+          <p>No. Si los posts individuales se consultan poco, el coste de Redis puede superar el beneficio. Mide primero. Generalmente, listas y datos muy populados son mejores candidatos.</p>
+        </details>
+
+        <details>
+          <summary>¿Cómo pruebo el caché en integración?</summary>
+          <p>Registra <code>AddDistributedMemoryCache</code> en los tests de la factory para no depender de Redis, o usa Testcontainers para levantar un Redis real. Verifica que la primera lectura devuelve datos y que tras una escritura se invalidan.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

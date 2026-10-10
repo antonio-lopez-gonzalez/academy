@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-persistent-volumes">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PersistentVolumes y PVCs — Módulo 7 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>PersistentVolumes y PVCs</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Configuración y almacenamiento</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ===================== 1 · INTRODUCCIÓN ===================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un Pod es <strong>efímero por diseño</strong>: se puede recrear, reescalar o mover a otro nodo en cualquier momento (eso le da a Kubernetes su poder de auto-reparación). Pero esa efimeridad tiene un precio: todo lo que un Pod escriba en su sistema de archivos local <em>desaparece</em> cuando muere. ¿Y si ese dato es la base de datos de HarborTasks con todas las tareas de tus usuarios?</p>
+        <p>En esta lección entenderás el modelo de almacenamiento de Kubernetes en tres piezas: el <strong>PersistentVolume (PV)</strong> — un trozo de almacenamiento del clúster —, el <strong>PersistentVolumeClaim (PVC)</strong> — la petición que hace un Pod —, y la <strong>StorageClass</strong> — la «fábrica» que crea almacenamiento bajo demanda. Veremos <code>accessModes</code>, <code>reclaimPolicy</code>, aprovisionamiento dinámico, hostPath en kind y cómo queda esto en la nube (CSI).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque en el <a href="../../modulos/04-docker-compose/03-dependencias-y-healthchecks.html">módulo de Compose</a> aprendiste a «montar un volumen»; en Kubernetes el problema es más profundo: el volumen debe sobrevivir a Pods, nodos y reinicios, y el clúster debe saber <em>qué almacenamiento tiene</em> y <em>qué se puede adjuntar</em>. Sin esta abstracción, postgres perdería los datos en el primer reschedule.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 2 · TEORÍA ===================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema: almacenamiento en un clúster con nodos</h3>
+        <p>En Docker pensabas en el volumen como «una carpeta que persiste». En Kubernetes tienes un clúster con varios nodos: un Pod puede caer y reaparecer en <em>otro</em> nodo. Si el volumen dependía del nodo concreto (un directorio del disco local), el dato queda huérfano en la máquina equivocada. Para resolverlo, Kubernetes separa tres conceptos:</p>
+        <ul>
+          <li><strong>PV (PersistentVolume):</strong> un <em>recurso del clúster</em> (cluster-scoped, como un nodo). Es el «disco» real: puede ser un hostPath de un nodo, un disco de la nube (EBS, GCE PD, Azure Disk), un NFS, etc. Nadie lo «usa» directamente: se ofrece.</li>
+          <li><strong>PVC (PersistentVolumeClaim):</strong> la <em>petición</em> que hace un namespace («necesito 5 Gi con RWO»). Kubernetes encuentra un PV que encaje y lo «liga» (bind). El Pod monta el PVC, no el PV. Así el Pod no sabe ni le importa dónde vive físicamente el dato.</li>
+          <li><strong>StorageClass:</strong> la <em>fábrica</em>. Define cómo se aprovisiona almacenamiento nuevo (provisioner) y qué características tiene (slow/fast, SSD/HHD, reclaim). Cuando un PVC pide una StorageClass, Kubernetes <em>crea</em> el PV al vuelo: eso es el <strong>aprovisionamiento dinámico</strong>.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el PV es un apartamento en alquiler (hay N inmuebles en el edificio); el PVC es tu contrato («busco un estudio de 45 m²»); la StorageClass es la constructora que, si no hay inmueble libre, <em>construye</em> uno según tus requisitos. Tú, como inquilino (Deployment), solo firmas tu contrato; nunca tocas la llave del edificio.</p>
+        </div>
+
+        <h3>Diagrama de flujo de una petición de almacenamiento</h3>
+        <div class="diagram">
+   desarrollo (estático)                 producción (dinámico)
+
+  ┌──────────────┐  PV creado a mano   ┌──────────────────────┐
+  │  PV hostPath │◄─────────────────── │  StorageClass (CSI)  │
+  │  (manual)    │                     │  provisioner: ebs.csi┘
+  └──────┬───────┘                     └──────────┬───────────┘
+         │ binds con matching specs              │ provisiona disco al vuelo
+         │              ┌────────────────────────┘
+         ▼              ▼
+   ┌────────────────────────────────────────────┐
+   │           PersistentVolumeClaim (PVC)      │
+   │   requester: 5Gi · RWO · storageClass      │
+   └────────────────────┬───────────────────────┘
+                        │ montado en volumenMounts
+                        ▼
+   ┌────────────────────────────────────────────┐
+   │             Pod (postgres)                 │
+   │   volumeMounts: mountPath /var/lib/…       │
+   └────────────────────────────────────────────┘
+        </div>
+
+        <h3>accessModes: quién y cómo monta</h3>
+        <p>El PVC y el PV deben negociar el modo de acceso. Es una propiedad del medio físico (un hostPath solo puede ser usado por un nodo; un EBS también):</p>
+        <table>
+          <thead><tr><th>Modo</th><th>Significado</th><th>Ejemplo real</th></tr></thead>
+          <tbody>
+            <tr><td><code>ReadWriteOnce (RWO)</code></td><td>Montaje lectura/escritura por <em>un solo nodo</em></td><td>PostgreSQL: un solo pod a la vez</td></tr>
+            <tr><td><code>ReadOnlyMany (ROX)</code></td><td>Solo lectura en varios nodos</td><td>Config compartida, contenido estático</td></tr>
+            <tr><td><code>ReadWriteMany (RWX)</code></td><td>Lectura/escritura en varios nodos</td><td>NFS, shares, PV multi-replica</td></tr>
+            <tr><td><code>ReadWriteOncePod (RWO-Pod)</code></td><td>Uso exclusivo por <em>un Pod</em> (K8s 1.22+)</td><td>StatefulSet Stateful de un solo pod</td></tr>
+          </tbody>
+        </table>
+        <p>Regla comprensible: <strong>una BBDD relacional no puede tener dos escritores sobre el mismo archivo</strong> (corrupción de datos). PostgreSQL usa RWO. Las réplicas de la API no necesitan almacenamiento (son stateless).</p>
+
+        <h3>reclaimPolicy: qué pasa al borrar el PVC</h3>
+        <p>Cuando un PVC se borra, el PV queda libre. ¿Qué hago con el disco?
+        <ul>
+          <li><strong><code>Retain</code>:</strong> el PV queda en estado <code>Released</code> y NO se borra. Tú decides (borrarlo, recuperar datos…). Es lo más seguro y el valor para datos críticos.</li>
+          <li><strong><code>Delete</code>:</strong> al borrar el PVC, el clúster destruye también el almacenamiento subyacente (disco en la nube). Típico con aprovisionamiento dinámico.</li>
+          <li><code>Recycle</code>: deprecado y eliminado (hacía <code>rm -rf</code>). No uses.</li>
+        </ul>
+
+        <h3>Local vs cloud: hostPath en kind, CSI en la nube</h3>
+        <p>Con <code>hostPath</code> el PV apunta a un directorio <em>del archivo system del nodo</em>. En kind es perfecto porque cada nodo es un contenedor Docker con su propio filesystem. En un clúster real <strong>multinodo</strong>, un hostPath solo sirve en ese nodo concreto (y un Pod que aterrice en otro nodo no encontrará el dato). En la nube se usa <strong>CSI (Container Storage Interface)</strong>: un driver conecta el clúster con el almacenamiento gestionado (AWS EBS, GCE PD, Azure Disk…). Kubernetes habla con el driver, y el driver crea/adjunta/monta el disco de verdad. Todo esto es transparente para tu PVC.</p>
+        <div class="callout callout--note">
+          <p><strong>Windows / WSL2:</strong> los contenedores de kind corren dentro de WSL2. Un <code>hostPath</code> apuntando a <code>/mnt/c/…</code> funciona pero es lentísimo para bases de datos. Para kind usa <code>hostPath</code> dentro del filesystem Linux (p. ej. <code>/tmp/harbortasks-pg</code>) o mejor ni uses hostPath y deja que la StorageClass <code>standard</code> de kind (provisioner <code>rancher.io/local-path</code>) cree el almacenamiento en local-path — que es lo que haremos en el ejemplo real.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 3 · EJEMPLO MÍNIMO ===================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ciclo completo estático: un PV hostPath, un PVC que lo reclama y un Pod que lo usa.</p>
+        <div class="code-file">pv.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-demo                  # los PV son cluster-scoped: nombre global
+spec:
+  capacity:
+    storage: 1Gi                 # cuánto ofrece este disco
+  accessModes:
+    - ReadWriteOnce              # solo un nodo a la vez
+  persistentVolumeReclaimPolicy: Retain   # al borrar el PVC, conservar el disco
+  hostPath:
+    path: /tmp/demo-pv           # directorio del nodo (didáctico: ¡no en prod!)
+</code></pre>
+        <div class="code-file">pvc.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claim-demo               # los PVC viven en un namespace
+spec:
+  accessModes:
+    - ReadWriteOnce              # pido el mismo acceso que ofrece el PV
+  resources:
+    requests:
+      storage: 1Gi               # pido 1 Gi (casará con el PV de 1 Gi)
+</code></pre>
+        <pre><code class="language-bash">kubectl apply -f pv.yaml
+kubectl apply -f pvc.yaml
+kubectl get pv
+kubectl get pvc
+
+# El PVC pasa a estado 'Bound' (ligado al PV). El PV pasa de Available a Bound.
+kubectl describe pvc claim-demo   # muestra el volumeName del PV ligado
+kubectl get pvc claim-demo -o yaml | grep volumeName
+</code></pre>
+        <p>Claves: el PV se <em>ofrece</em>, el PVC <em>pide</em>, y el controlador de volumen los empareja cuando capacity+accessMode+storageClass coinciden. El Pod montará <code>claim-demo</code>, no el PV. Si no hubiera un PV que encaje, el PVC quedaría en <code>Pending</code> (el estado que verás si en tu clúster no hay StorageClass dinámica).</p>
+      </section>
+
+      <!-- ===================== 4 · EJEMPLO REAL ===================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>PostgreSQL en HarborTasks. Pods «stateless» (web, api) no necesitan volumen; el que lo necesita es <code>postgres</code>, que persiste las tareas. En kind usaremos la StorageClass <code>standard</code> por defecto (local-path): creamos SOLO el PVC y el clúster aprovisiona el almacenamiento bajo demanda.</p>
+
+        <div class="code-file">pvc-postgres.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data                  # nombre descriptivo: es la data de postgres
+  namespace: harbortasks
+spec:
+  accessModes:
+    - ReadWriteOnce                    # una sola instancia de postgres
+  storageClassName: standard           # kind viene con 'standard' (local-path,
+                                       # aprovisionador rancher.io/local-path)
+  resources:
+    requests:
+      storage: 1Gi                     # 1 Gi es suficiente para este curso
+</code></pre>
+
+        <div class="code-file">deployment-postgres.yaml (fragmento)</div>
+        <pre><code class="language-yaml">spec:
+  replicas: 1                          # postgres = 1 réplica: RWO no permite dos
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: PGDATA             # forzamos PGDATA dentro del volumen 💡
+              value: /var/lib/postgresql/data
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pg-secret
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: data               # el volumen del PVC, montado aquí
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data   # el PVC creado antes
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>¿Por qué <code>PGDATA</code>?</strong> Las imágenes de PostgreSQL a partir de la 18 usan un directorio interno con la versión (<code>/var/lib/postgresql/18/docker</code>). Fijar <code>PGDATA</code> a una ruta bajo nuestro <code>mountPath</code> hace que los datos de la BBDD estén <em>de verdad</em> dentro del volumen montado, sea cual sea la versión de la imagen. Es un detalle que evita «el volumen vacío» o pérdidas al actualizar imagen.</p>
+        </div>
+
+        <p><strong>Verificación de persistencia</strong> — escribe datos, mata el Pod y comprueba que sobreviven:</p>
+        <pre><code class="language-bash"># 1) Entra en postgres y crea una tabla
+kubectl exec deployment/postgres -- psql -U harbor -d harbortasks \
+  -c "CREATE TABLE demo (id int);"
+
+# 2) Elimina el Pod (el Deployment lo recrea al instante en otro lugar posible)
+kubectl delete pod -l app=postgres
+
+# 3) La tabla sigue ahí, porque los datos viven en el PVC, no en el Pod
+kubectl exec deployment/postgres -- psql -U harbor -d harbortasks -c "\dt demo"
+</code></pre>
+      </section>
+
+      <!-- ===================== 5 · BUENAS PRÁCTICAS ===================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usa PVC + StorageClass dinámica en el clúster</td>
+              <td>Crear PV a mano en kind/servers (solo para didáctica)</td>
+              <td>El aprovisionamiento dinámico escala: no hay «discos agotados» que gestionar</td>
+            </tr>
+            <tr>
+              <td>Solo pide el storage que necesitas (<code>requests.storage</code>)</td>
+              <td>Pedir 100 Gi «por si acaso»</td>
+              <td>En la nube pagas por lo asignado; y el PV ligado puede quedarse sin espacio si la StorageClass no crece</td>
+            </tr>
+            <tr>
+              <td>RWO para postgres; RWX/RWO-Pod según el caso de uso</td>
+              <td>Poner RWX creyendo que «dos réplicas comparten postgres»</td>
+              <td>Dos escritores sobre el mismo PGData = datos corruptos. Las BBDD relacionales son de UNA instancia</td>
+            </tr>
+            <tr>
+              <td><code>reclaimPolicy: Retain</code> para datos críticos</td>
+              <td>Delete sin pensarlo en lo que no quieres perder</td>
+              <td>Con Retain, un PVC borrado no arrastra el disco: puedes recuperar antes de borrar</td>
+            </tr>
+            <tr>
+              <td>Fija <code>PGDATA</code> + <code>mountPath</code> explícitos (usa <code>subPath</code> si compartes un volumen grande)</td>
+              <td>Dejar que postgres use el PGDATA «mágico» de la imagen</td>
+              <td>Asegura que los bytes están dentro del volumen y evita pérdidas al subir la versión de la imagen</td>
+            </tr>
+            <tr>
+              <td>En producción: CSI (EBS/GCE/Azure) + backups</td>
+              <td><code>hostPath</code> en un clúster multinodo real</td>
+              <td>Un hostPath solo existe en un nodo: un Pod re-colocado en otro nodo no encuentra sus datos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== 6 · ERRORES HABITUALES ===================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>❌ PVC <code>Pending</code> para siempre</h3>
+        <pre><code class="language-bash">kubectl get pvc       # PENDING
+kubectl describe pvc postgres-data
+# → "no persistent volumes available for this claim …"
+</code></pre>
+        <p>Causa típica: el PVC pide una <code>storageClassName</code> que no existe, o un <code>accessModes</code> que ningún PV ofrece. Comprueba con <code>kubectl get storageclass</code> cuáles hay y con <code>kubectl get pv</code> qué modos publican. En kind, <code>standard</code> suele existir; en clústeres minimalistas sin CSI no hay nada y el PVC nunca se liga.</p>
+
+        <h3>❌ Creer que hostPath sobrevive a un clúster multinodo</h3>
+        <pre><code class="language-yaml"># ❌ hostPath en un clúster con 3 nodos: el dato vive solo en node-1
+#    Si el Pod se re-coloca en node-2, ¡sus datos no están ahí!
+spec:
+  hostPath:
+    path: /data/harbortasks
+
+# ✅ en la nube, StorageClass con CSI provisiona discos gestionados
+#    que se montan en el nodo donde caiga el Pod.
+</code></pre>
+
+        <h3>❌ Dos réplicas de postgres sobre el mismo RWO</h3>
+        <pre><code class="language-yaml"># ❌ replicas: 3 con el MISMO PVC postgres-data
+#    El scheduler al final lanza 3 postgres… sobre el MISMO disco (o falla)
+spec:
+  replicas: 3
+  ...
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-data     # no puede ligarse a 3 pods distintos
+
+# ✅ postgres es stateful: 1 réplica con un PVC, o un StatefulSet con
+#    volumeClaimTemplates (ver módulo 9). Los web/api sí escalan (stateless).
+</code></pre>
+
+        <h3>❌ Pedir una StorageClass en el PVC que no coincide con la del PV</h3>
+        <pre><code class="language-bash"># ❌ PV sin storageClassName vs PVC con 'standard' → nunca se liga
+# ✅ o ambos sin storageClassName, o ambos con la misma clase exacta
+kubectl get pv --show-labels
+kubectl get sc
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>WSL2 / paths:</strong> los <code>hostPath</code> en kind son <em>dentro de los nodos</em> (contenedores Docker de WSL), no de tu sistema Windows. Si quieres «ver» el archivo en <code>\\wsl$</code>, usa un MVP intermedio. Mejor: para el ejercicio usa la StorageClass local-path de kind, que gestiona el path ella misma.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 7 · EJERCICIO GUIADO ===================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> demostrar que los datos sobreviven a Pods y nodos en kind, con una StorageClass dinámica.</p>
+        <ol class="steps">
+          <li>
+            <strong>Revisa las StorageClass de kind:</strong>
+            <pre><code class="language-bash">kubectl get storageclass
+# NAME       PROVISIONER          RECLAIMPOLICY   VOLUMEBINDINGMODE
+# standard   rancher.io/local-path  Delete          WaitForFirstConsumer
+</code></pre>
+          </li>
+          <li>
+            <strong>Crea el PVC <code>persist-demo</code></strong> pidiendo 100 Mi con <code>storageClassName: standard</code> (mira el ejemplo real, cambia nombre y tamaño). Verás:
+            <pre><code class="language-bash">kubectl get pvc persist-demo
+# NAME          STATUS   VOLUME                                  CAPACITY
+# persist-demo  Bound    pvc-xxxx-xxxx                            100Mi
+</code></pre>
+          </li>
+          <li>
+            <strong>Crea un Deployment <code>writer</code></strong> con la imagen <code>busybox</code> que arranque con <code>sleep 3600</code> y monte el PVC en <code>/mnt/data</code>:
+            <pre><code class="language-bash">kubectl create deployment writer --image=busybox -- sleep 3600
+kubectl edit deployment writer
+# añade volumeMounts y volumes (como en el ejemplo real, claimName: persist-demo)
+</code></pre>
+            <div class="callout callout--tip"><p>¿El PVC quedó en <code>Pending</code> con <code>WaitForFirstConsumer</code>? Es normal: esa StorageClass aplaza la creación del disco hasta que haya un Pod que lo use. Al crear/editar el Deployment, verás cómo pasa a <code>Bound</code> solo.</p></div>
+          </li>
+          <li>
+            <strong>Escribe un archivo dentro del pod:</strong>
+            <pre><code class="language-bash">kubectl exec deployment/writer -- sh -c "echo datos-persistentes > /mnt/data/prueba.txt"
+kubectl exec deployment/writer -- cat /mnt/data/prueba.txt
+</code></pre>
+          </li>
+          <li>
+            <strong>Borra el pod y lee de nuevo:</strong>
+            <pre><code class="language-bash">kubectl delete pod -l app=writer        # el Deployment lo recrea
+kubectl exec deployment/writer -- cat /mnt/data/prueba.txt
+# → datos-persistentes   ✔
+</code></pre>
+            <p><em>Resultado esperado:</em> el archivo persiste porque sus bytes viven en el PV (local-path en el nodo), no en el Pod borrado.</p>
+          </li>
+          <li><strong>Limpia:</strong> <code>kubectl delete deployment writer</code>, <code>kubectl delete pvc persist-demo</code>. Con <code>Delete</code> reclaim, el PV asociado también se libera.</li>
+        </ol>
+      </section>
+
+      <!-- ===================== 8 · RETO ===================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Storage estático con hostPath y un solo nodo</h3>
+          <p>En kind todos los nodos son contenedores Docker con su propio filesystem. Crea un <code>config‑pv</code> hostPath (ruta <code>/mnt/mi-pv</code>) que solo se monte en el nodo <em>control-plane</em> de tu clúster, un PVC <code>static-claim</code> de 50 Mi sin <code>storageClassName</code>, y liga ambos. Pista: un PV estático puede declarar <code>storageClassName</code> vacío y usar <code>nodeAffinity</code> con <code>kubernetes.io/hostname</code> para limitar dónde puede montarse; o mira qué hostnames tienen tus nodos con <code>kubectl get nodes -o wide</code>.</p>
+          <p><em>Pista: en el PV estático define <code>nodeAffinity</code> con <code>kubernetes.io/hostname</code> del nodo y en el Deployment un <code>nodeSelector</code> con el mismo valor. Si el PVC queda Pending, revisa que el <code>storageClassName</code> del PV y del PVC estén iguales (puedes dejarlo vacío en ambos) y que el affinity encaje.</em></p>
+        </div>
+      </section>
+
+      <!-- ===================== 9 · RESUMEN ===================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>PV</strong> = almacenamiento del clúster (cluster-scoped): un disco que se ofrece.</li>
+          <li><strong>PVC</strong> = petición del namespace: «necesito X Gi con tal acceso»; se liga a un PV (<code>Bound</code>) o queda <code>Pending</code>.</li>
+          <li><strong>StorageClass</strong> = fábrica: aprovisiona dinámico (local-path en kind, EBS/GCE/CSI en la nube).</li>
+          <li><code>accessModes</code>: RWO (un nodo), ROX (solo lecturas), RWX (muchos nodos), RWO-Pod (un solo Pod). Postgres → RWO.</li>
+          <li><code>reclaimPolicy</code>: <code>Retain</code> (conserva el disco al borrar PVC) vs <code>Delete</code> (lo destruye).</li>
+          <li>Un Pod monta un PVC, nunca un PV; postgres fija <code>PGDATA</code> dentro del volumen.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl get pv</code></td><td>Lista los PV del clúster y su estado (Available/Bound/Released)</td></tr>
+            <tr><td><code>kubectl get pvc</code></td><td>Lista los PVC por namespace y su estado</td></tr>
+            <tr><td><code>kubectl describe pvc &lt;nombre&gt;</code></td><td>Ves el volumen ligado y los eventos (Pending → causa)</td></tr>
+            <tr><td><code>kubectl get storageclass</code></td><td>Lista las fábricas de aprovisionamiento (provisioner, reclaim)</td></tr>
+            <tr><td><code>kubectl delete pvc &lt;nombre&gt;</code></td><td>Borra el PVC (el PV se libera según reclaimPolicy)</td></tr>
+            <tr><td><code>kubectl exec deploy/postgres -- psql …</code></td><td>Verifica los datos persistentes dentro del contenedor</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== 10 · FAQ ===================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo tener dos Deployments montando el mismo PVC con RWO?</summary>
+            <div>
+              <p>Con RWO solo puede montarse en <em>un nodo</em> a la vez. Dos Deployments cuyos Pods caigan en el mismo nodo podrían compartirlo a nivel de archivos, pero es peligroso (compiten por el mismo directorio). Para varios consumidores usa ROX (solo lectura) o RWX con un medio que lo soporte (NFS, EFS). PostgreSQL nunca comparte su disco.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Mi PVC queda Pending para siempre. ¿Qué hago?</summary>
+            <div>
+              <p><code>kubectl describe pvc &lt;nombre&gt;</code> te dice el motivo. Las causas comunes: la StorageClass no existe o el provisioner no está instalado; el PV estático no coincide en accessMode/tamaño/storageClass; o el binding es <code>WaitForFirstConsumer</code> y aún no hay Pod. Cuando hayas creado el Pod consumidor, míralo de nuevo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre montar un PVC en un Deployment y un StatefulSet?</summary>
+            <div>
+              <p>Un Deployment usa <em>un PVC concreto</em> que comparten todas las réplicas (o lo usa una sola). Un StatefulSet define <code>volumeClaimTemplates</code>: cada pod tiene su <em>propio</em> PVC con su propio PV (postgres-instancia-0, -1…). Es lo correcto para BBDDs replicadas, aunque con datos de verdad todavía hay que gestionar la replicación de los datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El hostPath es seguro en kind?</summary>
+            <div>
+              <p>Es rápido de entender y reproducible en un clúster de un solo nodo (todos los pods de kind acaban en nodos de un solo maestro/worker). Pero no debe cruzar a producción multinodo: rompe la promesa de que el dato siga al Pod. En kind una StorageClass local-path ya te da lo mismo con mejor DX.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo hago backups si el PVC se pierde?</summary>
+            <div>
+              <p>El PVC no es un backup: es una garantía de persistencia dentro del clúster. La copia debe ser externa al clúster (dumps de postgres a almacenamiento, snapshots EBS, etc.). En producción lo típico es un job de backup con volumen aparte que exporte los dumps (verás Jobs/CronJobs en el módulo 6 y 9).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

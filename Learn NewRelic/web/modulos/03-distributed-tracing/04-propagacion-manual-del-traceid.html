@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-propagacion-manual-del-traceid">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Propagación manual del traceId sin HTTP — Módulo 3 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Propagación manual del traceId sin HTTP</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Distributed Tracing y traceId</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En HTTP el agente propaga los headers él solo. Pero en canales que no instrumenta —tu WebSocket, una cola custom— <strong>tú decides cómo viaja el contexto</strong>. New Relic te da dos llamadas para eso: <code>InsertDistributedTraceHeaders</code> (al enviar) y <code>AcceptDistributedTraceHeaders</code> (al recibir).</p>
+        <p>Esta es la pieza que convierte a tu WebSocket en un participante de pleno derecho del distributed tracing, con el <code>traceId</code> viajando dentro del propio JSON del mensaje.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué importa?</strong> Porque ahora mismo, un mensaje que entra por tu WebSocket y dispara una llamada HTTP pierde su contexto: el traceId del HTTP no tendrá relación con el mensaje que lo provocó. Con esta lección lo «cosemos» para hilar un solo trace.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El patrón manual</h3>
+        <p>Fíjate en el requisito clave: ambas llamadas necesitan estar <strong>dentro de una transacción</strong>.</p>
+        <pre><code class="language-text">EMISOR (dentro de una transacción)              RECEPTOR (dentro de una transacción)
+   │                                                │
+   │ InsertDistributedTraceHeaders(carrier, setter) │
+   │   → escribe traceparent/tracestate/newrelic    │
+   │     en el carrier del mensaje                  │
+   │ ──────────── mensaje (cola/WS) ───────────────► │
+   │                                                │ AcceptDistributedTraceHeaders(
+   │                                                │    carrier, getter, transportType)
+   │                                                │   → enlaza su entry span como hijo
+   │                                                ▼
+   │                              el traceId del receptor = el del emisor</code></pre>
+
+        <h3>El carrier</h3>
+        <p>El <strong>carrier</strong> es «el lugar donde escribes claves/valores del mensaje»: propiedades de un mensaje de cola, un <code>Dictionary&lt;string,string&gt;</code>, o el propio objeto de tu mensaje WebSocket con un campo <code>TraceContext</code>. El <strong>setter</strong> y el <strong>getter</strong> son las funciones que adaptan la llamada de la API a TU tipo de objeto.</p>
+
+        <h3>transportType</h3>
+        <p>Al aceptar, indicas cómo viajó (enum <code>TransportType</code>): valores reales <code>HTTP</code>, <code>HTTPS</code>, <code>Queue</code>, <code>AMQP</code>, <code>Kafka</code>, <code>JMS</code>, <code>IronMQ</code>… y <code>Other</code> (para tu WebSocket). Ayuda a la UI a tipar bien el salto entre procesos.</p>
+
+        <h3>Alternativa ligera: GetLinkingMetadata()</h3>
+        <p>Si no necesitas saltar de proceso pero sí «declarar» el traceId (por ejemplo, en un log o en un evento custom), <code>IAgent.GetLinkingMetadata()</code> te devuelve un diccionario con <code>trace.id</code>, <code>span.id</code>, <code>entity.guid</code>… sin fabricar headers.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Con un <code>Dictionary&lt;string,string&gt;</code> como carrier (patrón universal para probar):</p>
+        <pre><code class="language-csharp">using NewRelic.Api.Agent;
+
+IAgent agent = NewRelic.Api.Agent.NewRelic.GetAgent();
+
+// ───── EMISOR ───── (dentro de una transacción)
+var carrier = new Dictionary&lt;string, string&gt;();
+agent.CurrentTransaction.InsertDistributedTraceHeaders(
+    carrier,
+    static (props, key, value) =&gt; props[key] = value);
+
+EnqueueMessage(new Message { Type = "trade", TraceContext = carrier });
+
+// ───── RECEPTOR ───── (dentro de una transacción recién creada)
+Message msg = DequeueMessage();
+
+agent.CurrentTransaction.AcceptDistributedTraceHeaders(
+    msg.TraceContext,
+    static (props, key) =&gt;
+        props.TryGetValue(key, out var v) ? [v] : [],
+    TransportType.Queue);</code></pre>
+        <p><code>AcceptDistributedTraceHeaders</code> lee W3C (<code>traceparent</code>/<code>tracestate</code>) o el header <code>newrelic</code> según lo que encuentre.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En tu WebSocket el <strong>carrier es el propio JSON</strong>. Definimos una bolsa de contexto en el envoltorio:</p>
+        <pre><code class="language-csharp">// El payload JSON del mensaje tiene estos campos además de payload/business:
+//   "type", "timestamp", "traceId", "tracestate", "messageId"
+
+// Al enviar un mensaje hacia un worker (dentro de una transacción existente):
+var env = new MessageEnvelope(type: "trade", timestamp: now, messageId: id);
+txn.InsertDistributedTraceHeaders(env.TraceContext, WriteTraceHeader);
+
+static void WriteTraceHeader(MessageEnvelope env, string key, string value)
+    =&gt; env.TraceContext[key] = value;
+
+// Al recibirlo, dentro del [Transaction] que creas para el mensaje (M4):
+agent.CurrentTransaction.AcceptDistributedTraceHeaders(
+    env.TraceContext,
+    ReadTraceHeader,
+    TransportType.Other);   // no existe "WebSocket"; usa Other
+
+static IEnumerable&lt;string&gt; ReadTraceHeader(MessageEnvelope env, string key)
+    =&gt; env.TraceContext.TryGetValue(key, out var v) ? [v] : [];</code></pre>
+        <p>Y el <code>TraceContext</code> se serializa dentro del JSON:</p>
+        <pre><code class="language-json">{
+  "type": "trade",
+  "timestamp": "2026-08-31T10:15:00.123Z",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "tracestate": "newrelic=1-21-...-...",
+  "messageId": "887",
+  "payload": { }
+}</code></pre>
+        <p>Así, el traceId del mensaje <strong>es</strong> el traceId de la traza: de recibirlo a procesarlo y a llamar a la API de precios, todo queda hilado.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Aceptar contexto SOLO dentro de una transacción</td><td>Llamar Accept fuera de una transacción</td><td>Necesitas un entry span que cuelgue del parentId</td></tr>
+            <tr><td>Sanear y validar los IDs del carrier</td><td>Propagar cualquier string</td><td>Seguridad y salud del árbol de trazas</td></tr>
+            <tr><td>Proceder con <code>TransportType</code> correcto</td><td>Usar siempre <code>Queue</code></td><td>La UI y el análisis tipan bien el tipo de frontera</td></tr>
+            <tr><td>Usar <code>GetLinkingMetadata()</code> para logs/eventos sueltos</td><td>Fabricar headers a mano para un log</td><td>Para no saltar de proceso no necesitas el contexto completo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Aceptar el contexto ANTES de crear la transacción del mensaje</h3>
+        <pre><code class="language-csharp">// ❌ No hay transacción todavía: Accept no enlaza nada
+AcceptTrace(msg);
+Process(msg);
+
+// ✅ Primero el [Transaction]/transacción del mensaje, después Accept
+[Transaction]
+public void Dispatch(MessageEnvelope msg)
+{
+    agent.CurrentTransaction.AcceptDistributedTraceHeaders(...);
+    Process(msg);
+}</code></pre>
+
+        <h3>Leer/escribir claves que no están</h3>
+        <pre><code class="language-csharp">// ❌ El getter hace fallar si la clave no existe
+static IEnumerable&lt;string&gt; BadGetter(MessageEnvelope e, string k) =&gt; [e.TraceContext[k]];
+
+// ✅ Devuelve vacío si no existe (la API lo trata como «sin contexto»)</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> En tu Dispatch <code>[Transaction]</code>, añade la llamada <code>AcceptDistributedTraceHeaders</code> con un getter tolerante.</li>
+          <li><strong>Paso 2:</strong> Envía mensajes SIN contexto: verás traces «nuevas» (traceId generado).</li>
+          <li><strong>Paso 3:</strong> Envía mensajes que incluyan un <code>traceparent</code> falso/válido en sus campos de contexto y comprueba que el entry span hereda ese traceId.</li>
+          <li><strong>Paso 4:</strong> Consulta <code>SELECT traceId FROM Span WHERE name LIKE '%Dispatch%'</code> y verifica el enlace.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Extremo a extremo</h3>
+          <p>Diseña el flujo donde tu servidor recibe un <code>trade</code>, lo procesa y llama a una API interna; y donde un worker recoge el resultado y lo guarda. Escribe las 4 llamadas (Insert/Accept) que harían falta y dibuja el árbol que esperas (usuario→WS→API→cola→worker). Aplica lo dibujado en el Módulo 8.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>InsertDistributedTraceHeaders</code> escribe el contexto en el carrier; <code>AcceptDistributedTraceHeaders</code> lo enlaza.</li>
+          <li>Ambas requieren una transacción en curso; el <code>transportType</code> califica la frontera.</li>
+          <li>En WebSocket, el carrier es el propio JSON con campos de contexto.</li>
+          <li><code>GetLinkingMetadata()</code> es la versión ligera para logs/eventos.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Y si el cliente no manda contexto?</summary>
+            <div><p>No pasa nada: el receptor empieza una traza nueva. La decisión de diseño es tuya: al filtrar «mensajes sin contexto» puedes medir qué % de tus mensajes no provienen de un extremo trazado.</p></div>
+          </details>
+          <details>
+            <summary>¿InsertDistributedTraceHeaders e Inyección automática de HttpClient se pisan?</summary>
+            <div><p>No. Para HttpClient el agente ya lo hace solo; Insert/Accept es para canales que él no conoce. Solo <em>una</em> de las dos debe escribir el contexto por canal.</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo propagar sin W3C, solo con traceId?</summary>
+            <div><p>Puedes llevar solo el traceId como atributo (para correlacionar logs), pero para que New Relic reconstruya trazas unidas necesitas el contexto W3C/NewRelic completo. Lleva el contexto.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

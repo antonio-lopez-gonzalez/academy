@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-write-through-write-behind">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Write-through, write-behind y cuándo cachear — Módulo 5 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Write-through, write-behind y cuándo cachear</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Patrones de Caché</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El cache-aside resuelve lecturas; pero ¿qué pasa al <strong>escribir</strong>? Ahí aparecen los patrones de <em>write-through</em> (escribir caché + fuente a la vez) y <em>write-behind</em> (escribir caché rápido y persistir en segundo plano).</p>
+        <p>Verás las diferencias, cuándo merecen la pena y cómo decidir <strong>qué se cachea y qué no</strong> en tu hub.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Los tres enfoques de escritura</h3>
+        <table>
+          <thead><tr><th>Patrón</th><th>Qué hace</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cache-aside + DEL</strong> (lo visto)</td><td>Al escribir: fuente + borra la key</td><td>Ventana de «caché viejísima» hasta el próximo GET</td></tr>
+            <tr><td><strong>Write-through</strong></td><td>Al escribir: fuente + REDIS con el mismo valor (SET)</td><td>Escribir en caché por cada write (cuesta si escribe mucho y sirve poco)</td></tr>
+            <tr><td><strong>Write-behind</strong></td><td>Al escribir: fuente (rápido) y en segundo plano refrescare valores calientes</td><td>Riesgo de lag entre lo que ves y lo almacenado</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cuándo cada uno</h3>
+        <ul>
+          <li><strong>Write-through:</strong> cuando el dato se lee mucho más de lo que se escribe, y quieres que la caché ya esté «caliente» al primer GET. Ej.: configuración que cambia raramente.</li>
+          <li><strong>Write-behind:</strong> cuando el write a la fuente es caro y puedes agregar en Redis para persistirlo después. Ej.: contadores de estadísticas (acumulas e inserto en lote).</li>
+          <li><strong>Cache-aside + DEL:</strong> el default; simplemente deja que el próximo GET rellene la caché.</li>
+        </ul>
+
+        <pre><code class="language-text">write-through        write-behind
+cliente → app        cliente → app
+   ├─► fuente           ├─► Redis (rápido) ──► (background) ──► fuente
+   └─► Redis (SET)      └─ COPIA DELEGADA (ack inmediato)</code></pre>
+
+        <h3>La regla de «dónde cachear»</h3>
+        <ul>
+          <li>Cachea lo que <strong>se lee mucho y cambia poco</strong>.</li>
+          <li>No cachees lo que <strong>cambia siempre</strong> ni lo <strong>denso y único</strong> (paginaciones innumerables).</li>
+          <li>La <strong>fuente de verdad</strong> sigue siendo tu DB; Redis es un acelerador que se puede reiniciar (y tu app debe seguir viva).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># write-through (simple): escribe fuente(no necesaria aquí) + caché
+SET config:feature:X '{"enabled":true}' EX 3600
+
+# write-behind (acumular stats): INCR contadores…
+INCR stats:day:2026-08-31:orders
+# …y un job cada X minutos sumariza a la DB y RESETEA (o DECRBY)</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el hub conviven ambos sin dolor:</p>
+        <pre><code class="language-csharp">// 1) Write-through de una configuración de canal (se lee mucho, se escribe poco)
+public async Task SetChannelConfigAsync(string ch, ChannelConfig cfg)
+{
+    await _repo.SaveAsync(ch, cfg);                      // fuente
+    await _db.StringSetAsync($"cfg:chan:{ch}",
+        JsonSerializer.Serialize(cfg), TimeSpan.FromHours(1));   // caché "caliente"
+}
+
+// 2) Write-behind de estadísticas (acumuladas en Redis, volcadas en lote)
+await _db.StringIncrementAsync($"stats:{_nodeId}:msgs"); // este minuto
+// (cada minuto, un worker lee+resetea e inserta en la DB — M3-02 stream/colas)</code></pre>
+        <p>La configuración se sirve del caché al instante; las estadísticas se agregan sin tocar la DB en caliente.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Write-through solo en datos «poco escritos, muy leídos»</td><td>Write-through en contadores de alto write</td><td>Duplicarías el coste de red por escribir en caché lo que nadie lee</td></tr>
+            <tr><td>Write-behind para agregar y persistir en lote</td><td>Write-behind para datos que deben verse ya en la fuente</td><td>El lag del background rompe la consistencia esperada</td></tr>
+            <tr><td>Mantener la fuente como única «fuente de verdad»</td><td>Hacer de Redis la única copia de algo persistente</td><td>Redis es volátil por diseño; perderías historia</td></tr>
+            <tr><td>Metrics de hit/miss para decidir qué cachear</td><td>Cachear «por intuición»</td><td>El ratio hit/miss te dice si el dato merece caché</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar write-through con datos de altísimo write</h3>
+        <pre><code class="language-csharp">// ❌ Cada tick del precio (10/s) escribiendo en Redis aunque nadie lea
+await _db.StringSetAsync("price:live", p, ttl);
+// ✅ Cache-aside + TTL corto, o métricas/contador según lectura real</code></pre>
+
+        <h3>La «caché infinita» de tablas paginables</h3>
+        <p>Cachear todas las combinaciones de filtro/página de un catálogo gigante = hay rebalse; mejor cachear los datos «verticales» (por id) y montar búsquedas por separado.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Clasifica los datos de tu hub en «lectura alta / escritura baja» y viceversa.</li>
+          <li><strong>Paso 2:</strong> Elige uno para write-through (config), otro para write-behind (stats).</li>
+          <li><strong>Paso 3:</strong> Escribe el código de ambos y ponles las queries de verificación.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Métrica de decisión</h3>
+          <p>Define cómo medirías el hit ratio de una key (p. ej. instrumentando GETs/HITs con contadores en Redis). Escribe la consulta/lógica y el umbral a partir del cual aconsejarías dejar de cachear un dato (ratio < 40 %). Al final, y compárala con keyspace_hits / keyspace_misses de `INFO stats` del propio Redis.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Cache-aside + DEL es el default humano.</li>
+          <li>Write-through: poco-write/mucho-read (config).</li>
+          <li>Write-behind: agregar en Redis, persistir en lote (stats).</li>
+          <li>La fuente de verdad permanece; Redis es el acelerador.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Write-through y write-behind son excluyentes del cache-aside?</summary>
+            <div><p>No, conviven al mismo tiempo en la app para distintos datos: unos usan cache-aside (+DEL), otros write-through, otros métricas agregadas. La clave es clasificarlos.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si escribo en Redis y falla la fuente?</summary>
+            <div><p>Ese es el riesgo del write-behind: ack al cliente pero fallo al persistir. Diseña reintentos (streams del M3) o fondo de compensación si el dato importa.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

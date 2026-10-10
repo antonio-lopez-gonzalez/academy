@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-arquitectura-kubernetes">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control plane, nodos y etcd — Módulo 5 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Control plane, nodos y etcd</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · De Docker a Kubernetes</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior declaraste el <em>qué</em> (estado deseado) y Kubernetes se comprometió a sostenerlo. Ahora toca la pregunta incómoda: <strong>¿quiénes son los que lo sostienen?</strong> Kubernetes es un sistema distribuido que no corre tu aplicación: corre <em>la lógica que vigila tu aplicación</em>. Comprender esa lógica — el <strong>control plane</strong> y los <strong>nodos</strong> — es lo que separa a quien «usa kubectl» de quien entiende por qué kubectl funciona.</p>
+        <p>Esta lección no requiere instalar nada: es pura anatomía. Vas a conocer a cada componente (kube-apiserver, etcd, scheduler, controller-manager, kubelet, kube-proxy, runtime), el concepto de <strong>planos de control vs planos de datos</strong>, el flujo completo de un `kubectl apply`, y qué significa hacer un clúster de alta disponibilidad (HA) de verdad.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todos los errores de Kubernetes tienen su raíz aquí: «no me conecto al clúster» suele ser un problema del apiserver; «el Pod no aparece» suele ser etctd o el scheduler; «no hay red» suele ser kube-proxy. Si conoces a cada actor, los <a href="../06-workloads/01-pods.html">problemas de troubleshooting del módulo 6</a> se vuelven triviales.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos planos, como en una empresa o un avión de pasajeros</h3>
+        <p>Toda plataforma distribuida se divide en dos planos. Piensa en una aerolínea: la <strong>torre de control</strong> decide, coordina y vigila (rutas, qué avión despega); los <strong>aviones</strong> transportan a los pasajeros y reciben órdenes de la torre. En Kubernetes:</p>
+        <ul>
+          <li><strong>Control plane:</strong> el conjunto de procesos que toman decisiones — quién, qué, dónde. Nunca ejecuta tu app.</li>
+          <li><strong>Data plane (los nodos):</strong> las máquinas donde <em>sí</em> corren tus contenedores, siguiendo las órdenes del control plane.</li>
+        </ul>
+
+        <h3>Los 5 actores del control plane</h3>
+        <table>
+          <thead><tr><th>Componente</th><th>Vive en</th><th>Su única responsabilidad</th></tr></thead>
+          <tbody>
+            <tr><td><code>kube-apiserver</code></td><td>Control plane</td><td>La puerta de entrada de TODA la comunicación: autentica, autoriza, valida y expone la API REST</td></tr>
+            <tr><td><code>etcd</code></td><td>Control plane</td><td>Base de datos clave-valor distribuida: la fuente de verdad del estado del clúster</td></tr>
+            <tr><td><code>kube-scheduler</code></td><td>Control plane</td><td>Decide en qué nodo aterriza cada Pod nuevo (recursos, afinidades, taints)</td></tr>
+            <tr><td><code>kube-controller-manager</code></td><td>Control plane</td><td>Ejecuta los control loops (deployment, replicaset, node, endpoints…)</td></tr>
+            <tr><td><code>cloud-controller-manager</code></td><td>Control plane (opcional)</td><td>Integración con el proveedor cloud: balanceadores, volúmenes, nodos</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cada componente, con su por qué</h3>
+        <p><strong>kube-apiserver — la única puerta.</strong> Todo (kubectl, kubelet, kube-proxy, controllers, dashboards…) habla con él por HTTPS. Nada en Kubernetes se comunica por otra vía. Esto centraliza la seguridad: puedes auditar una sola API. Es <em>stateless</em>: no guarda nada él, lo delega a etcd. Por eso puedes tener varios apiserver replicados detrás de un balanceador.</p>
+        <p><strong>etcd — la memoria del clúster.</strong> Es un almacén clave-valor distribuido que guarda «el mundo tal y como debe ser y tal y como es». Es la única fuente de verdad: si etctd se pierde, el clúster <em>olvida</em> qué desea. Usa el algoritmo <strong>Raft</strong> (consenso): para sobrevivir necesita mayoría (quorum). Con 1 nodo necesita 1, con 3 necesita 2, con 5 necesita 3. Por eso en producción se corren 3 o 5 copias de etcd, nunca 2 ni 4 (número impar).</p>
+        <p><strong>kube-scheduler — el colocador.</strong> Cuando un Pod nace sin nodo asignado, el scheduler elige el mejor nodo aplicando <em>filtros</em> (¿tiene CPU/memoria libres?) y <em>pesos</em> (¿prefiero nodos con menos carga?). No crea el Pod ni lo lanza: solo decide <em>dónde</em>.</p>
+        <p><strong>kube-controller-manager — el reconciliador.</strong> Aquí viven los <em>control loops</em>: cada controller quiere que el estado real iguale al deseado. El deployment controller crea/actualiza ReplicaSets; el replicaset controller crea/borra Pods; el node controller marca un nodo como perdido; el endpoints controller mantiene la lista de IPs de un Service. Todos hacen lo mismo: <code>mirar estado actual → comparar con deseado → actuar → volver a mirar</code>.</p>
+        <p><strong>cloud-controller-manager — el traductor.</strong> En un clúster en la nube (EKS/AKS/GKE), traduce los deseos del clúster en recursos del proveedor: un Service tipo LoadBalancer crea un balanceador real; un PVC crea un disco. En kind (local) no hace falta: no hay nube.</p>
+
+        <h3>Los 3 agentes del data plane (todo nodo)</h3>
+        <table>
+          <thead><tr><th>Componente</th><th>Responsabilidad</th><th>Analogía</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubelet</code></td><td>El agente del nodo: habla con el apiserver, arranca y vigila los contenedores de «sus» Pods, reporta estado y probes</td><td>El jefe de estación que recibe trenes de la central</td></tr>
+            <tr><td><code>kube-proxy</code></td><td>Aplica las reglas de red de los Services (iptables/IPVS) para que el tráfico llegue a los Pods</td><td>El operador de vías que cambia los raíles</td></tr>
+            <tr><td><code>containerd</code> (runtime CRI)</td><td>El runtime real de contenedores: `pull` imágenes, crear/arrancar/parar contenedores</td><td>El motor del tren</td></tr>
+          </tbody>
+        </table>
+        <p><strong>kubelet</strong> es lo único que hay que instalar en cada nodo junto al runtime. Se registra en el apiserver con su nombre; recibe la lista de Pods asignados a ese nodo y los ejecuta. Es quien llama a containerd por la <strong>CRI</strong> (Container Runtime Interface), el estándar que permite cambiar de runtime sin reescribir nada: el mismo containerd de Docker, CRI-O, containerd puro… Todo cumple la CRI.</p>
+        <p><strong>kube-proxy</strong> no es un proxy de aplicación: no mira el contenido HTTP. Mantiene las <em>reglas de forwarding</em> para que un Service (una IP virtual y un DNS) reparta paquetes entre los Pods de sus réplicas. Si los Pods cambian de IP, él actualiza las reglas.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> tú (kubectl) llamas por teléfono a la central de reservas (apiserver); la central anota tu reserva en su registro maestro (etcd); un planificador (scheduler) te asigna mesa (nodo); el jefe de sala (kubelet) te sienta y vigila que comas (probes); y unos camareros-socorristas (kube-proxy) se encargan de que el plato llegue a la mesa correcta aunque te muevan de sitio. Tú solo hiciste la reserva.</p>
+        </div>
+
+        <h3>Diagrama completo del clúster</h3>
+        <div class="diagram">
+                      ┌────────────────────────────────────────────────────┐
+                      │                 CONTROL PLANE                      │
+                      │                                                    │
+ kubectl ──────────▶ │   kube-apiserver  ──persiste──▶ etcd (fuente de    │
+ (HTTPS / REST)      │   (puerta única)   ◀──watch──   verdad, KV + Raft) │
+                      │        │   ▲                                       │
+                      │        │   │    leen/escriben el mismo estado      │
+                      │   kube-scheduler      kube-controller-manager      │
+                      │   (elige nodo)        (control loops / reconcilia) │
+                      │        │                 cloud-controller-manager  │
+                      │        │                  (nube, opcional)         │
+                      └────────┼───────────────────────────────────────────┘
+                               │  API: "aquí va este Pod" (watch)
+        ┌──────────────────────┼──────────────────────────────────────────┐
+        ▼                      ▼                                          ▼
+ ┌────────────────┐   ┌────────────────┐                        ┌────────────────┐
+ │   NODO A       │   │   NODO B       │                        │   NODO C       │
+ │  kubelet       │   │  kubelet       │                        │  kubelet       │
+ │  kube-proxy    │   │  kube-proxy    │                        │  kube-proxy    │
+ │  containerd    │   │  containerd    │                        │  containerd    │
+ │  Pod · Pod     │   │  Pod · Pod     │                        │  Pod · Pod     │
+ └────────────────┘   └────────────────┘                        └────────────────┘
+                    DATA PLANE — aquí corre tu aplicación
+        </div>
+        <p>Los nodos pueden ser todos worker, o el control plane puede vivir en nodos dedicados (la separación física es recomendable en producción y opcional en clústeres de pruebas como kind).</p>
+
+        <h3>HA de verdad: replicar el control plane</h3>
+        <p>Un clúster «HA de verdad» no significa «muchos nodos»: significa <strong>control plane replicado</strong>. La receta estándar: 3+ apiservers stateless detrás de un balanceador externo, 3 o 5 etcd con quorum Raft (número impar), cuellos de botella eliminados por replicación. El data plane, mientras tanto, se escala horizontalmente añadiendo nodos worker.</p>
+        <div class="callout callout--warning">
+          <p><strong>Mito común:</strong> «tengo 3 nodos worker, mi clúster es HA». Si el control plane es único, sigues teniendo un único punto de fallo: la <em>inteligencia</em> cae aunque los trabajadores sigan (de hecho, los Pods no mueren, pero nada nuevo se puede crear ni reparar).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ejemplo más pequeño de «arquitectura» es un único viaje: ver <strong>qué procesos forman tu clúster</strong>. Cuando en la próxima lección tengas kind levantado, este comando te enseñará a todos los actores del control plane viviendo como Pods en el namespace <code>kube-system</code>:</p>
+        <pre><code class="language-bash"># (Ejecuta esto cuando tengas el clúster de la lección 03)
+kubectl get pods -n kube-system
+#    NAME                                         READY   STATUS
+#    coredns-5d6c8b6f9c-abcde                     1/1     Running   ← DNS del clúster
+#    etcd-kind-control-plane                      1/1     Running   ← la memoria (etcd)
+#    kube-apiserver-kind-control-plane            1/1     Running   ← la puerta (apiserver)
+#    kube-controller-manager-kind-control-plane   1/1     Running   ← los reconciliadores
+#    kube-scheduler-kind-control-plane            1/1     Running   ← el colocador
+</code></pre>
+        <p>Fíjate en la riqueza del detalle: en un clúster de un solo nodo (kind), control plane y worker comparten la misma máquina física, pero <strong>siguen siendo actores distintos</strong>: el apiserver no es el scheduler, ni el scheduler es etcd. Aunque corran como contenedores, cada uno cumple exactamente el papel del diagrama anterior.</p>
+        <div class="callout callout--tip">
+          <p><strong>Lectura rápida con kubectl:</strong> también puedes pedirle al propio apiserver su versión por HTTP, demostrando que «todo entra por la misma puerta»:</p>
+          <pre><code class="language-bash">kubectl get --raw /version     # responde el kube-apiserver
+kubectl get --raw /api/v1     # el catálogo de recursos de la API
+</code></pre>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Vamos a seguir a un manifiesto de <strong>HarborTasks</strong> por todo el sistema. Todo lo que haces con kubectl sigue este guion — aprendértelo es aprenderse Kubernetes:</p>
+        <div class="diagram">
++--------------+  ①  HTTPS: POST /apis/apps/v1/namespaces/.../deployments
+|   kubectl    |──────────────────────────────▶┌──────────────────────────┐
+| apply -f api │                               │   kube-apiserver          │
++--------------+                               │ ②  autentica + autoriza + │
+                                               │     valida el esquema     │
+                                               └───────────┬───────────────┘
+                                                           │ ③  persiste el estado DESEADO
+                                                           ▼
+                                                ┌──────────────────────────┐
+                                                │   etcd                   │
+                                                │ "api: 3 réplicas, img: X"│
+                                                └───────────┬───────────────┘
+                                                           │ ④  watch: «algo ha cambiado»
+                           ┌──────────────────────────────┼─────────────────────────────┐
+                           ▼                              ▼                             ▼
+                  ┌────────────────────┐         ┌────────────────────┐        (otros controllers)
+                  │ deployment ctrl    │         │ replicaset ctrl    │
+                  │ ve «api existe,    │         │ ve «0 pods, quiero 3│
+                  │ 3 réplicas, img X» │         │ de image X» → crea  │
+                  │ → crea/ajusta RS   │         │ Pods sin nodo       │
+                  └─────────┬──────────┘         └─────────┬──────────┘
+                            ▼                             ▼
+                                                    ┌─────────────────────┐
+                                                    │ kube-scheduler      │
+                                                    │ ⑤ filtra+pesa nodos │
+                                                    │ → asigna A, B, C    │
+                                                    └─────────┬───────────┘
+                                                              ▼
+                                                   ┌─────────────────────┐
+                                                   │ kubelet (nodo A)    │
+                                                   │ ⑥ CRI → containerd  │
+                                                   │ crea y arranca el   │
+                                                   │ contenedor de la API│
+                                                   └─────────────────────┘
+                                                              │
+                                                  La readiness probe responde OK
+                                                              │
+                                                   el Service ya puede repartir tráfico
+        </div>
+        <p>La clave del paso ④: <strong>nadie «llama» a nadie</strong>. Los controllers y el scheduler <em>miran</em> (watch) el estado en el apiserver y reaccionan cuando no coincide con su deseo. Es exactamente el control loop de la lección 1, repartido entre actores especializados.</p>
+        <p>Y aquí un matiz profundo: el kubelet (nodo) también actúa como <strong>controlador de su propio nodo</strong> — si su Pod muere, reporta el estado real y deja que el estado deseado de arriba lo vuelva a crear. El «poder» fluye siempre desde el control plane hacia abajo, nunca al revés.</p>
+        <div class="callout callout--note">
+          <p><strong>En HarborTasks en concreto:</strong> cuando despliegues api con 3 réplicas, verás ese «reparto» en acción: cada Pod aterriza en un nodo distinto (si hay varios), kube-proxy pone las reglas del Service <code>api</code>, y DNS del clúster (CoreDNS) hace que <code>http://api</code> funcione desde cualquier Pod. Todo eso lo montan los actores de este diagrama, sin que tu manifiesto mencione IP alguna.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Replicar el control plane (3+ apiservers, 3-5 etcd) en producción</td><td>Un control plane único «porque el clúster es pequeño»</td><td>Sin HA del control plane, cualquier fallo del nodo maestro deja el clúster sin gobierno</td></tr>
+            <tr><td>Mantener etcd con backups y versión compatible</td><td>Probar upgrades de etcd con datos críticos sin copia</td><td>etcd es la fuente de verdad; perderla es perder el clúster entero</td></tr>
+            <tr><td>Pensar el clúster como «torre de control + aviones»</td><td>Confundir control plane con «lo que corre mi app»</td><td>Si metes tu app en el control plane, los problemas se mezclan y el HA se rompe</td></tr>
+            <tr><td>Entender los logs por componente (apiserver, kubelet…)</td><td>Mirar «los logs de Kubernetes» sin saber de cuál hablas</td><td>Cada actor loguea aparte; el diagnóstico depende de aislar al responsable</td></tr>
+            <tr><td>Usar versiones de nodos ≤ apiserver (skew policy)</td><td>Mezclar versiones muy distintas entre componentes</td><td>El apiserver es el contrato común; saltarse el skew produce fallos raros</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Confundir kubelet con kube-proxy</h3>
+        <pre><code class="language-bash"># ❌ "El tráfico entra por kubelet y kube-proxy arranca Pods"
+#    Es al revés:
+#      - kubelet:  arranca y vigila LOS PODS de su nodo
+#      - kube-proxy: mantiene REGLAS DE RED (iptables/IPVS) de los Services
+
+# ✅ Recuerda la división:
+#      kubelet     → vida de los contenedores (habla con el runtime CRI)
+#      kube-proxy  → red de los Services (para que una IP llegue a los Pods)
+</code></pre>
+
+        <h3>Creer que etcd es «la base de datos de mi aplicación»</h3>
+        <pre><code class="language-bash"># ❌ "Me guardo los datos de HarborTasks en etcd"
+#    etcd NO es Postgres: no guarda datos de aplicaciones.
+
+# ✅ etcd guarda SOLO el estado del clúster:
+#    quiénes son los nodos, qué Pods existen, qué desea cada Deployment.
+#    Los datos de la app (tareas, usuarios) viven en Postgres (o el
+#    almacenamiento que uses): separación de responsabilidades estricta.
+</code></pre>
+
+        <h3>Escalar solo el data plane y llamarlo «HA»</h3>
+        <pre><code class="language-bash"># ❌ "Tengo 10 nodos worker → soy a prueba de fuego"
+#    Si el control plane es único, sigue siendo single point of failure.
+
+# ✅ HA real = control plane replicado (etcd con quorum impar, varios
+#    apiservers) + data plane escalable. Como en un avión: muchos
+#    pasajeros no sirven de nada si la torre de control cae.
+</code></pre>
+
+        <h3>Tocar el estado directamente a escondidas del apiserver</h3>
+        <pre><code class="language-bash"># ❌ Editar las tablas de etcd a mano "para arreglar rápido"
+#    etcd NO es un cache: nadie más se entera y el clúster se corrompe.
+
+# ✅ Todo cambio pasa SIEMPRE por la API (kubectl apply). Es la regla
+#    del diseño centralizado: una sola puerta, auditable y validada.
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> fijar la arquitectura dibujando y verificando el flujo completo, sin necesidad de un clúster vivo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Dibuja de memoria.</strong> En una hoja, reproduce el diagrama del clúster: caja CONTROL PLANE (5 componentes) encima, cajas NODO A/B/C debajo (3 componentes). No mires el texto; así detectas los huecos de memoria.
+          </li>
+          <li>
+            <strong>Paso 2 — Verifica.</strong> Marca con ✔ cada componente que hayas colocado bien y contrasta con las tablas de la teoría. Repite hasta que las 5 + 3 posiciones salgan de memoria.
+          </li>
+          <li>
+            <strong>Paso 3 — Etiqueta el flujo.</strong> Sobre el mismo dibujo, numera el viaje de `kubectl apply -f api.yaml` (apiserver → etcd → controllers → scheduler → kubelet → containerd). Son 6 paradas: enuméralas en orden y en una frase para cada una di qué actor actúa y qué decide.
+          </li>
+          <li>
+            <strong>Paso 4 — Escribe el «quiénes» de la HA.</strong> Redacta 2 líneas: «si falla mi apiserver único, …» y «si falla uno de mis 3 etcd, …». La respuesta a la segunda es «nada, sigue el quorum»: demuestra que entiendes que con 3, sobrevivir 2 es mayoría.
+          </li>
+          <li>
+            <strong>Paso 5 — Généralo con tu vocabulario.</strong> Traduce el dibujo a una analogía propia distinta de la aerolínea (por ejemplo, una ciudad, una empresa, un partido de fútbol). Que cada componente tenga un rol claro en tu analogía.
+          </li>
+        </ol>
+        <p><strong>Verificación esperada:</strong> al terminar, eres capaz de responder sin mirar nada: (a) cuáles son los 5 componentes del control plane, (b) cuáles los 3 del data plane, (c) en qué orden fluye un apply, y (d) por qué 3 etcd aguantan un fallo y 2 no.</p>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El experimento del apagón</h3>
+          <p>Cuando tengas el clúster de kind de la lección 03, haz este experimento (es cien por cien seguro, es tu portátil): para el contenedor que ejecuta el control plane con `docker stop kind-control-plane`, espera 20 segundos y responde por escrito: <em>1) ¿Puedes hablar con el clúster desde kubectl? 2) ¿Qué le ocurre a los Pods que ya estaban corriendo? 3) ¿Qué comando de `docker` / `kubectl` te devolvería la evidencia de la respuesta 1?</em> Luego haz `docker start kind-control-plane` y observa cómo se recupera.</p>
+          <p><em>Pista: recuerda la lección 1 — el data plane «vive» sin el control plane un rato, pero sin gobierno no se repara ni se crea nada nuevo. Fíjate también en qué componente tarda en «volver a enterarse» del mundo.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Control plane = inteligencia:</strong> kube-apiserver (puerta única, REST), etcd (fuente de verdad, KV + Raft), scheduler (dónde), controller-manager (control loops) y cloud-controller-manager (nube).</li>
+          <li><strong>Data plane = músculo</strong> (nodos): kubelet (agente del nodo), kube-proxy (reglas de red de Services) y el runtime CRI (containerd).</li>
+          <li>Todo el tráfico entra por el <strong>apiserver</strong>; nada en el clúster habla «por fuera».</li>
+          <li>La <strong>reconciliación</strong> es la chispa de la arquitectura: controllers y scheduler <em>observan</em> el estado y actúan cuando difiere del deseado.</li>
+          <li>Un flujo de <code>kubectl apply</code>: apiserver → etcd → controllers → scheduler → kubelet → containerd.</li>
+          <li><strong>HA real</strong> = control plane replicado (3-5 etcd con quorum impar) + data plane escalable.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl get pods -n kube-system</code></td><td>Lista los componentes del control plane y del addon DNS</td></tr>
+            <tr><td><code>kubectl get nodes -o wide</code></td><td>Muestra los nodos con IP, runtime y versión de kubelet</td></tr>
+            <tr><td><code>kubectl get --raw /version</code></td><td>Pregunta directamente al apiserver por su versión (HTTP puro)</td></tr>
+            <tr><td><code>kubectl describe node NODO</code></td><td>Estado y condiciones de un nodo visto por el control plane</td></tr>
+            <tr><td><code>kubectl cluster-info</code></td><td>Resumen del control plane: la dirección del apiserver y los componentes</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Puente con la siguiente lección:</strong> ya sabes quién manda y quién trabaja. Ahora vas a montar el clíster de verdad con <strong>kind</strong> y a conocer a kubectl, tu mando a distancia. Continúa en <a href="03-kind-y-kubectl.html">kind y kubectl: primer contacto</a>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo ejecutar el control plane como contenedores Docker normales?</summary>
+            <div>
+              <p>Casi. En un clúster real, el control plane suele correr como Pods estáticos gestionados por el propio kubelet (con kubeadm) o como servicio gestionado del proveedor cloud. Eso es precisamente lo que hace <strong>kind</strong>: ejecuta cada «nodo» como un contenedor Docker con un kubelet y un runtime dentro, y el control plane como Pods estáticos en el nodo de control. La arquitectura que has aprendido es la misma dentro de esos contenedores.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué etcd necesita número impar de nodos?</summary>
+            <div>
+              <p>etcd usa el algoritmo de consenso <strong>Raft</strong>: una decisión solo se considera tomada si la aprueba la mayoría (quorum). Con N nodos, la mayoría es <code>N/2 + 1</code>. Con 3, sobrevives la caída de 1; con 5, de 2. Con un número par, desperdicias un nodo que no te da más tolerancia (4 = mismo umbral que 3), así que la industria usa 3 o 5.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Mi aplicación corre en el control plane?</summary>
+            <div>
+              <p>No debería. El control plane ejecuta la lógica de Kubernetes, no la tuya. Tu app vive en los nodos worker (data plane). Mezclarlos es una mala práctica: el control plane debe estar aislado, con sus propios recursos y política de upgrades. En kind (un solo nodo) conviven por necesidad de laboratorio, pero conceptualmente son planos distintos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué todo pasa por el apiserver y no se hablan los componentes directamente?</summary>
+            <div>
+              <p>Es una decisión de diseño deliberada. Centralizar la comunicación en una API única da: (1) <strong>seguridad</strong> (una sola puerta a autenticar y auditar), (2) <strong>consistencia</strong> (el estado vive en un solo sitio, etcd), y (3) <strong>testabilidad</strong> (cualquier parte se sustituye sin romper las demás). Es el mismo porqué de por qué tu navegador no «llama» al router: hay protocolos y contratos centrales.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si el control plane de mi clúster de kind se queda colgado?</summary>
+            <div>
+              <p>En kind el control plane es un contenedor Docker: <code>docker restart kind-control-plane</code> suele bastar para devolverlo. Si no, <code>kind delete cluster</code> y <code>kind create cluster</code> te dan un clúster limpio en segundos — esa es la gran ventaja de kind frente a un clúster físico. En un clúster de empresa, sin embargo, el control plane es el último sitio donde quieres «reiniciar para ver qué pasa».</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

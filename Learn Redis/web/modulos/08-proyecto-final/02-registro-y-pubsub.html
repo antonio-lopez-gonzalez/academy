@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="02-registro-y-pubsub">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Implementar registro y pub/sub — Módulo 8 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Implementar registro y pub/sub</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Proyecto Final</span>
+          <span>⏱ 45 minutos</span>
+          <span class="badge">🟢 proyecto</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Rellenamos la primera mitad del proyecto: <code>ConnectionRegistry</code> (hash + TTL + presencia + heartbeat) y <code>ConnectionHub</code> (suscripción/pub del backplane). Al final, dos procesos .NET «hablan» vía Redis.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>ConnectionRegistry — el contrato</h3>
+        <pre><code class="language-csharp">// Methods
+RegisterAsync(connId, userId)   // hash + TTL + ZADD presencia
+HeartbeatAsync(connId, userId)  // refresh lease + score
+UnregisterAsync(connId, userId) // DEL hash + ZREM
+FindNodeAsync(connId)           // HGET node
+OnlineAsync()                   // ZRANGEBYSCORE (última ventana)</code></pre>
+
+        <h3>ConnectionHub — el backplane</h3>
+        <ul>
+          <li>Se suscribe a <code>hub:events</code> (broadcast) y <code>hub:direct</code> (dirigido).</li>
+          <li>Mantiene el diccionario local <code>connId → WebSocket</code>.</li>
+          <li>Filtra <code>from == nodeId</code> para no hacer loop.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>Decisión de diseño del proyecto:</strong> el broadcast publica Y reenvía local en el propio nodo origen; el suscriptor de los demás nodos reenvía a sus sockets. El filtro evita «el origen recibe y reenvía dos veces».</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">// Registro rápido (resumen de lo que implementarás)
+await db.HashSetAsync($"hub:conn:{conn}", [new("node", nodeId), new("userId", userId)]);
+await db.KeyExpireAsync($"hub:conn:{conn}", TimeSpan.FromSeconds(30));
+await db.SortedSetAddAsync("hub:presence", userId, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+// ... y el publish del evento
+await sub.PublishAsync("hub:events", JsonSerializer.Serialize(new { type = "connect", conn, node = nodeId }));</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Integración con el handler del socket: al conectar, registrar + publicar; en cada mensaje, heartbeat; al cerrar, unregister + publicar.</p>
+        <pre><code class="language-csharp">// en el loop del WebSocket (Program.cs simplificado)
+await hub.AddAsync(context, socket);       // registra + guarda local + publica "connect"
+
+while (socket.State == WebSocketState.Open)
+{
+    var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+    if (result.MessageType == WebSocketMessageType.Close) break;
+
+    await hub.HeartbeatAsync(connId, userId);       // refresh lease + presencia
+    var envelope = JsonSerializer.Deserialize&lt;WsEnvelope&gt;(
+        Encoding.UTF8.GetString(buffer, 0, result.Count));
+
+    switch (envelope?.Type)
+    {
+        case "broadcast": await hub.BroadcastAsync(envelope!.Payload!); break;
+        case "send":      await hub.SendToAsync(envelope!.To!, envelope.Payload!); break;
+    }
+}
+await hub.RemoveAsync(connId, userId);      // unregister + publica "disconnect"</code></pre>
+        <p>Todo lo «de Redis» está encapsulado; el loop del socket queda legible.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Misma clase encapsula las dos vistas (db + sub)</td><td>SQL de Redis esparcido por handlers</td><td>Testear y cambiar más fácil</td></tr>
+            <tr><td>Filtro <code>from == nodeId</code> en eventos</td><td>Reenviar al origen del mensaje</td><td>Evita broadcast duplicado</td></tr>
+            <tr><td>Try/catch + unregister en el cierre</td><td>Dejar conexiones sin limpiar en excepciones</td><td>El diccionario local y el registro quedan coherentes</td></tr>
+            <tr><td>DTOs del backplane en <code>HubEvents.cs</code></td><td>JSON sueltos y sin tipo</td><td>Compilación te avisa de los campos mal escritos</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Publicar «connect» sin que otros lo sepan (no suscripción)</h3>
+        <pre><code class="language-csharp">// ❌ Registras en Redis pero nadie se enteró (sin SUBSCRIBE en los nodos)
+// ✅ ConnectionHub se suscribe al arrancar y publica connect/disconnect</code></pre>
+
+        <h3>Segar el loop con el heartbeat en cada mensaje</h3>
+        <p>Healthbeat por mensaje está bien, pero si el cliente envía muchos mensajes, refresca «igual»; el lease y el score son baratos (una round-trip). Si quieres reducir, hazlo a intervalos mínimos (p. ej. si han pasado &gt;5 s).</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa ConnectionRegistry y ConnectionHub en el proyecto.</li>
+          <li><strong>Paso 2:</strong> Levanta 2 instancias con NODE_ID distintos y 2 clientes WebSocket.</li>
+          <li><strong>Paso 3:</strong> Envía «broadcast» desde el cliente del nodo-1 y comprueba que el del nodo-2 lo recibe.</li>
+          <li><strong>Paso 4:</strong> Verifica en RedisInsight las keys <code>hub:conn:*</code> y el zset <code>hub:presence</code>.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Envío dirigido entre nodos</h3>
+          <p>Usa <code>hub:direct</code>: el cliente del nodo-1 pide «send a conn-X» donde X vive en el nodo-2. Verifica que solo el dueño lo responde (revisa el registro con HGET) y que no se duplique nada. Añade una métrica <code>stats:direct</code> con INCR.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>ConnectionRegistry: hash+TTL+presencia.</li>
+          <li>ConnectionHub: backplane broadcast/dirigido con filtro de origen.</li>
+          <li>2 instancias coordinan broadcast vía Redis (demo central).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El diccionario local es «memoria de más»?</summary>
+            <div><p>Es la parte «solo de este nodo» (los sockets que le tocan). Redis guarda el directorio; el diccionario contiene los sockets reales. Es el diseño correcto (no guardes sockets en Redis).</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo usar Streams en vez de pub/sub para el broadcast?</summary>
+            <div><p>Si quieres historial/auditoría, sí (M3-02); para broadcast en vivo, pub/sub es más directo y ligero. El curso te deja los dos; el proyecto usa pub/sub por simplicidad del caso de uso.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

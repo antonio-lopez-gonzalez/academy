@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-pods">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pods: la unidad mínima — Módulo 6 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Pods: la unidad mínima</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Workloads</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has visto contenedores gestionados por <code>docker run</code> y orquestados a mano con Compose. Kubernetes introduce una abstracción nueva entre tú y el contenedor: el <strong>Pod</strong>. Es LA unidad mínima de cómputo de Kubernetes. No existe el concepto de "contenedor suelto": cuando haces <code>kubectl run</code> o escribes un manifiesto, siempre estás pidiendo un Pod.</p>
+        <p>En esta lección vas a entender <strong>por qué</strong> Kubernetes decidió que el contenedor no sea la unidad mínima, qué comparten los contenedores dentro de un Pod, cuál es el ciclo de vida completo de un Pod, qué son los <code>initContainers</code> y el patrón <em>sidecar</em>, y cómo inspeccionar un Pod con <code>kubectl</code>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque todos los workloads del resto del curso (Deployments, Jobs, CronJobs) son, en el fondo, <em>fábricas de Pods</em>. Si no dominas qué es un Pod, el resto de Kubernetes será un montón de YAML sin significado. Es la lección base del Módulo 6.</p>
+        </div>
+        <p><strong>Errores típicos de esta pieza:</strong> pensar que Pod y contenedor son sinónimos, meter varias aplicaciones independientes en un mismo contenedor, olvidar que un Pod es efímero (se borra y sus datos con él) y usar <code>kubectl run</code> como si fuera un <code>docker run</code> de producción.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Analogía: el camarote compartido</h3>
+        <p>Piensa en un barco de carga. Cada contenedor de mercancías tiene un propósito propio, pero a veces varias piezas que <em>trabajan juntas</em> deben viajar en el <strong>mismo camarote</strong>: comparten el espacio, los cables de alimentación y el acceso a la cubierta; suben y bajan del barco juntas. El camarote es la unidad de manipulación — never nos moveremos "una caja suelta" por el muelle. Ese camarote es el <strong>Pod</strong> y las cajas son los <strong>contenedores</strong>.</p>
+
+        <p>Kubernetes agrupa uno o más contenedores en una unidad de despliegue y scheduling llamada Pod. Todo lo que está dentro de un Pod se programa, arranca y muere <strong>como un bloque</strong>. Y todos sus contenedores comparten tres cosas fundamentales:</p>
+        <ul>
+          <li><strong>La misma red:</strong> una única IP de Pod y el mismo <code>localhost</code>. Dos contenedores de un Pod pueden hablarse por <code>127.0.0.1:puerto</code> entre sí.</li>
+          <li><strong>Los mismo volúmenes de storage:</strong> un volumen montado en el Pod se puede montar en todos sus contenedores (lectura/escritura o solo lectura).</li>
+          <li><strong>El mismo ciclo de vida y lugar del mundo:</strong> corren en el <em>mismo nodo</em> (la misma máquina) de forma simultánea, con la misma política de reinicio.</li>
+        </ul>
+
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> si un contenedor es una "caja de mercancías", el Pod es el "camarote" donde se estiban las cajas que deben viajar juntas. Kubernetes manipula camarotes, no cajas sueltas: <em>nunca</em> dice "arranca este contenedor", siempre dice "materializa este Pod".</p>
+        </div>
+
+        <h3>¿Por qué Kubernetes no ejecuta contenedores "sueltos"?</h3>
+        <p>El contenedor único está bien cuando tu aplicación es una pieza aislada. Pero en producción es constantísimo encontrar <strong>procesos complementarios</strong> que deben vivir pegados a la aplicación: un agente que envía logs, un proxy que cachea respuestas, un proceso que regenera contenido estático, un sidecar de malla de servicios. Si cada uno fuera un contenedor suelto, Kubernetes tendría que coordinar su co-ubicación, su red compartida y su ciclo de vida a mano. El Pod resuelve eso de raíz: <strong>todo lo que debe compartir red, storage y ciclo de vida se declara dentro del mismo Pod</strong>.</p>
+
+        <h3>El ciclo de vida de un Pod</h3>
+        <p>Un Pod nace cuando el <em>scheduler</em> lo asigna a un nodo, el <code>kubelet</code> de ese nodo materializa sus contenedores con el runtime (containerd) y el kube-apiserver registra su estado. Las fases son:</p>
+        <table>
+          <thead><tr><th>Fase</th><th>Qué significa</th><th>Cuándo termina así</th></tr></thead>
+          <tbody>
+            <tr><td><code>Pending</code></td><td>El Pod fue aceptado por el API pero no se ha materializado</td><td>Esperando scheduling o descarga de imágenes</td></tr>
+            <tr><td><code>Running</code></td><td>Al menos un contenedor está ejecutándose</td><td>Ya hay procesos vivos</td></tr>
+            <tr><td><code>Succeeded</code></td><td>Todos los contenedores terminaron con código 0</td><td>Pod finito (Jobs), nunca un Deployment normal</td></tr>
+            <tr><td><code>Failed</code></td><td>Algún contenedor terminó con error</td><td>El proceso principal murió con código distinto de 0</td></tr>
+            <tr><td><code>Unknown</code></td><td>El nodo no comunica estado</td><td>Problemas de red o kubelet caído</td></tr>
+          </tbody>
+        </table>
+        <p>Dentro de un Pod, cada contenedor tiene su propio sub-estado <code>Waiting</code>, <code>Running</code> o <code>Terminated</code>. Y ojo, el ciclo de vida es <strong>efímero</strong>: si un Pod muere (nodo cae, se borra), Kubernetes no lo "revive" — <em>alguien</em> (normalmente un Deployment) crea un Pod <em>nuevo</em>. Nada se reutiliza.</p>
+
+        <h3>initContainers</h3>
+        <p>Dentro de un Pod puedes declarar contenedores <strong>de inicialización</strong> (<code>initContainers</code>): corren <strong>en orden, uno a uno, y deben completarse</strong> (terminar con código 0) antes de que arranque el primer contenedor principal. El resto de contenedores espera. Son perfectos para "esperar a que exista una dependencia", descargar un artefacto, preparar el esquema o ajustar permisos de un volumen. Y se repiten en cada arranque del Pod.</p>
+
+        <h3>El patrón sidecar (multi-contenedor)</h3>
+        <p>El <strong>sidecar</strong> es el caso clásico de Pod multi-contenedor: un contenedor auxiliar que acompaña al principal y le da logística (logs, métricas, proxy, refresh de contenido). Comparten el mismo volumen, así que el sidecar puede escribir y el principal leer.</p>
+
+        <div class="diagram">┌──────────────────────────── POD ────────────────────────────┐
+│  IP DEL POD: 10.244.0.7   ·   localhost = red compartida   │
+│                                                             │
+│  ┌─────────────────────┐   ┌─────────────────────────────┐  │
+│  │  container: web     │   │  container: sidecar-logs    │  │
+│  │  imagen nginx       │   │  imagen node:20-alpine      │  │
+│  │  puerto 80          │   │  lee el volumen compartido  │  │
+│  └─────────┬───────────┘   └─────────────┬───────────────┘  │
+│            │                             │                   │
+│            └────────── emptyDir vol ─────┘                   │
+│  (un mismo volumen, montado en ambos)                        │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  initContainer: init-setup (node) -> corre y sale 0  │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘</div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El Pod más pequeño que existe: un solo contenedor nginx. Todo corre sobre el clúster de kind creado en el Módulo 5.</p>
+        <div class="code-file">pod-nginx.yaml</div>
+        <pre><code class="language-yaml"># apiVersion: grupo/versión de la API de tipo Core (objetos base). Los Pods viven aquí.
+apiVersion: v1
+# kind: el tipo de objeto que declaramos. Este es un Pod.
+kind: Pod
+metadata:
+  # name: nombre del Pod. Debe ser único dentro del namespace.
+  name: pod-nginx
+  # labels: etiquetas clave=valor. Son el "pegamento" de Kubernetes:
+  # los Services y Deployments las usan para encontrar sus Pods.
+  labels:
+    app: nginx-demo
+spec:
+  # containers: lista de contenedores principales del Pod (uno o varios).
+  containers:
+    # Un elemento por contenedor. Este es el único que tiene este Pod.
+    - name: web
+      # image: imagen del contenedor, igual que en docker run (sin tag = :latest).
+      image: nginx:1.27-alpine
+      # ports: PUERTOS QUE EXPONE el contenedor. Es informativo y documenta,
+      # no "abre" nada externo (eso lo hacen los Services, lección 03).
+      ports:
+        - containerPort: 80
+          # protocol: por defecto TCP, lo dejamos explícito para que se lea bien.
+          protocol: TCP</code></pre>
+        <p>Comandos de la vida diaria de un Pod, explicados:</p>
+        <pre><code class="language-bash"># 1. Declaremos el Pod: enviamos el manifiesto al clúster (modelo declarativo).
+kubectl apply -f pod-nginx.yaml
+
+# 2. Ver el estado. "-w" vigila en vivo hasta que cambie.
+kubectl get pods -w
+
+# 3. Ver qué NODO lo alberga y su IP interna.
+kubectl get pods -o wide
+
+# 4. Informe detallado: eventos, imagen, reinicios, fase.
+kubectl describe pod pod-nginx
+
+# 5. Logs del contenedor con su nombre (si hay varios, -c nombre).
+kubectl logs pod-nginx -c web
+
+# 6. Entrar DENTRO del contenedor (como docker exec).
+kubectl exec -it pod-nginx -- sh
+
+# 7. Limpiar. Ojo: un Pod borrado NO se recrea solo.
+kubectl delete -f pod-nginx.yaml</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Dato clave:</strong> <code>kubectl exec -it POD -- COMANDO</code> ejecuta <code>COMANDO</code> dentro del primer contenedor del Pod. Con <code>-c NOMBRE</code> eliges otro contenedor. Es tu llave inglesa para diagnosticar.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Llevemos la API de <strong>HarborTasks</strong> a un Pod. La imagen <code>harbortasks-api:1.0.0</code> se construyó en los Módulos 1–4; para kind hay que cargarla en el clúster con <code>kind load docker-image</code> (no hay registro remoto). El Pod incluye un <code>initContainer</code> que imita el <code>depends_on</code> de Compose: espera a que Postgres responda antes de arrancar la API.</p>
+        <div class="code-file">pod-api-harbortasks.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-api-harbortasks
+  # Namespace propio del proyecto (se crea en la lección de namespaces).
+  namespace: harbortasks
+  labels:
+    app: api
+    project: harbortasks
+spec:
+  # initContainers: corren en orden y deben terminar con código 0
+  # ANTES de que arranque cualquier contenedor principal.
+  initContainers:
+    - name: init-wait-postgres
+      image: node:20-alpine
+      # command/args: sobrescriben el CMD de la imagen. Lanzamos un mini script.
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          # Bucle de espera: la API no arrancará hasta que Postgres acepte conexión.
+          echo "Esperando a postgres.harbortasks.svc.cluster.local:5432..."
+          n=0
+          until wget -q -O- --timeout=2 postgres.harbortasks.svc.cluster.local:5432 2>/dev/null
+          do
+            n=$((n+1))
+            if [ "$n" -ge 30 ]; then
+              echo "ERROR: postgres no respondió en 30 intentos" >&2
+              exit 1   # Si sale distinto de 0, el Pod falla y nunca arranca la API.
+            fi
+            echo "  intento $n: aún no disponible, reintento en 2s"
+            sleep 2
+          done
+          echo "Postgres disponible. Arrancando contenedores principales."
+  containers:
+    - name: api
+      image: harbortasks-api:1.0.0
+      ports:
+        - containerPort: 3000
+      # env: variables de entorno igual que -e en Docker (Módulos 7/8 con ConfigMap/Secret).
+      env:
+        - name: PORT
+          value: "3000"
+        - name: PGHOST
+          value: postgres.harbortasks.svc.cluster.local   # DNS del Service (lección 03)
+        - name: PGDATABASE
+          value: tasks</code></pre>
+        <p>Y ahora el patrón <strong>sidecar</strong>: un Pod donde nginx sirve contenido estático que un sidecar con Node regenerea dentro de un volumen compartido. Así aprendes el mecanismo exacto de multi-contenedor:</p>
+        <div class="code-file">pod-web-sidecar.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-web-sidecar
+  labels:
+    app: web
+spec:
+  containers:
+    # Contenedor principal: sirve lo que encuentre en /usr/share/nginx/html
+    - name: web
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+      volumeMounts:
+        - name: contenido   # nombre del volumen declarado abajo
+          mountPath: /usr/share/nginx/html
+          readOnly: true    # nginx solo LEE; quien escribe es el sidecar
+    # Sidecar: regenera el índice cada 10 segundos en el MISMO volumen.
+    - name: generador
+      image: node:20-alpine
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          # Bucle infinito: escribe index.html con la fecha actual.
+          while true; do
+            date "+&lt;h1&gt;Generado a las %H:%M:%S&lt;/h1&gt;" &gt; /contenido/index.html
+            sleep 10
+          done
+  volumes:
+    # emptyDir: volumen EFÍMERO (se crea con el Pod, muere con él).
+    # Ideal para compartir entre contenedores; NUNCA para persistir.
+    - name: contenido
+      emptyDir: {}</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Por qué importa:</strong> ambos contenedores ven el mismo <code>emptyDir</code> porque es un volumen de Pod, no de contenedor. El sidecar escribe, nginx lee. Si un contenedor vive y el otro muere, el volumen sigue mientras el Pod exista.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Declara un contenedor por proceso (API en uno, proxy en otro)</td>
+              <td>Meter varios procesos en un mismo contenedor (nginx + cron + app)</td>
+              <td>Un contenedor debe tener UNA responsabilidad; el supervisor que orquesta es Kubernetes, no un script interno</td>
+            </tr>
+            <tr>
+              <td>Usa etiquetas (<code>labels</code>) descriptivas desde el día 1</td>
+              <td>Manifiestos sin labels</td>
+              <td>Services, Deployments, selectores y herramientas (kubectl -l) dependen de ellas para "encontrar" pods</td>
+            </tr>
+            <tr>
+              <td>Trata los Pods como ganado EFÍMERO</td>
+              <td>Enamorarte de un Pod concreto, guardar estado en su filesystem</td>
+              <td>Los Pods se borran y recrean sin aviso; si no hay volumen o Deployment, pierdes todo</td>
+            </tr>
+            <tr>
+              <td>Usa imágenes con tag fijo (<code>nginx:1.27-alpine</code>)</td>
+              <td>Tags flotantes (<code>:latest</code>) en clúster</td>
+              <td>Cuadratura: un Pod viejo y uno nuevo pueden tirar de imágenes distintas sin que nadie lo note</td>
+            </tr>
+            <tr>
+              <td>Separa responsabilidades: Pod para ejemplo mínimo, Deployment para todo lo demás</td>
+              <td>Crear Pods "a mano" para producción</td>
+              <td>Un Pod suelto no se autorepara ni escala; eso lo aporta el Deployment (lección 02)</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Pensar que Pod y contenedor son el mismo concepto</h3>
+        <pre><code class="language-yaml"># ❌ Creer que cada Pod tiene exactamente UN contenedor y que "pod" y
+# "container" son intercambiables en la documentación. Falso: un Pod
+# puede agrupar muchos contenedores que comparten red y storage.
+
+# ✅ Un Pod es la UNIDAD lógica; el contenedor es la unidad de proceso.
+# Los Deployments y Services trabajan con Pods, nunca con "contenedores sueltos".</code></pre>
+
+        <h3>Un selector que no coincide con las labels del Pod</h3>
+        <pre><code class="language-yaml"># ❌ metadata.labels dice app: web, pero un Service (lección 03) buscaría app: api
+# Resultado: el Service no encuentra endpoints y no llega nadie a tu app.
+metadata:
+  name: pod-web
+  labels:
+    app: web
+
+# ✅ La regla de oro: lo que declaras en labels, es lo que usarás para encontrarlo.
+# Antes de aplicar, piensa: "¿cómo lo localizaré después?"</code></pre>
+
+        <h3>Usar kubectl run como si fuera docker run de producción</h3>
+        <pre><code class="language-bash"># ❌ Esta línea sirve para PROBAR, no para producción:
+kubectl run api --image=harbortasks-api:1.0.0 --port=3000
+
+# ✅ En producción se declara el estado deseado en un manifiesto y se aplica:
+kubectl apply -f pod-api-harbortasks.yaml
+
+# Cuando quieras replicas, autonomía, reintentos y rollback,
+# pasa al Deployment de la lección 02.</code></pre>
+
+        <h3>Esperar que un Pod se recupere tras borrarlo</h3>
+        <pre><code class="language-bash"># ❌ Pensar "si borro el Pod, Kubernetes lo recrea igual que docker restart".
+# Docker RESTARTA el mismo contenedor; Kubernetes crea objetos nuevos.
+kubectl delete pod pod-nginx   # desaparece para siempre (si no hay ReplicaSet detrás)
+
+# ✅ Si necesitas que el sistema recreé el Pod bajo demanda,
+# usa un Deployment: él vuelve a crear el Pod.</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> materializar, inspeccionar y entrar en un Pod usando el clúster de kind del Módulo 5.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> verifica que el clúster sigue vivo:
+            <pre><code class="language-bash"># Contexto actual y nodos del clúster kind (debe existir uno o más).
+kubectl config current-context
+kubectl get nodes -o wide</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea el manifiesto <code>pod-nginx.yaml</code> de la sección "Ejemplo mínimo" (etiquétalo <code>app: nginx-demo</code>) y aplícalo:
+            <pre><code class="language-bash">kubectl apply -f pod-nginx.yaml
+kubectl get pods -w       # espera a que aparezca Running 1/1</code></pre>
+          </li>
+          <li><strong>Paso 3:</strong> inspecciona el detalle con <code>kubectl describe pod pod-nginx</code> y localiza en el informe: la fase del Pod, la IP, el nodo y los <em>Events</em> (deben mostrar <code>Scheduled</code> y <code>Started container web</code>).</li>
+          <li>
+            <strong>Paso 4:</strong> prueba desde DENTRO del Pod que nginx responde:
+            <pre><code class="language-bash"># Entramos a un shell dentro del contenedor "web"
+kubectl exec -it pod-nginx -- sh
+
+# Dentro del contenedor: pedimos la página local (wget existe en alpine)
+wget -qO- http://localhost/ | head -5
+exit   # salimos del shell del contenedor</code></pre>
+            Salida esperada: la primera línea es <code>&lt;!DOCTYPE html&gt;</code> o "Welcome to nginx!". La IP <code>localhost</code> funciona porque es la red del Pod en la que vive nginx.</li>
+          <li><strong>Paso 5:</strong> mira los logs del contenedor: <code>kubectl logs pod-nginx</code>. Deben aparecer las peticiones HTTP que acabamos de hacer.</li>
+          <li><strong>Paso 6:</strong> borra y verifica que ya no existe: <code>kubectl delete -f pod-nginx.yaml</code> y <code>kubectl get pods</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación final:</strong> si en el paso 4 viste el HTML de nginx y en el paso 6 <code>kubectl get pods</code> ya no muestra <code>pod-nginx</code>, el ejercicio está correcto.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Sidecar de logs con hora</h3>
+          <p>Modifica el ejemplo del <code>pod-web-sidecar</code> para que el contenedor <code>api</code> escriba sus logs a un archivo compartido (<code>/logs/app.log</code>) y un contenedor <em>sidecar</em> adicional (<code>tail-logs</code>) haga <code>tail -f</code> de ese archivo en su propio <code>stdout</code>, de modo que <code>kubectl logs pod -c tail-logs</code> muestre la actividad en vivo.</p>
+          <p><em>Pista: haz que <code>api</code> escriba con un bucle <code>echo "tarea ${i} procesada" >> /logs/app.log</code>, monta el mismo volumen <code>emptyDir</code> en ambos contenedores y usa <code>command: ["/bin/sh","-c","tail -f /logs/app.log"]</code> en el sidecar. Luego verifícalo con <code>kubectl logs POD -c tail-logs</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>Pod</strong> es la unidad mínima de cómputo de Kubernetes; <strong>nunca</strong> existen contenedores "sueltos".</li>
+          <li>Los contenedores de un Pod comparten <strong>red (IP y localhost), storage y ciclo de vida</strong> y se programan juntos en el mismo nodo.</li>
+          <li>El <strong>ciclo de vida</strong> del Pod: <code>Pending</code> → <code>Running</code> → <code>Succeeded</code>/<code>Failed</code>; los Pods son efímeros y no reutilizables.</li>
+          <li><code>initContainers</code>: corren en orden y terminan antes que los principales (esperar dependencias, preparar storage).</li>
+          <li><strong>Sidecar</strong>: contenedor auxiliar que comparte volúmenes y red con el principal (logs, proxy, refresh de contenido).</li>
+          <li>Comandos esenciales: <code>kubectl apply/get/describe/logs/exec/delete</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando/Manifiesto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -f pod.yaml</code></td><td>Crea/actualiza un Pod a partir del manifiesto (declarativo)</td></tr>
+            <tr><td><code>kubectl get pods -o wide</code></td><td>Lista Pods con nodo e IP</td></tr>
+            <tr><td><code>kubectl describe pod NOMBRE</code></td><td>Informe completo: fases, eventos, reinicios</td></tr>
+            <tr><td><code>kubectl logs POD -c CONT</code></td><td>Logs de un contenedor concreto del Pod</td></tr>
+            <tr><td><code>kubectl exec -it POD -- sh</code></td><td>Shell dentro del primer contenedor del Pod</td></tr>
+            <tr><td><code>spec.initContainers[]</code></td><td>Contenedores de inicialización que deben completarse primero</td></tr>
+            <tr><td><code>spec.containers[] + spec.volumes[]</code></td><td>Múltiples contenedores que comparten volúmenes del Pod (sidecar)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puede un Pod tener varios contenedores? ¿Cuándo tiene sentido?</summary>
+            <div>
+              <p>Sí. Tiene sentido cuando dos procesos deben compartir red y storage de forma inseparable (patrón sidecar: logs, proxy, proxy mTLS). En HarborTasks, la web y la API NO van en el mismo Pod, porque no necesitan compartir red local: son servicios independientes que se hablan por Service.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si un Pod se borra, ¿Kubernetes lo vuelve a crear?</summary>
+            <div>
+              <p>Solo si el Pod es gestionado por un controlador (ReplicaSet, DaemonSet, Job…). Un Pod creado "a mano" con <code>kubectl run</code> o un manifiesto <code>kind: Pod</code> se borra y desaparece para siempre. Para garantías de autoreparación y réplicas necesitas un Deployment (lección 02).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre la fase del Pod y el estado de un contenedor?</summary>
+            <div>
+              <p>La fase del Pod (<code>Pending</code>/<code>Running</code>/…) es la visión del conjunto; el estado del contenedor (<code>Waiting</code>/<code>Running</code>/<code>Terminated</code>) es la visión individual. Un Pod puede estar <code>Running</code> con un contenedor en <code>Waiting</code> (p. ej. CrashLoopBackOff). <code>kubectl describe pod</code> muestra ambas capas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no debería crear Pods a mano para producción?</summary>
+            <div>
+              <p>Porque un Pod no escala, no se autorepara y no tiene despliegues versionados. Los controladores (Deployment, Job, DaemonSet) añaden: número fijo de réplicas, reinicio ante caída, actualizaciones sin downtime y rollback. El Pod es el "atomo"; el controlador es el que lo mantiene vivo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

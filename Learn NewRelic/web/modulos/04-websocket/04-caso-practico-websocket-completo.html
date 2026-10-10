@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-caso-practico-websocket-completo">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso práctico: servidor WebSocket instrumentado — Módulo 4 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso práctico: servidor WebSocket instrumentado</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Instrumentar WebSocket</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Reunimos todo: un servidor WebSocket en .NET 8 que instrumenta <strong>cada mensaje</strong> con transacción, atributos, spans, errores y propagación W3C, más una Minimal API. Es la semilla del proyecto <code>proyectos/newrelic-ws-demo</code>.</p>
+        <p>Este documento es el «código completo comentado» que podrás ejecutar ya (<code>dotnet run</code>) y, con tu licencia, ver en New Relic.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <p>Arquitectura deseada:</p>
+        <pre><code class="language-text">Program.cs (Minimal API + WebSocket)
+   ├── GET  /api/status        ──► transacción automática
+   ├── POST /api/broadcast     ──► transacción + atributo audience
+   └── WS   /ws                ──► upgrade automático
+            └── WsServer.Handle
+                 └── [Transaction] MessageDispatcher.OnMessage
+                      ├── AcceptDistributedTraceHeaders(W3C del JSON)
+                      ├── atributos (messageType, messageId, userId)
+                      ├── dispatch → [Trace] por tipo (Validate/Apply/Broadcast)
+                      └── NoticeError (expected/non-expected)
+   └── meters de datos: RecordMetric (QueueLatency, BroadcastMs)
+   └── logs estructurados con ILogger (M5 los enriquecerá)</code></pre>
+        <p>División de responsabilidades por archivos, testable y clara.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Primer corte funcional, un único archivo:</p>
+        <pre><code class="language-csharp">// ConsoleRun.cs — compilable con dotnet run en un proyecto web
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton(NR.Agent());   // lazy IAgent (M2-04)
+builder.Services.AddSingleton&lt;MessageDispatcher&gt;();
+var app = builder.Build();
+
+app.MapGet("/api/status", () =&gt;
+{
+    NewRelic.Api.Agent.NewRelic.GetAgent().CurrentTransaction
+        .AddCustomAttribute("version", Environment.GetEnvironmentVariable("APP_VERSION") ?? "dev");
+    return Results.Ok(new { status = "ok" });
+});
+
+app.UseWebSockets();
+app.Map("/ws", async (HttpContext ctx, MessageDispatcher dispatcher) =&gt;
+{
+    if (!ctx.WebSockets.IsWebSocketRequest) return Results.BadRequest();
+
+    // El upgrade toma el control de la conexión; el endpoint la acompaña
+    using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
+    await new WsServer(socket, dispatcher).HandleAsync();
+    return Results.Empty;
+});
+
+app.Run();
+
+static class NR
+{
+    public static NewRelic.Api.Agent.IAgent Agent() =&gt;
+        NewRelic.Api.Agent.NewRelic.GetAgent();     // lazy: se resuelve al usarse
+}</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El proyecto completo comentado (idéntico al de <code>proyectos/newrelic-ws-demo</code>, versión reducida):</p>
+        <pre><code class="language-csharp">// ─────────── Messages.cs ───────────
+public sealed record MessageEnvelope(
+    string Type, DateTimeOffset Timestamp, string MessageId,
+    Dictionary&lt;string, string&gt; TraceContext, JsonElement Payload);
+
+// ─────────── MessageDispatcher.cs ───────────
+public sealed class MessageDispatcher(ILogger&lt;MessageDispatcher&gt; logger)
+{
+    private readonly IAgent _agent = NewRelic.Api.Agent.NewRelic.GetAgent();
+
+    [Transaction]                       // 1 mensaje = 1 transacción (OtherTransaction)
+    public void OnMessage(MessageEnvelope msg)
+    {
+        var txn = _agent.CurrentTransaction;
+        txn.AddCustomAttribute("messageType", msg.Type)
+           .AddCustomAttribute("messageId", msg.MessageId);
+
+        // Acepta el contexto W3C que viaja en el JSON (M3-04)
+        txn.AcceptDistributedTraceHeaders(msg.TraceContext,
+            static (env, k) =&gt; env.TraceContext.TryGetValue(k, out var v) ? [v] : [],
+            TransportType.Other);   // el enum real no tiene "WebSocket"
+
+        try { Dispatch(msg); }
+        catch (Exception ex)
+        {
+            var expected = IsBusinessError(msg, ex);
+            NewRelic.Api.Agent.NewRelic.NoticeError(ex,
+                new Dictionary&lt;string, string&gt; { { "messageType", msg.Type } },
+                expected );
+            logger.LogError(ex, "Fallo procesando {Type} {MessageId}", msg.Type, msg.MessageId);
+        }
+    }
+
+    private void Dispatch(MessageEnvelope msg) =&gt; msg.Type switch
+    {
+        "trade" =&gt; _trade.ProcessTrade(msg),
+        "ping"  =&gt; _ping.Respond(msg),
+        _ =&gt; logger.LogWarning("Desconocido {Type}", msg.Type),
+    };
+}
+
+// ─────────── TradeProcessor.cs ───────────
+public sealed class TradeProcessor
+{
+    [Trace]
+    public void ProcessTrade(MessageEnvelope msg)
+    {
+        _agent.CurrentSpan.AddCustomAttribute("symbol", GetSymbol(msg));
+        Validate(msg);                       // [Trace]
+        Apply(msg);                          // [Trace] + métrica de latencia
+    }
+}
+
+// ─────────── WsServer.cs ───────────
+public sealed class WsServer(WebSocket socket, MessageDispatcher dispatcher)
+{
+    public async Task HandleAsync()
+    {
+        var buffer = new byte[4 * 1024];
+        while (socket.State == WebSocketState.Open)
+        {
+            var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+            if (result.MessageType == WebSocketMessageType.Close) break;
+
+            var env = JsonSerializer.Deserialize&lt;MessageEnvelope&gt;(
+                Encoding.UTF8.GetString(buffer, 0, result.Count));
+            if (env is null) continue;
+
+            dispatcher.OnMessage(env);      // transacción aquí
+        }
+    }
+}</code></pre>
+        <p>Con tu licencia puesta, esto produce: transacciones <code>OtherTransaction</code>, spans, errores y, si activas logs, correlación. Es el MVP del proyecto final.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Separar transporte (WsServer) de negocio (Dispatcher)</td><td>Todo en el handler del socket</td><td>Testable y la transacción queda en el sitio correcto</td></tr>
+            <tr><td>Aceptar el contexto ANTES del dispatch</td><td>Dispatch sin enlazar a la traza</td><td>Los spans hijos cuelgan del entry correcto</td></tr>
+            <tr><td>Errors esperados vs no (NoticeError)</td><td>Meter todo en el mismo saco</td><td>Alertas y Apdex con señal limpia</td></tr>
+            <tr><td>IAgent lazy en DI</td><td>Resolverlo en la construcción</td><td>Evita el placeholder no-op (M2-04)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Transacción en el async loop completo (otra vez el clásico)</h3>
+        <pre><code class="language-csharp">// ❌ Recibe + transacción juntos: la duración mide la espera del siguiente
+[Transaction]
+public async Task HandleAsync() { while(...) await socket.ReceiveAsync(...); }
+
+// ✅ Transacción solo en OnMessage (procesado)</code></pre>
+
+        <h3>Deserializar con la transacción activa y fallar en parseo</h3>
+        <p>Si el JSON viene roto y lo parseas <em>dentro</em> de la transacción, el error de parseo será del mensaje (correcto). Si lo evitas con `?`/`!`, pierdes ese contexto. Manejalo con try/catch alrededor del dispatch.</p>
+
+        <h3>Olvidar que el TraceContext viaja en JSON, no en headers</h3>
+        <p>En el cliente y en cualquier proxy debe propagarse el JSON completo; si un proxy descarta campos, pierdes el context. No te apoyes en headers del WS.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea el proyecto <code>newrelic-ws-demo</code> tal como está en <code>proyectos/</code> (o copia el código de arriba a un proyecto <code>dotnet new web</code>).</li>
+          <li><strong>Paso 2:</strong> Pon tu licencia y app name, y ejecuta.</li>
+          <li><strong>Paso 3:</strong> Conecta un cliente WS (por ejemplo una página o un script con <code>WebSocket</code>) y envía <code>trade</code>, <code>ping</code> y un malformado.</li>
+          <li><strong>Paso 4:</strong> Consulta el dashboard:
+          <pre><code class="language-nrql">SELECT count(*), average(duration) FROM Transaction
+WHERE name LIKE 'OtherTransaction/%'
+FACET messageType SINCE 1 hour ago</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Completa tu arquitectura</h3>
+          <p>Añade al caso práctico: (1) una llamada <code>HttpClient</code> a un endpoint tuyo dentro del <code>ProcessTrade</code>; (2) una métrica <code>Custom/BroadcastMs</code>; (3) un log con el <code>traceId</code>. Deja preparadas las queries para comprobar cada uno. Esto es prácticamente el Módulo 8.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Patrón completo: transporte → <code>[Transaction]</code> → Accept(mensaje) → dispatch → <code>[Trace]</code> → errores.</li>
+          <li>Separa socket de negocio; la transacción mide el trabajo.</li>
+          <li>Con este MVP ya tienes transactions, spans, errores y trazas del WebSocket.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Este código cubre también el consumo?</summary>
+            <div><p>Sí, en parte: las transacciones por mensaje y sus eventos cuentan. Ajusta el sampling y usa métricas si el volumen es brutal (M2-02).</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo ver el WebSocket en «APM» como tal?</summary>
+            <div><p>Sí: verás la entidad con sus transacciones (upgrade + OtherTransaction por mensaje), traces y errors. El «WebSocket» como concepto se construye con tus atributos.</p></div>
+          </details>
+          <details>
+            <summary>¿Y la conexión que se mantiene abierta?</summary>
+            <div><p>La conexión en sí (long-lived) la vigila la infraestructura, no necesariamente necesita transacción; el upgrade da su métrica y la persistencia del socket puedes medirla aparte.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

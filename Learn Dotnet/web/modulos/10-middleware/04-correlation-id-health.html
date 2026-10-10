@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="es" data-module="10" data-lesson="04-correlation-id-health">
+<head>
+  <meta charset="UTF-8">
+  <title>Correlation ID y Health Checks — Módulo 10 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Correlation ID y Health Checks</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 10 · Middleware y pipelines</span><span>25 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En sistemas distribuidos, una petición puede atravesar múltiples servicios, bases de datos, colas y caches. Sin una identidad única, es imposible seguir el rastro de una petición. El <strong>Correlation ID</strong> es un identificador que se propaga entre servicios y se incluye en los logs. Los <strong>Health Checks</strong> permiten a los orquestadores y balanceadores saber si la aplicación está sana.</p>
+        <p>En esta lección aprenderemos a implementar ambos con middleware de ASP.NET Core y a exponerlos de forma profesional.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelven?</h4>
+          <p>El Correlation ID permite correlacionar logs de distintos servicios y entender el flujo completo de una operación. Los Health Checks detectan problemas antes de que el usuario los experimente y permiten reinicios automáticos.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Crear un nuevo correlation ID en cada servicio en lugar de respetar el que vino del cliente.</li>
+          <li>No propagar el correlation ID en llamadas <code>HttpClient</code> salientes.</li>
+          <li>Implementar un health check que consulta la base de datos en cada ping, saturándola.</li>
+          <li>Exponer información sensible en el endpoint <code>/health</code>.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>Correlation ID</h3>
+        <p>El correlation ID es simplemente un GUID o un identificador único que viaja en una cabecera HTTP, normalmente <code>X-Correlation-ID</code> o <code>Correlation-Id</code>. Si el cliente lo envía, el servidor lo respeta; si no, lo genera. El ID se propaga a:</p>
+        <ul>
+          <li>Los logs estructurados (Serilog).</li>
+          <li>Las respuestas al cliente.</li>
+          <li>Las llamadas HTTP a otros servicios.</li>
+          <li>Los mensajes de cola o eventos.</li>
+        </ul>
+
+        <h3>Health Checks</h3>
+        <p>ASP.NET Core incluye <code>Microsoft.Extensions.Diagnostics.HealthChecks</code>. Se registran con <code>AddHealthChecks</code> y se exponen con <code>MapHealthChecks</code>. Pueden ser:</p>
+        <ul>
+          <li><strong>Readiness:</strong> indica si la aplicación está lista para recibir tráfico. Puede depender de la base de datos.</li>
+          <li><strong>Liveness:</strong> indica si la aplicación sigue viva. Suele ser muy ligero.</li>
+        </ul>
+
+        <h3>Health Checks con <code>HealthCheckResult</code></h3>
+        <p>Cada check devuelve <code>Healthy</code>, <code>Degraded</code> o <code>Unhealthy</code>. Puedes configurar qué checks forman parte de cada endpoint y personalizar el output.</p>
+
+        <table>
+          <thead><tr><th>Cabecera</th><th>Origen</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>X-Correlation-ID</code></td><td>Estándar de facto</td><td>Identificar una petición en logs</td></tr>
+            <tr><td><code>traceparent</code></td><td>OpenTelemetry/W3C</td><td>Trazas distribuidas</td></tr>
+            <tr><td><code>request-id</code></td><td>Microsoft</td><td>Compatibilidad con ASP.NET Core anterior</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--tip">
+          <h4>Combinar con OpenTelemetry</h4>
+          <p>En producción moderna, el correlation ID suele ser el <code>traceparent</code> de OpenTelemetry. Así unificas logs, trazas y métricas. En esta lección usamos <code>X-Correlation-ID</code> por simplicidad; en el módulo de telemetría profundizaremos.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Crearemos un middleware que lee o genera un correlation ID y lo expone en la respuesta.</p>
+
+        <pre><code class="language-bash">dotnet new web -n CorrelationDemo -o CorrelationDemo
+cd CorrelationDemo
+dotnet run --project .</code></pre>
+
+        <pre><code class="language-csharp">// Middleware/CorrelationIdMiddleware.cs
+public sealed class CorrelationIdMiddleware : IMiddleware
+{
+    public const string HeaderKey = "X-Correlation-ID";
+
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var correlationId = GetOrCreateCorrelationId(context);
+        context.Response.Headers.Append(HeaderKey, correlationId);
+
+        using (LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            await next(context);
+        }
+    }
+
+    private static string GetOrCreateCorrelationId(HttpContext context)
+    {
+        if (context.Request.Headers.TryGetValue(HeaderKey, out var value) &&
+            !string.IsNullOrWhiteSpace(value))
+        {
+            return value.ToString();
+        }
+
+        return Guid.NewGuid().ToString();
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddTransient<CorrelationIdMiddleware>();
+
+var app = builder.Build();
+
+app.UseMiddleware<CorrelationIdMiddleware>();
+
+app.MapGet("/", (ILogger<Program> logger) =>
+{
+    logger.LogInformation("Endpoint raíz");
+    return Results.Ok(new { message = "Hola" });
+});
+
+app.Run();</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>Si el cliente envía <code>X-Correlation-ID: abc-123</code>, la respuesta lo repite. Si no envía nada, el middleware genera un GUID. El uso de <code>LogContext</code> (Serilog) permite incluir el ID en todos los logs de la petición.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Añadimos health checks con una verificación de base de datos y un endpoint separado para liveness.</p>
+
+        <pre><code class="language-bash">dotnet add package Microsoft.Extensions.Diagnostics.HealthChecks.EntityFrameworkCore</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Default")!));
+
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>("database", tags: new[] { "ready" })
+    .AddCheck("self", () => HealthCheckResult.Healthy(), tags: new[] { "live" });
+
+builder.Services.AddTransient<CorrelationIdMiddleware>();
+
+var app = builder.Build();
+
+app.UseMiddleware<CorrelationIdMiddleware>();
+
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("live")
+});
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
+
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    ResponseWriter = async (context, report) =>
+    {
+        var response = new
+        {
+            Status = report.Status.ToString(),
+            Checks = report.Entries.Select(e => new
+            {
+                Name = e.Key,
+                Status = e.Value.Status.ToString(),
+                Duration = e.Value.Duration.ToString()
+            })
+        };
+
+        await context.Response.WriteAsJsonAsync(response);
+    }
+});
+
+app.MapGet("/", () => "OK");
+
+app.Run();</code></pre>
+
+        <div class="callout callout--tip">
+          <h4>UI de Health Checks</h4>
+          <p>Para entornos de desarrollo puedes instalar <code>AspNetCore.HealthChecks.UI</code>, que muestra un panel visual. No lo incluyas en producción sin autenticación, ya que expone detalles internos.</p>
+        </div>
+
+        <h3>Propagación de correlation ID en HttpClient</h3>
+        <pre><code class="language-csharp">public class CorrelationIdDelegatingHandler : DelegatingHandler
+{
+    private readonly IHttpContextAccessor _httpContextAccessor;
+
+    public CorrelationIdDelegatingHandler(IHttpContextAccessor httpContextAccessor)
+    {
+        _httpContextAccessor = httpContextAccessor;
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var correlationId = _httpContextAccessor.HttpContext?.Request.Headers
+            .TryGetValue(CorrelationIdMiddleware.HeaderKey, out var value) == true
+            ? value.ToString()
+            : Guid.NewGuid().ToString();
+
+        request.Headers.TryAddWithoutValidation(CorrelationIdMiddleware.HeaderKey, correlationId);
+        return base.SendAsync(request, cancellationToken);
+    }
+}</code></pre>
+
+        <pre><code class="language-csharp">builder.Services.AddHttpContextAccessor();
+builder.Services.AddHttpClient("Downstream")
+    .AddHttpMessageHandler<CorrelationIdDelegatingHandler>();</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Respeta el correlation ID entrante.</strong> No generes uno nuevo si el cliente ya lo envió.</li>
+          <li><strong>Devuélvelo en la respuesta.</strong> Así el cliente puede consultar sus logs propios.</li>
+          <li><strong>Registra el correlation ID en todos los logs.</strong> Usa Serilog <code>LogContext</code> o <code>LoggerMessage</code>.</li>
+          <li><strong>Separa liveness de readiness.</strong> Kubernetes usa <code>/health/live</code> para decidir si reinicia y <code>/health/ready</code> para decidir si enruta tráfico.</li>
+          <li><strong>No abuses de los health checks pesados.</strong> Un ping de base de datos en cada <code>/health</code> puede saturarla. Considera caches o intervalos de sondeo largos.</li>
+          <li><strong>No expongas detalles internos.</strong> El endpoint público debe ser mínimo; los detalles completos solo para administradores.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Generar siempre un correlation ID nuevo</h3>
+        <pre><code class="language-csharp">// ❌ MAL: pierde la trazabilidad entre servicios
+var correlationId = Guid.NewGuid().ToString();</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO: reutiliza si existe
+var correlationId = context.Request.Headers.TryGetValue(HeaderKey, out var value)
+    ? value.ToString()
+    : Guid.NewGuid().ToString();</code></pre>
+
+        <h3>6.2. Health check que no valida dependencias</h3>
+        <pre><code class="language-csharp">// ❌ MAL: readiness siempre Healthy
+app.MapHealthChecks("/health/ready");</code></pre>
+        <pre><code class="language-csharp">// ✅ CORRECTO: readiness verifica dependencias críticas
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>(tags: new[] { "ready" });
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});</code></pre>
+
+        <h3>6.3. No usar <code>IHttpContextAccessor</code> correctamente</h3>
+        <p>El <code>HttpContext</code> no se debe propagar a código fuera del request. Para <code>HttpClient</code>, usa un <code>DelegatingHandler</code> que acceda al <code>IHttpContextAccessor</code> en el momento de enviar la petición.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Crea un health check personalizado que devuelva <code>Degraded</code> si el disco tiene menos de 1 GB libre.</p>
+
+        <pre><code class="language-csharp">public class DiskSpaceHealthCheck : IHealthCheck
+{
+    public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
+    {
+        var drive = new DriveInfo(Path.GetPathRoot(Environment.CurrentDirectory)!);
+        var freeGb = drive.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0);
+
+        if (freeGb < 1)
+            return Task.FromResult(HealthCheckResult.Degraded($"Solo quedan {freeGb:F2} GB libres"));
+
+        return Task.FromResult(HealthCheckResult.Healthy($"{freeGb:F2} GB libres"));
+    }
+}
+
+// Program.cs
+builder.Services.AddHealthChecks()
+    .AddCheck<DiskSpaceHealthCheck>("disk", tags: new[] { "ready" });
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});</code></pre>
+
+        <p>Prueba con <code>curl http://localhost:5000/health/ready</code> y observa el estado del disco.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un middleware que, si la petición es un <code>POST</code>, <code>PUT</code> o <code>DELETE</code>, añada el correlation ID a un header de respuesta y también lo incluya en un archivo de log local. Luego, añade un health check que verifique que el archivo de log no ha crecido más de 100 MB en la última hora.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El correlation ID permite seguir una petición a través de servicios y logs.</li>
+          <li>Respeta el ID entrante, genera uno si falta, devuélvelo en la respuesta y propágalo en llamadas externas.</li>
+          <li>Los health checks separan <strong>liveness</strong> (vive) de <strong>readiness</strong> (lista para tráfico).</li>
+          <li>Usa <code>AddHealthChecks</code>, <code>IHealthCheck</code> y <code>MapHealthChecks</code>.</li>
+          <li>No expongas detalles sensibles en endpoints de salud públicos.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿Correlation ID es lo mismo que Trace ID?</h3>
+        <p>Conceptualmente son similares. Un correlation ID es un identificador de negocio. Un trace ID (como el de OpenTelemetry) es un identificador técnico de trazas distribuidas. En la práctica, muchos sistemas usan el mismo valor para ambos.</p>
+
+        <h3>¿Qué pasa si un servicio downstream no acepta la cabecera?</h3>
+        <p>Intenta usar un estándar como <code>traceparent</code>. Si no es posible, documenta la cabecera esperada y proporciona un adaptador en tu servicio.</p>
+
+        <h3>¿Los health checks deben estar en el mismo puerto que la API?</h3>
+        <p>Depende. Kubernetes y muchos balanceadores prefieren un endpoint en el puerto principal. Para mayor seguridad, puedes exponerlos en un puerto administrativo separado con <code>MapHealthChecks</code> en una segunda aplicación.</p>
+
+        <h3>¿Debo usar <code>HealthChecks.UI</code> en producción?</h3>
+        <p>Solo si lo proteges con autenticación y autorización. Exponer detalles de todos tus checks puede revelar información útil para un atacante.</p>
+
+        <h3>¿Cómo propago el correlation ID en mensajes de cola?</h3>
+        <p>Inclúyelo como propiedad o cabecera del mensaje. Cuando el consumidor lo procesa, extrae el ID y lo establece en su propio <code>LogContext</code> para mantener la trazabilidad.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

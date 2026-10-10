@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-coexistir-agente-y-otel">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Coexistencia del agente APM con OTel — Módulo 6 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Coexistencia del agente APM con OTel</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · OpenTelemetry (OTLP a New Relic)</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>No tienes que elegir entre agente y OTel en «o/o». En sistemas reales conviven: el agente aporta su APM rico, y OTel añade instrumentación que él no cubre. Lo que hay que ordenar es <strong>qué instrumento habla de qué</strong>, o duplicarás trazas y te confundirán los números.</p>
+        <p>Verás un patrón de coexistencia sensato para tu WebSocket y qué evitar a toda costa.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El principio de no-duplicación</h3>
+        <p>Cada <strong>span de cada operación</strong> debe ser emitido por <em>una</em> fuente. Si el agente ya instrumenta el <code>HttpClient</code> (external span) y tú además creas un Activity OTel para la misma llamada, tendrás spans duplicados en el trace y en las métricas.</p>
+
+        <h3>Regla práctica: reparto por capas</h3>
+        <pre><code class="language-text">Capa                               Instrumento
+──────────────────────────────────────────────────────
+HTTP entrante (ASP.NET Core)  →    Agente (WebTransaction)
+   ├─ HttpClient saliente     →    Agente (External) 
+   └─ DB / Redis              →    Agente (Datastore)
+Lógica del mensaje (WebSocket)→    OTel (ActivitySource custom)
+   ├─ Parse/Validate          →    OTel (Activities hijos)
+   └─ Llamadas HTTP           →    Agente (External, ya automat.)
+Datos de negocio (OrderPlaced)→    Agente (RecordCustomEvent)</code></pre>
+        <p>Es decir: el agente «caza» lo automático; OTel aporta lo custom que el agente no hace por diseño (spans de negocio bien anidados).</p>
+
+        <h3>Cómo quedaría en trazas</h3>
+        <pre><code class="language-text">Trace único (traceId común):
+├─ Span (agente): WebTransaction/.../POST /api/broadcast
+│   └─ Span (agente): http externo a precios
+└─ Span (OTel): ProcessTrade          ← el custom (tu WebSocket)
+    └─ Span (OTel): Validate
+       └─ Span (OTel): Persist</code></pre>
+        <p>Con el W3C de por medio, agente y OTel hablan el mismo traceparent: se unen en una sola traza aunque cada uno haya emitido spans de distinta capa.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La «frontera» en el código: el WebSocket usa OTel para la lógica; el agente sigue con su instrumentación automática. No te metas en el código de HttpClient del otro:</p>
+        <pre><code class="language-csharp">// OTel: la capa de negocio
+using var act = Telemetry.Source.StartActivity("ProcessTrade");
+act?.SetTag("messageType", msg.Type);
+
+await _priceApi.GetAsync(symbol);   // ← esto lo mide el AGENTE (External), no OTel
+
+// el Activity de OTel sigue abierto: contiene la duración total,
+// y el span HTTP del agente aparece como hijo/externo</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Configuración híbrida en <code>Program.cs</code>:</p>
+        <pre><code class="language-csharp">// 1. AGENTE: lo tienes con NewRelic.Agent + env (guarda su APM)
+//    NEW_RELIC_APP_NAME=NotificadorWebSocket (agente)
+
+// 2. OTEL: SDK + exporter para la capa custom
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t =&gt; t
+        .AddSource("NotificadorWs")       // SOLO nuestro source custom
+        // NO AddAspNetCoreInstrumentation ni HttpClient: eso ya lo hace el agente
+        .AddOtlpExporter())
+    .WithMetrics(m =&gt; m.AddMeter("NotificadorWs.Meters").AddOtlpExporter());
+</code></pre>
+        <p>Clave: <strong>no actives instrumentaciones automáticas de OTel que ya cubre el agente</strong> para no duplicar. Lo custom, en tu <code>Source</code>; lo automático, al agente.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Reparto claro: automático→agente, custom→OTel</td><td>Doble-emisión de la misma operación</td><td>Spans duplicados inflan métricas y confunden traces</td></tr>
+            <tr><td>Usar W3C para que se unan en la misma traza</td><td>Dos traceIds para el mismo viaje</td><td>Ambos aceptan traceparent → mismo trace</td></tr>
+            <tr><td>Documentar el «mapa de instrumentación»</td><td>Dejarlo a la suerte</td><td>Cuando llegue un tercero, sabrá quién emite qué</td></tr>
+            <tr><td>Probar en un entorno dev el patrón</td><td>Hacer el primer «hibrido» en prod</td><td>La duplicidad se ve comparando counts</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Activar instrumentaciones duplicadas en OTel</h3>
+        <pre><code class="language-csharp">// ❌ Duplicas el HTTP: el agente ya emite el external span de HttpClient
+.WithTracing(t =&gt; t
+    .AddAspNetCoreInstrumentation()
+    .AddHttpClientInstrumentation()   // ¡el agente ya hace esto!
+    .AddSource("NotificadorWs"))
+
+// ✅ Solo el source custom
+.WithTracing(t =&gt; t.AddSource("NotificadorWs"))</code></pre>
+
+        <h3>Mezclar conceptos en el análisis</h3>
+        <p>No compares «Transaction del agente» (duración de la petición) con «Activity de OTel» (duración de tu fase) sin saber que miran cosas distintas. Normaliza en tu dashboard qué cada uno significa.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> En tu app con agente activo, añade OTel SOLO con tu <code>Source</code> (sin instrumentaciones duplicadas).</li>
+          <li><strong>Paso 2:</strong> Genera tráfico y consulta <code>SELECT count(*) FROM Span FACET service.name</code>.</li>
+          <li><strong>Paso 3:</strong> Revisa si algún SPAN aparece contado dos veces (traceId repetido en el mismo trace): señal de duplicidad.</li>
+          <li><strong>Paso 4:</strong> Ajusta el mapa de instrumentación hasta que no se duplique.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El mapa definitivo de tu app</h3>
+          <p>Escribe, para TU app: qué emite el agente, qué emitirá OTel y qué se queda sin instrumentar. Señala 1 riesgo de duplicidad concreto y cómo lo detectarías en NRQL.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Agente y OTel coexisten: reparto por capas evita duplicados.</li>
+          <li>W3C los une en el mismo traceId.</li>
+          <li>No actives instrumentaciones OTel que ya cubre el agente.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El agente y OTel se "pisan" la propagación de context?</summary>
+            <div><p>Pueden, si ambos injectan headers en la misma llamada. La regla: deja que solo uno haga la inyección automática (normalmente el agente), y OTel solo para tu lógica custom.</p></div>
+          </details>
+          <details>
+            <summary>¿Merece la pena el híbrido para un WebSocket pequeño?</summary>
+            <div><p>Si tu app es pequeña y el agente cubre todo lo que necesitas, no añadas OTel. El híbrido paga cuando necesitas instrumentación custom muy especializada o si buscas portabilidad futura.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

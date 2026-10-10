@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="01-hashes">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hashes: el registro de una conexión — Módulo 2 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Hashes: el registro de una conexión</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Estructuras de Datos</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un <strong>hash</strong> es un mapa <em>campo→valor</em> bajo una key. Es la forma natural de representar un «objeto»: todos los campos de una conexión (<code>node</code>, <code>userId</code>, <code>state</code>, <code>since</code>) en una sola key, con acceso a campos individuales.</p>
+        <p>Es LA estructura del registro de conexiones del hub. Verás los comandos principales y por qué es mejor que un string con JSON para campos que tocas por separado.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El comando core</h3>
+        <pre><code class="language-redis">HSET hub:conn:8632 node node-1 userId 42 state open
+HGET hub:conn:8632 node          # "node-1"
+HGETALL hub:conn:8632            # pares campo,valor
+HMGET hub:conn:8632 node state   # varios campos
+HEXISTS hub:conn:8632 state      # 1/0
+HDEL hub:conn:8632 state         # borra un campo
+HLEN hub:conn:8632               # nº de campos
+HINCRBY hub:conn:8632 msgs 1     # incrementa un campo numérico</code></pre>
+
+        <h3>Por qué hash en lugar de «string con JSON»</h3>
+        <table>
+          <thead><tr><th>Criterio</th><th>String+JSON</th><th>Hash</th></tr></thead>
+          <tbody>
+            <tr><td>Leer UN campo</td><td>Hay que deserializar todo</td><td><code>HGET</code> solo lo pedido</td></tr>
+            <tr><td>Actualizar UN campo</td><td>Releer-modificar-escribir (raza)</td><td><code>HSET</code>/<code>HINCRBY</code> atómico por campo</td></tr>
+            <tr><td>Memoria</td><td>OK (compacto)</td><td>Muy eficiente con &lt;128 campos cortos (listpack)</td></tr>
+            <tr><td>Modelo de «objeto»</td><td>Todo el JSON</td><td>Campos tipados e independientes</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p><strong>Regla:</strong> si necesitas acceder/actualizar campos por separado o incrementar contadores dentro del objeto → hash. Si solo lees/escribes el objeto completo de una pieza → string (JSON) o incluso un documento.</p>
+        </div>
+
+        <h3>Bajo el capó</h3>
+        <p>Para hashes pequeños (menos de ~128 campos y valores cortos) Redis guarda un <strong>listpack</strong> (una fila continua, muy barata); al crecer pasa a un dict clásico. Eso hace los <code>HGETALL</code> de tus conexiones eficientes.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">HSET user:42 name ana role operator
+HGET user:42 name              # "ana"
+HSET user:42 role supervisor   # actualiza solo role
+HGETALL user:42                # name, role
+HINCRBY user:42 msgCount 3     # contador dentro del objeto
+HLEN user:42                   # 4 (añadió msgCount)
+DEL user:42</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Registro de una conexión del hub como hash:</p>
+        <pre><code class="language-csharp">// Registrar (o refrescar) la conexión en el nodo local
+var key = $"hub:conn:{connectionId}";
+var entries = new HashEntry[]
+{
+    new("node", _nodeId),
+    new("userId", userId),
+    new("state", "open"),
+    new("since", DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+};
+
+await db.HashSetAsync(key, entries);
+await db.KeyExpireAsync(key, TimeSpan.FromSeconds(30));   // presencia
+
+// Otro nodo pregunta: ¿dónde está la conexión 8632?
+var node = await db.HashGetAsync($"hub:conn:{8632}", "node");
+if (!node.IsNull && node == "node-2") { /* reenvío al nodo dueño */ }
+
+// Bajada de estado sin perder el resto
+await db.HashSetAsync(key, "state", "closing");</code></pre>
+        <p>Lees y actualizas campos sin re-serializar el objeto cada vez.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Campos cortos y estables (schema conocido)</td><td>Campos que crecen sin límite</td><td>Un hash con un campo «log acumulado» revienta la RAM</td></tr>
+            <tr><td>HGETALL solo cuando necesitas el objeto completo</td><td>HGETALL para leer un campo</td><td>Pides toda la fila aunque quieras migajas</td></tr>
+            <tr><td>HINCRBY para contadores dentro del objeto</td><td>Reescribir el campo en .NET</td><td>Atómico y sin read-modify-write</td></tr>
+            <tr><td>TTL del hash = presencia (con refresh)</td><td>Hashes eternos acumulados</td><td>Regla de M1-03 aplicada a cualquier tipo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Guardar un set de campos como lista de strings (N keys)</h3>
+        <pre><code class="language-redis"># ❌ Una key por campo es peor y fragmenta
+SET hub:conn:8632:node node-1
+SET hub:conn:8632:userId 42
+
+# ✅ Un hash agrupa el objeto
+HSET hub:conn:8632 node node-1 userId 42</code></pre>
+
+        <h3>HGETALL de hashes gigantes</h3>
+        <p>En el hub están acotados, pero entra cuidando el tamaño: un HGETALL de 100k campos lastima la red y la RAM.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Con redis-cli crea <code>hub:conn:100</code> con 4 campos (node, userId, state, since).</li>
+          <li><strong>Paso 2:</strong> Actualiza solo <code>state</code> a <code>closing</code> y lee los demás con HMGET.</li>
+          <li><strong>Paso 3:</strong> Añade un contador <code>msgs</code> y haz HINCRBY 3 veces.</li>
+          <li><strong>Paso 4:</strong> Ponle TTL 30 y refresca; verifica <code>TYPE</code> en <code>hub:conn:100</code>.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Hash vs JSON</h3>
+          <p>En tu hub, enumera 3 «objetos» que guardarías en Redis (conexión, perfil de canal, sesión). Para cada uno, decide hash o string+JSON y justifica basándote en: ¿accedo a campos sueltos?, ¿necesito contadores internos?, ¿es el objeto leído/escrito entero? Escríbelo como tabla.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Hash = objeto bajo una key: <code>HSET/HGET/HGETALL/HMGET/HDEL/HINCRBY</code>.</li>
+          <li>Acceso e incremento por campo sin re-serializar.</li>
+          <li>Campos cortos + TTL = registro de conexión ideal.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos campos puede tener un hash?</summary>
+            <div><p>Prácticamente ilimitados (RAM mediante), pero la eficiencia (listpack) se mantiene con valores cortos. No lo uses como «una tabla SQL grande».</p></div>
+          </details>
+          <details>
+            <summary>¿El hash soporta JSON dentro de un campo?</summary>
+            <div><p>Sí: un campo puede guardar un string (y dentro, JSON). Pero si lo necesitas consultable, mejor otro tipo o campo plano.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

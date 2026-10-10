@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="04-limites-y-hpa">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Límites de recursos y HPA — Módulo 8 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Límites de recursos y HPA</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Helm, seguridad y operación</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has desplegado pods sin decirle a Kubernetes <em>cuánto necesitan</em>. Funciona… hasta que deja de funcionar: un solo pod que consuma toda la memoria del nodo puede tumbar a todos sus vecinos. En un clúster compartido, <strong>los recursos son de todos</strong>.</p>
+        <p>Esta lección tiene dos mitades que se refuerzan:</p>
+        <ul>
+          <li><strong>Requests y limits:</strong> declarar cuánto <em>reserva</em> tu pod (request) y cuál es su <em>techo</em> (limit). Es la diferencia entre un clúster caótico y uno predecible, y determina la clase de QoS de tu pod.</li>
+          <li><strong>El HorizontalPodAutoscaler (HPA):</strong> automatizar cuántas réplicas necesita tu Deployment en función del uso real de CPU/memoria. Escalar <em>a mano</em> con <code>kubectl scale</code> está bien para emergencias; el HPA es para dormir tranquilo.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>El porqué:</strong> un clúster es un apartamento compartido con un presupuesto de electricidad y agua. Nadie dice "nadie", todos se quedan sin. Requests = tu reserva garantizada; limits = tu tope de consumo. El scheduler decide dónde vive cada pod mirando los requests; el kubelet corta a los que superan sus limits.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Requests vs limits: la reserva y el techo</h3>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué significa</th><th>Quién lo usa</th></tr></thead>
+          <tbody>
+            <tr><td><strong>requests</strong></td><td>Lo que el pod <em>garantiza</em> tener (el scheduler lo reserva)</td><td>El <strong>kube-scheduler</strong> al colocar pods</td></tr>
+            <tr><td><strong>limits</strong></td><td>El máximo que el pod puede consumir (techo duro)</td><td>El <strong>kubelet</strong> al ejecutar: CPU se limita, memoria con OOMKill si se supera</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> reproducir un concierto en una sala. Request de CPU es el aforo que reservas (la sala te lo garantiza: nadie más usará esas butacas). Limit es el máximo de personas que deja entrar el cuerpo de bomberos. Si los límites del clúster se llenan, el manager te echa (eviction); si tu proceso se pasa de memoria, el kubelet le dispara el "guardián" (OOM kill).</p>
+        </div>
+        <p>Detalle de comportamiento que marca la diferencia:</p>
+        <ul>
+          <li><strong>CPU es comprimible:</strong> si un pod supera su limit de CPU, el kubelet lo <em>enfria</em> (throttling). La aplicación va lenta pero sigue viva.</li>
+          <li><strong>Memoria no es comprimible:</strong> superar el limit de memoria termina con el proceso <strong>OOMKilled</strong> (y el cgroup lo mata). Por eso los limits de memoria son decisiones delicadas.</li>
+        </ul>
+
+        <h3>Unidades: millicores y bytes</h3>
+        <ul>
+          <li>CPU se expresa en <strong>millicores</strong>: <code>100m</code> = 0.1 core; <code>250m</code> = un cuarto de core. <code>1</code> = un core completo (o <code>1000m</code>).</li>
+          <li>Memoria en bytes con sufijos: <code>128Mi</code> = 128 mebibytes (128 × 1024²); <code>1Gi</code> = 1 gibibyte. Cuidado con <code>M</code> (decimal) vs <code>Mi</code> (binario): <code>128M</code> ≈ 122Mi. En Kubernetes, la comunidad usa casi siempre <code>Mi</code>/<code>Gi</code>.</li>
+        </ul>
+
+        <h3>Las clases de QoS: quién sobrevive a una presión de recursos</h3>
+        <p>Kubernetes clasifica cada pod según cómo combines requests y limits. Esta clase decide <strong>el orden de expulsión</strong> cuando el nodo se queda sin recursos (eviction) y, en parte, dónde elige el scheduler:</p>
+        <div class="diagram">Pod con request == limit  →  QoS: Guaranteed   (los últimos en expulsar)
+Pod con request != limit  →  QoS: Burstable    (siguiente en la cola)
+Pod sin requests ni limits→  QoS: BestEffort   (los primeros en sacrificar)</div>
+        <table>
+          <thead><tr><th>QoS</th><th>Cómo se logra</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Guaranteed</strong></td><td>request == limit en CPU y memoria (todos los contenedores)</td><td>Mínimo: el nodo le reserva todo lo que pide</td></tr>
+            <tr><td><strong>Burstable</strong></td><td>Hay requests (y a veces limits) pero no coinciden</td><td>Medio: puede usar extra hasta el limit; expulsado antes que Guaranteed</td></tr>
+            <tr><td><strong>BestEffort</strong></td><td>Sin requests ni limits</td><td>Máximo: primero en morir ante presión</td></tr>
+          </tbody>
+        </table>
+        <p>La best-effort no es "gratis": cualquiera con un bug de fuga de memoria convierte el nodo en un casino. Por eso la práctica profesional marca requests siempre (y limits con criterio).</p>
+
+        <h3>kubectl top y kubectl scale: medir y escalar a mano</h3>
+        <pre><code class="language-bash"># Consumo real por nodo y por pod (requiere el metrics-server instalado)
+kubectl top nodes
+kubectl top pods -n harbortasks
+
+# Escalado manual: réplicas fijas, sin inteligencia
+kubectl scale deployment api -n harbortasks --replicas=4</code></pre>
+
+        <h3>El HorizontalPodAutoscaler: escalado automático</h3>
+        <p>El HPA es un controlador del plano de control que vigila métricas (memoria y CPU por defecto) y <em>ajusta las réplicas del Deployment</em> para acercarse a un objetivo. El bucle es sencillo:</p>
+        <div class="diagram">  ┌──────────────── control plane ────────────────┐
+  │  metrics-server ──► HPA controller ──► Deployment  │
+  │   (recoge uso)      (calcula réplicas)  (ReplicaSet)│
+  └────────────────────────────────────────────────────┘
+        │
+        ▼ fórmula (por ReplicaSet):
+   réplicas_objetivo = ceil( réplicas_actuales × (uso_medio / target) )
+
+   ejemplo: 2 réplicas al 85% de CPU, target 70 % →
+   ceil(2 × 85/70) = 3 réplicas → el Deployment escala a 3</div>
+        <p>Parámetros del HPA: <code>minReplicas</code>, <code>maxReplicas</code>, <code>targetCPUUtilizationPercentage</code> (y, en versiones modernas, <code>behavior</code> para suavizar el escalado con <code>scaleUp</code>/<code>scaleDown</code>). También puede usar <strong>métricas personalizadas</strong> (p. ej. longitud de la cola de la API o peticiones por segundo) vía el custom metrics API y Prometheus — lo mencionamos porque en producción real se acaba necesitando, pero aquí nos centramos en CPU.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un pod con requests y limits bien declarados:</p>
+        <pre><code class="language-yaml"># pod-limites.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-con-limites
+spec:
+  containers:
+    - name: app
+      image: node:20-alpine
+      # El proceso que va a consumir
+      command: ["node", "-e", "setInterval(()=>{},1000)"]
+      resources:
+        requests:            # reserva garantizada
+          cpu: "100m"        # 0.1 core
+          memory: "128Mi"    # 128 mebibytes
+        limits:              # techo duro
+          cpu: "500m"        # 0.5 core (más de eso: throttling)
+          memory: "256Mi"    # más de eso: OOMKilled por el kubelet</code></pre>
+        <pre><code class="language-bash">kubectl apply -f pod-limites.yaml
+# Comprueba la clase QoS que Kubernetes le asignó
+kubectl get pod pod-con-limites -o jsonpath='{.status.qosClass}'
+# Salida: Burstable   (porque request != limit)
+
+# Consumo real del pod (con metrics-server instalado)
+kubectl top pod pod-con-limites
+# NAME               CPU(cores)   MEMORY(bytes)
+# pod-con-limites    8m           12Mi</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado a HarborTasks. Primero, declaramos recursos en el Deployment de la API (la pieza que más varía de carga):</p>
+        <pre><code class="language-yaml"># deployment-api.yaml — extracto con recursos
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    spec:
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+          resources:
+            # Reserva mínima para arrancar sin hambre
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            # Techo: la API respira hasta 500m y 256Mi
+            limits:
+              cpu: "500m"
+              memory: "256Mi"</code></pre>
+        <p>Ahora el HPA de la API, el protagonista de la lección:</p>
+        <pre><code class="language-yaml"># hpa-api.yaml — HorizontalPodAutoscaler de la API
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: harbortasks
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api           # el Deployment al que escala
+  minReplicas: 2        # nunca por debajo de 2 (mantiene HA básica)
+  maxReplicas: 6        # nunca por encima de 6 (no romper el presupuesto)
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # intenta mantener ~70% de CPU media
+  behavior:                        # opcional: suaviza el escalado
+    scaleDown:
+      stabilizationWindowSeconds: 120   # espera 2 min antes de bajar
+      policies:
+        - type: Percent
+          value: 50                      # baja como mucho un 50% por tick</code></pre>
+        <pre><code class="language-bash">kubectl apply -f deployment-api.yaml -n harbortasks
+kubectl apply -f hpa-api.yaml -n harbortasks
+
+# Estado del HPA: réplicas actuales, target y uso medio
+kubectl get hpa api -n harbortasks
+# NAME   REFERENCE     TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+# api    Deployment/api 45%/70%   2         6         2          5m
+
+# Escalado manual de emergencia (cuando no hay HPA)
+kubectl scale deployment api -n harbortasks --replicas=4
+
+# Historico de eventos del HPA (por qué escaló o no)
+kubectl describe hpa api -n harbortasks</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Requisito:</strong> el HPA necesita el <code>metrics-server</code> en el clúster (de la misma forma que <code>kubectl top</code>). En kind se instala en rutina con un par de comandos; sin él, el HPA reporta <code>&lt;unknown&gt;</code> y no escala.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Declarar <code>requests</code> siempre</td>
+              <td>Pods sin requests con la esperanza de que sean "gratis"</td>
+              <td>Sin request el pod es BestEffort y el scheduler lo puede colocar donde no le corresponde; además es el primero en morir ante presión.</td>
+            </tr>
+            <tr>
+              <td>Poner <code>limits</code> con criterio, midiéndolos primero</td>
+              <td>Limits al azar o límites de memoria demasiado justos</td>
+              <td>Un limit de memoria bajo produce OOMKilled en baches normales. Mide con <code>kubectl top</code> antes de fijar el techo.</td>
+            </tr>
+            <tr>
+              <td>Dejar un request y un limit coherentes entre sí</td>
+              <td>request=50m y limit=4 cores (misma aplicación)</td>
+              <td>La brecha enorme crea QoS Burstable poco predecible y permite a un pod "robar" CPU de los vecinos, generando caos.</td>
+            </tr>
+            <tr>
+              <td>HPA con <code>behavior</code> y ventana de estabilización</td>
+              <td>HPA sin estabilización que oscila arriba/abajo</td>
+              <td>Sin histéresis, un pico de un minuto provoca un "baile" de scale up/down que degrada el servicio en vez de estabilizarlo.</td>
+            </tr>
+            <tr>
+              <td>Combinar HPA con probes y readiness</td>
+              <td>Escalar réplicas que aún no están listas</td>
+              <td>El HPA escala replicas, pero las réplicas solo reciben tráfico cuando pasan readiness (M6-05). Sin probes, escalas "en vacío".</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Confundir la unidad de memoria M vs Mi</h3>
+        <pre><code class="language-yaml"># ❌ 128M = 128 x 10^6 bytes (decimal) ≈ 122 Mi, confunde a quien lea
+#  memory: "128M"
+
+# ✅ 128Mi = 128 mebibytes, la convención del ecosistema K8s
+memory: "128Mi"</code></pre>
+
+        <h3>Limits de memoria "justos" que matan la app</h3>
+        <pre><code class="language-bash"># ❌ La API usa 140Mi en su pico habitual pero le das un limit de 128Mi
+# Resultado: la API en el pico muere por OOM (CrashLoopBackOff)
+
+# ✅ 1. Mide primero con kubectl top   2. decide el techo con margen
+kubectl top pods -n harbortasks
+# y luego, p. ej., ajustas limits.memory a 256Mi</code></pre>
+
+        <h3>No instalar metrics-server y esperar top/HPA</h3>
+        <pre><code class="language-bash"># ❌ kubectl top falla en kind recién creado
+kubectl top nodes
+# Error from server: the server could not find the requested resource
+
+# ✅ Instala metrics-server una vez en kind
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml</code></pre>
+
+        <h3>HPA apuntando al Deployment equivocado o con target imposible</h3>
+        <pre><code class="language-bash"># ❌ targetCPUUtilizationPercentage=0 → "invalid value": no escala
+kubectl autoscale deployment web -n harbortasks --cpu-percent=0 --min=1 --max=5
+
+# ✅ target razonable (entre ~50% y 80%) y al Deployment correcto
+kubectl autoscale deployment api -n harbortasks \
+  --cpu-percent=70 --min=2 --max=6</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear presión de CPU real sobre la API y ver cómo el HPA escala y luego se relaja, sin tocar el Deployment a mano.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> despliega la API con recursos y el HPA (usa los YAML del ejemplo real):
+            <pre><code class="language-bash">kubectl create namespace harbortasks
+kubectl apply -f deployment-api.yaml -n harbortasks
+kubectl apply -f hpa-api.yaml -n harbortasks
+kubectl get hpa api -n harbortasks     # REPLICAS 2, TARGETS ~0%/70%</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> abre un segundo terminal y sigue el estado:
+            <pre><code class="language-bash">kubectl get hpa api -n harbortasks -w     # watch: ves el cambio en vivo</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> genera carga con un bucle de peticiones a la API (expuesta por port-forward o por el Ingress):
+            <pre><code class="language-bash">kubectl -n harbortasks port-forward svc/api 3000:3000 &
+# en otro terminal:
+for i in $(seq 1 300); do curl -s http://localhost:3000/api/tasks > /dev/null; done</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> observa en el <code>-w</code> cómo el TARGETS sube por encima de 70 y REPLICAS pasa de 2 a 3 o 4.
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> deja de generar carga y, tras la ventana de estabilización, comprueba que las réplicas vuelven a bajar:
+            <pre><code class="language-bash">kubectl get hpa api -n harbortasks
+kubectl get pods -n harbortasks -l app.kubernetes.io/name=api
+# Comprueba que vuelven a ser 2 (minReplicas)</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6:</strong> limpia si no quieres seguir usando el clúster:
+            <pre><code class="language-bash">kubectl delete hpa api -n harbortasks
+kubectl delete deployment api -n harbortasks</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación clara:</strong> la prueba de que el HPA funciona es que <em>tú</em> nunca ejecutaste <code>kubectl scale</code>. Las réplicas subieron por el controlador, no por ti.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 HPA que también escale por memoria</h3>
+          <p>Extiende el HPA de la API para que además de CPU tenga una métrica de <code>memory</code> con target de utilización (p. ej. 60%), con <code>minReplicas: 2</code> y <code>maxReplicas: 6</code>. Averigua qué comportamiento tiene cuando ambas métricas coexisten y genera un pico de memoria real (p. ej. subiendo las tareas o el tamaño de la respuesta) para comprobar que el HPA lo ve en <code>kubectl get hpa api -o yaml</code>.</p>
+          <p><em>Pista: en <code>autoscaling/v2</code> el array <code>metrics</code> acepta varias entradas con <code>Resource</code> + <code>name: memory</code>. El HPA usa el ratio más alto de las métricas declaradas para decidir el número de réplicas.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Requests</strong> = reserva garantizada (la usa el scheduler); <strong>limits</strong> = techo duro (la aplica el kubelet).</li>
+          <li>CPU es comprimible (throttling); <strong>memoria no lo es</strong> (OOMKill sobre el limit).</li>
+          <li>Clases de QoS: <strong>Guaranteed</strong> (request==limit), <strong>Burstable</strong>, <strong>BestEffort</strong> (sin requests) — en ese orden a la hora de expulsar.</li>
+          <li><code>kubectl top</code> mide, <code>kubectl scale</code> actúa a mano, <code>HPA</code> automatiza.</li>
+          <li>El HPA calcula <code>ceil(réplicas × uso/target)</code> y escala dentro de <code>minReplicas</code>…<code>maxReplicas</code>.</li>
+          <li>Ventana de estabilización y <code>behavior</code> evitan el "baile" de réplicas.</li>
+          <li>Métricas personalizadas (colas, RPS) existen vía custom metrics API + Prometheus.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl top nodes</code> / <code>kubectl top pods -n N</code></td><td>Uso real de CPU/memoria por nodo/pod (requiere metrics-server)</td></tr>
+            <tr><td><code>kubectl scale deployment api -n N --replicas=4</code></td><td>Escalado manual de réplicas</td></tr>
+            <tr><td><code>kubectl apply -f hpa-api.yaml</code></td><td>Crea el HPA declarado en el manifiesto</td></tr>
+            <tr><td><code>kubectl autoscale deployment api --cpu-percent=70 --min=2 --max=6</code></td><td>Crea un HPA imperativamente desde el CLI</td></tr>
+            <tr><td><code>kubectl get hpa api -n N -w</code></td><td>Sigue el estado del HPA en vivo</td></tr>
+            <tr><td><code>kubectl describe hpa api -n N</code></td><td>Eventos y decisiones de escalado del HPA</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué pasa si un pod supera el limit de memoria?</summary>
+            <div>
+              <p>Depende del QoS: si el pod es BestEffort o Burstable, el kubelet puede matar el contenedor (OOM) y reiniciarlo según la política. En cenarlos Guaranteed, el kubelet prefiere no tocar el pod y expulsar a otros. El estado visible es <code>OOMKilled</code> en la última terminación del pod.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El request de CPU garantiza que el pod SIEMPRE tiene esa CPU?</summary>
+            <div>
+              <p>Sí a efectos de programación (el scheduler solo coloca pods si quedan requests disponibles) y en términos de "peso" en el CPU manager. Pero en CPU comprimible, si hay competencia por sobresuscripción, el pod con más CPU de su request puede ver throttling. La garantía dura de verdad es la memoria y la CPU con QoS Guaranteed.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Con HPA me olvido de kubectl scale para siempre?</summary>
+            <div>
+              <p>Casi. El HPA gestiona el número de réplicas automáticamente, pero situaciones como picos inminentes (Black Friday), mantenimientos o incidentes siguen exigiendo decisión humana o pipelines de CI/CD. Además, el HPA no "precalienta": responde a la métrica ya medida. Ahí entran los autoscalers predictivos o eventos programados.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿HPA puede escalar también Web o Postgres?</summary>
+            <div>
+              <p>En principio sí (cualquier Deployment/StatefulSet con métricas), pero tiene sentido sobre todo en stateless e intensivos en CPU (como la API y la web). Escalar Postgres automáticamente por CPU no da réplicas que escriban de forma coherente; ahí el enfoque correcto es otro (una instancia primaria + réplicas de lectura gestionadas, o un operador de bases de datos).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El HPA funciona en kind?</summary>
+            <div>
+              <p>Sí, si instalas metrics-server. kind no lo trae por defecto. Con <code>kubectl apply -f components.yaml</code> (el manifiesto oficial releases) lo tendrás en minutos y podrás practicar toda la lección. Solo recuerda que en kind el "escalado" ocurre con uno o unos pocos nodos, así que los límites físicos llegan rápido — perfecto para ver OOM/eviction en vivo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

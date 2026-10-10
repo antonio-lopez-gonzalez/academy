@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-transaccion-por-mensaje-json">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crear una transacción por mensaje JSON — Módulo 4 · Curso New Relic para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('nr-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Crear una transacción por mensaje JSON</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Instrumentar WebSocket</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La columna vertebral de tu WebSocket observable: <strong>cada mensaje entrante genera una transacción</strong>  nombrada correctamente como <em>OtherTransaction</em>. Sobre ella colgarás atributos, errores, spans y propagación W3C.</p>
+        <p>Esta lección te da el patrón completo y ejecutable: handler async con WebSocket, parseo con <code>System.Text.Json</code> y la transacción colocada en el sitio exacto para que no mida «tiempo muerto» del socket.</p>
+        <div class="callout callout--why">
+          <p><strong>La trampa que evitamos:</strong> si abarcas la espera del <code>ReceiveAsync</code> dentro de la transacción, medirás el tiempo de espera del siguiente mensaje (ruido), no el trabajo. El truco es marcar la transacción <em>después</em> de recibir, o usar la transacción solo alrededor del procesado.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La forma correcta</h3>
+        <pre><code class="language-text">ReceiveAsync (espera bloqueante — fuera de la transacción)
+   │
+   ▼
+ParseJson   (recogida y validación mínima)
+   │
+   ▼
+OnMessage()  [Transaction] — aquí se mide el "trabajo útil" del mensaje
+   │   ├── AcceptDistributedTraceHeaders  (línea M3-04)
+   │   ├── atributos (type, messageId, userId…)
+   │   ├── dispatch por tipo → [Trace] de negocio
+   │   └── errores con NoticeError
+   ▼
+respuesta opcional (SendAsync) con spans propios</code></pre>
+        <p>Si envías respuesta al cliente, el <code>SendAsync</code> debe estar <strong>dentro</strong> de la transacción para que se mida (o con su propio <code>[Trace]</code>), pero nunca bloqueando la transacción con la espera del siguiente frame.</p>
+
+        <h3>Async y transacciones</h3>
+        <p>Los atributos y la API del agente funcionan con async/await; el agente mantiene el contexto de transacción del mensaje. La única advertencia: en procesado muy paralelo (<code>Task.Run</code>, hilos del TP) el «CurrentTransaction» puede no coincidir con tu mensaje — mantenlo predecible o propaga explícitamente.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">using NewRelic.Api.Agent;
+
+public sealed class MessageDispatcher
+{
+    // Solo el "trabajo" del mensaje se mide como transacción
+    [Transaction]
+    public void OnMessage(MessageEnvelope msg)
+    {
+        IAgent agent = NewRelic.Api.Agent.NewRelic.GetAgent();
+        var txn = agent.CurrentTransaction;
+
+        txn.AddCustomAttribute("messageType", msg.Type);
+        txn.AddCustomAttribute("messageId", msg.MessageId);
+
+        // Acepto el contexto W3C si el cliente lo incluyó
+        txn.AcceptDistributedTraceHeaders(
+            msg.TraceContext,
+            static (env, key) =>
+                env.TraceContext.TryGetValue(key, out var v) ? [v] : [],
+            TransportType.Other);   // no hay valor WebSocket; usamos Other
+
+        // dispatch
+        _handlers[msg.Type](msg);
+    }
+}</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Handler WebSocket completo con <code>System.Net.WebSockets</code>:</p>
+        <pre><code class="language-csharp">public class WsServer
+{
+    private readonly MessageDispatcher _dispatcher;
+
+    public async Task Handle(WebSocket socket)
+    {
+        var buffer = new byte[4 * 1024];
+        while (socket.State == WebSocketState.Open)
+        {
+            // 1) Esperar (FUERA de la transacción)
+            var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+            if (result.MessageType == WebSocketMessageType.Close) break;
+
+            // 2) Convierte los bytes que llegan a texto
+            var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+            var msg = Parse(json);   // MessageEnvelope
+
+            // 3) Trabajo por mensaje (la transacción)
+            _dispatcher.OnMessage(msg);
+        }
+    }
+
+    private static MessageEnvelope Parse(string json) =>
+        JsonSerializer.Deserialize&lt;MessageEnvelope&gt;(json)
+        ?? throw new InvalidDataException("JSON nulo");
+}</code></pre>
+        <p>Con esto: cada <code>trade</code>, <code>ping</code> o <code>disconnect</code> es una transacción con sus atributos, y la duración media mide <em>solo</em> el procesado.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Medir solo el procesado en la transacción</td><td>Incluir el <code>ReceiveAsync</code> en espera</td><td>El tiempo de espera del socket no es trabajo del mensaje</td></tr>
+            <tr><td>Parsear antes de la transacción</td><td>Métricas de parseo separadas del «procesado» para distinguirlas</td><td>Puedes decidir qué fase entra en el timer</td></tr>
+            <tr><td>Añadir atributos STABLES del mensaje</td><td>Atributos con values high-cardinality</td><td>Facet útil y coste controlado</td></tr>
+            <tr><td>Enviar la respuesta dentro de la transacción</td><td>Responder en un hilo/segmento suelto</td><td>La respuesta es parte del mensaje (duración incluida)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Transacción alrededor del ReceiveAsync</h3>
+        <pre><code class="language-csharp">// ❌ Recibe… y mientras espera, la transacción está "abierta"
+[Transaction]
+public async Task Handle(WebSocket socket)
+{
+    while (socket.State == WebSocketState.Open)
+    {
+        var result = await socket.ReceiveAsync(...);  // ⏳ duración = espera
+        OnMessage(Parse(result));                       // trabajo escondido
+    }
+}
+
+// ✅ El [Transaction] va en OnMessage (procesado), ReceiveAsync fuera</code></pre>
+
+        <h3>Resincronizar en hilos del pool sin contexto</h3>
+        <pre><code class="language-csharp">// ❌ CurrentTransaction puede apuntar a otra cosa en Task.Run
+await Task.Run(() => ProcessHeavy(msg));   // timer ajeno
+
+// ✅ O procesa sin Task.Run para conservar el contexto de transacción,
+//    o instrumenta explícitamente dentro (y acepta el contexto ahí)</code></pre>
+
+        <h3>No aceptar el contexto del mensaje en el primer procesado</h3>
+        <p>Si no llamas a <code>AcceptDistributedTraceHeaders</code>, tu nuevo traceId ignora el que llevaba el mensaje.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Implementa el <code>WsServer</code> del ejemplo real y envíale <code>ping</code> y <code>trade</code> de prueba.</li>
+          <li><strong>Paso 2:</strong> Verifica en APM 2 transacciones <code>OtherTransaction</code> con <code>messageType</code>.</li>
+          <li><strong>Paso 3:</strong> Mide la duración media con:
+          <pre><code class="language-nrql">SELECT count(*), average(duration), max(duration) FROM Transaction
+FACET messageType
+SINCE 15 minutes ago</code></pre>
+          </li>
+          <li><strong>Paso 4:</strong> Cambia <code>ReceiveAsync</code> para que la espera quede fuera y vuelve a medir: la duración debería bajar (sin el tiempo de espera).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Latencias en dos fases</h3>
+          <p>Añade la métrica <code>Custom/QueueLatencyMs</code> (diferencia entre <code>msg.Timestamp</code> y ahora) y decide: ¿la reportas como atributo de la transacción (facet) o como métrica? Justifica. Compárala con la duración de la transacción para entender dónde se va el tiempo total.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>[Transaction]</code> en el «procesado» del mensaje, no en la espera del socket.</li>
+          <li>Atributos estables + <code>AcceptDistributedTraceHeaders</code> por mensaje.</li>
+          <li>La respuesta (<code>SendAsync</code>) dentro de la transacción.</li>
+          <li>Ojo con <code>Task.Run</code>: preserva el contexto de transacción.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Es caro tener transacción por mensaje con miles de mensajes/minuto?</summary>
+            <div><p>Los eventos Transaction se generan en cliente con sampling de trazas; el volumen controlado y los facets y métricas lo mantienen en la green band. Si es enorme, sustituye la transacción por métricas y conserva trazas muestreadas.</p></div>
+          </details>
+          <details>
+            <summary>¿Tengo que usar [Transaction] o puedo crear transacciones desde la API?</summary>
+            <div><p>Para .NET lo idiomático son los atributos. La API te da <code>IAgent.CurrentTransaction</code> pero necesitas que exista una transacción; crearla la hacen los atributos o el XML.</p></div>
+          </details>
+          <details>
+            <summary>¿El agente mide el tamaño del payload?</summary>
+            <div><p>No por defecto. Añade tú <code>sizeBytes</code> con <code>AddCustomAttribute</code> si quieres.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

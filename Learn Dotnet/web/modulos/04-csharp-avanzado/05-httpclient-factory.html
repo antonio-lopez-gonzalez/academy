@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="es" data-module="04" data-lesson="05-httpclient-factory">
+<head>
+  <meta charset="UTF-8">
+  <title>HttpClientFactory en profundidad — Módulo 4 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>HttpClientFactory en profundidad</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 4 · C# Avanzado</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aprenderemos a usar <code>IHttpClientFactory</code> correctamente. Veremos por qué crear <code>new HttpClient()</code> a mano es peligroso, cómo gestionar sockets y DNS, cómo configurar clientes con nombre y tipados, y cómo encadenar handlers para logging, resiliencia y auth.</p>
+        <p>¿Por qué existe? Porque <code>HttpClient</code> esconde un <code>HttpClientHandler</code>, que a su vez esconde un <code>SocketsHttpHandler</code> con un pool de conexiones. Si creas un <code>HttpClient</code> por cada request y lo descartas, agotas el pool de sockets del sistema operativo y causas <code>SocketException</code> tras miles de requests. Si reutilizas un <code>HttpClient</code> estático, no se refrescan los DNS. La factory resuelve ambos problemas.</p>
+        <p>¿Cuándo se utiliza? En cualquier aplicación .NET que haga llamadas HTTP salientes: APIs, workers, microservicios, clientes de terceros.</p>
+        <p>Errores típicos: <code>using var client = new HttpClient()</code>, no configurar <code>PooledConnectionLifetime</code>, no usar handlers de resiliencia, descartar el cliente tras cada uso.</p>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>2.1. El problema del socket exhaustion</h3>
+        <p>Cada <code>HttpClient</code> mantiene conexiones TCP abiertas durante un tiempo. Cuando instancias y descartas un cliente por cada request, el sistema operativo acumula conexiones en estado TIME_WAIT. Tras un volumen alto, no puedes abrir más sockets. El error típico es "Only one usage of each socket address is normally permitted".</p>
+
+        <h3>2.2. El problema del DNS stale</h3>
+        <p>Si reutilizas un <code>HttpClient</code> estático, el <code>SocketsHttpHandler</code> subyacente no detecta cambios de DNS hasta que caduca la conexión. Si un microservicio cambia de IP tras un redeploy, tu cliente seguirá apuntando a la IP antigua. La solución es limitar la vida útil del pool de conexiones.</p>
+
+        <h3>2.3. IHttpClientFactory</h3>
+        <p>La factory crea y recicla handlers de forma controlada. Mantiene un pool de handlers (<code>HttpMessageHandler</code>) y rota cada uno cuando expira su vida útil. El <code>HttpClient</code> que te devuelve es de corta duración, pero el handler subyacente es reutilizado y renovado. Así evitas tanto el agotamiento de sockets como el DNS stale.</p>
+
+        <h3>2.4. Diagrama de la factory</h3>
+        <pre><code>┌────────────────────────────────────────────────────────────────────┐
+│                     IHttpClientFactory                              │
+│                                                                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │  HttpClient │  │  HttpClient │  │  HttpClient │  (corto plazo) │
+│  │  (descartar)│  │  (descartar)│  │  (descartar)│                │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                │
+│         │                │                │                       │
+│         └────────────────┼────────────────┘                       │
+│                          │                                         │
+│  ┌───────────────────────┴───────────────────────┐                 │
+│  │       HttpMessageHandler Pool (pooling)       │                 │
+│  │  ┌─────────────┐  ┌─────────────┐            │                 │
+│  │  │ Handler A   │  │ Handler B   │ (rotados │                 │
+│  │  │  lifetime   │  │  lifetime   │  por DNS) │                 │
+│  │  └─────────────┘  └─────────────┘            │                 │
+│  └─────────────────────────────────────────────┘                 │
+│                                                                    │
+│  Cada HttpClient es nuevo; los handlers se reciclan y renuevan.   │
+└────────────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>2.5. Named clients, typed clients y factory directa</h3>
+        <p><strong>Named clients</strong>: se registran con un nombre y se resuelven con <code>CreateClient("name")</code>. Útiles cuando tienes varias APIs externas.</p>
+        <p><strong>Typed clients</strong>: encapsulan la configuración en una clase propia inyectada en tu servicio. Son más testeables y type-safe.</p>
+        <p><strong>Factory directa</strong>: inyectas <code>IHttpClientFactory</code> y creas clientes ad-hoc. Es flexible pero menos declarativo.</p>
+
+        <h3>2.6. DelegatingHandler</h3>
+        <p>Un <code>DelegatingHandler</code> envuelve otro handler y puede inspeccionar o modificar la request/response. Es el mecanismo para añadir logging, auth, resiliencia, headers, etc.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Creamos un API web que consume un servicio externo usando <code>IHttpClientFactory</code>.</p>
+        <pre><code>dotnet new webapi -n HttpClientFactoryDemo -o ejemplos/m04-csharp-avanzado/httpclient-factory-demo/src/HttpClientFactoryDemo</code></pre>
+        <p><code>Program.cs</code>:</p>
+        <pre><code>// Configuración de HttpClientFactory con un cliente nombrado
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddHttpClient("jsonplaceholder", client =>
+{
+    client.BaseAddress = new Uri("https://jsonplaceholder.typicode.com/");
+    client.DefaultRequestHeaders.Add("Accept", "application/json");
+    client.Timeout = TimeSpan.FromSeconds(10);
+})
+    .SetHandlerLifetime(TimeSpan.FromMinutes(5));
+
+builder.Services.AddControllers();
+
+var app = builder.Build();
+app.MapControllers();
+app.Run();</code></pre>
+        <p>Controlador:</p>
+        <pre><code>[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase
+{
+    private readonly IHttpClientFactory _factory;
+
+    public UsersController(IHttpClientFactory factory)
+    {
+        _factory = factory;
+    }
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; GetUsers()
+    {
+        // Creamos un cliente corto; el handler se recicla internamente
+        var client = _factory.CreateClient("jsonplaceholder");
+        var response = await client.GetAsync("users");
+        response.EnsureSuccessStatusCode();
+        var content = await response.Content.ReadAsStringAsync();
+        return Content(content, "application/json");
+    }
+}</code></pre>
+        <p>Explicación línea por línea:</p>
+        <ul>
+          <li><code>AddHttpClient("jsonplaceholder", ...)</code>: registra un cliente con nombre y configuración.</li>
+          <li><code>SetHandlerLifetime</code>: define cada cuánto tiempo se rota el handler subyacente para refrescar DNS.</li>
+          <li><code>_factory.CreateClient("jsonplaceholder")</code>: crea un <code>HttpClient</code> con la configuración registrada. No uses <code>using</code> para descartarlo.</li>
+          <li><code>EnsureSuccessStatusCode</code>: lanza si la respuesta no es 2xx.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Typed client + delegating handler para añadir un header de correlación y reintentos con Polly.</p>
+        <pre><code>public class CorrelationIdHandler : DelegatingHandler
+{
+    private readonly IHttpContextAccessor _httpContextAccessor;
+    private readonly ILogger&lt;CorrelationIdHandler&gt; _logger;
+
+    public CorrelationIdHandler(IHttpContextAccessor httpContextAccessor, ILogger&lt;CorrelationIdHandler&gt; logger)
+    {
+        _httpContextAccessor = httpContextAccessor;
+        _logger = logger;
+    }
+
+    protected override async Task&lt;HttpResponseMessage&gt; SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var correlationId = _httpContextAccessor.HttpContext?.Request.Headers["X-Correlation-Id"].FirstOrDefault()
+                            ?? Guid.NewGuid().ToString();
+
+        request.Headers.TryAddWithoutValidation("X-Correlation-Id", correlationId);
+        _logger.LogInformation("Enviando request {Method} {Uri} con correlation {CorrelationId}",
+            request.Method, request.RequestUri, correlationId);
+
+        var response = await base.SendAsync(request, cancellationToken);
+        return response;
+    }
+}</code></pre>
+        <p>Typed client:</p>
+        <pre><code>public interface IJsonPlaceholderClient
+{
+    Task&lt;List&lt;UserDto&gt;&gt; GetUsersAsync(CancellationToken cancellationToken = default);
+}
+
+public class JsonPlaceholderClient : IJsonPlaceholderClient
+{
+    private readonly HttpClient _client;
+
+    public JsonPlaceholderClient(HttpClient client)
+    {
+        _client = client;
+    }
+
+    public async Task&lt;List&lt;UserDto&gt;&gt; GetUsersAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await _client.GetFromJsonAsync&lt;List&lt;UserDto&gt;&gt;("users", cancellationToken);
+        return response ?? new List&lt;UserDto&gt;();
+    }
+}
+
+public record UserDto(int Id, string Name, string Email);</code></pre>
+        <p>Registro en DI:</p>
+        <pre><code>builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddTransient&lt;CorrelationIdHandler&gt;();
+
+builder.Services.AddHttpClient&lt;IJsonPlaceholderClient, JsonPlaceholderClient&gt;(client =>
+{
+    client.BaseAddress = new Uri("https://jsonplaceholder.typicode.com/");
+    client.DefaultRequestHeaders.Add("Accept", "application/json");
+})
+.AddHttpMessageHandler&lt;CorrelationIdHandler&gt;()
+.AddPolicyHandler(GetRetryPolicy())
+.SetHandlerLifetime(TimeSpan.FromMinutes(5));
+
+static IAsyncPolicy&lt;HttpResponseMessage&gt; GetRetryPolicy()
+{
+    return HttpPolicyExtensions
+        .HandleTransientHttpError()
+        .WaitAndRetryAsync(3, retryAttempt =>
+            TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
+}</code></pre>
+        <p>Con este patrón el código de negocio no sabe nada de HTTP ni resiliencia; todo se configura declarativamente en DI.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li>Nunca uses <code>new HttpClient()</code> en código de producción.</li>
+          <li>Configura <code>SetHandlerLifetime</code> para refrescar DNS (2-5 minutos es habitual).</li>
+          <li>Prefiere typed clients para encapsular APIs externas.</li>
+          <li>Usa <code>DelegatingHandler</code> para cross-cutting concerns: headers, logging, auth, resiliencia.</li>
+          <li>Configura timeouts razonables; nunca dejes el valor por defecto de 100 segundos.</li>
+          <li>Para resiliencia, usa <code>PolicyHttpMessageHandler</code> de Polly.</li>
+          <li>Evita <code>using var client = factory.CreateClient(...)</code>; el factory gestiona la vida útil.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>6.1. HttpClient estático</h3>
+        <pre><code>// ❌ MAL: no refresca DNS y puede agotar conexiones si cambia la configuración
+public static readonly HttpClient Client = new HttpClient();</code></pre>
+        <p>Correcto:</p>
+        <pre><code>// ✅ BIEN: la factory gestiona ciclos de vida y pooling
+public class MyService
+{
+    private readonly IHttpClientFactory _factory;
+    public MyService(IHttpClientFactory factory) => _factory = factory;
+}</code></pre>
+
+        <h3>6.2. Descartar el cliente con using</h3>
+        <pre><code>// ❌ MAL: descartar el cliente no libera el handler correctamente
+using var client = _factory.CreateClient("api");
+var response = await client.GetAsync("...");</code></pre>
+        <p>Correcto:</p>
+        <pre><code>// ✅ BIEN: el cliente es de corta vida pero no necesita dispose explícito
+var client = _factory.CreateClient("api");
+var response = await client.GetAsync("...");</code></pre>
+
+        <h3>6.3. No configurar timeout ni lifetime</h3>
+        <pre><code>// ❌ MAL: configuración por defecto puede causar requests colgados
+builder.Services.AddHttpClient("api", client =>
+{
+    client.BaseAddress = new Uri("https://api.example.com");
+});</code></pre>
+        <p>Correcto:</p>
+        <pre><code>// ✅ BIEN: timeout y handler lifetime configurados
+builder.Services.AddHttpClient("api", client =>
+{
+    client.BaseAddress = new Uri("https://api.example.com");
+    client.Timeout = TimeSpan.FromSeconds(10);
+})
+.SetHandlerLifetime(TimeSpan.FromMinutes(5));</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Crea un <code>DelegatingHandler</code> que añada automáticamente un header de autorización <code>Bearer</code> obtenido de un <code>ITokenProvider</code> inyectado. Regístralo en un typed client.</p>
+        <p>Solución:</p>
+        <pre><code>public class AuthHandler : DelegatingHandler
+{
+    private readonly ITokenProvider _tokenProvider;
+
+    public AuthHandler(ITokenProvider tokenProvider) => _tokenProvider = tokenProvider;
+
+    protected override async Task&lt;HttpResponseMessage&gt; SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var token = await _tokenProvider.GetTokenAsync(cancellationToken);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        return await base.SendAsync(request, cancellationToken);
+    }
+}
+
+// Registro
+builder.Services.AddTransient&lt;AuthHandler&gt;();
+builder.Services.AddHttpClient&lt;IApiClient, ApiClient&gt;(client =>
+{
+    client.BaseAddress = new Uri("https://api.example.com");
+})
+.AddHttpMessageHandler&lt;AuthHandler&gt;();</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un <code>DelegatingHandler</code> que registre en un <code>ILogger</code> el tiempo total de cada request (tiempo entre la salida y la llegada de la respuesta). Incluye método, URI, status code y duración. Regístralo globalmente para todos los clientes de la factory.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li><code>IHttpClientFactory</code> resuelve socket exhaustion y DNS stale.</li>
+          <li>Los clientes son de corta duración; los handlers se reciclan y renuevan.</li>
+          <li>Existen named clients, typed clients y factory directa.</li>
+          <li>Los typed clients encapsulan la API externa y mejoran la testabilidad.</li>
+          <li>Los <code>DelegatingHandler</code> añaden cross-cutting concerns de forma declarativa.</li>
+          <li>Polly se integra fácilmente con <code>PolicyHttpMessageHandler</code>.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <dl>
+          <dt>¿Puedo usar HttpClient en un using dentro de un método?</dt>
+          <dd>Sí, pero si lo creas con <code>new HttpClient()</code> causarás problemas de sockets. Si lo creas con <code>IHttpClientFactory</code>, no es necesario ni recomendable usar <code>using</code>.</dd>
+          <dt>¿Cuánto debe durar SetHandlerLifetime?</dt>
+          <dd>Depende de tu entorno. Entre 2 y 5 minutos es habitual. Si tus endpoints cambian de IP frecuentemente, reduce el valor. Si las conexiones son estables y costosas de establecer, aumenta el valor.</dd>
+          <dt>¿Es HttpClient thread-safe?</dt>
+          <dd>Sí, <code>HttpClient</code> es thread-safe para enviar requests, pero no para modificar sus headers durante el uso. Si necesitas headers dinámicos, usa un handler.</dd>
+          <dt>¿Puedo usar HttpClientFactory en un BackgroundService?</dt>
+          <dd>Sí, inyecta <code>IHttpClientFactory</code> en el constructor del <code>BackgroundService</code> y crea clientes dentro del método de trabajo.</dd>
+          <dt>¿Qué paquete necesito para Polly?</dt>
+          <dd><code>Microsoft.Extensions.Http.Polly</code> integra Polly con <code>IHttpClientFactory</code>.</dd>
+        </dl>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

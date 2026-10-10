@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-volumes-y-bind-mounts">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Volúmenes, bind mounts y tmpfs — Módulo 3 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Volúmenes, bind mounts y tmpfs</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Datos y redes Docker</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has creado contenedores que corren procesos y sirven peticiones. Pero hay un problema que tarde o temprano te muerde: <strong>si un contenedor es destruido, su sistema de archivos desaparece con él</strong>. El famoso <code>docker rm -f</code>, un reinicio con <code>--rm</code>, o un simple <code>docker compose down</code> pueden borrar datos que jamás podrás recuperar.</p>
+        <p>Esta lección resuelve esa pregunta: <strong>¿dónde guardo los datos si el contenedor es efímero?</strong> Verás las tres respuestas que ofrece Docker — <strong>volúmenes</strong>, <strong>bind mounts</strong> y <strong>tmpfs</strong> — cuándo usar cada una, por qué los volúmenes son la opción recomendada para datos de producción, y cómo se gestionan los permisos (uid/gid) al montar rutas del host.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque sin persistencia, mongodb/postgres/redis dentro de un contenedor son inútiles: cada vez que escalees o redepliegues perderías todo. Y porque un error muy típico en Windows/WSL (montar <code>/mnt/c</code>) convierte un bind mount rápido en algo frustrantemente lento. Entender los tres mecanismos te ahorra horas de misterios.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué los contenedores no guardan datos</h3>
+        <p>Recuerda la anatomía de una imagen (Módulo 1): la imagen es una pila de <strong>capas de solo lectura</strong>. Cuando lanzas un contenedor, Docker añade encima una <strong>capa de escritura</strong> (writable layer) usando copy-on-write. Todo lo que escribe el proceso — archivos, logs, una base de datos — va a esa capa.</p>
+        <pre><code class="diagram">            CONTENEDOR (proceso aislado)
+┌─────────────────────────────────────────┐
+│  Capa de escritura (copy-on-write)      │ ← EFÍMERA: se borra con el contenedor
+│                                         │   (docker rm, --rm, compose down…)
+├─────────────────────────────────────────┤
+│  Capa 3 de la imagen (solo lectura)     │ ┐
+│  Capa 2 de la imagen (solo lectura)     │ ├─ INMUTABLES y compartidas
+│  Capa 1 de la imagen (solo lectura)     │ ┘   entre todos los contenedores
+└─────────────────────────────────────────┘
+</code></pre>
+        <p>La capa de escritura vive <strong>dentro de la vida del contenedor</strong>. Al eliminarlo, Docker descarta también esa capa. Es exactamente como escribir con un rotulador borrable en una pizarra que se limpia al salir de clase. Por eso, si la aplicación genera datos que deben sobrevivir (registros de usuario, pedidos, archivos subidos), hay que <strong>sacarlos fuera del sistema de archivos del contenedor</strong>: a un volumen, a una ruta del host, o mantenerlos solo en memoria.</p>
+
+        <h3>Los tres mecanismos de almacenamiento</h3>
+        <p>Docker cuatros caminos para exponer datos a un contenedor. Tres son <em>montajes</em> (del inglés <em>mounts</em>): el contenedor ve un directorio como propio, pero el contenido vive <strong>en otro sitio</strong>.</p>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Dónde vive el dato</th><th>Ciclo de vida</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Volumen</strong> (<code>docker volume</code>)</td><td>Gestionado por Docker en su área privada (<code>/var/lib/docker/volumes/…</code>)</td><td>Sobrevive a los contenedores; se borra solo con <code>docker volume rm</code></td><td>Datos de bases de datos, datos que deben persistir (recomendado)</td></tr>
+            <tr><td><strong>Bind mount</strong></td><td>Una ruta cualquiera del host (tu disco: <code>/home/tu/…</code>, <code>C:\…</code> o <code>/mnt/c/…</code>)</td><td>Sobrevive a Docker por completo (es tu archivo)</td><td>Desarrollo: ver tu código sin reconstruir la imagen</td></tr>
+            <tr><td><strong>tmpfs</strong></td><td>Memoria RAM del host</td><td>Vive exactamente lo que el contenedor</td><td>Secretos temporales o cachés que nunca se deben escribir a disco</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> la capa de escritura es el <em>cuaderno de apuntes</em> que tiras al final del curso. Un <strong>volume</strong> es un <em>armario de archivos</em> que Docker guarda por ti en su trastero: siempre en el mismo sitio, fácil de mover entre contenedores. Un <strong>bind mount</strong> es prestar tu <em>disco duro externo personal</em>: tú decides exactamente qué carpeta comparte el contenedor, y el contenido existe aunque Docker no exista. El <strong>tmpfs</strong> es escribir en una <em>pizarra</em>: rapidísimo, pero al apagar las luces, se fue todo.</p>
+        </div>
+
+        <h3>Volúmenes: los protagonistas</h3>
+        <p>Un <strong>volumen</strong> es un directorio que Docker crea y gestiona fuera del ciclo de vida de cualquier contenedor. Sus ventajas frente al bind mount: no depende de la estructura de tu disco (Docker elige la ruta), se respalda/migra de forma trivial con <code>docker volume</code>, funciona igual en cualquier sistema y es la única opción recomendada por Docker para datos de producción. Los volúmenes pueden ser <strong>anónimos</strong> (Docker les asigna un nombre aleatorio) o <strong>con nombre</strong> — estos últimos son los que debes usar.</p>
+        <p>Se montan con el flag <code>-v</code> (forma corta) o <code>--mount</code> (forma larga, más explícita):</p>
+        <pre><code class="language-bash"># Forma corta (-v):  nombre_del_volumen : ruta_dentro_del_contenedor
+docker run -d --name web-datos -v mis-datos:/usr/share/nginx/html nginx
+
+# Forma larga (--mount): igual pero con claves explícitas y en JSON
+docker run -d --name web-datos --mount type=volume,source=mis-datos,target=/usr/share/nginx/html nginx
+</code></pre>
+
+        <h3>Bind mounts: tu disco, tus reglas</h3>
+        <p>Un <strong>bind mount</strong> monta una ruta existente del host directamente en el contenedor. Es la herramienta estrella en desarrollo: editas el código en tu editor, y el contenedor ve el cambio al instante sin reconstruir la imagen.</p>
+        <pre><code class="language-bash"># Linux / macOS: ruta absoluta primero, después la ruta en el contenedor
+docker run -v /home/usuario/proyectos/harbortasks/api:/app -p 3000:3000 node:22
+
+# Windows nativo (PowerShell): C:\ruta\a\api:/app  ← con la unidad C:
+docker run -v C:\Users\tu\proyectos\api:/app -p 3000:3000 node:22
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>⚠️ En WSL2, tu proyecto debe vivir en el filesystem de Linux (~/…), nunca en /mnt/c.</strong> Montar <code>/mnt/c/...</code> como bind mount funciona técnicamente, pero cada acceso cruza la frontera 9P entre Windows y WSL: es un orden de magnitud más lento. Peor todavía: los permisos <code>uid/gid</code> se traducen mal, lo que rompe bases de datos que cambian propietarios de archivos. Repite conmigo: <em>el proyecto vive en <code>~/.../harbortasks</code>, y <code>/mnt/c</code> solo para copiar archivos puntuales.</em></p>
+        </div>
+
+        <h3>tmpfs: datos en RAM</h3>
+        <p>El <strong>tmpfs</strong> monta un directorio <strong>en la memoria RAM del host</strong>: lo más rápido posible y, por diseño, imposible de persistir. Es perfecto para cosas que no deben tocar el disco ni sobrevivir: ficheros de lock, tokens temporales o cachés intra-proceso.</p>
+        <pre><code class="language-bash"># tmpfs en /tmp (solo existe mientras el contenedor viva)
+docker run --rm --tmpfs /tmp:rw,size=64m alpine sh -c "echo hola > /tmp/x.txt &amp;&amp; cat /tmp/x.txt"
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Regla de oro:</strong> ¿Datos que deben sobrevivir? <strong>Volumen</strong>. ¿Código fuente en desarrollo? <strong>Bind mount</strong> (fuera de <code>/mnt/c</code> en WSL). ¿Cosas temporales sensibles? <strong>tmpfs</strong>. Y si no sabes cuál elegir, la respuesta por defecto es <em>volumen con nombre</em>.</p>
+        </div>
+
+        <h3>Permisos: el problema del uid/gid</h3>
+        <p>Dentro de un contenedor no hay cuentas de usuario de tu host: los procesos corren con un <strong>uid</strong> (usuario) y <strong>gid</strong> (grupo) numéricos. Cuando montas un bind mount, los archivos del host tienen los permisos de tu usuario real (uid 1000 típicamente), pero el proceso del contenedor puede correr como root (uid 0) o como otro uid. Si el proceso escribe y su uid no coincide, encontrarás <code>Permission denied</code> o archivos que no puedes tocar desde el host.</p>
+        <p>La imagen oficial de <code>postgres</code>, por ejemplo, corre como <code>postgres</code> (uid 999). Si montas un bind mount de tu <code>~/harbortasks/data</code>, Postgres intentará escribir con uid 999 en una carpeta tuya. La solución limpia es preasignar el dueño: <code>mkdir -p data &amp;&amp; sudo chown -R 999:999 data</code>. Con volúmenes, Docker asigna los permisos de la propia imagen automáticamente — otra razón más para preferirlos.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La forma más corta de ver un volumen en acción: crearlo, usarlo y comprobar que sobrevive a los contenedores.</p>
+        <pre><code class="language-bash"># 1) Crear un volumen con nombre
+docker volume create demo-datos
+
+# 2) Verlo en la lista (status Driver=local, gestión por el motor Docker)
+docker volume ls
+
+# 3) Montarlo en un contenedor y escribir un archivo en él
+docker run --rm -v demo-datos:/datos alpine sh -c "echo 'datos que sobreviven' > /datos/hola.txt &amp;&amp; cat /datos/hola.txt"
+
+# 4) Montarlo de nuevo en OTRO contenedor: el archivo sigue ahí
+docker run --rm -v demo-datos:/datos alpine sh -c "cat /datos/hola.txt"
+
+# 5) Inspeccionar el volumen: dónde guarda Docker los datos reales
+docker volume inspect demo-datos
+
+# 6) Al terminar, limpiar (borrar un volumen con contenedores lo impide: primero los contenedores)
+docker volume rm demo-datos
+</code></pre>
+        <p>Desglose: <code>-v demo-datos:/datos</code> significa "monta el volumen <code>demo-datos</code> en la ruta <code>/datos</code> del contenedor". Como el volumen no muere con el contenedor y ni siquiera depende de cuál contenedor lo usa, el paso 4 demuestra la persistencia real. El flag <code>--rm</code> borra el contenedor al salir… pero el volumen, y su contenido, permanecen hasta que hagas <code>docker volume rm</code>.</p>
+        <div class="callout callout--note">
+          <p><strong>Nota:</strong> en el Resumen de la lección tienes la tabla con <code>docker volume create / ls / inspect / rm</code> y sus variantes. Los volúmenes anónimos (<code>-v /ruta</code> sin nombre) existen, pero tienes que rastrearlos con <code>docker volume ls -f dangling=true</code>; dales siempre nombre.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En HarborTasks hay tres piezas, y cada una usa el mecanismo apropiado. La base de datos (<code>postgres</code>) necesita un <strong>volumen con nombre</strong> en su ruta de datos; la <strong>API en desarrollo</strong> se lanza con un <strong>bind mount</strong> de tu carpeta del código para no reconstruir la imagen en cada cambio.</p>
+        <pre><code class="language-bash"># --- PostgreSQL: volumen con nombre para los datos ---
+# /var/lib/postgresql/data es donde la imagen oficial escribe el cluster
+docker run -d --name harborpostgres \
+  -e POSTGRES_PASSWORD=secretito \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 5432:5432 \
+  postgres:16-alpine
+
+# --- API (Node) en desarrollo: bind mount del código en el host ---
+# editas api/server.js en tu editor y el contenedor ya ve el cambio
+docker run -d --name harborapi \
+  -v "$(pwd)/api":/app \
+  -w /app \
+  -e PG_HOST=host.docker.internal \
+  -p 3000:3000 \
+  node:22-alpine node server.js
+
+# Comprobar que el volumen existe y dónde vive físicamente
+docker volume ls | grep pgdata      # filtra el volumen de harborpostgres
+docker volume inspect harborpostgres
+</code></pre>
+        <p>Decisiones tomadas: los datos de Postgres van a <strong>volumen</strong> porque deben sobrevivir a cualquier ciclo de vida del contenedor (reinicios, <code>rm</code>, cambios de imagen). El código de la API va a <strong>bind mount</strong> porque es exactamente lo contrario: queremos ver cambios instantáneos mientras desarrollamos. Y fíjate: nunca montas el código de producción como bind mount, ni los datos de una DB como bind mount de una carpeta cualquiera sin controlar el uid (recuerda el uid 999 de postgres).</p>
+        <div class="callout callout--warning">
+          <p><strong>⚠️ En Windows nativo (PowerShell)</strong>, <code>$(pwd)</code> no existe en bash; usa <code>"${PWD}/api"</code> o escribe la ruta completa con la unidad: <code>-v "C:\Users\tu\proyectos\harbortasks\api:/app"</code>. Pero recuerda la regla del curso: <strong>desarrolla dentro de WSL2</strong>, donde <code>$(pwd)</code> y los permisos Linux funcionan de forma nativa.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usa <strong>volúmenes con nombre</strong> para datos de bases de datos y estado</td><td>Montar la carpeta de datos de una DB como bind mount a <code>/mnt/c</code> o a un directorio sin control de uid</td><td>El volumen gestiona permisos y ubicación; los bind mounts mal controlados rompen con uid/gid y son lentísimos en WSL</td></tr>
+            <tr><td>Usa <strong>bind mounts solo en desarrollo</strong> para código fuente</td><td>En producción, copiar el código en la imagen en vez de montarlo</td><td>En producción no quieres que el host controle la app: la imagen debe ser autónoma, inmutable y reproducible</td></tr>
+            <tr><td>Comprueba la persistencia tras <code>docker rm</code> y pequeños cortes</td><td>Confiar en que "el contenedor sigue ahí y no se tocará"</td><td>Los contenedores se reemplazan continuamente (deploys, restaurars, CI). El volumen es la única garantía</td></tr>
+            <tr><td>Mantén tu código del proyecto en <code>~</code> de WSL2, lejos de <code>/mnt/c</code></td><td>Bind mounts a rutas <code>/mnt/c/...</code> que cruzan la frontera Windows↔Linux</td><td>Casos de I/O de un orden de magnitud más lentos y permisos inconsistentes</td></tr>
+            <tr><td>Prefiere <code>--mount</code> cuando la precisión importa</td><td>Mezclar <code>-v</code> y <code>--mount</code> sin saber su sintaxis</td><td><code>-v</code> se "adivina" el tipo; <code>--mount</code> obliga a declararlo (<code>type=volume|bind|tmpfs</code>)</td></tr>
+            <tr><td>Usa <strong>tmpfs</strong> para tokens y ficheros temporales sensibles</td><td>Escribir secretos temporales a un volumen</td><td>La RAM desaparece con el contenedor: si el proceso muere, no queda huella en disco</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Creer que el contenedor "guarda" sus datos</h3>
+        <pre><code class="language-bash"># ❌ Escribir en la capa de escritura y esperar que persista
+docker run --rm alpine sh -c "echo 'tarea' > /tareas.txt"
+# ... el contenedor se borra con --rm y /tareas.txt desaparece para siempre
+
+# ✅ Escribir en un volumen montado: el dato sobrevive al contenedor
+docker volume create tareas-datos
+docker run --rm -v tareas-datos:/data alpine sh -c "echo 'tarea' > /data/tareas.txt"
+docker run --rm -v tareas-datos:/data alpine cat /data/tareas.txt   # → tarea
+</code></pre>
+
+        <h3>Confundir sintaxis de bind mount en Windows</h3>
+        <pre><code class="language-bash"># ❌ En PowerShell no puedes usar $(pwd) de bash
+docker run -v $(pwd):/app node:22-alpine
+
+# ✅ PowerShell: ${PWD} o la ruta completa con la unidad
+docker run -v "${PWD}:/app" node:22-alpine
+docker run -v "C:\Users\tu\proyectos\api:/app" node:22-alpine
+</code></pre>
+
+        <h3>Montar el código en WSL desde /mnt/c (lento y con permisos rotos)</h3>
+        <pre><code class="language-bash"># ❌ Trabajar sobre /mnt/c: cada lectura cruza la frontera Windows↔WSL
+cd /mnt/c/Users/tu/proyectos/harbortasks
+docker run -v "$(pwd):/app" node:22-alpine ...
+
+# ✅ Trabajar dentro del filesystem ext4 de WSL (~), con permisos Linux sanos
+cd ~/proyectos/harbortasks
+docker run -v "$(pwd):/app" node:22-alpine ...
+</code></pre>
+
+        <h3>Peor aún: mezclar ambos flag sin saber qué hacen</h3>
+        <pre><code class="language-bash"># ❌ Un nombre sin barra busca "volumen", una ruta con barra hace "bind mount"
+docker run -v pgdata:/var/lib/postgresql/data ...   # volumen llamado pgdata ✅
+
+# ❌ La misma intención mal escrita: ruta absoluta del host que no existe
+docker run -v /pgdata:/var/lib/postgresql/data ...  # bind mount del host /pgdata ❌
+
+# ✅ --mount no deja lugar a dudas
+docker run --mount type=volume,source=pgdata,target=/var/lib/postgresql/data ...
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> demostrar con tus propias manos que un volumen sobrevive a la destrucción del contenedor, y que un bind mount refleja cambios del host.</p>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea el volumen para las tareas: <pre><code class="language-bash">docker volume create ejercicio-tareas</code></pre></li>
+          <li><strong>Paso 2:</strong> Lanza un contenedor con <code>--rm</code> que escriba una tarea en el volumen (el <code>--rm</code> garantiza que el contenedor se autodestruirá):
+            <pre><code class="language-bash">docker run --rm -v ejercicio-tareas:/data alpine sh -c "echo 'comprar leche' > /data/tareas.txt"</code></pre>
+          </li>
+          <li><strong>Paso 3:</strong> Verifica con <code>docker volume ls</code> que el volumen sigue listado aunque el contenedor ya no exista.</li>
+          <li><strong>Paso 4:</strong> Vuelve a leer el archivo desde un contenedor nuevo y comprueba que la tarea sigue ahí:
+            <pre><code class="language-bash">docker run --rm -v ejercicio-tareas:/data alpine cat /data/tareas.txt
+# Salida esperada: comprar leche</code></pre>
+          </li>
+          <li><strong>Paso 5 (bind mount):</strong> crea una carpeta temporal en el host y monta un archivo que crees desde el host, dentro del contenedor:
+            <pre><code class="language-bash">mkdir -p /tmp/ejercicio
+echo "desde el host" > /tmp/ejercicio/nota.txt
+docker run --rm -v /tmp/ejercicio:/mnt alpine cat /mnt/nota.txt
+# Salida esperada: desde el host</code></pre>
+          </li>
+          <li><strong>Paso 6 — verificación final:</strong> cambia el contenido desde el host y compruébalo dentro del contenedor SIN reconstruir nada:
+            <pre><code class="language-bash">echo "modificado" > /tmp/ejercicio/nota.txt
+docker run --rm -v /tmp/ejercicio:/mnt alpine cat /mnt/nota.txt
+# Salida esperada: modificado  → prueba de que el bind mount es en vivo</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Permisos de bind mount con Postgres</h3>
+          <p>Monta un <strong>bind mount</strong> de una carpeta nueva <code>~/harbortasks/pg-bind</code> en <code>/var/lib/postgresql/data</code> de una imagen <code>postgres:16-alpine</code>. Verás que Postgres no arranca o falla al escribir: descubre por qué (¿qué uid usa el proceso <code>postgres</code> en la imagen?) y arregla los permisos de la carpeta para que el contenedor funcione. Luego comprueba que puedes leer/borrar los archivos desde tu usuario del host.</p>
+          <p><em>Pista: <code>docker run --rm -v ~/harbortasks/pg-bind:/var/lib/postgresql/data ...</code> fallará por dueño. Investiga cómo consultar el uid del usuario dentro de la imagen (<code>docker run --rm postgres:16-alpine id postgres</code>) y ajusta con <code>chown</code>. En WSL2 no olvides el aviso de la teoría: nada de <code>/mnt/c</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La <strong>capa de escritura</strong> del contenedor es efímera: <code>docker rm</code> la borra con todo su contenido.</li>
+          <li>Un <strong>volumen con nombre</strong> es el lugar recomendado para datos que deben persistir (sobre todo bases de datos).</li>
+          <li>Un <strong>bind mount</strong> monta una ruta de tu host: ideal para desarrollo en vivo, no para datos con permisos complejos.</li>
+          <li>El <strong>tmpfs</strong> vive en RAM: datos temporales que no deben llegar jamás al disco.</li>
+          <li>Los <strong>permisos uid/gid</strong> explican la mayoría de <code>Permission denied</code>: el proceso del contenedor corre con un uid distinto al tuyo.</li>
+          <li>En <strong>WSL2</strong>, los bind mounts a <code>/mnt/c</code> son lentos y rompen permisos: desarrolla en <code>~</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker volume create nombre</code></td><td>Crea un volumen con nombre gestionado por Docker</td></tr>
+            <tr><td><code>docker volume ls</code></td><td>Lista los volúmenes del sistema</td></tr>
+            <tr><td><code>docker volume inspect nombre</code></td><td>Muestra detalles (ruta física, drivers, contenedores que lo usan)</td></tr>
+            <tr><td><code>docker volume rm nombre</code></td><td>Borra un volumen (falla si está en uso por un contenedor)</td></tr>
+            <tr><td><code>docker run -v nombre:/ruta/en/contenedor …</code></td><td>Monta un volumen (o bind mount) en el contenedor (forma corta)</td></tr>
+            <tr><td><code>docker run --mount type=volume,source=x,target=/r …</code></td><td>Montaje explícito con <code>--mount</code> (forma larga)</td></tr>
+            <tr><td><code>docker run --tmpfs /tmp:rw,size=64m …</code></td><td>Monta un tmpfs en RAM con límite de tamaño</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo uso <code>-v</code> y cuándo <code>--mount</code>?</summary>
+            <div>
+              <p><code>-v</code> es la forma corta y cómoda; <code>--mount</code> es la forma explícita: hay que declarar el tipo (<code>type=volume|bind|tmpfs</code>), el origen y el destino. Son equivalentes en la mayoría de casos. Usa <code>--mount</code> cuando la claridad importe (scripts compartidos, documentación), y <code>-v</code> para comandos rápidos en la terminal.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde guarda Docker los volúmenes físicamente?</summary>
+            <div>
+              <p>En el área del daemon, normalmente <code>/var/lib/docker/volumes/&lt;nombre&gt;/_data</code> en Linux, y dentro de la VM de Docker Desktop en macOS/Windows (no accesible directamente a tu filesystem). Por eso no debes tocar esa ruta a mano: gestiona volúmenes con los comandos <code>docker volume</code>. <code>docker volume inspect</code> te dice el <code>Mountpoint</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo copiar un archivo del host a un volumen sin entrar al contenedor?</summary>
+            <div>
+              <p>Sí, de dos maneras: con <code>docker cp archivo contenedor:/ruta</code> (copia al contenedor, que está montando el volumen) o montando el volumen en un contenedor de utilidades: <code>docker run --rm -v mivol:/dest busybox cp /origen /dest/</code>. La segunda forma funciona incluso con el contenedor original parado, porque el volumen es independiente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un volumen consume espacio aunque no lo use ningún contenedor?</summary>
+            <div>
+              <p>Sí: el volumen existe y ocupa disco hasta que lo <code>docker volume rm</code>. Por eso los volúmenes anónimos huérfanos (de <code>docker compose</code> o de contenedores borrados sin <code>-v</code>) se acumulan. Límpialos con <code>docker volume prune</code> cuando estés seguro de que sus datos no importan. Revisa antes con <code>docker volume ls -f dangling=true</code>.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

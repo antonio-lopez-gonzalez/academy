@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es" data-module="11" data-lesson="04-refresh-tokens">
+<head>
+  <meta charset="UTF-8">
+  <title>Refresh Tokens: rotation y revocación — Módulo 11 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Refresh Tokens: rotation y revocación</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 11 · Autenticación y autorización</span><span>35 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>Un <strong>access token</strong> de corta duración es seguro pero incómodo: si expira cada 15 minutos, el usuario tendría que iniciar sesión constantemente. Los <strong>refresh tokens</strong> resuelven este problema: permiten obtener un nuevo access token sin volver a pedir la contraseña.</p>
+        <p>En esta lección aprenderemos la estrategia de <strong>rotation</strong> (cada refresh token se usa una sola vez), la <strong>revocación</strong> y cómo almacenar refresh tokens de forma segura.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelve?</h4>
+          <p>Mantener sesiones largas sin aumentar el riesgo de un access token comprometido. El access token es corto; el refresh token es largo y puede invalidarse en el servidor.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Usar un único refresh token largo sin rotation ni expiración.</li>
+          <li>Almacenar refresh tokens en localStorage del navegador.</li>
+          <li>No revocar tokens en logout o cambio de contraseña.</li>
+          <li>Generar refresh tokens predecibles (por ejemplo, GUIDs sin hash).</li>
+          <li>Permitir múltiples refresh tokens por usuario sin límite.</li>
+          <li>Ignorar la detección de reutilización de refresh tokens robados.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>Access token vs refresh token</h3>
+        <table>
+          <thead>
+            <tr><th>Característica</th><th>Access token</th><th>Refresh token</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Duración</td><td>Corta (minutos)</td><td>Larga (días/semanas)</td></tr>
+            <tr><td>Uso</td><td>Acceder a recursos</td><td>Obtener nuevos access tokens</td></tr>
+            <tr><td>Formato</td><td>JWT autocontenido</td><td>Opaco (string aleatorio largo)</td></tr>
+            <tr><td>Revocación</td><td>Imposible hasta expirar</td><td>Posible en servidor</td></tr>
+            <tr><td>Almacenamiento</td><td>Cliente</td><td>Cliente + servidor</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Rotation</h3>
+        <p>Cada vez que se usa un refresh token, se genera un nuevo par de tokens y el refresh token anterior se invalida. Esto reduce el impacto de un token robado: si un atacante lo usa, el usuario legítimo notará que su token ya no funciona.</p>
+
+        <h3>Revocación</h3>
+        <p>El servidor debe poder invalidar refresh tokens en eventos como:</p>
+        <ul>
+          <li>Logout del usuario.</li>
+          <li>Cambio de contraseña.</li>
+          <li>Detección de uso sospechoso.</li>
+          <li>Revocación administrativa.</li>
+        </ul>
+
+        <h3>Detección de reutilización</h3>
+        <p>La estrategia más robusta guarda el refresh token actual en la base de datos. Si llega un refresh token que no coincide con el actual, se asume que fue robado y se revocan todos los tokens de la sesión.</p>
+
+        <h3>Almacenamiento en cliente</h3>
+        <ul>
+          <li><strong>HttpOnly cookie</strong>: protegida contra XSS, accesible solo por el servidor.</li>
+          <li><strong>Secure cookie</strong>: solo se envía por HTTPS.</li>
+          <li><strong>SameSite</strong>: mitiga CSRF en ciertos escenarios.</li>
+          <li><strong>localStorage</strong>: no usar para refresh tokens; es vulnerable a XSS.</li>
+        </ul>
+
+        <div class="callout callout--warning">
+          <h4>Refresh tokens opacos</h4>
+          <p>Los refresh tokens no deben ser JWTs. Deben ser strings largos y aleatorios almacenados en la base de datos. Así puedes revocarlos y detectar reutilización.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Simularemos el flujo de login, refresh y logout con un servicio en memoria.</p>
+        <pre><code class="language-bash"># Crear proyecto de consola
+dotnet new console -n RefreshTokensDemo -o RefreshTokensDemo
+cd RefreshTokensDemo
+# No necesitamos paquetes externos; usamos solo BCL.
+dotnet run</code></pre>
+
+        <pre><code class="language-csharp">using System.Security.Cryptography;
+
+// ----------------------------------------------------------------
+// MODELOS
+// ----------------------------------------------------------------
+public sealed record UserSession(Guid UserId, string Email, string[] Roles);
+public sealed class RefreshToken
+{
+    public required string Token { get; init; }
+    public required Guid UserId { get; init; }
+    public required DateTime ExpiresAt { get; init; }
+    public required bool IsRevoked { get; set; }
+    public required string? ReplacedBy { get; set; }
+}
+
+// ----------------------------------------------------------------
+// SERVICIO EN MEMORIA
+// ----------------------------------------------------------------
+public sealed class RefreshTokenService
+{
+    private readonly List<RefreshToken> _tokens = new();
+    private readonly TimeProvider _timeProvider;
+
+    public RefreshTokenService(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider;
+    }
+
+    public RefreshToken Create(UserSession session)
+    {
+        var token = new RefreshToken
+        {
+            Token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64)),
+            UserId = session.UserId,
+            ExpiresAt = _timeProvider.GetUtcNow().AddDays(7).DateTime,
+            IsRevoked = false,
+            ReplacedBy = null
+        };
+
+        _tokens.Add(token);
+        return token;
+    }
+
+    public RefreshToken Rotate(string oldToken, UserSession session)
+    {
+        var stored = _tokens.FirstOrDefault(t => t.Token == oldToken);
+        if (stored is null || stored.IsRevoked || stored.ExpiresAt < _timeProvider.GetUtcNow())
+        {
+            throw new InvalidOperationException("Refresh token inválido.");
+        }
+
+        // Detectar reutilización: si el token usado ya fue reemplazado, revocamos toda la sesión.
+        if (stored.ReplacedBy is not null)
+        {
+            RevokeAllUserTokens(stored.UserId);
+            throw new InvalidOperationException("Posible robo de token. Sesión revocada.");
+        }
+
+        var newToken = Create(session);
+        stored.IsRevoked = true;
+        stored.ReplacedBy = newToken.Token;
+        return newToken;
+    }
+
+    public void Revoke(string token)
+    {
+        var stored = _tokens.FirstOrDefault(t => t.Token == token);
+        if (stored is not null)
+        {
+            stored.IsRevoked = true;
+        }
+    }
+
+    public void RevokeAllUserTokens(Guid userId)
+    {
+        foreach (var token in _tokens.Where(t => t.UserId == userId))
+        {
+            token.IsRevoked = true;
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// USO
+// ----------------------------------------------------------------
+var service = new RefreshTokenService(TimeProvider.System);
+var session = new UserSession(Guid.NewGuid(), "ana@example.com", ["Author"]);
+
+var refreshToken = service.Create(session);
+Console.WriteLine($"Refresh token creado: {refreshToken.Token[..20]}...");
+
+var newToken = service.Rotate(refreshToken.Token, session);
+Console.WriteLine($"Nuevo refresh token: {newToken.Token[..20]}...");
+
+// Reutilizar el antiguo debería fallar.
+try
+{
+    service.Rotate(refreshToken.Token, session);
+}
+catch (InvalidOperationException ex)
+{
+    Console.WriteLine($"Error esperado: {ex.Message}");
+}</code></pre>
+
+        <div class="callout callout--tip">
+          <h4>Cryptographically secure</h4>
+          <p><code>RandomNumberGenerator.GetBytes</code> genera bytes criptográficamente seguros. Nunca uses <code>Guid.NewGuid().ToString()</code> como refresh token.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En una API real, el refresh token se guarda en PostgreSQL, se envía al cliente como HttpOnly cookie y se valida en el endpoint <code>/auth/refresh</code>.</p>
+
+        <pre><code class="language-csharp">// RefreshToken.cs (entidad EF Core)
+public sealed class RefreshToken
+{
+    public required Guid Id { get; init; }
+    public required string TokenHash { get; init; } // SHA-256 del token para búsqueda rápida.
+    public required Guid UserId { get; init; }
+    public required DateTime ExpiresAt { get; init; }
+    public bool IsRevoked { get; set; }
+    public string? ReplacedByTokenHash { get; set; }
+    public DateTime CreatedAt { get; init; }
+}
+
+// IRefreshTokenRepository.cs
+public interface IRefreshTokenRepository
+{
+    Task<RefreshToken?> GetByTokenHashAsync(string tokenHash, CancellationToken ct);
+    Task AddAsync(RefreshToken token, CancellationToken ct);
+    Task UpdateAsync(RefreshToken token, CancellationToken ct);
+    Task RevokeAllForUserAsync(Guid userId, CancellationToken ct);
+}
+
+// IJwtService.cs
+public interface IJwtService
+{
+    string GenerateAccessToken(User user);
+    string GenerateRefreshToken();
+}
+
+// AuthService.cs
+public sealed class AuthService(
+    IUserRepository userRepository,
+    IRefreshTokenRepository refreshTokenRepository,
+    IJwtService jwtService,
+    IPasswordHasher<User> passwordHasher,
+    TimeProvider timeProvider) : IAuthService
+{
+    public async Task<AuthResult> LoginAsync(LoginRequest request, CancellationToken ct)
+    {
+        var user = await userRepository.GetByEmailAsync(request.Email, ct);
+        if (user is null)
+        {
+            return AuthResult.Failure("Credenciales inválidas.");
+        }
+
+        var result = passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+        if (result == PasswordVerificationResult.Failed)
+        {
+            return AuthResult.Failure("Credenciales inválidas.");
+        }
+
+        if (result == PasswordVerificationResult.SuccessRehashNeeded)
+        {
+            user.PasswordHash = passwordHasher.HashPassword(user, request.Password);
+        }
+
+        var accessToken = jwtService.GenerateAccessToken(user);
+        var refreshTokenValue = jwtService.GenerateRefreshToken();
+        var refreshToken = new RefreshToken
+        {
+            Id = Guid.NewGuid(),
+            TokenHash = HashToken(refreshTokenValue),
+            UserId = user.Id,
+            ExpiresAt = timeProvider.GetUtcNow().AddDays(7).DateTime,
+            CreatedAt = timeProvider.GetUtcNow().DateTime
+        };
+
+        await refreshTokenRepository.AddAsync(refreshToken, ct);
+        return AuthResult.Success(accessToken, refreshTokenValue);
+    }
+
+    public async Task<AuthResult> RefreshAsync(string refreshTokenValue, CancellationToken ct)
+    {
+        var tokenHash = HashToken(refreshTokenValue);
+        var token = await refreshTokenRepository.GetByTokenHashAsync(tokenHash, ct);
+
+        if (token is null || token.IsRevoked || token.ExpiresAt < timeProvider.GetUtcNow())
+        {
+            return AuthResult.Failure("Refresh token inválido.");
+        }
+
+        // Detección de reutilización.
+        if (token.ReplacedByTokenHash is not null)
+        {
+            await refreshTokenRepository.RevokeAllForUserAsync(token.UserId, ct);
+            return AuthResult.Failure("Sesión comprometida. Revocada.");
+        }
+
+        var user = await userRepository.GetByIdAsync(token.UserId, ct);
+        if (user is null)
+        {
+            return AuthResult.Failure("Usuario no encontrado.");
+        }
+
+        var newAccessToken = jwtService.GenerateAccessToken(user);
+        var newRefreshTokenValue = jwtService.GenerateRefreshToken();
+        var newRefreshToken = new RefreshToken
+        {
+            Id = Guid.NewGuid(),
+            TokenHash = HashToken(newRefreshTokenValue),
+            UserId = user.Id,
+            ExpiresAt = timeProvider.GetUtcNow().AddDays(7).DateTime,
+            CreatedAt = timeProvider.GetUtcNow().DateTime,
+            ReplacedByTokenHash = null
+        };
+
+        token.IsRevoked = true;
+        token.ReplacedByTokenHash = newRefreshToken.TokenHash;
+
+        await refreshTokenRepository.AddAsync(newRefreshToken, ct);
+        await refreshTokenRepository.UpdateAsync(token, ct);
+
+        return AuthResult.Success(newAccessToken, newRefreshTokenValue);
+    }
+
+    public async Task LogoutAsync(string refreshTokenValue, CancellationToken ct)
+    {
+        var token = await refreshTokenRepository.GetByTokenHashAsync(HashToken(refreshTokenValue), ct);
+        if (token is not null)
+        {
+            token.IsRevoked = true;
+            await refreshTokenRepository.UpdateAsync(token, ct);
+        }
+    }
+
+    private static string HashToken(string token)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+        return Convert.ToHexString(bytes);
+    }
+}</code></pre>
+
+        <p>Los endpoints de <code>/auth/login</code> y <code>/auth/refresh</code> reciben el servicio, generan tokens y devuelven el refresh token como cookie <code>HttpOnly</code>, <code>Secure</code> y <code>SameSite=Strict</code>.</p>
+
+        <div class="callout callout--warning">
+          <h4>Hash del refresh token</h4>
+          <p>Guarda el hash del refresh token en la base de datos, no el token en texto plano. Si la base de datos se filtra, el atacante no puede usar los tokens directamente.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Usa access tokens cortos</strong> (15 minutos) y refresh tokens largos (7 días).</li>
+          <li><strong>Implementa rotation</strong>: cada refresh genera un nuevo refresh token.</li>
+          <li><strong>Detecta reutilización</strong> de refresh tokens y revoca toda la sesión.</li>
+          <li><strong>Almacena refresh tokens como HttpOnly Secure cookies</strong>.</li>
+          <li><strong>Guarda el hash del refresh token</strong>, no el token original.</li>
+          <li><strong>Revoca tokens en logout, cambio de contraseña y comportamiento sospechoso</strong>.</li>
+          <li><strong>Usa <code>TimeProvider</code></strong> para que los tests controlen el tiempo.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Incorrecto: refresh token sin expiración</h3>
+        <pre><code class="language-csharp">// ❌ Mal: refresh token eterno.
+ExpiresAt = DateTime.MaxValue</code></pre>
+        <h3>Correcto: refresh token con expiración</h3>
+        <pre><code class="language-csharp">// ✅ Bien: expiración razonable.
+ExpiresAt = timeProvider.GetUtcNow().AddDays(7).DateTime</code></pre>
+
+        <h3>Incorrecto: refresh token en localStorage</h3>
+        <pre><code class="language-javascript">// ❌ Mal: vulnerable a XSS.
+localStorage.setItem("refreshToken", token);</code></pre>
+        <h3>Correcto: HttpOnly Secure cookie</h3>
+        <pre><code class="language-csharp">// ✅ Bien: cookie no accesible por JavaScript.
+context.Response.Cookies.Append("refreshToken", token, new CookieOptions
+{
+    HttpOnly = true,
+    Secure = true,
+    SameSite = SameSiteMode.Strict
+});</code></pre>
+
+        <h3>Incorrecto: permitir reutilización sin detección</h3>
+        <pre><code class="language-csharp">// ❌ Mal: el token antiguo sigue siendo válido.
+if (stored.IsRevoked) return Invalid;
+return CreateNewToken();</code></pre>
+        <h3>Correcto: rotation con detección</h3>
+        <pre><code class="language-csharp">// ✅ Bien: invalidar el antiguo y detectar si ya fue usado.
+if (stored.ReplacedByTokenHash is not null)
+{
+    RevokeAllUserTokens(stored.UserId);
+    return Compromised;
+}
+stored.IsRevoked = true;
+// emitir nuevo token...</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Implementa un flujo de login y refresh con un diccionario en memoria.</p>
+        <ol>
+          <li>Crea <code>dotnet new console -n RefreshExercise</code>.</li>
+          <li>Define un modelo <code>RefreshToken</code> con <code>Token</code>, <code>UserId</code>, <code>ExpiresAt</code>, <code>IsRevoked</code> y <code>ReplacedBy</code>.</li>
+          <li>Implementa <code>Create</code>, <code>Rotate</code> y <code>Revoke</code>.</li>
+          <li>Usa <code>RandomNumberGenerator.GetBytes(64)</code> para generar tokens.</li>
+          <li>Simula un login, un refresh y un logout.</li>
+          <li>Prueba a reutilizar el refresh token antiguo y verifica que la sesión se revoca.</li>
+        </ol>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Extiende el ejercicio para soportar múltiples dispositivos por usuario: cada dispositivo tiene su propia cadena de refresh tokens. Si un refresh token se reutiliza en un dispositivo, revoca solo esa cadena, no todos los dispositivos. ¿Cómo modelarías la base de datos? No lo resuelvas ahora; piénsalo primero.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El access token es corto y autocontenido; el refresh token es largo y opaco.</li>
+          <li>La rotation invalida el refresh token anterior al emitir uno nuevo.</li>
+          <li>La revocación permite cerrar sesiones y responder ante compromisos.</li>
+          <li>La detección de reutilización protege contra tokens robados.</li>
+          <li>Almacena refresh tokens como HttpOnly Secure cookies, guarda su hash en la base de datos y genera valores con <code>RandomNumberGenerator</code>.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Por qué no usar un JWT como refresh token?</summary>
+          <p>Porque no podrías revocarlo hasta que expire. Los refresh tokens opacos permiten invalidación inmediata y detección de reutilización.</p>
+        </details>
+        <details>
+          <summary>¿Cuánto debe durar un refresh token?</summary>
+          <p>Depende del riesgo. Entre 7 días y 30 días es común. Aplicaciones bancarias pueden usar duraciones más cortas y reautenticación frecuente.</p>
+        </details>
+        <details>
+          <summary>¿Qué hago si el refresh token expira?</summary>
+          <p>El usuario debe volver a iniciar sesión con usuario y contraseña. No extiendas automáticamente la expiración de refresh tokens sin justificación.</p>
+        </details>
+        <details>
+          <summary>¿Debo almacenar el refresh token o su hash?</summary>
+          <p>Hash. Si alguien accede a la base de datos, no podrá usar los tokens directamente. Aunque SHA-256 es rápido, el token ya es aleatorio y largo, por lo que el hash añade defensa en profundidad.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

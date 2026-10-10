@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="es" data-module="08" data-lesson="04-exception-handling">
+<head>
+  <meta charset="UTF-8">
+  <title>Global Exception Handling y Problem Details — Módulo 8 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Global Exception Handling y Problem Details</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 8 · ASP.NET Core Web API</span><span>30 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>Toda aplicación falla eventualmente. La diferencia entre una API amateur y una profesional está en <strong>cómo gestiona los errores</strong>: mensajes útiles para el cliente, logs detallados para el equipo y sin fugas de información sensible.</p>
+        <p>En esta lección veremos el manejo global de excepciones en .NET 8 con <code>IExceptionHandler</code>, <code>UseExceptionHandler</code> y <code>ProblemDetails</code> siguiendo el estándar RFC 9457.</p>
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelve?</h4>
+          <p>Evitar que cada endpoint necesite bloques <code>try/catch</code> repetidos. Centraliza la conversión de excepciones en respuestas HTTP consistentes y seguras.</p>
+        </div>
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Poner <code>try/catch</code> en cada controller y devolver mensajes inconsistentes.</li>
+          <li>Exponer stack traces al cliente en producción.</li>
+          <li>Devolver 500 sin más contexto, obligando al cliente a adivinar.</li>
+          <li>Registrar la excepción en el controller en lugar de en el middleware global.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>El pipeline de ASP.NET Core</h3>
+        <p>El middleware se ejecuta en orden. Cuando ocurre una excepción en un endpoint, el control viaja hacia atrás por el pipeline hasta encontrar un middleware que la capture. Si nadie la captura, ASP.NET Core devuelve un 500 genérico.</p>
+        <pre><code>Request → ExceptionHandler → Routing → Endpoint → ❗ Excepción
+                                     ↑___________________|
+</code></pre>
+        <h3><code>IExceptionHandler</code> (.NET 8)</h3>
+        <p>Es la forma moderna y extensible de manejar excepciones. Puedes registrar varios handlers y ASP.NET Core los ejecutará en orden hasta que uno indique que manejó la excepción.</p>
+        <ul>
+          <li>Implementa <code>IExceptionHandler</code>.</li>
+          <li>Regístralo con <code>builder.Services.AddExceptionHandler&lt;THandler&gt;()</code>.</li>
+          <li>Activa el middleware con <code>app.UseExceptionHandler()</code>.</li>
+          <li>Activa <code>ProblemDetails</code> con <code>builder.Services.AddProblemDetails()</code>.</li>
+        </ul>
+        <h3><code>ProblemDetails</code> y RFC 9457</h3>
+        <p><code>ProblemDetails</code> es un formato estándar para errores HTTP. Antes se conocía como RFC 7807; .NET 8 sigue RFC 9457. La respuesta incluye campos como <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code> y extensiones personalizadas.</p>
+        <div class="callout callout--tip">
+          <h4>Orden importa</h4>
+          <p>Registra <code>AddProblemDetails</code> y <code>AddExceptionHandler</code> en <code>Program.cs</code> y luego usa <code>app.UseExceptionHandler()</code> lo más temprano posible en el pipeline, antes de <code>UseRouting</code> y <code>MapControllers</code>.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <pre><code class="language-bash"># Crear proyecto y ejecutar
+dotnet new web -n ExceptionHandlingDemo -o ExceptionHandlingDemo
+cd ExceptionHandlingDemo
+dotnet run --project .
+# Probar: GET /api/error          → 500 mapeado a ProblemDetails
+#         GET /api/not-found      → 404 mapeado a ProblemDetails
+#         GET /api/validation     → 422 mapeado a ProblemDetails
+</code></pre>
+        <pre><code class="language-csharp">// Program.cs
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+var app = builder.Build();
+
+app.UseExceptionHandler();
+app.MapControllers();
+
+app.Run();
+
+// GlobalExceptionHandler.cs
+public class GlobalExceptionHandler : IExceptionHandler
+{
+    private readonly ILogger<GlobalExceptionHandler> _logger;
+
+    public GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logger)
+    {
+        _logger = logger;
+    }
+
+    public async ValueTask<bool> TryHandleAsync(
+        HttpContext httpContext,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        _logger.LogError(exception, "Excepción no controlada capturada");
+
+        var problemDetails = exception switch
+        {
+            NotFoundException nf => new ProblemDetails
+            {
+                Status = StatusCodes.Status404NotFound,
+                Title = "Recurso no encontrado",
+                Detail = nf.Message,
+                Instance = httpContext.Request.Path
+            },
+            ValidationException ve => new ValidationProblemDetails(ve.Errors)
+            {
+                Status = StatusCodes.Status422UnprocessableEntity,
+                Title = "Error de validación",
+                Instance = httpContext.Request.Path
+            },
+            _ => new ProblemDetails
+            {
+                Status = StatusCodes.Status500InternalServerError,
+                Title = "Error interno del servidor",
+                Detail = "Ocurrió un error inesperado. Contacta con soporte.",
+                Instance = httpContext.Request.Path
+            }
+        };
+
+        httpContext.Response.StatusCode = problemDetails.Status!.Value;
+        await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken);
+        return true;
+    }
+}
+
+// Excepciones personalizadas de dominio
+public class NotFoundException : Exception
+{
+    public NotFoundException(string message) : base(message) { }
+}
+
+public class ValidationException : Exception
+{
+    public IDictionary<string, string[]> Errors { get; }
+
+    public ValidationException(IDictionary<string, string[]> errors)
+        : base("La solicitud contiene errores de validación")
+    {
+        Errors = errors;
+    }
+}
+</code></pre>
+        <div class="callout callout--info">
+          <h4>Observa</h4>
+          <p>El handler devuelve <code>true</code> para indicar que manejó la excepción. Si devolviera <code>false</code>, ASP.NET Core pasaría al siguiente handler registrado.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En el CMS queremos que excepciones de dominio específicas se conviertan en respuestas HTTP adecuadas, mientras que errores inesperados se oculten al cliente pero se registren con detalle.</p>
+        <pre><code class="language-csharp">// Controllers/PostsController.cs
+[ApiController]
+[Route("api/v1/[controller]")]
+public class PostsController : ControllerBase
+{
+    private readonly IPostService _postService;
+
+    public PostsController(IPostService postService)
+    {
+        _postService = postService;
+    }
+
+    [HttpGet("{id:guid}")]
+    public async Task<IActionResult> GetById(Guid id, CancellationToken ct)
+    {
+        // Sin try/catch: el middleware global se encarga
+        var post = await _postService.GetByIdAsync(id, ct);
+        return Ok(post);
+    }
+}
+
+// Domain/Exceptions/DomainException.cs
+public abstract class DomainException : Exception
+{
+    protected DomainException(string message) : base(message) { }
+    public abstract int StatusCode { get; }
+}
+
+public class PostNotFoundException : DomainException
+{
+    public PostNotFoundException(Guid id) : base($"Post {id} no encontrado") { }
+    public override int StatusCode => StatusCodes.Status404NotFound;
+}
+
+public class DuplicateSlugException : DomainException
+{
+    public DuplicateSlugException(string slug) : base($"El slug '{slug}' ya existe") { }
+    public override int StatusCode => StatusCodes.Status409Conflict;
+}
+</code></pre>
+        <pre><code class="language-csharp">// Actualizamos el handler para DomainException
+public async ValueTask<bool> TryHandleAsync(
+    HttpContext httpContext,
+    Exception exception,
+    CancellationToken cancellationToken)
+{
+    if (exception is DomainException domainException)
+    {
+        var problemDetails = new ProblemDetails
+        {
+            Status = domainException.StatusCode,
+            Title = GetTitleForStatus(domainException.StatusCode),
+            Detail = domainException.Message,
+            Instance = httpContext.Request.Path
+        };
+
+        httpContext.Response.StatusCode = problemDetails.Status.Value;
+        await httpContext.Response.WriteAsJsonAsync(problemDetails, cancellationToken);
+        return true;
+    }
+
+    _logger.LogError(exception, "Excepción no controlada");
+
+    var fallback = new ProblemDetails
+    {
+        Status = StatusCodes.Status500InternalServerError,
+        Title = "Error interno del servidor",
+        Detail = "Ocurrió un error inesperado.",
+        Instance = httpContext.Request.Path
+    };
+
+    httpContext.Response.StatusCode = fallback.Status.Value;
+    await httpContext.Response.WriteAsJsonAsync(fallback, cancellationToken);
+    return true;
+}
+</code></pre>
+        <div class="callout callout--warning">
+          <h4>No expongas detalles internos</h4>
+          <p>En producción, nunca devuelvas stack traces, nombres de servidores o cadenas de conexión. Usa logs para el diagnóstico y <code>ProblemDetails</code> genéricos para el cliente.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Centraliza el manejo de excepciones</strong> en un <code>IExceptionHandler</code> o middleware.</li>
+          <li><strong>Usa excepciones de dominio específicas</strong> para casos conocidos (no encontrado, conflicto, validación).</li>
+          <li><strong>Devuelve <code>ProblemDetails</code></strong> siguiendo RFC 9457.</li>
+          <li><strong>Registra siempre la excepción</strong> con <code>ILogger</code> antes de responder.</li>
+          <li><strong>No devuelvas stack traces</strong> al cliente en producción.</li>
+          <li><strong>Usa <code>ValidationProblemDetails</code></strong> para errores de validación por campo.</li>
+          <li><strong>Prueba el handler</strong> con integration tests usando <code>WebApplicationFactory</code>.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Incorrecto: try/catch en cada controller</h3>
+        <pre><code class="language-csharp">// ❌ Mal: código repetido y respuestas inconsistentes
+[HttpGet("{id:guid}")]
+public async Task<IActionResult> GetById(Guid id)
+{
+    try
+    {
+        var post = await _service.GetByIdAsync(id);
+        return Ok(post);
+    }
+    catch (PostNotFoundException ex)
+    {
+        return NotFound(ex.Message);
+    }
+    catch (Exception ex)
+    {
+        return StatusCode(500, ex.Message);
+    }
+}
+</code></pre>
+        <h3>Correcto: dejar que el middleware global maneje</h3>
+        <pre><code class="language-csharp">// ✅ Bien: el controller solo orquesta, no maneja excepciones
+[HttpGet("{id:guid}")]
+public async Task<IActionResult> GetById(Guid id, CancellationToken ct)
+{
+    var post = await _service.GetByIdAsync(id, ct);
+    return Ok(post);
+}
+</code></pre>
+        <h3>Incorrecto: exponer ex.Message en 500</h3>
+        <pre><code class="language-csharp">// ❌ Mal: fugas de información sensible
+var problem = new ProblemDetails
+{
+    Status = 500,
+    Detail = exception.Message
+};
+</code></pre>
+        <h3>Correcto: mensaje genérico en 500</h3>
+        <pre><code class="language-csharp">// ✅ Bien: detalle genérico al cliente, detalle completo en logs
+var problem = new ProblemDetails
+{
+    Status = 500,
+    Title = "Error interno del servidor",
+    Detail = "Ocurrió un error inesperado."
+};
+_logger.LogError(exception, "Error interno: {Message}", exception.Message);
+</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Implementa un manejador global de excepciones en un proyecto nuevo.</p>
+        <ol>
+          <li>Crea <code>dotnet new web -n ErrorHandlingApi</code>.</li>
+          <li>Registra <code>AddProblemDetails</code> y <code>AddExceptionHandler&lt;GlobalExceptionHandler&gt;</code>.</li>
+          <li>Implementa <code>GlobalExceptionHandler</code> que mapee:
+            <ul>
+              <li><code>ArgumentException</code> → 400</li>
+              <li><code>KeyNotFoundException</code> → 404</li>
+              <li><code>InvalidOperationException</code> → 409</li>
+              <li>Otras → 500 con mensaje genérico</li>
+            </ul>
+          </li>
+          <li>Crea un controller que lance cada tipo de excepción.</li>
+          <li>Prueba que devuelva <code>ProblemDetails</code> correctamente.</li>
+        </ol>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Añade un segundo <code>IExceptionHandler</code> especializado en errores de validación de <code>FluentValidation</code>. Haz que convierta <code>ValidationException</code> en <code>ValidationProblemDetails</code> con los errores por campo. Asegúrate de que se ejecute antes que el handler genérico y que el handler genérico sea el último recurso.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El manejo global de excepciones evita <code>try/catch</code> repetidos y unifica las respuestas de error.</li>
+          <li><code>IExceptionHandler</code> es la forma moderna en .NET 8.</li>
+          <li><code>AddProblemDetails</code> habilita respuestas estándar RFC 9457.</li>
+          <li>Usa excepciones de dominio para casos conocidos y un handler genérico para lo inesperado.</li>
+          <li>Nunca expongas stack traces o información sensible al cliente.</li>
+          <li>Registra siempre el error completo en logs para diagnóstico interno.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Puedo tener varios <code>IExceptionHandler</code>?</summary>
+          <p>Sí. Se ejecutan en orden de registro. Un handler puede devolver <code>false</code> para delegar al siguiente. El último suele ser un handler genérico que siempre devuelve <code>true</code>.</p>
+        </details>
+        <details>
+          <summary>¿Qué diferencia hay entre <code>UseExceptionHandler</code> y <code>IExceptionHandler</code>?</summary>
+          <p><code>UseExceptionHandler</code> captura excepciones y reejecuta el request en un pipeline de error. <code>IExceptionHandler</code> es un servicio inyectado que decide qué respuesta devolver. En .NET 8 puedes combinar ambos.</p>
+        </details>
+        <details>
+          <summary>¿Qué es <code>ValidationProblemDetails</code>?</summary>
+          <p>Es una especialización de <code>ProblemDetails</code> que incluye un diccionario <code>errors</code> con los errores por campo. Es ideal para respuestas 400/422 de validación.</p>
+        </details>
+        <details>
+          <summary>¿Debo lanzar excepciones para flujo de negocio normal?</summary>
+          <p>Dependerá del patrón que elijas. <code>Result&lt;T&gt;</code> es mejor para flujo controlado. Las excepciones deben reservarse para casos excepcionales o errores que deben detener la operación.</p>
+        </details>
+        <details>
+          <summary>¿Cómo evito fugas de información en producción?</summary>
+          <p>No incluyas <code>exception.Message</code>, stack traces ni datos internos en <code>ProblemDetails</code>. Usa <code>ASPNETCORE_ENVIRONMENT</code> para mostrar más detalle solo en desarrollo si lo necesitas.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

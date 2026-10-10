@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-cache-aside">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cache-aside (look-aside) — Módulo 5 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Cache-aside (look-aside)</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Patrones de Caché</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El patrón de caché más común y más sano: <strong>cache-aside</strong> (o look-aside). La aplicación controla cuándo cachear, con qué TTL y cómo invalidar — sin esa «magia» que rompe la consistencia.</p>
+        <p>Es la base de «la API + Redis para tu servidor WebSocket» cuando quieres dar velocidad a datos que vienen de una fuente de verdad (perfiles, precios, config).</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El flujo</h3>
+        <pre><code class="language-text">GET datos
+   │
+   ├─► 1) ¿en caché?  GET cached:price:msft
+   │        HIT  → devolver
+   │        MISS
+   ▼
+  2) leer fuente de verdad (base de datos / API)      ← CARO
+  3) guardar en caché con TTL (SET EX)
+  4) devolver
+  (la próxima vez el HIT evita el paso 2)</code></pre>
+
+        <h3>Ventajas y desventajas</h3>
+        <table>
+          <thead><tr><th>Ventaja</th><th>Contra</th></tr></thead>
+          <tbody>
+            <tr><td>Fácil de razonar; la app controla todo</td><td>Riesgo de datos «algo viejos» durante el TTL</td></tr>
+            <tr><td>Escala lecturas sin tocar la fuente</td><td>MISS catastrófico si la fuente cae (stampede → M5-02)</td></tr>
+            <tr><td>Se añade a un sistema existente sin refactor big-bang</td><td>Requiere invalidación manual al escribir</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Reglas de oro</h3>
+        <ul>
+          <li><strong>TTL SIEMPRE:</strong> sin TTL, el dato viejísimo sobrevive y la caché crece.</li>
+          <li><strong>Invalidar o expirar:</strong> al escribir en la fuente, o borra la key (<code>DEL</code>) o dejas que TTL la caduque. Borrar de inmediato da la mejor frescura.</li>
+          <li><strong>Evict, no «update»:</strong> si actualizas la key con el nuevo valor, dos procesos a la vez pueden intercalar escrituras; el DEL (o un «muere pronto») es más simple y seguro.</li>
+          <li><strong>Idempotencia/miss handling:</strong> si la fuente falla, decide: sirve el dato viejo (stale-while-revalidate) o error.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis"># 1) intento de HIT
+GET cached:price:msft
+# 2) MISS → ir a la fuente → 3) guardar:
+SET cached:price:msft 415.25 EX 300
+# 4) invalidar al escribir la fuente:
+DEL cached:price:msft</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En .NET, un servicio cache-aside sobre StackExchange.Redis (el patrón <code>IDistributedCache</code> también lo usa por debajo):</p>
+        <pre><code class="language-csharp">public async Task&lt;Profile?&gt; GetProfileAsync(string userId)
+{
+    string key = $"cache:profile:{userId}";
+
+    // 1) HIT
+    var cached = await _db.StringGetAsync(key);
+    if (!cached.IsNull)
+        return JsonSerializer.Deserialize&lt;Profile&gt;(cached!);
+
+    // 2) MISS → fuente de verdad (aquí simulada)
+    var profile = await _repo.GetAsync(userId);
+    if (profile is null) return null;
+
+    // 3) guardar con TTL
+    await _db.StringSetAsync(key,
+        JsonSerializer.Serialize(profile),
+        TimeSpan.FromMinutes(5));
+
+    return profile;
+}
+
+public async Task InvalidateAsync(string userId)   // al escribir en la fuente
+{
+    await _db.KeyDeleteAsync($"cache:profile:{userId}");
+}</code></pre>
+        <p>Nota: en el hub, el «perfil de sesión» de un usuario es un buen candidato cache-aside, mientras que la presencia usa TTL-heartbeat (no cache-aside: es estado «vivo» que tú refrescas).</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>TTL razonable según frescura necesaria</td><td>TTL infinito</td><td>Un dato eterno es un bug latente</td></tr>
+            <tr><td>Invalidar con DEL al escribir</td><td>Actualizar la key «a mano»</td><td>El DEL es seguro y simple; el update lleva condiciones</td></tr>
+            <tr><td>TTL con jitter en claves masivas</td><td>Todas con el mismo TTL</td><td>Evita la «estampada» de expiración masiva (M5-02)</td></tr>
+            <tr><td>Manejar el MISS cuando la fuente falla</td><td>Cachear errores o «nil» sin sentido</td><td>Evita colapsos y resultados envenenados</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Cachear la ausencia del dato</h3>
+        <pre><code class="language-csharp">// ❌ Si la fuente devuelve null y le pones TTL "para no volver a preguntar",
+//    guardas "null" y ya no te enteras cuando exista.
+await _db.StringSetAsync(key, value ?? emptySentinel, ttlFar);
+// ✅ No cachees null; o usa un TTL corto y un marcador explícito "absent".</code></pre>
+
+        <h3>Invalidar con DEL solo en «algunas» escrituras</h3>
+        <p>Si solo algunos writes invalidan, te quedan cachés zombies. Invalida en TODAS las rutas que cambian el dato (o reduce el TTL).</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Emula cache-aside en redis-cli: «MISS» → lee fake → SET EX 120.</li>
+          <li><strong>Paso 2:</strong> Repite el GET y observa el HIT.</li>
+          <li><strong>Paso 3:</strong> Invalida con DEL y verifica el MISS.</li>
+          <li><strong>Paso 4:</strong> En tu hub, elige UN dato que cache-asides (p. ej. perfil) y escribe el par Get/Invalidate en C#.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Frescura explícita</h3>
+          <p>Define para tu hub una política: qué dato tolera 5 min de staleness (config, catálogo), qué dato solo 5 s (precio), y qué dato es «vivo» y NO se cachea (presencia). Justifica cada elección con un escenario de tu producto.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Cache-aside: HIT→devuelve; MISS→lee fuente→guarda con TTL.</li>
+          <li>Invalidación con DEL al escribir; TTL siempre; cuidar «cachear null».</li>
+          <li>El hub: perfiles/config cache-aside; presencia viva por TTL no cache-aside.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cache-aside equivale a IDistributedCache?</summary>
+            <div><p>No del todo: IDistributedCache te da Get/Set con TTL (una infra); tú implementas el «mira caché, luego fuente» (el cache-aside) encima, o usas librerías como OpenCaching/LazyCache que lo automatizan.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si quiero que entre varios nodos la caché sea coherente?</summary>
+            <div><p>La invalidación con DEL/Aviso es por Redis (todos ven la misma key); si necesitas «avisar» a otros cachés locales, publica en un canal (M3-01) y que cada nodo borre.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

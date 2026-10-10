@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-pubsub">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pub/Sub: SUBSCRIBE/PUBLISH y el backplane — Módulo 3 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Pub/Sub: SUBSCRIBE/PUBLISH y el backplane del hub</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Pub/Sub y Streams</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <strong>pub/sub</strong> es el mecanismo push de Redis: un proceso <em>publica</em> en un canal y todos los procesos <em>suscritos</em> a ese canal reciben el mensaje al instante. Sin polling, sin cola intermedia.</p>
+        <p>Es la pieza que convierte tu hub en <strong>distribuido</strong>: cuando el nodo A recibe un broadcast, lo publica y el nodo B lo reenvía a sus clientes. Aquí verás el mecanismo exacto.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El flujo</h3>
+        <pre><code class="language-text">PUBLISH  hub:events {"type":"trade",...}
+   │
+   ├────────────────────────►  Subscriptor A (nodo-1)    → reenvía a sus sockets
+   └────────────────────────►  Subscriptor B (nodo-2)    → reenvía a los suyos
+   (los que no están suscritos NO reciben nada; el mensaje NO se guarda)</code></pre>
+
+        <h3>Comandos</h3>
+        <pre><code class="language-redis">SUBSCRIBE hub:events            # suscribirse (quedarte en modo listener)
+UNSUBSCRIBE hub:events
+PSUBSCRIBE hub:*                # patrón (múltiples canales)
+PUNSUBSCRIBE hub:*
+PUBLISH hub:events '{"type":"trade"}'
+PUBSUB CHANNELS                 # canales activos
+PUBSUB NUMSUB hub:events        # nº de subscriptores del canal</code></pre>
+
+        <h3>Características (y límites) que debes conocer</h3>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Implicación</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Fire-and-forget</strong></td><td>Si el mensaje llega a un canal sin suscriptores, se pierde. No hay persistencia</td></tr>
+            <tr><td><strong>No es una cola</strong></td><td>Todos los suscritores reciben el mensaje (broadcast), no compiten por él</td></tr>
+            <tr><td><strong>En memoria de la conexión</strong></td><td>La suscripción se pierde si la conexión a Redis se cae (re-suscribirse al reconectar)</td></tr>
+            <tr><td><strong>Bloqueante para esa conexión</strong></td><td>La conexión que usa SUBSCRIBE queda dedicada a recibir; no la reuses para comandos normales</td></tr>
+            <tr><td><strong>Latencia</strong></td><td>Muy baja (event-loop); sirve para backplanes de tiempo real</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--why">
+          <p><strong>¿Por qué para el hub?</strong> Necesitamos que «un mensaje llegue a todos los nodos» (broadcast), no que «uno solo lo consuma». El pub/sub modela exactamente eso. Para «que uno lo procese y confirme» usaríamos streams (M3-02).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-bash"># Terminal 1
+docker exec -it redis redis-cli
+SUBSCRIBE hub:events
+
+# Terminal 2
+docker exec -it redis redis-cli
+PUBLISH hub:events '{"type":"connect","id":887}'
+# → Terminal 1 imprime: message hub:events {"type":"connect","id":887}</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En .NET (StackExchange.Redis), el hub se suscribe una vez al arrancar y publica en cada evento:</p>
+        <pre><code class="language-csharp">// Al arrancar el nodo: suscribirse (ISubscriber) — nunca reutilizar esta
+// conexión para operaciones normales del IDatabase
+ISubscriber sub = mux.GetSubscriber();
+await sub.SubscribeAsync("hub:events", (channel, payload) =&gt;
+{
+    // Llega a TODOS los nodos; este nodo reenvía a sus sockets
+    var evt = JsonSerializer.Deserialize&lt;HubEvent&gt;(payload!);
+    if (evt?.Node == _nodeId) return;              // originó este nodo
+
+    var connection = _connections.FirstOrDefault(c =&gt; c.UserId == evt!.UserId);
+    if (connection is not null)
+        await connection.SendAsync(payload);
+});
+
+// Al hacer un broadcast
+await sub.PublishAsync("hub:events",
+    JsonSerializer.Serialize(new HubEvent("broadcast", payloadJson, _nodeId)));</code></pre>
+        <p>El filtro <code>evt.Node == _nodeId</code> evita reenvíos en bucle del mismo nodo.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Canal por dominio de evento (<code>hub:events</code>, <code>hub:presence</code>)</td><td>Un único canal con todo mezclado</td><td>Separar señales por canal evita sobrecargar suscriptores</td></tr>
+            <tr><td>Usar una conexión dedicada para subscriber</td><td>SUBSCRIBE sobre la misma conexión que hace GET/SET</td><td>La conexión de suscripción se bloquea en modo listener</td></tr>
+            <tr><td>Re-suscribirse tras reconexión (M6-04)</td><td>Asumir que la suscripción sobrevive a la caída</td><td>Al reconectar hay que volver a inscribir los canales</td></tr>
+            <tr><td>Mensaje pequeño y con campos de routing</td><td>Publicar el payload completo gigante</td><td>Va en memoria y a todos: publica señales + datos chicos o referencia</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Esperar que el mensaje «dure» para un cliente que no estaba</h3>
+        <pre><code class="language-redis"># ❌ Cliente se conecta DESPUÉS del publish → no recibe nada
+# ✅ Para «mensajes que no deben perderse» → streams (M3-02)</code></pre>
+
+        <h3>Reusar la conexión suscrita</h3>
+        <pre><code class="language-csharp">// ❌ Mismo ISubscriber + IDatabase sobre UNA sola conexión (bloqueo)
+// ✅ Conexión/es independientes; si solo tienes una, usa multiplexer
+//    y mantén la suscripción sin hacer llamadas normales en ese canal.</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Reproduce el ejemplo mínimo con dos terminales.</li>
+          <li><strong>Paso 2:</strong> Prueba PSUBSCRIBE con <code>hub:*</code> y publica en <code>hub:events</code> y <code>hub:presence</code>.</li>
+          <li><strong>Paso 3:</strong> Con <code>PUBSUB CHANNELS</code> verifica qué canales están activos.</li>
+          <li><strong>Paso 4:</strong> Publica SIN subscriptores y confirma que no queda nada guardado (no hay «cola»).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Desconexión limpia</h3>
+          <p>Cuando un nodo muere, sus suscripciones desaparecen con la conexión. Diseña el protocolo «disconnect» del hub: ¿qué publica el nodo moribundo (o su health-check) para que los demás limpien sus referencias? Pruébalo publicando <code>{"type":"node-down","node":"node-1"}</code> y procesando en tus suscriptores.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Pub/Sub = broadcast push en tiempo real (<code>SUBSCRIBE/PUBLISH/PSUBSCRIBE</code>).</li>
+          <li>Fire-and-forget: no persiste, no compite (todos reciben).</li>
+          <li>Conexión dedicada y re-suscripción al reconectar.</li>
+          <li>Es el backplane del hub; para «uno consume y confirma», streams.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué pasa si Redis se reinicia estando suscrito?</summary>
+            <div><p>La suscripción vive en la conexión; al reconectar, el cliente debe re-<code>SUBSCRIBE</code>. El código resiliente lo re-inscribe (lo aseguramos en M6-04).</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo suscribirme a miles de canales?</summary>
+            <div><p>Sí (patrones PSUBSCRIBE lo resuelven), pero vigila el volumen: cada mensaje de cada canal que te toca se procesa en tu proceso de suscriptor.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

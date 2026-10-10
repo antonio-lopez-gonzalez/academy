@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-resiliencia-y-monitorizacion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Resiliencia, reconexión y configuración — Módulo 6 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Resiliencia, reconexión y configuración</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · StackExchange.Redis en .NET</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Redis cae, las redes parpadean y tu hub debe seguir vivo. Esta lección junta la config del cliente (<code>ConfigurationOptions</code>), las respuestas a caídas (degradación), y cómo monitorizar a Redis + a tu cliente para reaccionar antes de que duela.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>ConfigurationOptions: el «bosque de botones»</h3>
+        <pre><code class="language-csharp">var opts = ConfigurationOptions.Parse(conn);
+opts.AbortOnConnectFail = false;        // no romper la app si Redis tarda
+opts.ConnectTimeout = 5000;             // ms de intento de conexión
+opts.SyncTimeout = 5000;                // timeout de comandos síncronos/async
+opts.AsyncTimeout = 5000;
+opts.ReconnectRetryPolicy = new ExponentialRetry(5000);  // backoff
+// (opcional) opts.CommandMap para restringir comandos; evítalo si no lo necesitas
+opts.EndPoints.Add("localhost:6379");
+</code></pre>
+        <p>Con <code>AbortOnConnectFail=false</code>, los comandos se encolan y esperan a la conexión (con timeout). Así la app arranca aunque Redis aún no esté.</p>
+
+        <h3>El modelo de conexión y reconexión</h3>
+        <ul>
+          <li>El multiplexer intenta (re)conectar en background; expone eventos <code>ConnectionRestored</code>/<code>ConnectionFailed</code>.</li>
+          <li>Al restaurarse, re-vínculas tus suscripciones (<code>SubscribeAsync</code>) y re-ejecutas lógica de «volver a la normalidad».</li>
+          <li>Tu aplicación, durante la caída: <strong>degradar, no fallar</strong>.</li>
+        </ul>
+
+        <h3>Degradación en el hub</h3>
+        <pre><code class="language-csharp">try
+{
+    await db.HashSetAsync(key, entries, TimeSpan.FromSeconds(30));
+}
+catch (RedisConnectionException)
+{
+    _logger.LogWarning("Redis caído: presencia en memoria (temporal)");
+    _localFallback[connectionId] = DateTimeOffset.UtcNow;   // modo local
+    // No publiques ni registres a nivel global hasta que vuelva.
+}
+</code></pre>
+
+        <h3>Monitorizar a Redis y a tu cliente</h3>
+        <pre><code class="language-csharp">// Estado del multiplexer
+bool connected = mux.IsConnected;
+var server = mux.GetServer("localhost:6379");
+var info = server.Info();
+long hits  = (long)info.First(x =&gt; x.Key == "keyspace_hits").Value;
+long misses= (long)info.First(x =&gt; x.Key == "keyspace_misses").Value;
+long clients = (long)info.First(x =&gt; x.Key == "connected_clients").Value;
+
+// PING de salud (puerto sano)
+TimeSpan ping = await mux.GetDatabase().PingAsync();</code></pre>
+        <p>Expón <code>/health</code> con estas métricas: verás las caídas antes de que los usuarios se quejen.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-csharp">var opts = ConfigurationOptions.Parse("localhost:6379");
+opts.AbortOnConnectFail = false;
+opts.ReconnectRetryPolicy = new ExponentialRetry(2000);
+
+var mux = ConnectionMultiplexer.Connect(opts);
+mux.ConnectionRestored += (_, _) =&gt; Console.WriteLine("Redis volvió");
+mux.ConnectionFailed += (_, e) =&gt;
+    Console.WriteLine($"Redis caído: {e.Exception?.Message}");
+</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Un health‑endpoint de tu API que combina ping + stats (y que tus alertas pueden leer):</p>
+        <pre><code class="language-csharp">app.MapGet("/health/redis", (IConnectionMultiplexer mux) =&gt;
+{
+    IDatabase db = mux.GetDatabase();
+    TimeSpan ping;
+    try { ping = db.PingAsync().GetAwaiter().GetResult(); }
+    catch (RedisConnectionException ex)
+    {
+        return Results.Json(new { ok = false, error = ex.Message }, statusCode: 503);
+    }
+
+    var info = mux.GetServer().Info();
+    long hits = Key(info, "keyspace_hits");
+    long misses = Key(info, "keyspace_misses");
+    return Results.Ok(new
+    {
+        ok = true,
+        pingMs = ping.TotalMilliseconds,
+        hitRatio = (hits + misses) == 0 ? null : Math.Round(hits / (double)(hits + misses), 3),
+        clients = Key(info, "connected_clients"),
+    });
+
+    static long Key(IDictionary&lt;string, string&gt; info, string k) =>
+        info.TryGetValue(k, out var v) ? long.Parse(v) : 0;
+});</code></pre>
+        <p>No es elegante bloquear con <code>GetAwaiter()</code> (mejor async), pero el patrón es claro: estado en JSON para healthchecks.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>AbortOnConnectFail=false + timeouts razonables</td><td>App que no arranca porque Redis tarda</td><td>Tu hub debe ser resiliente a la indisponibilidad de Redis</td></tr>
+            <tr><td>Degradar: modo local + reconectar y re-registrar</td><td>Propagar excepción sin fallback</td><td>Los usuarios siguen conectados aunque el backplane esté caído</td></tr>
+            <tr><td>Re-suscribirse a <code>ConnectionRestored</code></td><td>Asumir suscripciones eternas</td><td>Al reconectar, tu ISubscriber debe volver a inscribir canales</td></tr>
+            <tr><td>Health en /health/redis (ping + hitRatio)</td><td>Descubrir la caída por tickets</td><td>La telemetría te avisa antes</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Tirar la excepción y no degradar</h3>
+        <pre><code class="language-csharp">// ❌ El hub "no contesta" porque Redis falló y no atrapas
+// ✅ try/catch alrededor de operaciones de Redis → fallback local
+try { await db...; } catch (RedisException) { _localMode = true; }</code></pre>
+
+        <h3>Configurar SyncTimeout demasiado corto</h3>
+        <p>Un SyncTimeout pequeño causa «Redis Timeout» bajo picos; usa tiempos de red normales (5 s) y piensa en async.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Configura el multiplexer robusto (AbortOnConnectFail=false, backoff).</li>
+          <li><strong>Paso 2:</strong> Detén Redis y verifica: la app SEGUE andando (modo local) y el health marca 503.</li>
+          <li><strong>Paso 3:</strong> Vuelve a levantar Redis: ConnectionRestored dispara re-suscripción y re-registro.</li>
+          <li><strong>Paso 4:</strong> Anota en README cómo probarías la caída en tu CI/CD.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Diseño «caída de Redis»</h3>
+          <p>Redacta el plan de tu hub ante caída de Redis: qué pasa con la presencia, el broadcast (se pierde pub/sub), las escrituras encoladas y cómo se recupera al volver (re-registro + re-suscripción). Compáralo después con el proyecto final.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>ConfigurationOptions: AbortOnConnectFail=false, timeouts, retryPolicy.</li>
+          <li>Degrada con gracia (modo local) y re-registra al volver.</li>
+          <li>Re-suscribirse en ConnectionRestored.</li>
+          <li>Health: ping + hitRatio + clients.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿AbortOnConnectFail=false «oculta» errores?</summary>
+            <div><p>No: los comandos se encolan y acaban con timeout si Redis no vuelve. Es solo que la app no «se niega a arrancar» por un Redis lento.</p></div>
+          </details>
+          <details>
+            <summary>¿Necesito reiniciar la app si Redis vuelve?</summary>
+            <div><p>No para lo esencial; el multiplexer reconecta solo. Pero vuelve a suscribirte (ISubscriber) y a limpiar el «modo local» con eventos del multiplexer.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

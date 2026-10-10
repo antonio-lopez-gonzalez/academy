@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="es" data-module="14" data-lesson="03-redis-backplane">
+<head>
+  <meta charset="UTF-8">
+  <title>Escalar SignalR con Redis Backplane — Módulo 14 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Escalar SignalR con Redis Backplane</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 14 · Tiempo real</span><span>35 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>SignalR por defecto mantiene en memoria el mapa de conexiones y grupos. Esto funciona perfectamente con un solo servidor, pero en producción casi siempre tendrás múltiples instancias de tu API detrás de un balanceador de carga.</p>
+        <p>En esta lección aprenderemos qué es un <strong>backplane</strong>, por qué Redis es la opción estándar en .NET 8 y cómo configurar <code>AddStackExchangeRedis</code> para que los mensajes de SignalR se repliquen entre todos los servidores.</p>
+
+        <div class="callout callout--info">
+          <h4>¿Qué problema resuelve?</h4>
+          <p>Sin backplane, un cliente conectado al servidor A no recibe mensajes enviados desde el servidor B. El backplane actúa como una "radio común" a la que todos los servidores se suscriben y retransmiten.</p>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Desplegar SignalR a Kubernetes sin backplane y descubrir que los mensajes no llegan a todos los usuarios.</li>
+          <li>Usar Redis solo para cache y olvidar configurarlo también para SignalR.</li>
+          <li>Asumir que <code>Clients.All</code> funciona entre servidores sin backplane.</li>
+          <li>Compartir la misma conexión de Redis para cache y SignalR sin revisar límites de timeout.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>¿Qué es un backplane?</h3>
+        <p>En una arquitectura horizontalmente escalable, cada instancia de la aplicación conoce solo las conexiones que ella misma mantiene. El backplane es un componente central que recibe los mensajes de cada instancia y los propaga al resto. Así, cuando el servidor A llama a <code>Clients.Group("editores").SendAsync(...)</code>, el mensaje también llega a los clientes conectados al servidor B y C.</p>
+
+        <div class="diagram">┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Servidor A     │     │  Servidor B     │     │  Servidor C     │
+│  conexiones 1,2 │     │  conexiones 3,4 │     │  conexiones 5,6 │
+└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │   Redis Backplane        │
+                    │  pub/sub de mensajes     │
+                    └──────────────────────────┘</div>
+
+        <h3>Opciones de backplane en .NET</h3>
+        <table>
+          <thead><tr><th>Backplane</th><th>Paquete</th><th>Escenario</th><th>Observaciones</th></tr></thead>
+          <tbody>
+            <tr><td>Redis (StackExchange)</td><td><code>Microsoft.AspNetCore.SignalR.StackExchangeRedis</code></td><td>On-premise / nube</td><td>Estándar, rápido, requiere Redis</td></tr>
+            <tr><td>Azure SignalR Service</td><td>SDK propio</td><td>Azure</td><td>Escalado automático, sin backplane propio</td></tr>
+            <tr><td>En memoria</td><td>Por defecto</td><td>Desarrollo / 1 instancia</td><td>No escala</td></tr>
+            <tr><td>Custom</td><td><code>IBackplane</code> (extensible)</td><td>Casos especiales</td><td>Rara vez necesario</td></tr>
+          </tbody>
+        </table>
+
+        <h3>¿Cómo funciona internamente?</h3>
+        <p>SignalR usa el mecanismo de pub/sub de Redis. Cuando un servidor quiere enviar un mensaje a un grupo, publica el mensaje en un canal de Redis. Los demás servidores están suscritos a ese canal y reenvían el mensaje a sus conexiones locales. El backplane no procesa la lógica de negocio; solo replica los mensajes.</p>
+
+        <h3>Consideraciones de rendimiento</h3>
+        <ul>
+          <li>Redis añade latencia de red: el mensaje debe ir al Redis y volver. Suele ser sub-milisegundo en la misma región.</li>
+          <li>Si tienes muchos mensajes pequeños, considera <code>MessagePack</code> en lugar de JSON para reducir el tamaño.</li>
+          <li>La latencia del backplane no afecta al envío al cliente local; el servidor A sigue enviando a sus clientes inmediatamente.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <h4>¿Cuándo no necesito backplane?</h4>
+          <p>Si tu aplicación corre en una sola instancia (desarrollo, pruebas o una app pequeña con un solo pod), el backplane no es necesario. En producción con más de una instancia, es prácticamente obligatorio.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Añadimos Redis a un proyecto web con SignalR. Necesitamos un servidor Redis local; puedes levantarlo con Docker.</p>
+
+        <pre><code class="language-bash"># Levantamos Redis localmente con Docker
+docker run -d -p 6379:6379 --name redis-signalr redis:7-alpine
+
+# Creamos el proyecto y añadimos el backplane
+dotnet new web -n BackplaneDemo -o BackplaneDemo
+cd BackplaneDemo
+dotnet add package Microsoft.AspNetCore.SignalR.StackExchangeRedis --version 8.0.0
+dotnet run --project .</code></pre>
+
+        <div class="code-file">Program.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.SignalR;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSignalR()
+    .AddStackExchangeRedis("localhost:6379", options =>
+    {
+        // Nombre de instancia útil para ver en logs de Redis
+        options.Configuration.ChannelPrefix = "BackplaneDemo";
+    });
+
+var app = builder.Build();
+app.UseStaticFiles();
+app.MapHub<ChatHub>("/chatHub");
+app.Run();
+
+public sealed class ChatHub : Hub
+{
+    public async Task Broadcast(string message)
+    {
+        // Este mensaje se replicará a todos los servidores gracias a Redis
+        await Clients.All.SendAsync("ReceiveMessage", Context.ConnectionId, message);
+    }
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>SignalR usa Redis como intermediario. Si lanzas dos instancias en puertos distintos y un cliente se conecta a cada una, ambos recibirán el mensaje cuando uno de ellos invoque <code>Broadcast</code>.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>En producción no conectamos con una cadena hardcodeada. Leemos la configuración, configuramos reintentos y añadimos health checks para Redis. También registramos un servicio que envía mensajes desde fuera del hub.</p>
+
+        <div class="code-file">appsettings.json</div>
+        <pre><code class="language-json">{
+  "ConnectionStrings": {
+    "Redis": "localhost:6379,abortConnect=false,connectTimeout=5000"
+  }
+}</code></pre>
+
+        <div class="code-file">Program.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.SignalR;
+using StackExchange.Redis;
+
+var builder = WebApplication.CreateBuilder(args);
+
+var redisConnectionString = builder.Configuration
+    .GetConnectionString("Redis") ?? throw new InvalidOperationException("Redis connection string is missing.");
+
+builder.Services.AddHealthChecks()
+    .AddRedis(redisConnectionString, name: "redis-signalr");
+
+builder.Services.AddSignalR()
+    .AddStackExchangeRedis(redisConnectionString, options =>
+    {
+        // Prefijo para evitar colisiones con otras apps que usen el mismo Redis
+        options.Configuration.ChannelPrefix = "CmsRealtime";
+
+        // Puedes añadir configuración de reintentos si es necesario
+        options.Configuration.ConnectTimeout = 5000;
+        options.Configuration.SyncTimeout = 5000;
+    });
+
+// IHubContext permite enviar desde cualquier servicio inyectado
+builder.Services.AddSingleton<INotificationService, NotificationService>();
+
+var app = builder.Build();
+app.UseStaticFiles();
+app.MapHub<NotificationHub>("/hubs/notifications");
+app.MapHealthChecks("/health/ready");
+app.Run();
+
+public sealed class NotificationHub : Hub<INotificationClient>
+{
+    public async Task JoinProject(string projectId)
+    {
+        await Groups.AddToGroupAsync(Context.ConnectionId, projectId);
+    }
+
+    public async Task LeaveProject(string projectId)
+    {
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, projectId);
+    }
+}
+
+public interface INotificationClient
+{
+    Task ProjectUpdated(string projectId, string status);
+}
+
+public interface INotificationService
+{
+    Task NotifyProjectUpdatedAsync(string projectId, string status);
+}
+
+public sealed class NotificationService : INotificationService
+{
+    private readonly IHubContext<NotificationHub, INotificationClient> _hubContext;
+
+    public NotificationService(IHubContext<NotificationHub, INotificationClient> hubContext)
+    {
+        _hubContext = hubContext;
+    }
+
+    public async Task NotifyProjectUpdatedAsync(string projectId, string status)
+    {
+        await _hubContext.Clients.Group(projectId).ProjectUpdated(projectId, status);
+    }
+}</code></pre>
+
+        <div class="callout callout--warning">
+          <h4>Conexión compartida</h4>
+          <p>El paquete de SignalR crea su propia conexión multiplexada a Redis. Si usas <code>IDistributedCache</code> con el mismo Redis, no es necesario que compartas la conexión de SignalR; cada servicio gestiona la suya. Solo asegúrate de que el servidor Redis soporte el número de conexiones esperado.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Usa un <code>ChannelPrefix</code> por aplicación.</strong> Si varias apps comparten Redis, el prefijo evita que reciban mensajes ajenos.</li>
+          <li><strong>Configura timeouts razonables.</strong> Redis caído no debe bloquear indefinidamente los envíos de SignalR.</li>
+          <li><strong>Monitoriza la conexión.</strong> Añade un health check de Redis y alerta si el backplane está caído.</li>
+          <li><strong>Considera Azure SignalR Service.</strong> Si usas Azure, te evitas gestionar Redis y obtienes escalado automático.</li>
+          <li><strong>Usa MessagePack para payloads grandes.</strong> Reduce ancho de banda y latencia en el backplane.</li>
+          <li><strong>Prueba en multi-instancia localmente.</strong> Lanza dos puertos con <code>dotnet run --urls</code> y verifica que los mensajes cruzan.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <h4>Prueba local multi-instancia</h4>
+          <pre><code class="language-bash"># Terminal A
+dotnet run --project MiApi --urls "http://localhost:5001"
+
+# Terminal B
+dotnet run --project MiApi --urls "http://localhost:5002"
+
+# Conecta clientes a ambos puertos y verifica que Clients.All funciona</code></pre>
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Olvidar el backplane en producción</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">// Funciona en local con 1 instancia; falla en producción con 2+
+builder.Services.AddSignalR();</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">builder.Services.AddSignalR()
+    .AddStackExchangeRedis(redisConnectionString, options =>
+    {
+        options.Configuration.ChannelPrefix = "CmsRealtime";
+    });</code></pre>
+
+        <h3>6.2. Cadena de conexión hardcodeada</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">.AddStackExchangeRedis("localhost:6379")</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">.AddStackExchangeRedis(builder.Configuration.GetConnectionString("Redis")!)</code></pre>
+
+        <h3>6.3. Confundir backplane con persistencia</h3>
+        <p>El backplane replica mensajes entre servidores, pero no los almacena. Si un cliente se reconecta después de un corte, no recibirá los mensajes que perdió durante la desconexión. Para persistencia, usa una cola de mensajes o un servicio gestionado como Azure SignalR Service.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Despliega dos instancias de la misma API con Redis y comprueba que un mensaje enviado desde una instancia llega a un cliente conectado a la otra.</p>
+
+        <ol class="steps">
+          <li><strong>Levanta Redis:</strong> <code>docker run -d -p 6379:6379 redis:7-alpine</code></li>
+          <li><strong>Crea un proyecto web con SignalR + Redis</strong> como en el ejemplo mínimo.</li>
+          <li><strong>Lanza la instancia A</strong> en <code>http://localhost:5001</code>.</li>
+          <li><strong>Lanza la instancia B</strong> en <code>http://localhost:5002</code>.</li>
+          <li><strong>Conecta un cliente JS</strong> a la instancia A.</li>
+          <li><strong>Desde un cliente conectado a la instancia B</strong>, envía un mensaje con <code>Clients.All</code>.</li>
+          <li><strong>Verifica</strong> que el cliente conectado a la instancia A recibe el mensaje.</li>
+        </ol>
+
+        <div class="code-file">Comando para lanzar la instancia B</div>
+        <pre><code class="language-bash">dotnet run --project BackplaneDemo --urls "http://localhost:5002"</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Por qué es importante esta prueba?</h4>
+          <p>Es la prueba de fuego de un backplane. Si los mensajes no cruzan, tus usuarios verán notificaciones incompletas cuando el balanceador los mande a un servidor distinto.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <div class="challenge">
+          <h3>Reto: simular un fallo de Redis</h3>
+          <p>Configura la aplicación con reintentos y un fallback. Cuando Redis está caído, el servidor debe seguir funcionando para sus propios clientes (modo degradado) y loguear advertencias. ¿Qué estrategia usarías para que los mensajes no se pierdan completamente?</p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El backplane permite que varias instancias de SignalR compartan conexiones y grupos.</li>
+          <li>Redis es el backplane estándar en .NET 8 con <code>AddStackExchangeRedis</code>.</li>
+          <li>SignalR usa pub/sub de Redis para replicar mensajes entre servidores.</li>
+          <li>Configura <code>ChannelPrefix</code> para evitar colisiones entre aplicaciones.</li>
+          <li>El backplane no reemplaza la persistencia ni las colas de mensajes.</li>
+          <li>Azure SignalR Service es una alternativa gestionada sin necesidad de Redis.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito Redis si uso Azure SignalR Service?</summary>
+            <div>
+              <p>No. Azure SignalR Service actúa como backplane y gestiona las conexiones por ti. Es la opción recomendada si despliegas en Azure.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar Redis Sentinel o Cluster?</summary>
+            <div>
+              <p>Sí. StackExchange.Redis soporta configuraciones de alta disponibilidad. Pasa la cadena de conexión con los endpoints de Sentinel/Cluster y el cliente se encarga del failover.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El backplane afecta al rendimiento?</summary>
+            <div>
+              <p>Añade una pequeña latencia de red, pero es despreciable comparado con la latencia del cliente. Si tienes miles de mensajes por segundo, monitoriza el uso de CPU y red de Redis.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los grupos se sincronizan entre servidores?</summary>
+            <div>
+              <p>La pertenencia a un grupo se sincroniza mediante el backplane. Cuando un servidor añade una conexión a un grupo, el cambio se propaga para que los envíos a ese grupo funcionen en todos los servidores.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo tener un backplane por entorno?</summary>
+            <div>
+              <p>Sí, y deberías. Usa prefijos de canal distintos o instancias de Redis separadas para desarrollo, staging y producción.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

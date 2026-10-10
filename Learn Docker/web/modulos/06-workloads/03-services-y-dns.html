@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-services-y-dns">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Services: ClusterIP, NodePort y LoadBalancer — Módulo 6 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Services: ClusterIP, NodePort y LoadBalancer</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Workloads</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Los Pods son efímeros: nacen, mueren y se recrean en nodos distintos con <strong>IPs nuevas</strong>. Si tu aplicación guardara la IP de otro Pod para hablarle, al día siguiente estaría apuntando a una dirección fantasma. El <strong>Service</strong> es la abstracción que convierte ese caos en un <strong>nombre estable</strong>: una dirección VIP (IP virtual + nombre DNS) que siempre responde, sin importar cuántos Pods haya detrás.</p>
+        <p>En esta lección vas a descubrir por qué los Pods no son direcciones fiables, qué tipos de Service existen (<code>ClusterIP</code>, <code>NodePort</code>, <code>LoadBalancer</code>), cómo el <code>selector</code> y los <code>Endpoints</code> conectan el Service con sus Pods, cómo funciona el DNS interno de Kubernetes, y los comandos <code>kubectl expose</code> y <code>kubectl port-forward</code> para probar todo desde tu máquina.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque sin Services, tu clúster es una colección de máquinas que no pueden encontrarse. En los Módulos 7–9 cada pieza de HarborTasks (api, web, postgres) se comunicará exclusivamente por nombres de Service. Es el sistema circulatorio del clúster.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> apuntar directamente a IPs de Pod, selector con typos (resultado: cero Endpoints), confundir <code>port</code> con <code>targetPort</code>, esperar que <code>LoadBalancer</code> funcione en kind sin un controlador externo, y olvidar que el DNS corto solo funciona dentro del mismo namespace.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué los Pods no son direcciones estables</h3>
+        <p>Cada Pod recibe una IP del rango de la red del clúster (p. ej. <code>10.244.0.7</code>). Pero esa IP es <strong>prestada</strong>: cuando el ReplicaSet recrea un Pod (crash, nodo caído, rollout), el Pod nuevo nace con otra IP. Encima, el rollout de la lección 02 sustituye Pods nuevos por viejos constantemente. Si "algo" del clúster tuviera que recordar <em>qué IP atiende a la API</em>, estaría siempre desactualizado.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un Pod es un empleado que se muda cada semana y cambia de teléfono. El Service es la <em>centralita de la empresa</em>: tiene un número fijo de siempre y, cuando llamas, te conecta con el empleado que hoy está de guardia. No necesitas saber su móvil personal (su IP).</p>
+        </div>
+
+        <h3>Qué es un Service</h3>
+        <p>Un Service es un objeto Kubernetes que define:</p>
+        <ul>
+          <li><strong>Un nombre DNS estable</strong> y, según el tipo, una <strong>IP virtual (ClusterIP)</strong>.</li>
+          <li><strong>Un selector de labels</strong>: "a mí envíame a todos los Pods que tengan <code>app: api</code>".</li>
+          <li><strong>Un reparto de carga (load balancing)</strong>: cuando llega una petición, kube-proxy la reparte entre los Pods que cumplen el selector.</li>
+        </ul>
+        <p>El Service no es un proceso ni un proxy que viva "en algún sitio": es una <strong>regla de red</strong> que kube-proxy programa en cada nodo (con iptables o IPVS). Kubernetes mantiene la lista de Pods válidos del selector en un objeto llamado <code>Endpoints</code>: <code>kubectl get endpoints</code> te dice a qué IPs está apuntando hoy el Service.</p>
+
+        <h3>Tipos de Service</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Alcance</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>ClusterIP</code> (default)</td><td>Solo dentro del clúster; IP virtual con DNS</td><td>Comunicación entre Pods (api → postgres, web → api)</td></tr>
+            <tr><td><code>NodePort</code></td><td>Expone el Service en un puerto alto de CADA nodo (<code>nodePort</code>, 30000–32767)</td><td>Probar desde el host contra kind; puertas de emergencia sin LoadBalancer</td></tr>
+            <tr><td><code>LoadBalancer</code></td><td>Cada tipo anterior + un balanceador externo del proveedor cloud (EKS/AKS/GKE)</td><td>Exponer al mundo exterior en producción (o con MetalLB en local)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Portales:</strong> <code>port</code> es el puerto público del Service (por el que "llamas al nombre"), <code>targetPort</code> es el puerto del contenedor al que se reenvía (<code>containerPort</code> de la lección 01). El mismo debate <code>nickname → empleado real</code> de la analogía.</p>
+        </div>
+
+        <h3>DNS de clúster</h3>
+        <p>El addon <code>CoreDNS</code> corre como un Deployment de Pods y responde a nombres del clúster. El FQDN de un Service es:</p>
+        <pre><code class="language-text">&lt;nombre-service&gt;.&lt;namespace&gt;.svc.cluster.local</code></pre>
+        <p>Dentro de <strong>su propio namespace</strong> basta con el nombre corto (<code>postgres</code> en vez de <code>postgres.harbortasks.svc.cluster.local</code>). Es exactamente el mecanismo que usaba el <code>initContainer</code> de la lección 01 para esperar a Postgres por DNS.</p>
+
+        <h3>Diagrama de enrutado</h3>
+        <div class="diagram">   CLIENTE EXTERNO (tu navegador)
+             │  http://localhost:30080        (kind expone el NodePort)
+             ▼
+     NODO kind (nodo-control-plane 172.18.0.2)
+             │  kube-proxy: iptables →  *:30080
+             ▼
+   SERVICE "web"  (ClusterIP 10.96.x.y  ·  DNS: web.harbortasks.svc.cluster.local)
+             │  selector app=web  →  Endpoints (3 IPs de Pod)
+             ▼  round-robin entre los Pods
+   ┌─────────────┬─────────────┐
+   ▼             ▼             ▼
+ Pod web-1     Pod web-2     Pod web-3
+ 10.244.1.4    10.244.1.7    10.244.1.9
+   (nginx:80)   (nginx:80)   (nginx:80)</div>
+        <p>Si un Pod muere, su IP sale de <code>Endpoints</code> en segundos y las peticiones dejan de ir hacia ella. <strong>El nombre nunca cambia.</strong></p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Partimos del Pod <code>pod-nginx</code> de la lección 01 (con label <code>app: nginx-demo</code>). Lo exponemos y lo consumimos por nombre, sin saber nunca su IP:</p>
+        <pre><code class="language-bash"># 1. Exponer el Pod con un Service ClusterIP en el puerto 80.
+#    --port: puerto del SERVICE; --target-port: puerto del contenedor.
+kubectl expose pod pod-nginx --name=servicio-web --port=80 --target-port=80
+
+# 2. Ver el Service: CLUSTER-IP, puerto y "SELECTOR".
+kubectl get svc servicio-web -o wide
+
+# 3. Ver los Endpoints (las IPs reales detrás del nombre).
+kubectl get endpoints servicio-web
+
+# 4. Probar el nombre DESDE OTRO Pod del clúster (aquí, uno de prueba).
+kubectl run cliente --image=node:20-alpine --restart=Never \
+        --command -- sleep 3600
+kubectl exec -it cliente -- sh -c "wget -qO- http://servicio-web:80 | head -3"
+
+# 5. O con port-forward desde TU máquina (puente de desarrollo).
+kubectl port-forward svc/servicio-web 8080:80
+#    y en el navegador: http://localhost:8080  -> nginx en directo</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Dato clave:</strong> <code>kubectl port-forward</code> no es un Service: es un túnel de desarrollo que lleva un puerto local hasta un Pod o Service del clúster. Perfecto para depurar, pero para trafico real se usan <code>NodePort</code>/<code>LoadBalancer</code>/Ingress.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Los tres Services de <strong>HarborTasks</strong>: uno interno (<code>ClusterIP</code> para que la web hable con la API), uno de base de datos (también interno, con el DNS que ya usamos) y uno de acceso local (<code>NodePort</code> para probar la web desde tu navegador).</p>
+        <div class="code-file">service-api.yaml</div>
+        <pre><code class="language-yaml"># Service INTERNO para la API: solo los Pods del clúster lo usan.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: harbortasks
+  labels:
+    app: api
+spec:
+  # type ClusterIP es el default; lo declaramos para que se lea explícito.
+  type: ClusterIP
+  # selector: aquí está EL pegamento. Debe coincidir con las labels
+  # del template del Deployment (lección 02). Si no coincide: cero Endpoints.
+  selector:
+    app: api
+  # ports: traducción puerto-destino.
+  ports:
+    - port: 80           # como lo verán los demás Pods: http://api
+      targetPort: 3000   # puerto real del contenedor de la API
+      protocol: TCP</code></pre>
+        <div class="code-file">service-postgres.yaml</div>
+        <pre><code class="language-yaml"># Service de PostgreSQL: INTERNO, sin equilibrio de carga especial.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: harbortasks
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres        # el Deployment de postgres etiqueta sus Pods igual (Módulo 7/9)
+  ports:
+    - port: 5432
+      targetPort: 5432</code></pre>
+        <div class="code-file">service-web.yaml</div>
+        <pre><code class="language-yaml"># Service EXTERNO de prueba: NodePort abre un puerto alto en cada nodo.
+# En kind (nodo dentro de Docker), ese puerto se ve desde el host.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: harbortasks
+  labels:
+    app: web
+spec:
+  # NodePort = ClusterIP + puerto en todos los nodos (30000-32767).
+  type: NodePort
+  selector:
+    app: web
+  ports:
+    - port: 80           # puerto del Service (interno)
+      targetPort: 80     # puerto de nginx en el contenedor
+      # nodePort: lo elige Kubernetes del rango 30000-32767 si no lo fijamos.
+      # Puedes fijarlo (p. ej. 30080) pero ojo con colisiones entre Services.
+      nodePort: 30080</code></pre>
+        <p>Comandos de operación y prueba junto al Deployment de la lección 02:</p>
+        <pre><code class="language-bash"># Aplicar los tres Services.
+kubectl apply -f service-api.yaml -f service-postgres.yaml -f service-web.yaml
+
+# Ver estado y Endpoints (aquí se "comprueba" que el selector funcionó).
+kubectl get svc,ep -n harbortasks
+
+# Desde tu host (kind expone el NodePort): la web responde.
+curl http://127.0.0.1:30080
+
+# Desde un Pod cualquiera: la API RESPONDE POR NOMBRE CORTO, sin IPs.
+kubectl exec -it cliente -n default -- sh -c \
+  "wget -qO- http://api.harbortasks.svc.cluster.local/tasks | head -1"
+
+# Puerto para desarrollo contra la API sin tocar nada de red.
+kubectl port-forward -n harbortasks svc/api 4000:80
+#   -> http://localhost:4000/tasks actúa contra el Service como si fuera local.</code></pre>
+        <div class="callout callout--note">
+          <p><strong>¿Por qué NodePort y no LoadBalancer en kind?</strong> kind no tiene balanceador de nube. <code>LoadBalancer</code> quedaría <code>Pending</code> sin un controlador como MetalLB. NodePort es la puerta determinista y sin dependencias para probar en local; <code>LoadBalancer</code> y <code>Ingress</code> llegan en el Módulo 7.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Conecta tus Pods SIEMPRE por nombre de Service</td>
+              <td>Guardar IPs de Pod en configuraciones</td>
+              <td>Las IPs son prestadas y rotan; el nombre DNS es estable mientras el Service exista</td>
+            </tr>
+            <tr>
+              <td>Nombra el Service por la pieza lógica (<code>api</code>, <code>postgres</code>)</td>
+              <td>Nombres opacos (<code>svc-7x9wx</code>)</td>
+              <td>El nombre ES la URL para los demás componentes: <code>http://api</code> se lee solo</td>
+            </tr>
+            <tr>
+              <td>Verifica <code>kubectl get endpoints</code> tras aplicar un Service</td>
+              <td>Aplicar y asumir que funciona</td>
+              <td>Un selector con un typo produce CERO Endpoints y un Service que "funca" pero no responde</td>
+            </tr>
+            <tr>
+              <td>Usa <code>ClusterIP</code> por defecto; expón solo lo necesario</td>
+              <td>Hacer <code>NodePort</code>/<code>LoadBalancer</code> para todo</td>
+              <td>Cada puerto externo es superficie de ataque y complejidad; mínimo privilegio de red</td>
+            </tr>
+            <tr>
+              <td>Distingue <code>port</code> (del Service) de <code>targetPort</code> (del contenedor)</td>
+              <td>Usar el mismo número "por si acaso"</td>
+              <td>La API escucha en 3000: el Service en 80 y targetPort 3000 lo deja claro sin ambigüedad</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Selector que no encuentra Pods (Endpoints vacíos)</h3>
+        <pre><code class="language-yaml"># ❌ El Deployment etiqueta sus Pods con app: api, pero el Service busca app: API.
+selector:
+  app: API        # ❌ typo / mayúsculas
+# kubectl get endpoints -> <none>  -> el Service no envía a nadie
+
+# ✅ El selector coincide EXACTAMENTE con template.metadata.labels del Deployment.
+selector:
+  app: api</code></pre>
+
+        <h3>Confundir port y targetPort</h3>
+        <pre><code class="language-yaml"># ❌ La API escucha en 3000, pero decimos targetPort 4000:
+ports:
+  - port: 80
+    targetPort: 4000   # ❌ nadie escucha en 4000 -> conexión rechazada
+
+# ✅ targetPort = containerPort declarado en el Pod/Deployment:
+ports:
+  - port: 80
+    targetPort: 3000</code></pre>
+
+        <h3>Esperar LoadBalancer en kind sin controlador</h3>
+        <pre><code class="language-yaml"># ❌ Con type: LoadBalancer en kind, la EXTERNAL-IP queda "pending" para siempre,
+# porque no hay proveedor cloud ni MetalLB instalado (kubectl get svc lo muestra).
+# ✅ Para pruebas locales: usa NodePort (determinista) o instala MetalLB.
+spec:
+  type: NodePort     # en kind/local: NodePort o ClusterIP + port-forward</code></pre>
+
+        <h3>Olvidar el namespace en el FQDN</h3>
+        <pre><code class="language-bash"># ❌ Desde el namespace default no existe "api" suelto; sí existe FQDN completo:
+wget http://api/tasks        # error: nombre no resuelto
+# ✅
+wget http://api.harbortasks.svc.cluster.local/tasks
+# (y desde DENTRO de harbortasks basta con http://api/tasks)</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> conectar una web estática a su Service en kind y comprobar el DNS interno y los Endpoints.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea el Deployment <code>deployment-web.yaml</code> de la lección 02 (3 réplicas nginx, <code>app: web</code>) y aplícalo. Verifica: <code>kubectl get pods -l app=web</code> (3 Running).
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea el Service <code>service-web.yaml</code> con <code>type: NodePort</code>, <code>nodePort: 30080</code> y selector <code>app: web</code>. Aplícalo.
+            <pre><code class="language-bash">kubectl apply -f service-web.yaml
+kubectl get svc web -o wide
+kubectl get endpoints web   # aquí DEBEN aparecer 3 IPs (las de los Pods)</code></pre>
+          </li>
+          <li><strong>Paso 3:</strong> comprueba que el selector está vivo: borra <strong>un</strong> Pod con <code>kubectl delete pod web-XXXX</code> (el ReplicaSet creará otro) y mira <code>kubectl get endpoints web</code> unos segundos después. Las IPs cambian, el nombre <code>web</code> no.</li>
+          <li>
+            <strong>Paso 4:</strong> crea un Pod cliente temporal y resuelve los dos nombres:
+            <pre><code class="language-bash">kubectl run cliente --image=node:20-alpine --restart=Never \
+        --command -- sleep 3600
+# DNS corto (mismo namespace default):
+kubectl exec -it cliente -- sh -c "wget -qO- http://web | head -3"
+# FQDN completo:
+kubectl exec -it cliente -- sh -c \
+  "wget -qO- http://web.default.svc.cluster.local | head -3"</code></pre>
+            La salida es el HTML "Welcome to nginx!" en ambos casos.
+          </li>
+          <li><strong>Paso 5:</strong> prueba el NodePort desde tu host: <code>curl http://127.0.0.1:30080</code> (o ábrelo en el navegador). En kind ese puerto del nodo debe responder.</li>
+          <li><strong>Paso 6:</strong> prueba el túnel de desarrollo: <code>kubectl port-forward svc/web 8080:80</code> y abre <code>http://localhost:8080</code>. Termina con <code>Ctrl+C</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación final:</strong> si los Endpoints mostraron 3 IPs en el paso 2, el HTML llegó por los 3 caminos del paso 4 y el NodePort respondió en el paso 5, tu Service está correcto. Si los Endpoints están vacíos, el selector no coincide: revisa las labels del Deployment.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Service multi-puerto para la API</h3>
+          <p>La API de HarborTasks puede exponer dos puertos: <code>3000</code> (HTTP) y <code>3001</code> (métricas). Modifica <code>service-api.yaml</code> para declarar <strong>dos entradas en <code>ports</code></strong> (nómbralas <code>http</code> y <code>metrics</code>) y verifica desde un Pod que ambas responden: <code>http://api:80/</code> y <code>http://api:81/metrics</code>.</p>
+          <p><em>Pista: cada entrada necesita su <code>port</code> y su <code>targetPort</code> distintos; además, el Deployment debe tener los dos <code>containerPort</code> (3000 y 3001). Si solo abres el puerto en el Service pero el contenedor no escucha en 3001, los Endpoints del segundo puerto no aparecerán: revisa con <code>kubectl get endpoints api</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los <strong>Pods son efímeros</strong> con IPs prestadas; el <strong>Service</strong> aporta un nombre DNS y una IP virtual estables.</li>
+          <li>El <strong>selector</strong> de labels enlaza Service y Pods; su live-lista son los <strong>Endpoints</strong>.</li>
+          <li>Tipos: <code>ClusterIP</code> (interno, default), <code>NodePort</code> (puerto en todos los nodos, rango 30000–32767), <code>LoadBalancer</code> (balanceador externo).</li>
+          <li>DNS: <code>svc.namespace.svc.cluster.local</code>; dentro del mismo namespace basta el nombre corto.</li>
+          <li><code>kubectl expose</code> expone recursos ya desplegados; <code>kubectl port-forward</code> crea túneles de desarrollo hacia Pods/Services.</li>
+          <li>En kind, <code>NodePort</code> es la puerta local; <code>LoadBalancer</code> queda <code>Pending</code> sin MetalLB.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando/Manifiesto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl expose POD|DEPLOY --name=X --port=80</code></td><td>Crea un Service a partir de un recurso ya existente</td></tr>
+            <tr><td><code>kubectl get svc,ep</code></td><td>Lista Services y sus Endpoints (IPs reales seleccionadas)</td></tr>
+            <tr><td><code>kubectl describe svc X</code></td><td>Detalle del Service: tipo, IP, selector, puertos y eventos</td></tr>
+            <tr><td><code>kubectl port-forward svc/X 8080:80</code></td><td>Túnel de desarrollo desde un puerto local hacia un Service del clúster</td></tr>
+            <tr><td><code>spec.type: ClusterIP</code></td><td>Service solo visible dentro del clúster (default)</td></tr>
+            <tr><td><code>spec.type: NodePort</code></td><td>Expone el Service en un puerto alto de cada nodo</td></tr>
+            <tr><td><code>spec.type: LoadBalancer</code></td><td>ClusterIP + balanceador externo del proveedor cloud</td></tr>
+            <tr><td><code>spec.selector / spec.ports[].targetPort</code></td><td>Define qué Pods atienden el Service y a qué puerto reenvía</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no puedo conectarme a la ClusterIP desde mi máquina?</summary>
+            <div>
+              <p>Por definición: <code>ClusterIP</code> vive solo dentro de la red del clúster. Desde tu host necesitas <code>kubectl port-forward svc/... </code>, un <code>NodePort</code>, un <code>LoadBalancer</code> o un Ingress (Módulo 7). Es una decisión de diseño: menos superficie externa, más seguridad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un Service puede repartir tráfico entre Pods de varios Deployments?</summary>
+            <div>
+              <p>Sí, porque el Service solo mira <strong>labels</strong>. Si dos Deployments etiquetan sus Pods con la misma <code>app</code> (p. ej., blue y green en un canary), los Endpoints del Service incluirán a las poblaciones de ambos. Eso es exactamente la base del patrón canary del reto de la lección 02.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si borro un Pod mientras está en los Endpoints?</summary>
+            <div>
+              <p>El controlador de Endpoints lo retira en segundos y la IP desaparece de la lista de destinos. Las conexiones en vuelo pueden fallar, pero el siguiente paquete ya irá a un Pod sano. Por eso las apps deben reintentar conexiones a través del Service: el nombre nunca miente, las IPs sí.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿NodePort comporta una IP extra? ¿Cuántos puertos tiene de rango?</summary>
+            <div>
+              <p><code>NodePort</code> es <code>ClusterIP + portal</code>: internamente conserva el nombre y la IP virtual; externamente abre un puerto TCP en <strong>cada</strong> nodo del clúster, dentro del rango 30000–32767. Para producción cloud se prefiere <code>LoadBalancer</code> o Ingress; NodePort queda como puerta de desarrollo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

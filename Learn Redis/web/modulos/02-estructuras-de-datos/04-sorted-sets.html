@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-sorted-sets">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sorted sets: last-seen y rate limiting — Módulo 2 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Sorted sets: last-seen y rate limiting</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Estructuras de Datos</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un <strong>sorted set</strong> (zset) es un set donde cada miembro lleva un <em>score</em> (número) que define el orden. Es la estructura perfecta para <strong>presencia con tiempo</strong> (score = timestamp), rankings y <strong>ventanas deslizantes</strong>.</p>
+        <p>Verás los comandos, el patrón «presencia con eviction natural» y cómo responder «¿quiénes están conectados desde hace X?» y «¿cuántos eventos en los últimos 60 segundos?».</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Comandos</h3>
+        <pre><code class="language-redis">ZADD presence 1750000000 user:42       # añade con score
+ZSCORE presence user:42                # su score
+ZINCRBY presence 1 user:42             # +1 al score
+ZCARD presence                         # nº de miembros
+ZRANGEBYSCORE presence -inf +inf [WITHSCORES]
+ZRANGEBYSCORE presence 1749913600 +inf # los "después de" un límite
+ZRANGE presence 0 2                    # por rango posicional
+ZREM presence user:42                  # quitar miembro
+ZREMRANGEBYSCORE presence -inf 1749913600   # quitar los viejos (limpieza)</code></pre>
+
+        <h3>El patrón «presencia con score = timestamp»</h3>
+        <pre><code class="language-text">ZADD presence &lt;now&gt; user:42
+consulta: ¿quiénes están online (últimos 60 s)?
+   ZRANGEBYSCORE presence &lt;now-60&gt; +inf
+limpieza (cada tanto):
+   ZREMRANGEBYSCORE presence -inf &lt;now-60&gt;
+conteo:  ZCARD</code></pre>
+        <p>Doble virtud: ordenada por tiempo y cada miembro puede expirarse/limpiarse individualmente — algo que el <code>set</code> no puede (M2-03 lo dejó abierto).</p>
+
+        <h3>Rate limiting con ventana deslizante</h3>
+        <pre><code class="language-redis">ZADD rl:user:42 &lt;now_ms1&gt; req1          # cada petición
+ZREMRANGEBYSCORE rl:user:42 -inf &lt;now_ms1-60000&gt;  # quitar las viejas
+ZCARD rl:user:42                       # peticiones en 60 s
+EXPIRE rl:user:42 65                  # evitar deuda de memoria</code></pre>
+        <p>Es más preciso que el fixed-window (M1-04) aunque algo más caro; un zset por usuario.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">ZADD scoreboard 100 ana 90 luis 80 carlos
+ZREVRANGEBYSCORE scoreboard +inf -inf LIMIT 0 2   # top 2 (orden desc)
+ZSCORE scoreboard ana          # 100
+ZINCRBY scoreboard 10 ana      # 110
+ZCARD scoreboard               # 3
+ZREM scoreboard carlos</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Presencia del hub: «usa el zset como lista de online y el hash para el detalle de cada conexión» (M7 lo monta entero):</p>
+        <pre><code class="language-csharp">long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+// Heartbeat de un usuario: refresca su score = "último latido"
+await db.SortedSetAddAsync("hub:presence", userId, now);
+
+// ¿Quiénes están online (últimos 60 s)?
+long cutoff = now - 60;
+var online = await db.SortedSetRangeByScoreAsync("hub:presence", cutoff, double.PositiveInfinity);
+// limpieza perezosa
+await db.SortedSetRemoveRangeByScoreAsync("hub:presence", double.NegativeInfinity, cutoff);
+// tamaño
+long count = await db.SortedSetLengthAsync("hub:presence");</code></pre>
+        <p>Ningún cron externo: la «desconexión» se vuelve «score antiguo» que se limpia y no cuenta.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Score = timestamp para presencia/ventanas</td><td>Guardar el ts en el miembro (string)</td><td>El score es el que ordena y filtra; el campo es opcional</td></tr>
+            <tr><td>Limpiar con ZREMRANGEBYSCORE periódicamente</td><td>Dejar scores eternos crecientes</td><td>El zset acumula y crece si nadie borra los viejos</td></tr>
+            <tr><td>Rangos acotados con +inf/-inf / LIMIT</td><td>Traer el zset completo sin filtrar</td><td>ZRANGEBYSCORE te da solo la ventana que te importa</td></tr>
+            <tr><td>Tener un TTL de seguridad en la key del zset de ventana</td><td>Rate-limit keys sin expirar</td><td>Si el usuario no vuelve, la key debe morir igualmente</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar ZRANGE como si fuera equivalente a ZRANGEBYSCORE</h3>
+        <pre><code class="language-redis"># ❌ ZRANGE presence 0 -1  devuelve el top por posición, no por tiempo
+# ✅ ZRANGEBYSCORE presence &lt;cutoff&gt; +inf  (ventana temporal)</code></pre>
+
+        <h3>Score con precisión de ms donde era segundos → cuenta distinta</h3>
+        <p>Decide la granularidad del score (s vs ms) y mantenla coherente con el cutoff; mezclar escalas rompe la ventana.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea <code>presence</code> con 4 usuarios y scores de hace 0, 10, 120, 300 s.</li>
+          <li><strong>Paso 2:</strong> Consulta los «de los últimos 60 s» con ZRANGEBYSCORE.</li>
+          <li><strong>Paso 3:</strong> Limpia con ZREMRANGEBYSCORE y comprueba ZCARD.</li>
+          <li><strong>Paso 4:</strong> Simula un rate limit: añade timestamps por segundo y cuenta los de la última ventana.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Ranking «online» del hub</h3>
+          <p>Diseña el zset de presencia que muestre «los 10 usuarios más activos de la última hora» usando ZINCRBY cada vez que procesan un mensaje, con limpieza por ventana. ¿Qué consulta usarías y con qué frecuencia la limpiarías? Pruébalo en redis-cli.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Sorted set = miembros únicos con score que ordena.</li>
+          <li>Score = timestamp → presencia, last-seen y ventanas deslizantes.</li>
+          <li><code>ZREMRANGEBYSCORE</code> = limpieza natural por antigüedad.</li>
+          <li>Combina con hash para el detalle de cada miembro.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo sorted set sobre set?</summary>
+            <div><p>Cuando el <em>orden/score</em> importe: tiempo, ranking, prioridad. Si solo necesitas membrecía, un set es más barato.</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo usar decimales en el score?</summary>
+            <div><p>Sí (doubles), aunque Redis los almacena como integer o double y evita precision losses para enteros. Para timestamps en ms son enteros → perfecto.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

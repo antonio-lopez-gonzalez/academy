@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="es" data-module="11" data-lesson="05-proyecto-cms-auth" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: JWT + roles — Módulo 11 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: JWT + roles</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 11 · Proyecto</span><span>50 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aplicamos todo lo aprendido sobre autenticación y autorización al proyecto CMS. Añadiremos autenticación JWT, roles (<code>Admin</code>, <code>Editor</code>, <code>Author</code>), protección de endpoints y refresh tokens. También sembraremos usuarios iniciales con contraseñas hasheadas mediante BCrypt.</p>
+        <p>Al finalizar, la API del CMS tendrá un sistema completo de login, endpoints protegidos por roles y políticas, y un flujo de refresh tokens seguro.</p>
+
+        <div class="callout callout--goal">
+          <h4>Objetivos del proyecto</h4>
+          <ul>
+            <li>Configurar autenticación JWT en <code>Cms.Api</code>.</li>
+            <li>Definir roles <code>Admin</code>, <code>Editor</code> y <code>Author</code>.</li>
+            <li>Proteger endpoints CRUD según el rol requerido.</li>
+            <li>Implementar un servicio de autenticación custom con JWT.</li>
+            <li>Implementar refresh tokens con rotation y revocación.</li>
+            <li>Sembrar usuarios iniciales con contraseñas hasheadas con BCrypt.</li>
+            <li>Verificar que los tests de integración pasan.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1. Arquitectura del CMS</h3>
+        <p>Seguimos Clean Architecture con cuatro capas:</p>
+        <ul>
+          <li><strong>Cms.Domain:</strong> entidades <code>User</code>, <code>Role</code> y value objects.</li>
+          <li><strong>Cms.Application:</strong> casos de uso, interfaces de servicios de autenticación.</li>
+          <li><strong>Cms.Infrastructure:</strong> EF Core, repositorios, implementación de <code>IJwtService</code>.</li>
+          <li><strong>Cms.Api:</strong> configuración de autenticación, endpoints, seeding.</li>
+        </ul>
+
+        <h3>2.2. Autenticación en capas</h3>
+        <p>La infraestructura conoce los detalles de JWT (claves, claims, emisor). La aplicación define las interfaces. La API solo configura el middleware y protege endpoints. El dominio no conoce JWT.</p>
+
+        <h3>2.3. Roles del CMS</h3>
+        <ul>
+          <li><strong>Admin:</strong> gestiona usuarios, categorías y cualquier post.</li>
+          <li><strong>Editor:</strong> puede editar y publicar cualquier post, gestionar categorías.</li>
+          <li><strong>Author:</strong> solo puede crear y editar sus propios posts.</li>
+        </ul>
+
+        <h3>2.4. Refresh tokens</h3>
+        <p>Usamos el patrón de lección anterior: tokens opacos de 64 bytes, rotación, detección de reutilización y almacenamiento como HttpOnly Secure cookie.</p>
+
+        <div class="callout callout--tip">
+          <h4>Consejo del proyecto</h4>
+          <p>Define los secretos de JWT en <code>user-secrets</code> o variables de entorno. Nunca incluyas una clave real en appsettings.Development.json que pueda subirse a Git.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Antes de integrar, veamos un endpoint de login mínimo para el CMS.</p>
+
+        <pre><code class="language-csharp">// Cms.Application/Contracts/IAuthService.cs
+public interface IAuthService
+{
+    Task<AuthResult> LoginAsync(LoginCommand command, CancellationToken ct);
+    Task<AuthResult> RefreshAsync(string refreshToken, CancellationToken ct);
+    Task LogoutAsync(string refreshToken, CancellationToken ct);
+}
+
+// Cms.Application/Contracts/AuthResult.cs
+public sealed class AuthResult
+{
+    public bool IsSuccess { get; init; }
+    public string? AccessToken { get; init; }
+    public string? RefreshToken { get; init; }
+    public string? Error { get; init; }
+
+    public static AuthResult Success(string accessToken, string refreshToken) =>
+        new() { IsSuccess = true, AccessToken = accessToken, RefreshToken = refreshToken };
+
+    public static AuthResult Failure(string error) =>
+        new() { IsSuccess = false, Error = error };
+}
+
+// Cms.Application/Commands/LoginCommand.cs
+public sealed record LoginCommand(string Email, string Password) : IRequest<AuthResult>;</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+
+        <h3>4.1. Paquetes necesarios</h3>
+        <pre><code class="language-powershell"># En Cms.Infrastructure
+dotnet add Cms.Infrastructure package System.IdentityModel.Tokens.Jwt --version 7.5.1
+dotnet add Cms.Infrastructure package BCrypt.Net-Next --version 4.0.3
+
+# En Cms.Api
+dotnet add Cms.Api package Microsoft.AspNetCore.Authentication.JwtBearer --version 8.0.0</code></pre>
+
+        <h3>4.2. Entidades de dominio</h3>
+        <p>Añadimos tres entidades al dominio del CMS:</p>
+        <ul>
+          <li><strong>User</strong>: <code>Id</code>, <code>Email</code>, <code>Name</code>, <code>PasswordHash</code> y una colección de <code>Role</code>.</li>
+          <li><strong>Role</strong>: <code>Id</code> y <code>Name</code>, con valores predefinidos <code>Admin</code>, <code>Editor</code> y <code>Author</code>.</li>
+          <li><strong>RefreshToken</strong>: <code>Id</code>, <code>TokenHash</code>, <code>UserId</code>, <code>ExpiresAt</code>, <code>IsRevoked</code> y <code>ReplacedByTokenHash</code>.</li>
+        </ul>
+        <p>El repositorio <code>IRefreshTokenRepository</code> ofrece operaciones para buscar por hash, añadir, actualizar y revocar todos los tokens de un usuario.</p>
+
+        <h3>4.3. Configuración JWT</h3>
+        <p>La configuración de JWT (<code>JwtSettings</code>) y el servicio (<code>JwtService</code>) siguen el mismo patrón visto en la <a href="01-jwt-estructura.html">lección 1</a>: generan un token con claims de sub, email, name, roles y <code>jti</code>, y generan refresh tokens aleatorios de 64 bytes. El secreto se lee desde variables de entorno o <code>dotnet user-secrets</code>.</p>
+
+        <h3>4.4. Servicio de autenticación</h3>
+        <pre><code class="language-csharp">// Cms.Infrastructure/Services/AuthService.cs
+public sealed class AuthService(
+    IUserRepository userRepository,
+    IRefreshTokenRepository refreshTokenRepository,
+    IJwtService jwtService,
+    TimeProvider timeProvider) : IAuthService
+{
+    public async Task<AuthResult> LoginAsync(LoginCommand command, CancellationToken ct)
+    {
+        var user = await userRepository.GetByEmailAsync(command.Email, ct);
+        if (user is null)
+        {
+            return AuthResult.Failure("Credenciales inválidas.");
+        }
+
+        if (!BCrypt.Net.BCrypt.Verify(command.Password, user.PasswordHash))
+        {
+            return AuthResult.Failure("Credenciales inválidas.");
+        }
+
+        return await GenerateTokensAsync(user, ct);
+    }
+
+    public async Task<AuthResult> RefreshAsync(string refreshTokenValue, CancellationToken ct)
+    {
+        var tokenHash = JwtService.HashToken(refreshTokenValue);
+        var token = await refreshTokenRepository.GetByTokenHashAsync(tokenHash, ct);
+
+        if (token is null || token.IsRevoked || token.ExpiresAt < timeProvider.GetUtcNow())
+        {
+            return AuthResult.Failure("Refresh token inválido.");
+        }
+
+        if (token.ReplacedByTokenHash is not null)
+        {
+            await refreshTokenRepository.RevokeAllForUserAsync(token.UserId, ct);
+            return AuthResult.Failure("Sesión comprometida.");
+        }
+
+        var user = await userRepository.GetByIdAsync(token.UserId, ct);
+        if (user is null)
+        {
+            return AuthResult.Failure("Usuario no encontrado.");
+        }
+
+        var result = await GenerateTokensAsync(user, ct);
+        token.Revoke(JwtService.HashToken(result.RefreshToken!));
+        await refreshTokenRepository.UpdateAsync(token, ct);
+        return result;
+    }
+
+    public async Task LogoutAsync(string refreshTokenValue, CancellationToken ct)
+    {
+        var token = await refreshTokenRepository.GetByTokenHashAsync(JwtService.HashToken(refreshTokenValue), ct);
+        if (token is not null)
+        {
+            token.Revoke();
+            await refreshTokenRepository.UpdateAsync(token, ct);
+        }
+    }
+
+    private async Task<AuthResult> GenerateTokensAsync(User user, CancellationToken ct)
+    {
+        var accessToken = jwtService.GenerateAccessToken(user);
+        var refreshTokenValue = jwtService.GenerateRefreshToken();
+        var refreshToken = RefreshToken.Create(
+            JwtService.HashToken(refreshTokenValue),
+            user.Id,
+            timeProvider.GetUtcNow().AddDays(7).DateTime);
+
+        await refreshTokenRepository.AddAsync(refreshToken, ct);
+        return AuthResult.Success(accessToken, refreshTokenValue);
+    }
+}</code></pre>
+
+        <h3>4.5. Configuración en Cms.Api</h3>
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        var settings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = settings.Issuer,
+            ValidAudience = settings.Audience,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret))
+        };
+    });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("CanCreatePosts", policy =>
+        policy.RequireRole("Admin", "Editor", "Author"));
+
+    options.AddPolicy("CanEditAnyPost", policy =>
+        policy.RequireRole("Admin", "Editor"));
+
+    options.AddPolicy("CanManageCategories", policy =>
+        policy.RequireRole("Admin", "Editor"));
+
+    options.AddPolicy("CanManageUsers", policy =>
+        policy.RequireRole("Admin"));
+});
+
+// Registro de servicios.
+builder.Services.AddScoped<IJwtService, JwtService>();
+builder.Services.AddScoped<IAuthService, AuthService>();
+
+var app = builder.Build();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Endpoints de autenticación.
+app.MapPost("/api/v1/auth/login", LoginAsync);
+app.MapPost("/api/v1/auth/refresh", RefreshAsync);
+app.MapPost("/api/v1/auth/logout", LogoutAsync);
+
+// Endpoints protegidos por policies.
+app.MapPost("/api/v1/posts", [Authorize(Policy = "CanCreatePosts")] async (CreatePostCommand command, IMediator mediator, CancellationToken ct) =>
+{
+    var result = await mediator.Send(command, ct);
+    return result.IsSuccess
+        ? Results.Created($"/api/v1/posts/{result.Value}", result.Value)
+        : Results.BadRequest(result.Errors);
+});
+
+app.MapDelete("/api/v1/posts/{id:guid}", [Authorize(Policy = "CanEditAnyPost")] async (Guid id, IMediator mediator, CancellationToken ct) =>
+{
+    var result = await mediator.Send(new DeletePostCommand(id), ct);
+    return result.IsSuccess ? Results.NoContent() : Results.NotFound();
+});
+
+app.Run();
+
+// Métodos de endpoint extraídos para claridad.
+static async Task<IResult> LoginAsync(LoginCommand command, IAuthService authService, HttpContext context)
+{
+    var result = await authService.LoginAsync(command, context.RequestAborted);
+    if (!result.IsSuccess) return Results.Unauthorized();
+    AppendRefreshTokenCookie(context, result.RefreshToken!);
+    return Results.Ok(new { result.AccessToken });
+}
+
+static async Task<IResult> RefreshAsync(IAuthService authService, HttpContext context)
+{
+    if (!context.Request.Cookies.TryGetValue("refreshToken", out var refreshToken))
+        return Results.Unauthorized();
+
+    var result = await authService.RefreshAsync(refreshToken, context.RequestAborted);
+    if (!result.IsSuccess) return Results.Unauthorized();
+
+    AppendRefreshTokenCookie(context, result.RefreshToken!);
+    return Results.Ok(new { result.AccessToken });
+}
+
+static async Task<IResult> LogoutAsync(IAuthService authService, HttpContext context)
+{
+    if (context.Request.Cookies.TryGetValue("refreshToken", out var refreshToken))
+        await authService.LogoutAsync(refreshToken, context.RequestAborted);
+
+    context.Response.Cookies.Delete("refreshToken");
+    return Results.Ok();
+}
+
+static void AppendRefreshTokenCookie(HttpContext context, string refreshToken)
+{
+    context.Response.Cookies.Append("refreshToken", refreshToken, new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = true,
+        SameSite = SameSiteMode.Strict,
+        Expires = DateTime.UtcNow.AddDays(7)
+    });
+}</code></pre>
+
+        <h3>4.6. Seeding de usuarios</h3>
+        <p>El seeder crea tres usuarios iniciales con roles distintos y contraseñas hasheadas con BCrypt. Las contraseñas son solo para desarrollo.</p>
+        <pre><code class="language-csharp">// Cms.Infrastructure/Persistence/Seeders/UserSeeder.cs
+public static class UserSeeder
+{
+    public static async Task SeedAsync(ApplicationDbContext context)
+    {
+        if (await context.Users.AnyAsync()) return;
+
+        var admin = User.Create("admin@cms.local", "Administrador",
+            BCrypt.Net.BCrypt.HashPassword("Admin123!", workFactor: 12),
+            [Role.Admin, Role.Editor]);
+
+        var editor = User.Create("editor@cms.local", "Editor Principal",
+            BCrypt.Net.BCrypt.HashPassword("Editor123!", workFactor: 12),
+            [Role.Editor]);
+
+        var author = User.Create("author@cms.local", "Autor Invitado",
+            BCrypt.Net.BCrypt.HashPassword("Author123!", workFactor: 12),
+            [Role.Author]);
+
+        context.Users.AddRange(admin, editor, author);
+        await context.SaveChangesAsync();
+    }
+}</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Configura JWT desde una sección dedicada</strong> y lee el secreto de variables de entorno.</li>
+          <li><strong>Define policies con nombres descriptivos</strong> en lugar de hardcodear roles en endpoints.</li>
+          <li><strong>Usa BCrypt o <code>PasswordHasher</code></strong> para hashear contraseñas.</li>
+          <li><strong>Almacena refresh tokens como HttpOnly Secure cookies</strong>.</li>
+          <li><strong>Implementa rotation y revocación</strong> de refresh tokens.</li>
+          <li><strong>Guarda el hash del refresh token</strong> en la base de datos.</li>
+          <li><strong>Testea los endpoints protegidos</strong> con y sin token, y con roles incorrectos.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Incorrecto: secretos en appsettings sin protección</h3>
+        <pre><code class="language-json">// ❌ Mal: nunca subas esto.
+{
+  "JwtSettings": {
+    "Secret": "mi-clave-secreta"
+  }
+}</code></pre>
+        <h3>Correcto: user-secrets o variables de entorno</h3>
+        <pre><code class="language-powershell"># ✅ Bien: user-secrets en desarrollo.
+dotnet user-secrets init --project Cms.Api
+dotnet user-secrets set --project Cms.Api "JwtSettings:Secret" "clave-secreta-de-32-bytes-min!"</code></pre>
+
+        <h3>Incorrecto: refresh token en body de la respuesta</h3>
+        <pre><code class="language-csharp">// ❌ Mal: expuesto a XSS si el cliente lo guarda en localStorage.
+return Results.Ok(new { AccessToken, RefreshToken });</code></pre>
+        <h3>Correcto: HttpOnly Secure cookie</h3>
+        <pre><code class="language-csharp">// ✅ Bien: cookie inaccesible desde JavaScript.
+context.Response.Cookies.Append("refreshToken", refreshToken, new CookieOptions
+{
+    HttpOnly = true,
+    Secure = true,
+    SameSite = SameSiteMode.Strict
+});</code></pre>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Completa la protección del CMS añadiendo autorización para editar posts propios.</p>
+        <ol>
+          <li>Crea un handler <code>IsAuthorOrEditorHandler</code> que permita editar un post si el usuario es Admin, Editor o el autor original.</li>
+          <li>Define una policy <code>CanEditOwnPost</code>.</li>
+          <li>Aplica la policy al endpoint <code>PUT /api/v1/posts/{id}</code>.</li>
+          <li>Registra <code>IHttpContextAccessor</code> y <code>IPostRepository</code> en el handler.</li>
+          <li>Testea que un Author pueda editar su post pero no el de otro Author.</li>
+        </ol>
+
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un endpoint <code>GET /api/v1/users/me</code> que devuelva el perfil del usuario autenticado. Luego, añade un endpoint <code>PUT /api/v1/users/me/password</code> que permita cambiar la contraseña propia. Al cambiarla, revoca todos los refresh tokens del usuario. No lo resuelvas ahora; intenta implementarlo primero.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El CMS ahora tiene autenticación JWT con roles Admin, Editor y Author.</li>
+          <li>La infraestructura implementa <code>IJwtService</code> y <code>IAuthService</code>; la API solo configura el middleware.</li>
+          <li>Las policies centralizan la autorización y evitan roles hardcodeados.</li>
+          <li>Los refresh tokens usan rotation, revocación y HttpOnly Secure cookies.</li>
+          <li>Se sembraron usuarios con contraseñas hasheadas mediante BCrypt.</li>
+          <li>Los endpoints críticos están protegidos por rol y por policy.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Dónde conviene guardar el secreto JWT en el CMS?</summary>
+          <p>En producción, en Azure Key Vault, AWS Secrets Manager o variables de entorno. En desarrollo, <code>dotnet user-secrets</code> es suficiente.</p>
+        </details>
+        <details>
+          <summary>¿Por qué no usamos Identity en el CMS?</summary>
+          <p>El CMS es una API headless con un modelo de dominio propio. Custom JWT nos da más control sobre usuarios, roles y refresh tokens sin arrastrar las tablas de Identity.</p>
+        </details>
+        <details>
+          <summary>¿Cómo pruebo endpoints protegidos en integración?</summary>
+          <p>Con <code>WebApplicationFactory</code>: crea un token de prueba con <code>JwtService</code> usando la misma clave configurada en el test, y envíalo en el header <code>Authorization: Bearer ...</code>.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="04-ingress">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ingress y entrada al clúster — Módulo 7 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Ingress y entrada al clúster</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Configuración y almacenamiento</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ===================== 1 · INTRODUCCIÓN ===================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora tus Pods solo eran visibles dentro del clúster: los Services con <code>ClusterIP</code> no son accesibles desde tu navegador. Para que un usuario de HarborTasks llegue a la web y a la API necesitamos <strong>exponerlos hacia fuera</strong>.</p>
+        <p>En esta lección verás las tres formas de abrir el clúster (<strong>NodePort</strong>, <strong>LoadBalancer</strong> e <strong>Ingress</strong>), qué es un <strong>IngressController</strong> (ingress-nginx) y por qué Kubernetes no viene con uno integrado, cómo se define el objeto <code>Ingress</code> (rules de host/path), cómo instalarlo en kind, y los primeros pasos de TLS (cert-manager mencionado). Al final, HarborTasks se servirá por <code>harbortasks.test</code> con rutas <code>/</code> (web) y <code>/api/</code> (API).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque instalar y configurar el routing L7 del clúster es el momento en que «todo se conecta» y también, estadísticamente, donde más gente se atasca: el controlador no viene instalado por defecto, los paths «comen» prefijos y el puerto nunca coincide. Entender la arquitectura evita debugging a ciegas.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 2 · TEORÍA ===================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>NodePort → LoadBalancer → Ingress</h3>
+        <p>En el <a href="../../modulos/06-workloads/03-services-y-dns.html">módulo 6</a> viste los tipos de Service. Recapitulemos qué ofrecen hacia fuera:</p>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Cómo expone</th><th>Limitación importante</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>NodePort</code></td><td>Abre un puerto alto (30000–32767) en <em>todos</em> los nodos; el tráfico llega a <code>IP:puerto</code></td>
+              <td>Un servicio = un puerto; puertos feos; sin routing por host/path; nada de TLS</td>
+            </tr>
+            <tr>
+              <td><code>LoadBalancer</code></td><td>Crea un balanceador en la nube (ELB/GLB) que reparte puerto 80/443</td>
+              <td>Cada servicio con su LoadBalancer = caro; sin routing por host/path (aún)</td>
+            </tr>
+            <tr>
+              <td><code>Ingress</code></td><td>Un punto de entrada (80/443) que enruta por <strong>host</strong> y <strong>path</strong> a varios Services</td>
+              <td>Requiere un controlador instalado y configurado (no viene con el clúster)</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> NodePort es como darle a cada empresa una puerta de entrada numerada (puerta 7, puerta 11…). LoadBalancer es comprar un edificio con <em>una sola puerta</em> por empresa en la calle principal. Ingress es el <strong>conserje del edificio</strong>: una única puerta con dirección, y dentro, el portero decide «los del piso 2 van a la derecha, los del piso 3 a la izquierda», según el letrero (host) y el pasillo (path).</p>
+        </div>
+
+        <h3>Dos piezas: el objeto Ingress y el IngressController</h3>
+        <p>Aquí está la confusión clásica. Kubernetes define el <strong>objeto <code>Ingress</code></strong> (<code>networking.k8s.io/v1</code>): un manifiesto <em>declarativo</em> que dice «el host X con el path Y va al Service Z». Pero un manifiesto YAML no enruta ni un byte: necesita un <strong>controlador que lo ejecute</strong>.</p>
+        <p>El <strong>IngressController</strong> (típicamente <strong>ingress-nginx</strong>) es un Deployment + Service que corre dentro del clúster, se registra en <code>IngressClass</code>, escucha la API de Kubernetes, lee tus objetos <code>Ingress</code> y reconfigura un <strong>nginx real</strong> (descarga el <code>nginx.conf</code>) para servir el routing. Sin controlador, <code>kubectl apply -f ingress.yaml</code> no da error: simplemente no hace nada visible.</p>
+        <div class="diagram">
+  Usuario                                Clúster Kubernetes (kind)
+  ───────                                ──────────────────────────
+  navegador
+    │  GET http://harbortasks.test/api/tasks
+    │
+    ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  NODO: puerto host 80 → ingress-nginx (Service NodePort/LB)  │
+  │  ┌───────────────────────────────────────────────────────┐   │
+  │  │ ingress-nginx controller (Deployment, en namespace    │   │
+  │  │ ingress-nginx)                                        │   │
+  │  │   lee el objeto Ingress → nginx.conf real             │   │
+  │  └──────────────────────┬────────────────────────────────┘   │
+  └─────────────────────────┼────────────────────────────────────┘
+                            │  enruta según host + path
+              ┌─────────────┴──────────────┐
+              ▼                            ▼
+   Service api-harbortasks        Service web-harbortasks
+   (ClusterIP :3000)              (ClusterIP :80)
+              │                            │
+              ▼                            ▼
+   Pods del API                  Pods de la web (nginx)
+   → postgres → BBDD             → /usr/share/nginx/html
+        </div>
+
+        <h3>Instalación del controlador y por qué kind necesita un cluster-config</h3>
+        <p>El controlador necesita que el tráfico del host llegue a sus Pods. En kind (los nodos SON contenedores Docker), debes crear el clúster <em>mapeando</em> los puertos 80/443 del host a los puertos 80/443 del nodo con <code>extraPortMappings</code>, y marcar uno de los nodos con la etiqueta <code>ingress-ready=true</code> que el controlador usa para fijar dónde instalarse.</p>
+        <div class="callout callout--note">
+          <p><strong>Mac / Windows:</strong> en Docker Desktop (Mac/Windows) el mapeo <code>hostPort: 80</code> publica directamente <code>localhost:80</code>. A veces el puerto 80 está ocupado (Skype, IIS, XAMPP): si falla <code>kubectl apply</code> del controlador o el curl no responde, cambia el <code>hostPort</code> a <code>8080</code> y entra por <code>http://localhost:8080</code>. La versión del manifiesto de kind es la misma; solo cambia el puerto de acceso y el Host header lo sigues enviando igual.</p>
+        </div>
+
+        <h3>HTTP y TLS</h3>
+        <p>El Ingress, por defecto, sirve <strong>HTTP en claro</strong>. Para HTTPS se monta: un <em>Secret de tipo TLS</em> (visto en la lección 02) con el certificado, la sección <code>tls:</code> del Ingress, y el controller termina el TLS y deriva HTTP a los Pods. En producción es habitual que <strong>cert-manager</strong> cree y renueve automáticamente esos certificados (Let's Encrypt), que es un operador que observa tus <code>Ingress</code> y genera el Secret TLS. En kind puedes emitir certificados autofirmados; lo veremos en el reto.</p>
+      </section>
+
+      <!-- ===================== 3 · EJEMPLO MÍNIMO ===================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Instalar ingress-nginx en kind y enrutar un servicio de prueba. Primero, el clúster con los puertos abiertos:</p>
+        <div class="code-file">kind-config.yaml</div>
+        <pre><code class="language-yaml"># kind despliega el clúster con un nodo control-plane.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"   # etiqueta que busca ingress-nginx
+    extraPortMappings:                          # expone 80/443 del host→nodo
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+</code></pre>
+        <pre><code class="language-bash"># Borra el clúster anterior si existe y crea uno nuevo con la config
+kind delete cluster
+kind create cluster --config kind-config.yaml
+
+# Instala el controlador residente de kind (proyecto ingress-nginx)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/kind/deploy.yaml
+
+# Espera a que el Deployment esté listo (2 réplicas)
+kubectl wait --namespace=ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=180s
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Versiones:</strong> la URL raw incluye una versión (<code>controller-v1.12.0</code>). Comprueba en <a href="https://github.com/kubernetes/ingress-nginx/releases">github.com/kubernetes/ingress-nginx/releases</a> la release estable más reciente y ajusta el número. Alternativa con Helm (módulo 8): <code>helm install ingress-nginx ingress-nginx/ingress-nginx --namespace ingress-nginx --create-namespace</code>.</p>
+        </div>
+        <p>Ahora el Ingress mínimo (asumimos un Service <code>mi-servicio</code> en el namespace <code>default</code>):</p>
+        <div class="code-file">ingress-minimo.yaml</div>
+        <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1   # API actual y estable desde K8s 1.19
+kind: Ingress
+metadata:
+  name: ingress-minimo
+spec:
+  ingressClassName: nginx           # usa la clase del controlador ingress-nginx
+  rules:
+    - host: ejemplo.test            # el Host header que debe coincidir
+      http:
+        paths:
+          - path: /                 # todas las rutas
+            pathType: Prefix
+            backend:
+              service:
+                name: mi-servicio   # los Pods de este Service
+                port:
+                  number: 80        # puerto del Service (no del Pod)
+</code></pre>
+        <p>Y a probar: <code>curl -H "Host: ejemplo.test" http://localhost/</code> (o <code>http://localhost:8080/</code> si cambiaste el hostPort). Devuelve lo que sirve <code>mi-servicio</code>. Sin Host header, el controller responde <code>404</code> con su página por defecto.</p>
+      </section>
+
+      <!-- ===================== 4 · EJEMPLO REAL ===================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El Ingress de HarborTasks: un host, dos paths. <code>/</code> servirá la web; <code>/api/</code> se reenvía a la API (cuidado: resolveremos el prefijo), y nacen los requisitos previos.</p>
+
+        <div class="code-file">ingress-harbortasks.yaml</div>
+        <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: harbor-ingress
+  namespace: harbortasks
+  annotations:
+    # Sin esta anotación, /api/proxy llega al backend como /api/proxy.
+    # nginx precisa regex para reescribir: quita el prefijo '/api'.
+    ingress.nginx.rewrite-target: /$2
+spec:
+  ingressClassName: nginx             # el controlador que lo atiende
+  rules:
+    - host: harbortasks.test
+      http:
+        paths:
+          # --- API: todo lo que empiece por /api/ … -----------------
+          - path: /api(/|$)(.*)        # regex: captura lo que va tras /api
+            pathType: ImplementationSpecific   # necesaria para regex
+            backend:
+              service:
+                name: api-harbortasks  # Service de la API (visto en módulo 6)
+                port:
+                  number: 3000
+          # --- Web: el resto va a nginx (estáticos) -----------------
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-harbortasks
+                port:
+                  number: 80
+</code></pre>
+        <p><strong>Requisitos previos para que funcione:</strong></p>
+        <ol>
+          <li>Los Services <code>api-harbortasks</code> y <code>web-harbortasks</code> en el namespace <code>harbortasks</code> (repasa el módulo 6 si falta alguno).</li>
+          <li>El controlador ingress-nginx instalado (ejemplo mínimo) y el clúster creado con los <code>extraPortMappings</code> (si creaste el clúster antes sin ellos, <code>kind delete cluster</code> + recrea).</li>
+          <li>El nombre <code>harbortasks.test</code> debe resolver a <code>127.0.0.1</code> en tu máquina.</li>
+        </ol>
+        <p><strong>Maqueta el DNS local (esencial en Mac y Windows)</strong> — prueba con curl primero, y solo si funciona añádelo al archivo hosts:</p>
+        <pre><code class="language-bash"># ---- Linux / macOS: /etc/hosts ------------------------------------
+echo "127.0.0.1 harbortasks.test" | sudo tee -a /etc/hosts
+
+# ---- Windows (PowerShell como administrador) -----------------------
+# Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "127.0.0.1 harbortasks.test"
+# En WSL2 la IP de localhost difiere: si no resuelve, usa la IP del nodo:
+# kubectl get nodes -o wide   → usa la IP INTERNAL-IP
+</code></pre>
+        <pre><code class="language-bash"># Verificación completa del flujo
+curl -i http://harbortasks.test/            # → 200, HTML estático de la web
+curl -i http://harbortasks.test/api/tasks   # → 200, JSON del API
+curl -i http://localhost/                   # → 404 del controller (sin Host correcto)
+kubectl get ingress -n harbortasks          # estado y ADDRESS del Ingress
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>WSL2 y hostPort:</strong> si <code>curl http://harbortasks.test/</code> falla desde dentro de WSL pero <code>http://localhost/api/tasks</code> funciona desde PowerShell del host de Windows, Docker Desktop publica el puerto en la IP del host y no en la de WSL. En ese caso usa la IP interna del nodo (<code>kubectl get nodes -o wide</code>) en WSL, o accede desde la sesión de Windows del host. El <code>404</code> sin el Host correcto es el comportamiento esperado del controller: exige <code>harbortasks.test</code> para enrutar.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 5 · BUENAS PRÁCTICAS ===================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un solo Ingress por aplicación, con paths claros (<code>/</code>, <code>/api/</code>, <code>/web/</code>)</td>
+              <td>Un Ingress por microservicio o paths anidados al azar</td>
+              <td>El routing L7 se queda en un único manifiesto; es la «config del conserje»</td>
+            </tr>
+            <tr>
+              <td>Define <code>ingressClassName</code> explícito</td>
+              <td>Esparcir Ingress dependiendo de la «clase por defecto»</td>
+              <td>Si mañana hay 2 controladores, la anotación explícita evita ambigüedad</td>
+            </tr>
+            <tr>
+              <td>Usa regex + <code>rewrite-target</code> solo cuando el backend espera el path limpio</td>
+              <td>Reescribir paths sin tester (<code>curl</code> contra cada backend)</td>
+              <td>La reescritura mal hecha rompe la API (404 en <code>/api/tasks</code>)</td>
+            </tr>
+            <tr>
+              <td>Monta TLS con Secret <code>kubernetes.io/tls</code> y cert-manager en producción</td>
+              <td>Dejar el 80 abierto «por si acaso» sin redirigir</td>
+              <td>HTTPS es hoy el estándar; cert-manager lo automatiza (Let's Encrypt)</td>
+            </tr>
+            <tr>
+              <td>Verifica con curl el Host correcto antes de tocar <code>/etc/hosts</code></td>
+              <td>Añadir a hosts hoy un dominio que aún no enruta</td>
+              <td>El 404 del controller es la pista de debugging principal; el de tu DNS, no</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Tráfico al API con CORS:</strong> la web de HarborTasks y la API comparten host (<code>harbortasks.test</code>), así que no hay CORS cruzado. En la <a href="../../modulos/04-docker-compose/04-stack-harbortasks.html">versión Compose</a> sí lo había; con Ingress lo resuelves de gratis. Si algún día separas hosts (api.example.com), recuerda que CORS vuelve a ser problema.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 6 · ERRORES HABITUALES ===================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>❌ «Apliqué el Ingress y no pasa nada» — olvidé el controlador</h3>
+        <pre><code class="language-bash"># ❌ Un cluster kind recién creado NO trae ingress-nginx.
+kubectl apply -f ingress-harbortasks.yaml   # "created" pero nada responde
+
+# ✅ Verifica el controlador:
+kubectl get ingresses -A                    # lista los Ingress atendidos
+kubectl get pods -n ingress-nginx           # los Pods del controller deben estar Running
+kubectl get ingressclass                   # debe existir una clase 'nginx'
+# Si no existe 'nginx', instala el controlador (paso del ejemplo mínimo).
+</code></pre>
+
+        <h3>❌ El path no se reescribe: 404 en <code>/api/tasks</code></h3>
+        <pre><code class="language-bash"># ❌ sin rewrite-target, el backend ve '/api/tasks' y Express no tiene esa ruta
+#    → la API responde 404 (o 404 del controller)
+
+# ✅ añade la anotación y path regex (vista en el ejemplo real)
+#    ingress.nginx.rewrite-target: /$2    que traduce /api/tasks → /tasks
+</code></pre>
+
+        <h3>❌ Host header ausente o distinto</h3>
+        <pre><code class="language-bash"># ❌ acceso con localhost sin Host → 404 genérico del controller
+curl http://localhost/
+
+# ✅ enruta con el dominio declarado en rules.host
+curl -H "Host: harbortasks.test" http://localhost/
+curl http://harbortasks.test/
+</code></pre>
+
+        <h3>❌ Puerto del Service frente al puerto del Pod</h3>
+        <pre><code class="language-yaml"># ❌ aquí va el puerto que el Service expone, no el containerPort del Pod
+backend:
+  service:
+    name: api-harbortasks
+    port:
+      number: 3000             # ✅ puerto publicado por el Service (ClusterIP)
+                               #   si el Service hace 80→3000, aquí escribirías 80.
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Mac/Windows:</strong> el puerto 80 del host puede estar ocupado (Skype, IIS, XAMPP, AirPlay). Antes de asumir «el Ingress no funciona», prueba: <code>netstat -ano | findstr :80</code> en PowerShell, o libera el puerto. Si no puedes usar 80, cambia <code>hostPort: 80</code> a <code>hostPort: 8080</code> en el <code>kind-config.yaml</code> y accede por <code>http://harbortasks.test:8080/</code> (ajustando <code>/etc/hosts</code> igual).</p>
+        </div>
+      </section>
+
+      <!-- ===================== 7 · EJERCICIO GUIADO ===================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> enrutar una aplicación de prueba con el controlador ya instalado, por host y por path, y verificar el flujo completo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea un Deployment + Service de prueba (usa la imagen <code>nginx</code>):</strong>
+            <pre><code class="language-bash">kubectl create deployment demo-web --image=nginx:1.27-alpine
+kubectl expose deployment demo-web --port=80 --target-port=80
+kubectl get svc demo-web       # debe tener ClusterIP 10.96.0.x:80
+</code></pre>
+          </li>
+          <li>
+            <strong>Crea el Ingress para <code>demo.test</code></strong> (aplica el <code>ingress-minimo.yaml</code> del ejemplo mínimo, pero con <code>name: demo-web</code> y <code>host: demo.test</code>):
+            <pre><code class="language-bash">kubectl apply -f ingress-minimo.yaml   # o el tuyo con demo.test
+sleep 5    # da tiempo al controller a reconfigurar nginx
+</code></pre>
+          </li>
+          <li>
+            <strong>Verifica el estado del Ingress:</strong>
+            <pre><code class="language-bash">kubectl get ingress
+# NAME     CLASS   HOSTS       ADDRESS        PORTS
+# ingres…  nginx   demo.test  <IP-local>     80
+</code></pre>
+            <p>Si CLASS está vacío (no <code>nginx</code>) o ADDRESS vacío, revisa el paso del controlador.</p>
+          </li>
+          <li>
+            <strong>Prueba el flujo real (sin tocar /etc/hosts todavía):</strong>
+            <pre><code class="language-bash"># Con Host header correcto → respuesta del nginx (200, HTML "Welcome to nginx")
+curl -i -H "Host: demo.test" http://localhost/
+
+# Sin Host → 404 del controller (no llega a tu app)
+curl -i http://localhost/
+</code></pre>
+            <p><em>Resultado esperado:</em> con <code>Host: demo.test</code> recibes el HTML de nginx; sin él, el 404 del ingress-nginx.</p>
+          </li>
+          <li>
+            <strong>Ponlo en /etc/hosts y comprueba con el nombre directo:</strong>
+            <pre><code class="language-bash">echo "127.0.0.1 demo.test" | sudo tee -a /etc/hosts   # Linux/macOS
+curl http://demo.test/                                 # → 200, "Welcome to nginx" ✔
+</code></pre>
+          </li>
+          <li><strong>Limpia:</strong> <code>kubectl delete ingress ingress-minimo</code>, <code>kubectl delete svc demo-web</code>, <code>kubectl delete deployment demo-web</code>, y quita la línea de <code>/etc/hosts</code>.</li>
+        </ol>
+      </section>
+
+      <!-- ===================== 8 · RETO ===================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 HTTPS con un certificado autofirmado</h3>
+          <p>Eleva el Ingress de HarborTasks a HTTPS. Crea un Secret de tipo <code>kubernetes.io/tls</code> con un certificado autofirmado para <code>harbortasks.test</code> (para generarlo en Linux puedes usar el binario <code>openssl</code>), añade la sección <code>spec.tls:</code> al Ingress y verifica que <code>curl -k https://harbortasks.test/</code> devuelve la web. Además, haz que el HTTP redirija al HTTPS: pista, en ingress-nginx se logra con la anotación <code>nginx.ingress.kubernetes.io/ssl-redirect: "true"</code>, aunque el tráfico no esté cifrado con un CA público (con cert-manager + Let's Encrypt la redirección es total).</p>
+          <p><em>Pista: <code>kubernetes.io/tls</code> exige las claves <code>tls.crt</code> y <code>tls.key</code>; crea el Secret con <code>kubectl create secret tls harbor-tls --cert=cert.pem --key=key.pem</code>. El navegador marcará el certificado como no confiable (autofirmado): esa advertencia es esperada, la comprobación con <code>curl -k</code> debe devolver el HTML igualmente.</em></p>
+        </div>
+      </section>
+
+      <!-- ===================== 9 · RESUMEN ===================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Tres formas de exponer: <strong>NodePort</strong> (puerto alto en nodos), <strong>LoadBalancer</strong> (un LB por servicio en la nube), <strong>Ingress</strong> (un punto de entrada con routing L7 por host/path).</li>
+          <li>El objeto <code>Ingress</code> (<code>networking.k8s.io/v1</code>) es <em>declaración</em>; el <strong>IngressController</strong> (ingress-nginx) es quien <em>ejecuta</em> el routing y NO viene instalado por defecto.</li>
+          <li>kind requiere clúster con <code>extraPortMappings</code> (80/443) y la etiqueta <code>ingress-ready=true</code>.</li>
+          <li>Rules de host + path: el path con regex y <code>rewrite-target</code> para tareas de prefijo como <code>/api/</code>.</li>
+          <li>HTTPS: Secret <code>kubernetes.io/tls</code> + sección <code>spec.tls</code>; en producción cert-manager automatiza Let's Encrypt.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kind create cluster --config kind-config.yaml</code></td><td>Crea el clúster con puertos 80/443 mapeados al host</td></tr>
+            <tr><td><code>kubectl apply -f …/provider/kind/deploy.yaml</code></td><td>Instala el controlador ingress-nginx en kind</td></tr>
+            <tr><td><code>kubectl wait --for=condition=ready pod -n ingress-nginx …</code></td><td>Espera a que el controlador esté Running</td></tr>
+            <tr><td><code>kubectl apply -f ingress.yaml</code></td><td>Crea (o actualiza) el objeto Ingress</td></tr>
+            <tr><td><code>kubectl get ingress -n &lt;ns&gt;</code></td><td>Estado y ADDRESS de los Ingress del namespace</td></tr>
+            <tr><td><code>kubectl get ingressclass</code></td><td>Lista los controladores disponibles (debe existir <code>nginx</code>)</td></tr>
+            <tr><td><code>curl -H "Host: demo.test" http://localhost/</code></td><td>Prueba el routing sin depender de DNS</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== 10 · FAQ ===================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué Kubernetes no incluye un controlador Ingress por defecto?</summary>
+            <div>
+              <p>Por diseño: el «reverse proxy» puede ser nginx, HAProxy, Traefik, Istio… y cada uno tiene reglas, anotaciones y operadores propios. Kubernetes define solo la API (el objetos de routing) y deja el <em>cómo</em> a cada implementación. Por eso «instalar el controlador» es un paso explícito que tú decides, no un componente oculto del control plane.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿NodePort sigue sirviendo para algo si tengo Ingress?</summary>
+            <div>
+              <p>Sí: <em>dentro</em> de un clúster en la nube el controlador ingress-nginx se publica habitualmente como Service LoadBalancer (o bien NodePort en kind). Y NodePort sigue siendo útil para exponer servicios no HTTP (gRPC, TCP, bases de datos) o en clústeres sin Ingress. Para tráfico HTTP/HTTPS público, Ingress es la norma.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Mi Ingress responde <code>404 default backend</code>. ¿Qué significa?</summary>
+            <div>
+              <p>Que el controlador recibió la petición pero no encontró ninguna regla que encajara: o el Host no coincide con <code>rules.host</code>, o el path/backend están mal, o la combinación host+path no está aplicada. Revisa <code>kubectl get ingress -n harbortasks -o yaml</code> y el <code>curl -H "Host: …"</code> adecuado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y el TLS cómo queda con host local?</summary>
+            <div>
+              <p>En local puedes emitir un certificado autofirmado para <code>harbortasks.test</code> junto con un CA propio o usar <code>mkcert</code> (instala la CA en tu sistema y los certificados dejan de marcar error). En producción, cert-manager + cluster issuer de Let's Encrypt hace la renovación automática y el Ingress solo declara <code>tls:</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo tener dos hosts sobre el mismo Ingress?</summary>
+            <div>
+              <p>Sí, añade más objetos en <code>rules</code> (por ejemplo <code>api.harbortasks.test</code> que aterrice en <code>/api/*</code> y <code>web.harbortasks.test</code> en <code>/</code>), o usa <code>host</code> con wildcard. En HarborTasks preferimos un host y routing por path (más simple, mejor DNS local).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-configmaps">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ConfigMaps — Módulo 7 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>ConfigMaps</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Configuración y almacenamiento</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ===================== 1 · INTRODUCCIÓN ===================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En el <a href="../../modulos/05-de-docker-a-kubernetes/04-yaml-declarativo.html">modelo declarativo de Kubernetes</a> una imagen Docker es una única entidad que debería servir <strong>igual en desarrollo, staging y producción</strong>. Si metes dentro de la imagen la URL de la base de datos o el límite de tareas, estás creando una imagen distinta por entorno: un desastre operativo. Por eso existe el <strong>ConfigMap</strong>: un objeto de Kubernetes que guarda configuración <em>fuera</em> de la imagen y la inyecta en los Pods.</p>
+        <p>En esta lección verás qué problema exacto resuelve (la regla de 12-factor «config in environment»), cómo se define, sus dos campos (<code>data</code> y <code>binaryData</code>), las tres formas de consumirla (variables de entorno, <code>envFrom</code> y volúmenes), y la inmutabilidad. Lo aplicaremos a HarborTasks: la web (nginx) y la API leerán su configuración desde un ConfigMap.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todos los fallos en producción con Kubernetes no son de código, sino de configuración: una URL mal apuntada, un límite distinto, un flag desactivado. Separar la config del binario es lo que permite promocionar <em>la misma imagen</em> por entornos y revertir cambios sin reconstruir nada.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 2 · TEORÍA ===================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La regla III de 12-factor: «config in environment»</h3>
+        <p>Las aplicaciones de 12-factor establecen que toda configuración que cambia entre despliegues (URLs, credenciales, flags, límites) debe vivir <strong>en el entorno</strong>, no en el código ni en los archivos de la imagen. La URL de la API en tu máquina no es la misma que en producción; si esa URL está escrita dentro de la imagen, la imagen deja de ser reproducible.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una imagen es como una pizza congelada: la receta y los ingredientes son siempre iguales. El ConfigMap son las instrucciones de horneado que escribes en el envoltorio: temperatura y minutos. Puedes cambiar las instrucciones sin volver a fabricar la pizza.</p>
+        </div>
+        <p>En Docker Compose ya usabas <code>environment:</code> para esto (módulo 4). Kubernetes da un paso más: en vez de variables sueltas en el manifiesto, crea un <strong>objeto declarativo</strong> llamado ConfigMap (<code>apiVersion: v1</code>, <code>kind: ConfigMap</code>). Es config versionada en Git, auditada por el API server y compartida por muchos Pods.</p>
+
+        <h3>Qué contiene un ConfigMap</h3>
+        <p>Es un mapa simple <code>clave → valor</code>, parecido a un diccionario o a un archivo <code>.env</code>. Tiene <strong>dos secciones</strong>:</p>
+        <ul>
+          <li><code>data</code> — valores de texto plano UTF-8 (cadenas, YAML, una URL, un bloque de nginx…). Los valores pueden ser multilínea usando bloque <code>|</code> de YAML.</li>
+          <li><code>binaryData</code> — valores binarios codificados en <strong>Base64</strong> (un certificado, un par de claves, un config de formato binario). Rara vez la necesitarás; es mejor montar estos ficheros como Secret o como imagen separada.</li>
+        </ul>
+        <p>El tamaño máximo de un ConfigMap es <strong>1 MiB</strong> (por defecto). Si necesitas más, ese dato no debería ir en un ConfigMap (piensa en un objeto propio, en un volumen o en un Secret con cifrado). Los ConfigMap son <strong>namespace-scoped</strong>: solo existen dentro de su namespace.</p>
+
+        <h3>Cómo se consume: tres vías, tres consecuencias</h3>
+        <div class="diagram">
+                  kubectl apply -f configmap.yaml
+                           │
+                           v
+                ┌───────────────────────┐
+                │  ConfigMap api-config │
+                │  DATABASE_URL=…       │
+                │  TASKS_LIMIT=10       │
+                │  LOG_LEVEL=info       │
+                └───────────┬───────────┘
+                            │  el kubelet las inyecta según cómo las pidas
+            ┌───────────────┼────────────────┐
+            │               │                │
+     envFrom (todas)  configMapKeyRef  volume mount
+            │        (una a una)       (como archivos)
+            │               │                │
+      ┌─────┴────┐   ┌──────┴─────┐   ┌─────┴─────┐
+      │ api Pod  │   │  api Pod   │   │ web Pod   │
+      │ variables│   │ variables  │   │ /etc/nginx│
+      │ (set de  │   │ específicas│   │ /conf.d   │
+      │  claves) │   │            │   │ default.conf
+      └──────────┘   └────────────┘   └───────────┘
+        </div>
+        <ol>
+          <li><strong><code>env</code> + <code>valueFrom.configMapKeyRef</code>:</strong> pides una clave concreta y la conviertes en una variable de entorno con el nombre que tú quieras. Útil cuando el nombre de la clave no es un nombre de variable válido (p. ej. <code>config.url</code>) o cuando solo quieres 2 de las 10 claves.</li>
+          <li><strong><code>envFrom</code>:</strong> vuelca <em>todas</em> las claves del ConfigMap como variables. Cómodo, pero si una clave choca con una variable ya definida el comportamiento es sutil (más abajo en errores).</li>
+          <li><strong>Volumen montado:</strong> cada clave se convierte en un <strong>archivo</strong> cuyo nombre es la clave, contenido en un directorio que montas dentro del Pod. Perfecto para config en forma de fichero (un <code>nginx.conf</code>, un <code>.env</code>, un <code>settings.json</code>).</li>
+        </ol>
+
+        <h3>Inmutabilidad (Kubernetes 1.21+)</h3>
+        <p>Si marcas <code>immutable: true</code>, el ConfigMap <strong>no se puede modificar ni borrar</strong> hasta que lo borres explícitamente. ¿Por qué existe? Por un problema real: cambiar la config de un sistema en marcha puede ser catastrófico (y los secretos heredados provocan «supply chain»). Hacerla inmutable garantiza que ninguna cuenta o pipeline pueda alterarla por accidente. Ganas rendimiento además: el kubelet deja de escuchar cambios en ese objeto.</p>
+        <div class="callout callout--warning">
+          <p><strong>Cambiar un ConfigMap no reinicia los Pods.</strong> Las variables de entorno se leen <em>una vez</em> al crear el contenedor. Si editas un ConfigMap de tipo env, necesitas <code>kubectl rollout restart deployment &lt;nombre&gt;</code> para aplicar los cambios. Con volúmenes, el kubelet sincroniza el archivo sin reiniciar (pero tu aplicación debe recargarlo).</p>
+        </div>
+      </section>
+
+      <!-- ===================== 3 · EJEMPLO MÍNIMO ===================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La forma más rápida de crear un ConfigMap es con <code>kubectl create</code> desde la línea de comandos:</p>
+        <pre><code class="language-bash"># --from-literal inyecta una clave=valor directa en el objeto
+kubectl create configmap demo-cm \
+  --from-literal=saludo=hola-mundo \
+  --from-literal=nivel=debug
+
+# Ver el objeto en YAML (la única fuente de verdad del clúster)
+kubectl get configmap demo-cm -o yaml
+
+# Ver un resumen legible: cuántas claves y su tamaño
+kubectl describe configmap demo-cm
+</code></pre>
+        <p>Salida del <code>-o yaml</code> (comentada):</p>
+        <pre><code class="language-yaml">apiVersion: v1            # API de objetos básicos (configmaps viven aquí)
+kind: ConfigMap           # el tipo de objeto
+metadata:
+  name: demo-cm           # nombre del objeto (único en el namespace)
+  namespace: default      # scope: este ConfigMap solo existe en 'default'
+data:
+  nivel: debug            # data = texto plano UTF-8
+  saludo: hola-mundo
+</code></pre>
+        <p>Puntos clave: <code>data</code> guarda texto, el nombre vive en <code>metadata</code>, y el namespace delimita dónde es visible. No hay «instalación» ni imágenes: es solo un objeto en etcd del clúster, listo para que los Pods lo consuman.</p>
+      </section>
+
+      <!-- ===================== 4 · EJEMPLO REAL ===================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Apliquémoslo a HarborTasks. Dos piezas, dos configuras:</p>
+        <ul>
+          <li><strong>API (Node/Express):</strong> necesita la URL de la base de datos, el límite de tareas por página y el nivel de log. Lo inyectamos como variables de entorno con <code>envFrom</code> + un par de <code>configMapKeyRef</code>.</li>
+          <li><strong>Web (nginx):</strong> necesita saber a qué servicio enviar el tráfico <code>/api/*</code>. En Kubernetes nginx no expande variables de entorno por sí solo, así que la solución idiomática es montar su configuración (un fichero) como <strong>volumen</strong>.</li>
+        </ul>
+
+        <div class="code-file">configmaps.yaml</div>
+        <pre><code class="language-yaml"># --- ConfigMap de la API: variables de entorno en texto plano ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config                  # lo consumirán los Pods con label app=api
+  namespace: harbortasks
+data:
+  # URL interna del servicio de postgres (DNS del clúster).
+  # El puerto 5432 es el estándar de PostgreSQL.
+  DATABASE_URL: postgres://harbor:harborpass@postgres:5432/harbortasks
+  TASKS_LIMIT: "10"                # YAML lo interpretaría como número; lo forzamos a texto
+  LOG_LEVEL: info                  # nivel de log para desarrollo local
+  # NOTA: la contraseña 'harborpass' está aquí SOLO para aprender.
+  # En producción va en un Secret (próxima lección), no en un ConfigMap.
+
+---
+# --- ConfigMap de la web: un fichero de configuración de nginx ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+  namespace: harbortasks
+data:
+  # El nombre de la clave (default.conf) será EL NOMBRE DEL ARCHIVO montado.
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;                       # cualquier host → esta web
+
+      # Cualquier petición /api/* se reenvía al servicio api
+      location /api/ {
+        proxy_pass http://api.harbortasks.svc:3000;
+        proxy_set_header Host $host;
+      }
+
+      # El resto (estáticos HTML/CSS/JS) se sirve desde /usr/share/nginx/html
+      location / {
+        root /usr/share/nginx/html;
+      }
+    }
+</code></pre>
+
+        <div class="code-file">deployment-api.yaml (fragmento)</div>
+        <pre><code class="language-yaml">spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+          # 1) envFrom: vierte TODAS las claves de api-config como variables.
+          envFrom:
+            - configMapRef:
+                name: api-config
+          # 2) configMapKeyRef: pide una clave concreta y la expone con el
+          #    nombre de variable que tú elijas (clave 'TASKS_LIMIT' de api-config).
+          env:
+            - name: MAX_TASKS_PER_PAGE       # la app espera este nombre
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config           # del ConfigMap api-config
+                  key: TASKS_LIMIT           # toma la clave TASKS_LIMIT
+                  optional: false            # si falta la clave, falla el arranque
+</code></pre>
+
+        <div class="code-file">deployment-web.yaml (fragmento)</div>
+        <pre><code class="language-yaml">spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: nginx-conf              # mismo nombre que el volumen de abajo
+              mountPath: /etc/nginx/conf.d  # reemplaza el contenido de este dir
+              readOnly: true                # nginx solo lee su config
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: web-config                # clave default.conf → archivo default.conf
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Ojo con el mountPath:</strong> al montar un volumen en <code>/etc/nginx/conf.d</code> estás <em>reemplazando</em> la carpeta completa de la imagen (se oculta su contenido previo). Por eso el fichero se llama <code>default.conf</code>: sustituye al <code>default.conf</code> de la imagen sin dejar versiones huérfanas. Es el patrón estándar con nginx en Kubernetes.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 5 · BUENAS PRÁCTICAS ===================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Separa un ConfigMap por componente (<code>api-config</code>, <code>web-config</code>)</td>
+              <td>Un mega-ConfigMap con la config de todo el stack</td>
+              <td>Cambios aislados, menor superficie de error y permisos RBAC ajustados</td>
+            </tr>
+            <tr>
+              <td>Usa <code>envFrom</code> para conjuntos de claves y <code>configMapKeyRef</code> para claves sueltas</td>
+              <td>Mezclar ambos sin pensarlo</td>
+              <td><code>envFrom</code> puede pisar variables ya definidas; <code>configMapKeyRef</code> es explícito</td>
+            </tr>
+            <tr>
+              <td>Monta ficheros con <code>readOnly: true</code></td>
+              <td>Montar la config en escritura</td>
+              <td>El contenedor no debe poder modificar su propia configuración</td>
+            </tr>
+            <tr>
+              <td>Marca <code>immutable: true</code> en config crítica tras madurar</td>
+              <td>Config mutable donde el cambio no necesita despliegue</td>
+              <td>Elimina el vector de cambio accidental y acelera el kubelet</td>
+            </tr>
+            <tr>
+              <td>Tras editar un ConfigMap de env: <code>kubectl rollout restart deployment &lt;name&gt;</code></td>
+              <td>Asumir que el Pod «ve» el cambio solo</td>
+              <td>Las variables se leen al crear el contenedor; sin reinicio no se aplican</td>
+            </tr>
+            <tr>
+              <td>Config sensible → Secret (próxima lección)</td>
+              <td>Contraseñas, tokens y claves en <code>data</code></td>
+              <td>Un ConfigMap no cifra nada: es texto plano visible a quien tenga acceso RBAC</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== 6 · ERRORES HABITUALES ===================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>❌ Claves con puntos o guiones usadas como variables de entorno</h3>
+        <pre><code class="language-yaml"># ❌ La clave 'DATABASE.URL' no es un nombre de variable válido.
+#    Docker/shell aceptarían fallos de mapeo; Kubernetes ignora la clave
+#    o directamente falla al validar el Pod.
+data:
+  DATABASE.URL: postgres://…
+
+# ✅ soluciones: (a) renombrar la clave, o (b) usar configMapKeyRef con re-naming
+env:
+  - name: DATABASE_URL                     # nombre de variable válido
+    valueFrom:
+      configMapKeyRef:
+        name: api-config
+        key: DATABASE.URL                  # clave rara… pero con nombre limpio fuera
+</code></pre>
+
+        <h3>❌ Confundir ConfigMap con el lugar para secretos</h3>
+        <pre><code class="language-bash"># ❌ La contraseña de postgres en texto plano dentro de un ConfigMap
+kubectl create configmap credenciales \
+  --from-literal=PASSWORD=hunter2          # visible para cualquiera con RBAC
+
+# ✅ Los secretos van en un objeto Secret (core/v1) que además soporta
+#    cifrado en reposo: se verá en la lección 02-secrets.
+kubectl create secret generic pg-secret \
+  --from-literal=POSTGRES_PASSWORD=hunter2
+</code></pre>
+
+        <h3>❌ Montar un archivo y olvidar que sustituye la carpeta</h3>
+        <p>Si montas un volumen ConfigMap en <code>/etc/nginx/conf.d</code> y la imagen ya tenía su propio <code>default.conf</code>, este queda oculto. Si además añades otra clave llamada como un archivo que esperabas conservar, también se pierde. La solución idiomática: que el ConfigMap <em>sea</em> el contenido completo de esa carpeta (como hicimos en el ejemplo real).</p>
+
+        <h3>❌ Esperar que un <code>kubectl edit configmap</code> actualice los Pods al instante</h3>
+        <pre><code class="language-bash"># ❌ No funciona así: los Pods siguen con las variables viejas
+kubectl edit configmap api-config
+
+# ✅ Debes reiniciar el Deployment para que sus Pods re-lean la config
+kubectl rollout restart deployment api
+kubectl rollout status deployment api     # esperar a que termine el rollout
+</code></pre>
+      </section>
+
+      <!-- ===================== 7 · EJERCICIO GUIADO ===================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un ConfigMap que se inyecte en un Pod de pruebas (busybox) por las tres vías y verificar el resultado dentro del Pod.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el ConfigMap con 3 claves:</strong>
+            <pre><code class="language-bash">kubectl create configmap app-config \
+  --from-literal=APP_NAME=harbortasks \
+  --from-literal=APP_COLOR=blue \
+  --from-literal=APP_PAGINA=principal
+kubectl get configmap app-config
+</code></pre>
+          </li>
+          <li>
+            <strong>Lanza un Pod de prueba que use envFrom y un configMapKeyRef:</strong>
+            <pre><code class="language-bash">kubectl run test-pod --image=busybox --restart=Never --command -- sleep 3600
+</code></pre>
+          </li>
+          <li>
+            <strong>Edita el Pod para añadir las variables</strong> (<code>kubectl edit pod test-pod</code>) y añade bajo <code>containers[0]</code>:
+            <pre><code class="language-yaml">          env:
+            - name: NOMBRE_RENOMBRADO        # renombramos la clave
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: APP_PAGINA
+          envFrom:
+            - configMapRef:
+                name: app-config             # vuelca APP_NAME y APP_COLOR
+</code></pre>
+          </li>
+          <li>
+            <strong>Verifica dentro del Pod:</strong>
+            <pre><code class="language-bash">kubectl exec test-pod -- env | grep -E 'APP_NAME|APP_COLOR|NOMBRE_RENOMBRADO'
+</code></pre>
+            <p><em>Resultado esperado:</em> seis líneas, una por variable, con los valores <code>harbortasks</code>, <code>blue</code> y <code>principal</code> (renombrada). Si no ves alguna, vuelve al paso 3 y confirma el YAML.</p>
+          </li>
+          <li><strong>Limpia:</strong> <code>kubectl delete pod test-pod</code> y <code>kubectl delete configmap app-config</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Windows (PowerShell):</strong> en cmd/PowerShell evita las barras inversas <code>\</code> de continuación; escribe el comando en una sola línea. Y los acentos en los literales pueden dar problemas de codificación: usa valores ASCII para los ejemplos.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 8 · RETO ===================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Recarga en caliente de un fichero de config</h3>
+          <p>Modifica el ejemplo real de la web: añade una cabecera de respuesta (<code>proxy_set_header X-Env "prod";</code>) al bloque <code>/api/</code> editando el ConfigMap <code>web-config</code> con <code>kubectl edit</code>. Después comprueba que nginx sirve la versión nueva de <code>default.conf</code> <em>sin</em> reiniciar el Deployment (las configuraciones montadas como volumen se sincronizan). ¿Qué comando de nginx ejecutarías dentro del Pod para forzar la recarga? Pista: existe un binario de señalización llamado <code>nginx -s</code> y la recarga se hace con <code>kubectl exec</code>.</p>
+          <p><em>Pista: <code>kubectl exec deployment/web -- nginx -s reload</code> y antes verifica el estado con <code>kubectl exec deployment/web -- nginx -t</code>. El fichero montado se actualiza en pocos segundos tras el <code>kubectl edit</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ===================== 9 · RESUMEN ===================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El ConfigMap separa la configuración de la imagen: <strong>misma imagen, distintos entornos</strong> (12-factor).</li>
+          <li>Es un objeto <code>core/v1</code> del namespace, con <code>data</code> (texto) y <code>binaryData</code> (Base64), máximo 1 MiB.</li>
+          <li>Tres vías de consumo: <code>env.configMapKeyRef</code> (una clave), <code>envFrom</code> (todas) y <strong>volumen</strong> (clave → archivo).</li>
+          <li>La config sensible NO va en un ConfigMap: va en un Secret (siguiente lección).</li>
+          <li><code>immutable: true</code> evita cambios accidentales y mejora el rendimiento del kubelet.</li>
+          <li>Cambiar un ConfigMap no reinicia Pods: las variables requieren <code>kubectl rollout restart</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl create configmap &lt;nombre&gt; --from-literal=k=v</code></td><td>Crea un ConfigMap con claves literales</td></tr>
+            <tr><td><code>kubectl create configmap &lt;nombre&gt; --from-file=&lt;archivo&gt;</code></td><td>Crea un ConfigMap a partir de un archivo (clave=nombre del archivo)</td></tr>
+            <tr><td><code>kubectl create configmap &lt;nombre&gt; --from-env-file=&lt;.env&gt;</code></td><td>Crea un ConfigMap desde un fichero <code>.env</code> clave=valor</td></tr>
+            <tr><td><code>kubectl get configmap &lt;nombre&gt; -o yaml</code></td><td>Muestra el objeto completo (fuente de verdad)</td></tr>
+            <tr><td><code>kubectl describe configmap &lt;nombre&gt;</code></td><td>Resumen legible: claves, valores y tamaño</td></tr>
+            <tr><td><code>kubectl rollout restart deployment &lt;nombre&gt;</code></td><td>Recrea los Pods para que re-lean la config</td></tr>
+            <tr><td><code>kubectl delete configmap &lt;nombre&gt;</code></td><td>Borra el objeto</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== 10 · FAQ ===================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Un ConfigMap puede tener más de 1 MiB?</summary>
+            <div>
+              <p>Por defecto el API server limita los objetos a 1 MiB (apiserver etcd request size). Superarlo hace fallar el <code>kubectl apply</code>. Es una señal de diseño: si necesitas más, ese dato no pertenece al ConfigMap; piensa en un volumen (archivo grande ya empaquetado) o en otro objeto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si un Pod referencia un ConfigMap que no existe?</summary>
+            <div>
+              <p>Depende: si usas <code>env</code>/<code>configMapKeyRef</code> con <code>optional: false</code> (por defecto), el Pod falla con <code>CreateContainerConfigError</code>. Marcando <code>optional: true</code> el Pod arranca sin esa variable. Con volúmenes, si el ConfigMap no existe el Pod permanece <code>Pending</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué las variables de entorno no se actualizan al editar el ConfigMap?</summary>
+            <div>
+              <p>El kubelet inyecta las variables de entorno <strong>en el momento de crear el contenedor</strong>, como si fueran argumentos del proceso. Son inmutables durante la vida del contenedor. Por eso hace falta <code>kubectl rollout restart</code> (recrea contenedores). Los volúmenes, en cambio, se sincronizan periódicamente sin reiniciar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿ConfigMap y Secret son lo mismo?</summary>
+            <div>
+              <p>Mismo mecanismo (mapa clave-valor), distinta semántica y distinto tratamiento. Los Secrets no se exponen en <code>kubectl describe</code> (por defecto), soportan cifrado en reposo y gestionan la rotación de otra forma. Regla sencilla en HarborTasks: la URL de la BBDD puede ser ConfigMap; la contraseña, siempre Secret.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo versionar los ConfigMap en Git?</summary>
+            <div>
+              <p>Sí: los manifiestos YAML de ConfigMap deben estar en Git junto al resto del código (los valores habitualmente referenciando secretos por nombre, no con el valor). Eso te da historial, revisión y aplicado reproducible. Basta con <code>kubectl apply -f configmaps.yaml</code> tras el despliegue de la aplicación.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

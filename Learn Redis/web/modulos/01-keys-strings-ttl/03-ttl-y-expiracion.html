@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="03-ttl-y-expiracion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTL y expiración: EXPIRE y presencia — Módulo 1 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TTL y expiración: EXPIRE y presencia</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Keys, Strings y TTL</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La <strong>expiración</strong> es el superpoder silencioso de Redis: una key con TTL se borra sola. Es lo que convierte «presencia de conexiones» en algo que se limpia sin cron ni garbage collector manual.</p>
+        <p>Verás los comandos (<code>EXPIRE/TTL/PERSIST</code>), cómo funciona bajo el capó (lazy + active) y el patrón <strong>TTL que se refresca</strong> (heartbeat) que usará tu hub.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Comandos</h3>
+        <pre><code class="language-redis">EXPIRE key 30           # fija/refresca expiración en s
+PEXPIRE key 30000       # en ms
+TTL key                 # segundos restantes (-1 sin TTL, -2 no existe)
+PTTL key                # ms
+PERSIST key             # quita el TTL
+SETEX key 30 valor      # crear + TTL en un comando</code></pre>
+
+        <h3>Cómo expira Redis (bajo el capó)</h3>
+        <ul>
+          <li><strong>Lazy:</strong> al acceder a una key expirada, Redis la borra en ese momento.</li>
+          <li><strong>Active:</strong> en segundo plano, Redis muestrea keys con TTL y elimina las vencidas (evita que las expiradas «ocupen» memoria por no leerse nunca).</li>
+        </ul>
+        <p>Implicación práctica: <strong>una key expirada no se nota hasta que la tocas</strong>; los «contadores de expirados» no son en tiempo real, y una key nunca leída pero vencida tarda un poco en liberar RAM.</p>
+
+        <h3>El patrón heartbeats / presencia</h3>
+        <pre><code class="language-text">cliente conecta → SETEX hub:conn:&lt;id&gt; 30 node-1
+cada 10-20 s     → EXPIRE hub:conn:&lt;id&gt; 30   (refresh)
+si se cae       → nadie refresca → expira sola en ~30 s
+¿está vivo?      → EXISTS hub:conn:&lt;id&gt;    (1 = sí)</code></pre>
+        <p>Es un <strong>lease</strong>: la existencia de la key significa «visto hace poco». Sin cron, sin listas negras.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">SET hub:conn:8632 node-1
+EXPIRE hub:conn:8632 30
+TTL hub:conn:8632          # ~29
+EXPIRE hub:conn:8632 60    # refresca a 60
+PERSIST hub:conn:8632      # sin TTL (-1) → ¡desconexión nunca limpiada!
+EXISTS hub:conn:8632</code></pre>
+        <p>Nota el peligro de <code>PERSIST</code> en presencia: si dejas de expirar, el registro queda «eterno».</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El heartbeat del hub, con el refresco en un intervalo mucho menor que el TTL (para aguantar latencias de red):</p>
+        <pre><code class="language-csharp">// En el proyecto redis-ws-hub
+const TimeSpan lease = TimeSpan.FromSeconds(30);
+
+// Al conectar:
+await db.StringSetAsync($"hub:conn:{connectionId}", _nodeId, lease);
+
+// En el heartbeat del socket (cada 10 s):
+await db.KeyExpireAsync($"hub:conn:{connectionId}", lease);
+
+// ¿Vivo? En operaciones: 
+bool alive = await db.KeyExistsAsync($"hub:conn:{connectionId}");
+if (!alive) { /* el cliente se fue o caducó; cerrar */ }</code></pre>
+        <p>Si el nodo muere, deja de refrescar; en ~30 s la presencia desaparece sin intervención.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>TTL a toda «presencia» o estado temporal</td><td>Keys eternas que se acumulan</td><td>Expiración = limpieza automática y RAM controlada</td></tr>
+            <tr><td>Lease ≫ periodicidad del heartbeat</td><td>TTL más corto que la jitter de red</td><td>Un lag de red normal no debe «matarte»</td></tr>
+            <tr><td>Refresh con EXPIRE/KeyExpire atómico</td><td>DEL+SET para renovar</td><td>Evita la ventana en la que la key «no existe»</td></tr>
+            <tr><td>Exponer el TTL como constante documentada</td><td>Números mágicos diseminados</td><td>El plazo es una decisión de negocio (M0-04)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Renovar después de que venció (raza)</h3>
+        <pre><code class="language-csharp">// ❌ KeyExpire puede llegar cuando la key ya no existe → sin efecto
+await db.KeyExpireAsync(key, lease);
+// ✅ Mejor: al refrescar, también valida con un SET KEEPTTL si aplica
+//    o reintenta registrar la presencia si ya expiró.
+</code></pre>
+
+        <h3>Toma de decisión con TTL==0</h3>
+        <p>Esperar <code>TTL == 0</code> para «confirmar» la muerte es frágil: usa <code>EXISTS</code> o trata <code>TTL==-2</code> (no existe) y <code>-1</code> (sin TTL) con claridad.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Crea <code>hub:conn:1</code> con valor <code>node-1</code> y TTL 30.</li>
+          <li><strong>Paso 2:</strong> Espera 5 s, refresca con <code>EXPIRE hub:conn:1 30</code> y anota el TTL.</li>
+          <li><strong>Paso 3:</strong> No toques nada y espera 35 s: <code>EXISTS hub:conn:1</code> debe dar 0 (expirada).</li>
+          <li><strong>Paso 4:</strong> Comprueba <code>TTL</code> de una key sin TTL (debe dar -1).</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Presencia en los 3 estados</h3>
+          <p>Diseña con Redis-cli una sesión de prueba que muestre los 4 valores de TTL y su significado correcto (<em>sano</em>, <em>refrescado</em>, <em>sin TTL</em>, <em>no existe</em>) y un mini-heartbeat que no deje la key sin expirar. Escríbelo como guión con comentarios.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>EXPIRE/TTL/PERSIST/SETEX</code> gestionan la vida de las keys.</li>
+          <li>Expiración lazy + active: no percibes la clave hasta que la tocas.</li>
+          <li>Heartbeat = refrescar el TTL → presencia que se limpia sola.</li>
+          <li>Lease ≫ intervalo de refresh para tolerar latencia.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El TTL consume CPU?</summary>
+            <div><p>Muy poco: Redis muestrea periodicamente y borra. El coste real está en las keys sin TTL que nunca borras por código.</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo refrescar el TTL sin reescribir el valor?</summary>
+            <div><p>Sí: <code>EXPIRE</code> (o <code>KeyExpireAsync</code>) solo toca el TTL; o <code>SET ... KEEPTTL</code> para escribir valor conservando vida.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

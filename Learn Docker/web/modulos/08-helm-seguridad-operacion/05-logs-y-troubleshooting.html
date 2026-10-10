@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="05-logs-y-troubleshooting">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Logs, kubectl debug y troubleshooting — Módulo 8 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Logs, kubectl debug y troubleshooting</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Helm, seguridad y operación</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Has desplegado HarborTasks en Kubernetes. Ahora toca la parte que nadie te enseña y todo el mundo necesita: <strong>cuando un pod falla, ¿qué haces?</strong> Kubernetes no falla "en silencio": cada estado raro tiene una huella concreta que puedes leer si sabes dónde mirar.</p>
+        <p>Esta lección te da el método: los cuatro comandos que configuran el 90% del troubleshooting (<code>kubectl logs</code>, <code>kubectl describe pod</code>, <code>kubectl get events</code> y <code>kubectl debug</code>), el significado de los estados problemáticos más comunes (<code>Pending</code>, <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code>, <code>CreateContainerConfigError</code>, <code>OOMKilled</code>) y un <strong>proceso sistemático</strong> para diagnosticar, no para tirar a ciegas.</p>
+        <div class="callout callout--why">
+          <p><strong>El porqué:</strong> la diferencia entre un operador junior y uno senior no es "saber el comando", es <em>saber qué comando cuando</em>. Los logs te dicen qué pasó dentro del contenedor; los eventos te dicen qué pasó alrededor del pod. El diagnóstico es leer ambas capas en orden.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Las capas de un problema: contenedor vs pod vs nodo</h3>
+        <div class="diagram">  ┌──────────────────────────────────────────────┐
+  │ Qué pasó DENTRO del contenedor → kubectl logs  │
+  │ Qué pasó ALREDEDOR del pod    → describe/events│
+  │ Qué pasó en el NODO           → describe node  │
+  └──────────────────────────────────────────────┘
+       Lee en este orden exacto cuando algo falla.</div>
+        <ul>
+          <li><strong>Logs:</strong> lo que el proceso imprimió por stdout/stderr (el contenedor ya arrancó y ejecutó código).</li>
+          <li><strong>Events:</strong> lo que el kubelet y el scheduler decidieron (pull de imagen, fallos de arranque, reinicios). A menudo el evento es más informativo que el log cuando el contenedor ni siquiera llegó a arrancar.</li>
+          <li><strong>Describe node:</strong> presión de recursos, taints, condiciones que impiden colocar pods.</li>
+        </ul>
+
+        <h3>Estados problemáticos y su significado</h3>
+        <table>
+          <thead><tr><th>Estado (STATUS / REASON)</th><th>Qué significa</th><th>Dónde mirar primero</th></tr></thead>
+          <tbody>
+            <tr><td><code>Pending</code></td><td>El Pod no encuentra nodo: pod sin recursos o taints que lo bloquean</td><td><code>describe pod</code>: evento <code>FailedScheduling</code> / <code>0/1 nodes available</code></td></tr>
+            <tr><td><code>ImagePullBackOff</code></td><td>La imagen no se puede descargar (no existe, tag mal, credenciales)</td><td>Evento <code>Failed to pull image …</code>: mira tag y <code>imagePullSecrets</code></td></tr>
+            <tr><td><code>CrashLoopBackOff</code></td><td>El contenedor arranca y muere repetidamente</td><td><code>logs --previous</code>: qué dijo el proceso en su última ejecución</td></tr>
+            <tr><td><code>CreateContainerConfigError</code></td><td>No se pudo construir el contenedor: env refs a ConfigMap/Secret inexistentes</td><td>Evento: <code>env: key not found</code> / ConfigMap/Secret no existe</td></tr>
+            <tr><td><code>OOMKilled</code></td><td>El kubelet mató el contenedor por superar el limit de memoria</td><td><code>describe</code>: <code>Last State: Terminated, Reason: OOMKilled</code>; sube el limit</td></tr>
+            <tr><td><code>RunContainerError</code></td><td>Problema al arrancar: entrypoint faltante, permisos, archivo inexistente</td><td>Evento con el detalle; <code>logs</code> puede estar vacío</td></tr>
+            <tr><td><code>Terminating</code></td><td>Bloqueado en borrado (a veces por finalizers o volumen)</td><td>Si persiste minutos: <code>kubectl get pod -o yaml</code> para ver finalizers</td></tr>
+          </tbody>
+        </table>
+
+        <h3>kubectl logs en sus tres variantes</h3>
+        <pre><code class="language-bash"># Logs actuales (desde que el contenedor está vivo)
+kubectl logs api-5d8f4f9d7f-xk2p4 -n harbortasks
+
+# Logs en streaming: la mejor herramienta durante un incidente
+kubectl logs -f api-5d8f4f9d7f-xk2p4 -n harbortasks
+
+# Logs ANTERIORES: la pieza clave del CrashLoopBackOff
+# El contenedor actual ya murió; la vida pasada está en --previous
+kubectl logs --previous api-5d8f4f9d7f-xk2p4 -n harbortasks
+
+# Combo: los últimos 50 del proceso anterior (evita spam)
+kubectl logs --previous --tail=50 api-5d8f4f9d7f-xk2p4 -n harbortasks</code></pre>
+
+        <h3>Los events: la crónica del kubelet</h3>
+        <pre><code class="language-bash"># Eventos del cluster ordenados por tiempo (invirtiendo lo reciente)
+kubectl get events --sort-by=.lastTimestamp -n harbortasks
+
+# Con nombres de objetos implicados (Time / Reason / Message)
+kubectl get events --sort-by=.lastTimestamp -n harbortasks -w</code></pre>
+        <p>Un detalle: los eventos son <strong>efímeros</strong> — se limpian solos con el tiempo. Si el pod falló hace horas, el evento ya no está. Por eso muchos equipos envían eventos a un agregador de logs (Módulo 9 verás CI/CD y observabilidad).</p>
+
+        <h3>kubectl debug: meter una sonda en el pod</h3>
+        <p>Hay problemas que no se ven ni con logs ni con eventos: "¿el DNS del clúster funciona?", "¿ese archivo existe en la imagen?". Para eso existe <code>kubectl debug</code>, que crea un <strong>ephemeral container</strong>: un contenedor temporal de inspección dentro del pod en ejecución (<em>debug container</em>). Comparte el network namespace y el filesystem del pod, así que puedes probar la red, montar herramientas y mirar procesos, sin tocar el código de la app:</p>
+        <pre><code class="language-bash"># Añade un contenedor temporal "debugger" (imagen con herramientas)
+kubectl debug api-5d8f4f9d7f-xk2p4 -n harbortasks \
+  --image=nicolaka/netshoot               # imagen clásica de red + shell
+  --target=api                            # comparte namespace del contenedor api
+
+# Ya dentro del debugger: mira la red, DNS, procesos y archivos
+ping web                                  # ¿resuelve el Service web?
+curl http://web/                          # ¿responde nginx?
+ps aux                                    # ¿qué procesos viven en el pod?
+ls /app/dist                              # ¿existe el artefacto que buscamos?</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Alternativa clásica:</strong> si la imagen tiene shell y herramientas, <code>kubectl exec</code> basta. El debug container es el refuerzo para cuando la imagen es mínima (alpine distroless) o el contenedor no arranca y necesitas inspeccionar el entorno.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ciclo completo de diagnóstico en un solo ejemplo. Crea un pod deliberadamente roto y léelo con el método:</p>
+        <pre><code class="language-yaml"># pod-roto.yaml — el pod fallará a propósito en el próximo paso
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-roto
+spec:
+  containers:
+    - name: app
+      # Imagen REAL pero con tag inventado → ImagePullBackOff
+      image: node:999</code></pre>
+        <pre><code class="language-bash"># 1. Aplica y mira el estado
+kubectl apply -f pod-roto.yaml
+kubectl get pod pod-roto          # STATUS: ImagePullBackOff
+
+# 2. Lee el reportaje del kubelet (¿por qué?): eventos
+kubectl describe pod pod-roto | tail -20
+# Events:
+#   Failed to pull image "node:999": ... manifest unknown
+#   Back-off pulling image "node:999"   ← aquí está la causa raíz
+
+# 3. Limpia
+kubectl delete pod pod-roto</code></pre>
+        <p>Observa el orden: primero el estado (<code>get</code>), luego el porqué (<code>describe</code>), sin saltar a los logs — que aquí no existen, porque el contenedor nunca llegó a arrancar.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Diagnóstico real de un pod de HarborTasks. Escenario: la API entra en <code>CrashLoopBackOff</code> justo después de un despliegue con Helm.</p>
+        <pre><code class="language-bash"># 0. El síntoma: el deployment no se estabiliza
+kubectl get pods -n harbortasks
+# NAME                   READY   STATUS             RESTARTS   AGE
+# api-7b5f8d9f5c-abc12   0/1     CrashLoopBackOff   5          3m</code></pre>
+        <pre><code class="language-bash"># 1. Describe: capa del pod, eventos (puede pedir "Por qué se reinicia") 
+kubectl describe pod api-7b5f8d9f5c-abc12 -n harbortasks
+# ...
+# State:          Waiting
+#   Reason:       CrashLoopBackOff
+# Last State:     Terminated
+#   Reason:       Error
+#   Exit Code:    1          ← el proceso murió con error
+# Events:
+#   Back-off restarting failed container</code></pre>
+        <pre><code class="language-bash"># 2. Logs del contenedor ANTES de morir: el mensaje real del proceso
+kubectl logs api-7b5f8d9f5c-abc12 -n harbortasks --previous --tail=30
+# ← Port 3000 is not listening?  No: aquí lo que imprime node/express
+# Error: Cannot find module '/app/dist/server.js'
+#     at Module._resolveFilename (node:internal/modules/...)
+# ← la API no puede encontrar su ejecutable
+
+# 3. ¿Dónde está el archivo? El pod construye la imagen desde el stage
+kubectl exec api-7b5f8d9f5c-abc12 -n harbortasks -- ls /app
+# ❌ exec failed: container is restarting ... (no da tiempo a entrar)</code></pre>
+        <pre><code class="language-bash"># 4. Como no arranca, usamos un debug container temporal
+kubectl debug api-7b5f8d9f5c-abc12 -n harbortasks \
+  --image=alpine --target=app -- rm 2>/dev/null
+# Crea un pod clon: api-7b5f8d9f5c-abc12-debug-XXXX (mismos volumenes)
+kubectl exec -it api-7b5f8d9f5c-abc12-debug-XXXX -n harbortasks -- sh
+# dentro del clon:
+ls /app          # ¿existe dist?
+# /app/dist NO existe → el Dockerfile multi-stage no copió la etapa builder
+
+# 5. La causa raíz: en el chart el image.tag apunta a un build que
+#    llegó sin dist (nueva imagen, etapa de build rota). La SOLUCIÓN
+#    correcta es arreglar el Dockerfile/build, no el pod a mano.
+helm list -n harbortasks
+helm history harbortasks -n harbortasks   # ¿qué revisión introdujo el bug?
+helm rollback harbortasks 3 -n harbortasks  # y si no la tenemos: arreglar imagen
+
+# 6. Tras corregir la imagen se despliega de nuevo y se verifica
+kubectl rollout status deployment/api -n harbortasks
+kubectl get pods -n harbortasks            # ahora sí Running y Ready</code></pre>
+        <div class="callout callout--devtools">
+          <p><strong>Moraleja del caso:</strong> ningún comando mágico. Fue <em>una cadena</em>: estado → describe → logs --previous → debug container → arreglo en el origen. El error del pod casi nunca se arregla en el pod: se arregla en la imagen, el chart o los values.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Diagnosticar en orden: estado → describe → logs → debug</td>
+              <td>Querer arreglar con el primer comando que revisa</td>
+              <td>Cada capa responde una pregunta distinta; saltartela te hace perder la causa raíz y "arreglar" el síntoma.</td>
+            </tr>
+            <tr>
+              <td>Usar <code>logs --previous</code> en CrashLoopBackOff</td>
+              <td>Mirar solo <code>kubectl logs</code> en un pod reiniciándose</td>
+              <td>El contenedor actual ya murió; el mensaje útil está en la ejecución anterior.</td>
+            </tr>
+            <tr>
+              <td>Dejar los logs con <code>-f</code> durante un incidente</td>
+              <td>Cerrar la condición de streaming y volver a lanzarla cada segundo</td>
+              <td>Ahorra tiempo y ves en el momento el impacto de tus cambios.</td>
+            </tr>
+            <tr>
+              <td>Leer los events con <code>--sort-by</code> y mirar el <code>Message</code></td>
+              <td>Ignorar los events porque "los logs decían otra cosa"</td>
+              <td>Cuando el contenedor ni arranca, solo los events tienen la verdad. Son efímeros: captúralos pronto.</td>
+            </tr>
+            <tr>
+              <td>Arreglar la causa raíz (imagen/chart/values) y hacer rollback con Helm</td>
+              <td>Parchear el pod en marcha con edits manuales</td>
+              <td>El pod es efímero por diseño: cualquier fix manual se pierde en el siguiente rollout. Repara el origen y re-despliega.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Mirar logs cuando el contenedor nunca arrancó</h3>
+        <pre><code class="language-bash"># ❌ En un ImagePullBackOff no hay logs: el contenedor no existe
+kubectl logs pod-roto
+# Error from server (BadRequest): container "app" in pod "pod-roto"
+# is waiting to start: trying and failing to pull image
+
+# ✅ Los events tienen la respuesta (credenciales, tag, imagen inexistente)
+kubectl describe pod pod-roto | grep -A 2 "Failed to pull image"</code></pre>
+
+        <h3>Olvidar el --previous en CrashLoopBackOff</h3>
+        <pre><code class="language-bash"># ❌ El log "actual" puede estar vacío o ser el de "estoy reiniciando"
+kubectl logs api-7b5f8d9f5c-abc12 -n harbortasks        # (casi vacío)
+
+# ✅ Logs de la ejecución ANTERIOR: ahí está el error real
+kubectl logs api-7b5f8d9f5c-abc12 -n harbortasks --previous</code></pre>
+
+        <h3>Confundir CreateContainerConfigError con un bug de la app</h3>
+        <pre><code class="language-bash"># ❌ Pensar que "la app no arranca" sin leer el evento
+kubectl get pod api-xxx -n harbortasks
+# STATUS: CreateContainerConfigError
+
+# ✅ El evento lo dice: te falta el ConfigMap/Secret que referencia el env
+kubectl describe pod api-xxx -n harbortasks | grep -i "error"
+# Error: configmap "mi-config" not found → crea el ConfigMap y redeploy</code></pre>
+
+        <h3>Pensar que GetEvents es lo mismo que logs</h3>
+        <pre><code class="language-bash"># ❌ Esperar que los events muestren la salida del proceso
+kubectl get events -n harbortasks    # (no está el mensaje de la app)
+
+# ✅ Los events cuentan la vida del pod; la salida de la app va a logs
+kubectl get events --sort-by=.lastTimestamp -n harbortasks
+kubectl logs api-xxx -n harbortasks --previous</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> reproducir y diagnosticar con método un <code>CreateContainerConfigError</code> (falla del despliegue de HarborTasks al referenciar un Secret inexistente) y dejarlo resuelto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un namespace de laboratorio y un Deployment que referencia un Secret que no existe:
+            <pre><code class="language-bash">kubectl create namespace debuglab
+kubectl apply -f - &lt;&lt;EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, namespace: debuglab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      containers:
+        - name: api
+          image: harbortasks-api:1.0.0
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: no-existe     # ← este Secret no creado
+                  key: database-url
+EOF</code></pre>
+          </li>
+          <li><strong>Paso 2:</strong> observa el estado: <code>kubectl get pods -n debuglab</code> → STATUS <code>CreateContainerConfigError</code>.</li>
+          <li>
+            <strong>Paso 3:</strong> culpable al instante en los events:
+            <pre><code class="language-bash">kubectl get events --sort-by=.lastTimestamp -n debuglab | tail -5
+# Message: secret "no-existe" not found</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> crea el Secret que falta con kubectl:
+            <pre><code class="language-bash">kubectl create secret generic harbor-secrets -n debuglab \
+  --from-literal=database-url='postgres://harbor:harborpass@postgres:5432/harbortasks'
+kubectl rollout restart deployment api -n debuglab
+kubectl get pods -n debuglab</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> el pod pasa a <code>Running</code> y <code>1/1 Ready</code>; los events nuevos ya no mencionan el Secret:
+            <pre><code class="language-bash">kubectl get pods -n debuglab
+kubectl logs deployment/api -n debuglab --tail=20   # la API arranca normal</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6:</strong> limpia:
+            <pre><code class="language-bash">kubectl delete namespace debuglab</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación que vale oro:</strong> fíjate en que para diagnosticar necesitaste <em>exactamente dos comandos</em> (<code>get events</code> y <code>create secret</code>). Ni logs ni describe: el evento ya te dio la página exacta del libro.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El pod que "no puede oír"</h3>
+          <p>Crea un Deployment del API de HarborTasks <em>sin</em> definir <code>port-forward</code> ni Service, con <code>command: ["sh","-c","curl http://web/"]</code> (intenta llamar al Service de la web). Verás un estado curioso de "falta de DNS/red". Tu misión: usar <code>kubectl debug</code> con una imagen de red (p. ej. <code>nicolaka/netshoot</code>), averiguar si <code>web</code> se resuelve por DNS del clúster y dejar documentado (en un comentario del propio manifiesto) el diagnóstico por el que la API no llega a la web desde dentro del clúster.</p>
+          <p><em>Pista: el DNS interno de Kubernetes crea <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>. El namespace importa: desde el mismo namespace basta <code>web</code>; desde otro, la forma larga.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un problema tiene <strong>dos capas</strong>: lo que pasó <em>dentro</em> del contenedor (logs) y lo que pasó <em>alrededor</em> del pod (events/describe).</li>
+          <li>Estado → describe → logs → debug: <strong>el método</strong> de diagnóstico sistemático.</li>
+          <li><code>kubectl logs --previous</code> es la primera herramienta contra <code>CrashLoopBackOff</code>.</li>
+          <li><code>CreateContainerConfigError</code> = referencia rota a Secret/ConfigMap; <code>ImagePullBackOff</code> = problema de imagen; <code>OOMKilled</code> = límite de memoria alcanzado.</li>
+          <li><code>kubectl debug</code> crea un ephemeral container para inspeccionar un pod sin tocar la imagen de la app.</li>
+          <li>Los events son efímeros y se ordenan con <code>--sort-by=.lastTimestamp</code>.</li>
+          <li>El arreglo vive en la causa raíz (imagen/chart/values), no en el pod.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl logs POD -n N</code></td><td>Logs actuales del contenedor</td></tr>
+            <tr><td><code>kubectl logs -f POD -n N</code></td><td>Logs en streaming (incidentes en vivo)</td></tr>
+            <tr><td><code>kubectl logs --previous POD -n N</code></td><td>Logs de la ejecución anterior (causa del reinicio)</td></tr>
+            <tr><td><code>kubectl describe pod POD -n N</code></td><td>Estado, condiciones y events del pod</td></tr>
+            <tr><td><code>kubectl get events --sort-by=.lastTimestamp -n N</code></td><td>Crónica del kubelet/scheduler ordenada en el tiempo</td></tr>
+            <tr><td><code>kubectl debug POD -n N --image=… --target=…</code></td><td>Crea un contenedor temporal (ephemeral) para inspeccionar</td></tr>
+            <tr><td><code>kubectl rollout status deployment/api -n N</code></td><td>Espera y comprueba que el rollout termina bien tras el fix</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Mi pod está en CrashLoopBackOff pero los logs no dicen nada, ¿qué hago?</summary>
+            <div>
+              <p>Tres frentes: (1) <code>logs --previous</code> por si el mensaje útil está en la corrida anterior; (2) <code>describe</code> para eventos de arranque (probes fallando, comandos rotos, permisos); (3) si sigue en blanco, el proceso puede estar muriendo antes de imprimir — sube temporalmente el nivel de log de la app o usa <code>kubectl debug</code> para inspeccionar el entorno.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los eventos sirven para algo en un pod que lleva horas roto?</summary>
+            <div>
+              <p>Sí, aunque los events se auto-purgan con el tiempo. Si ya no están se completa el diagnóstico con <code>describe</code> (que conserva condiciones), el historial de <code>kubectl rollout history</code> y los logs externos (un agregador central). Por eso en producción se persisten los logs y eventos fuera del clúster.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo hacer kubectl exec a un pod que se está reiniciando?</summary>
+            <div>
+              <p>No de forma fiable: entre reinicios no hay contenedor al que conectarse. Por eso el <code>kubectl debug</code> crea un <em>clon</em> del pod (mismos volúmenes y config) o un ephemeral container dentro del pod vivo; es la vía correcta para inspeccionar casos en que el contenedor objetivo no arranca.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo es mejor el debug container que una imagen "gorda" con shell?</summary>
+            <div>
+              <p>El debug container es ideal para imágenes mínimas o distroless (sin shell y sin herramientas), en producción, sin cambiar la imagen de la app ni reiniciar nada. La imagen "gorda" en producción es en sí un problema de superficie de ataque; el debug container es el compromiso: herramientas solo cuando las necesitas y solo mientras dura la sesión.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el mensaje de un OOMKilled no aparece en los logs?</summary>
+            <div>
+              <p>Porque el OOM no lo decide el proceso: lo decide el kernel (cgroup) cuando el contenedor cruza su límite de memoria. En logs verás la salida de la app justo hasta el corte; la razón exacta (<code>OOMKilled</code>) está en <code>describe pod</code> en <code>Last State</code>. Si quieres el detalle del kernel, consulta el <code>dmesg</code>/journaldel nodo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

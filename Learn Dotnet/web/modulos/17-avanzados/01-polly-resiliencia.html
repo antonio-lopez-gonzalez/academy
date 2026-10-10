@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="es" data-module="17" data-lesson="01-polly-resiliencia">
+<head>
+  <meta charset="UTF-8">
+  <title>Resiliencia con Polly — Módulo 17 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Resiliencia con Polly</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 17 · Temas avanzados</span><span>40 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección aprenderemos a hacer que nuestras aplicaciones .NET sobrevivan a fallos transitorios: bases de datos que no responden durante 200 ms, APIs externas que devuelven 503, redes inestables. La herramienta que usaremos es <strong>Polly</strong>, la librería de resiliencia más popular del ecosistema .NET.</p>
+        <p>No se trata solo de "intentarlo de nuevo". Se trata de decidir <em>cuándo</em> reintentar, <em>cuántas</em> veces, <em>cuánto</em> esperar entre intentos, y qué hacer cuando el fallo deja de ser transitorio.</p>
+        <p>Veremos retry, circuit breaker, timeout, bulkhead, fallback y cómo combinarlo todo con <code>IHttpClientFactory</code>.</p>
+
+        <div class="callout info">
+          <strong>Objetivo de aprendizaje:</strong> comprender las políticas de Polly, saber combinarlas en un <em>policy wrap</em> e integrarlas con <code>HttpClient</code> para llamadas externas resilientes.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>¿Qué es la resiliencia?</h3>
+        <p>La resiliencia es la capacidad de un sistema para recuperarse de fallos sin que el usuario lo note. En una aplicación distribuida, los fallos son inevitables: un nodo de Redis se reinicia, un servicio externo hace despliegue, la red tiene un pico de latencia.</p>
+        <p>Sin resiliencia, un único error transitorio puede propagarse y provocar un error 500 al cliente. Con resiliencia, la aplicación reintenta, espera o devuelve una respuesta degradada.</p>
+
+        <h3>Políticas de Polly</h3>
+        <p>Polly organiza el comportamiento de resiliencia en <strong>políticas</strong> (<em>policies</em>). Cada política responde a excepciones o resultados específicos. Las más importantes son:</p>
+        <ul>
+          <li><strong>Retry:</strong> vuelve a intentar la operación un número de veces.</li>
+          <li><strong>Circuit Breaker:</strong> corta temporalmente las llamadas si hay demasiados fallos seguidos.</li>
+          <li><strong>Timeout:</strong> limita el tiempo máximo de una operación.</li>
+          <li><strong>Bulkhead:</strong> limita la concurrencia y la cola de operaciones.</li>
+          <li><strong>Fallback:</strong> devuelve un valor alternativo cuando todo falla.</li>
+        </ul>
+
+        <h3>Retry fijo vs backoff exponencial</h3>
+        <p>Un retry con intervalo fijo espera siempre lo mismo. Es simple pero puede saturar el servicio caído si todos los clientes reintentan al mismo tiempo.</p>
+        <p>El <em>backoff exponencial</em> aumenta el tiempo de espera entre intentos (1 s, 2 s, 4 s, 8 s...). Da tiempo a que el servicio se recupere y reduce la carga. Suele añadirse <em>jitter</em> (aleatoriedad) para evitar sincronización de picos.</p>
+
+        <pre><code class="language-text">Retry fijo:          1s  1s  1s  1s  1s
+Backoff exponencial: 1s  2s  4s  8s 16s
+Backoff con jitter:  0.8s 1.9s 3.5s 9.2s 15.1s</code></pre>
+
+        <h3>Circuit breaker</h3>
+        <p>Imagina una puerta automática de un supermercado: si detecta que mucha gente tropieza a la entrada, se cierra temporalmente. El <em>circuit breaker</em> funciona igual: si se producen <em>N</em> fallos en un tiempo determinado, las llamadas fallan inmediatamente durante un tiempo de enfriamiento (<em>cooldown</em>). Luego deja pasar una llamada de prueba.</p>
+        <p>Esto evita saturar un servicio ya sobrecargado y permite recuperarse.</p>
+
+        <h3>Policy wrap</h3>
+        <p>Las políticas se pueden apilar. El orden importa. Normalmente se usa:</p>
+        <ol>
+          <li>Fallback (última línea de defensa).</li>
+          <li>Circuit Breaker (protege al servicio).</li>
+          <li>Retry (reintentos ante fallos transitorios).</li>
+          <li>Timeout (corta operaciones colgadas).</li>
+        </ol>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Creamos un retry simple que intenta una operación hasta 3 veces si lanza una <code>HttpRequestException</code>.</p>
+
+        <pre><code class="language-bash"># Añadimos el paquete de Polly
+dotnet add package Polly
+
+# Versión compatible con IHttpClientFactory
+dotnet add package Microsoft.Extensions.Http.Polly</code></pre>
+
+        <pre><code class="language-csharp">// Program.cs de una aplicación de consola
+using Polly;
+using Polly.Retry;
+
+// Definimos la política: reintentar hasta 3 veces con espera fija de 1 segundo
+var retryPolicy = Policy
+    .Handle&lt;HttpRequestException&gt;()
+    .WaitAndRetryAsync(
+        retryCount: 3,
+        sleepDurationProvider: retryAttempt =>
+            TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1)),
+        onRetry: (exception, duration, attempt, context) =>
+        {
+            Console.WriteLine($"Reintento {attempt} tras {duration.TotalSeconds}s. Error: {exception.Message}");
+        });
+
+await retryPolicy.ExecuteAsync(async () =>
+{
+    using var client = new HttpClient();
+    // Esta llamada fallará si el servidor no responde
+    var response = await client.GetAsync("https://httpbin.org/status/503");
+    response.EnsureSuccessStatusCode();
+    return await response.Content.ReadAsStringAsync();
+});</code></pre>
+
+        <p>Para ejecutarlo:</p>
+        <pre><code class="language-bash">dotnet run --project ejemplos/m17-avanzados/PollyRetryDemo</code></pre>
+
+        <div class="callout warning">
+          <strong>Cuidado:</strong> <code>new HttpClient()</code> se usa aquí solo para el ejemplo mínimo. En producción usa <code>IHttpClientFactory</code> con <code>PolicyHttpMessageHandler</code>.
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Configuramos un <code>HttpClient</code> con Polly integrado en ASP.NET Core: retry con backoff exponencial + jitter, circuit breaker y timeout.</p>
+
+        <pre><code class="language-csharp">// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddHttpClient&lt;IExternalCatalogService, ExternalCatalogService&gt;(client =&gt;
+{
+    client.BaseAddress = new Uri("https://api.catalog.example.com/");
+    client.Timeout = TimeSpan.FromSeconds(30);
+})
+.AddPolicyHandler(GetRetryPolicy())
+.AddPolicyHandler(GetCircuitBreakerPolicy());
+
+static IAsyncPolicy&lt;HttpResponseMessage&gt; GetRetryPolicy()
+{
+    return HttpPolicyExtensions
+        .HandleTransientHttpError() // 5xx y excepciones de red
+        .WaitAndRetryAsync(
+            retryCount: 3,
+            sleepDurationProvider: retryAttempt =&gt;
+                TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) +
+                TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1000)),
+            onRetry: (outcome, duration, attempt, context) =&gt;
+            {
+                // En producción usa ILogger en lugar de Console
+                Console.WriteLine($"Reintento {attempt} tras {duration.TotalSeconds:F1}s. Status: {outcome.Result?.StatusCode}");
+            });
+}
+
+static IAsyncPolicy&lt;HttpResponseMessage&gt; GetCircuitBreakerPolicy()
+{
+    return HttpPolicyExtensions
+        .HandleTransientHttpError()
+        .CircuitBreakerAsync(
+            handledEventsAllowedBeforeBreaking: 5,
+            durationOfBreak: TimeSpan.FromSeconds(30),
+            onBreak: (outcome, breakDelay) =&gt;
+                Console.WriteLine($"Circuito abierto durante {breakDelay.TotalSeconds}s"),
+            onReset: () =&gt; Console.WriteLine("Circuito cerrado"),
+            onHalfOpen: () =&gt; Console.WriteLine("Circuito medio abierto: prueba en curso"));
+}</code></pre>
+
+        <pre><code class="language-csharp">// ExternalCatalogService.cs
+public interface IExternalCatalogService
+{
+    Task&lt;CatalogItem?&gt; GetItemAsync(Guid id, CancellationToken ct = default);
+}
+
+public class ExternalCatalogService(HttpClient httpClient, ILogger&lt;ExternalCatalogService&gt; logger)
+    : IExternalCatalogService
+{
+    public async Task&lt;CatalogItem?&gt; GetItemAsync(Guid id, CancellationToken ct = default)
+    {
+        // Polly ya está aplicado al HttpClient; la llamada es transparente
+        var response = await httpClient.GetAsync($"items/{id}", ct);
+
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            logger.LogWarning("Item {ItemId} no encontrado", id);
+            return null;
+        }
+
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync&lt;CatalogItem&gt;(ct);
+    }
+}
+
+public sealed record CatalogItem(Guid Id, string Name, decimal Price);</code></pre>
+
+        <h3>Policy wrap completo</h3>
+        <p>Si queremos controlar el orden exacto de las políticas, usamos <code>Policy.WrapAsync</code>:</p>
+
+        <pre><code class="language-csharp">// Combinamos fallback, circuit breaker, retry y timeout
+var fallback = Policy&lt;HttpResponseMessage&gt;
+    .Handle&lt;Exception&gt;()
+    .FallbackAsync(
+        fallbackValue: new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonContent.Create(new CatalogItem(Guid.Empty, "Default", 0))
+        },
+        onFallbackAsync: (result, context) =&gt;
+        {
+            logger.LogWarning("Fallback activado");
+            return Task.CompletedTask;
+        });
+
+var timeout = Policy.TimeoutAsync&lt;HttpResponseMessage&gt;(TimeSpan.FromSeconds(10));
+var retry = GetRetryPolicy();
+var circuitBreaker = GetCircuitBreakerPolicy();
+
+var resilienceStrategy = Policy
+    .WrapAsync(fallback, circuitBreaker, retry, timeout);</code></pre>
+
+        <div class="callout tip">
+          <strong>Tip:</strong> el orden en <code>WrapAsync</code> es de fuera hacia dentro. El fallback envuelve al circuit breaker, que envuelve al retry, que envuelve al timeout.
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Reintenta solo errores transitorios:</strong> un 400 por datos inválidos no debe reintentarse.</li>
+          <li><strong>Usa backoff exponencial con jitter:</strong> evita que todos los clientes golpeen el servicio al mismo tiempo.</li>
+          <li><strong>Limita el número de reintentos:</strong> más de 3-5 reintentos suelen ser contraproducentes.</li>
+          <li><strong>Añade timeout fuera del retry:</strong> el timeout total debe controlar el tiempo máximo independientemente de los reintentos.</li>
+          <li><strong>No ocultes errores permanentes:</strong> un fallback no debe devolver datos incorrectos silenciosamente.</li>
+          <li><strong>Registra cada reintento:</strong> usa <code>ILogger</code> o los callbacks de Polly para observabilidad.</li>
+          <li><strong>Usa bulkhead para recursos críticos:</strong> limita cuántas llamadas concurrentes pueden entrar a un servicio externo.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>Reintentar operaciones no idempotentes</h3>
+        <pre><code class="language-csharp">// MAL: POST que cobra dinero o crea recursos
+await retryPolicy.ExecuteAsync(() =&gt; httpClient.PostAsJsonAsync("/orders", order));</code></pre>
+        <p><strong>Problema:</strong> si la solicitud llegó al servidor pero la respuesta se perdió, reintentar puede duplicar el pedido.</p>
+        <p><strong>Solución:</strong> usa idempotency keys o reintenta solo operaciones seguras (GET, PUT con idempotencia).</p>
+
+        <h3>Retry dentro de un circuit breaker mal ordenado</h3>
+        <pre><code class="language-csharp">// MAL: el retry envuelve al circuit breaker
+var wrong = Policy.WrapAsync(retry, circuitBreaker);</code></pre>
+        <p><strong>Problema:</strong> los reintentos aumentan el contador de fallos del circuit breaker, abriéndolo antes de tiempo.</p>
+        <p><strong>Solución:</strong> el circuit breaker debe envolver al retry: <code>Policy.WrapAsync(circuitBreaker, retry)</code>.</p>
+
+        <h3>Ignorar <code>HttpClient.Timeout</code></h3>
+        <pre><code class="language-csharp">// MAL: timeout del cliente mayor que el timeout de Polly
+client.Timeout = TimeSpan.FromMinutes(5);</code></pre>
+        <p><strong>Problema:</strong> <code>HttpClient.Timeout</code> lanza <code>TaskCanceledException</code> antes de que Polly pueda actuar.</p>
+        <p><strong>Solución:</strong> configura <code>HttpClient.Timeout</code> como infinito o muy alto cuando uses políticas de timeout de Polly.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Construye un cliente para una API meteorológica externa que sea resiliente.</p>
+        <ol>
+          <li>Crea un proyecto web API con <code>dotnet new web -n WeatherResilienceDemo</code>.</li>
+          <li>Registra un <code>HttpClient</code> para <code>https://api.weather.example.com</code>.</li>
+          <li>Añade una política de retry con 3 intentos y backoff exponencial + jitter.</li>
+          <li>Añade un circuit breaker que abra tras 3 fallos en 30 segundos.</li>
+          <li>Crea un endpoint GET <code>/weather/{city}</code> que use el cliente.</li>
+          <li>Simula fallos con una API de prueba como <code>https://httpbin.org/status/503</code>.</li>
+        </ol>
+
+        <pre><code class="language-csharp">// WeatherService.cs
+public class WeatherService(HttpClient client)
+{
+    public async Task&lt;WeatherResponse?&gt; GetAsync(string city, CancellationToken ct = default)
+    {
+        var response = await client.GetAsync($"forecast/{city}", ct);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync&lt;WeatherResponse&gt;(ct);
+    }
+}
+
+public sealed record WeatherResponse(string City, double Temperature, string Summary);</code></pre>
+
+        <p>Verifica en los logs que los reintentos y la apertura del circuito se registran correctamente.</p>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Extiende el ejercicio guiado con las siguientes capacidades:</p>
+        <ul>
+          <li>Añade un <strong>bulkhead</strong> que permita solo 5 llamadas concurrentes a la API meteorológica con una cola de 10.</li>
+          <li>Implementa un <strong>fallback</strong> que devuelva datos en caché cuando el circuito esté abierto.</li>
+          <li>Expón métricas del circuit breaker (estado, número de fallos) en un endpoint <code>/health/resilience</code>.</li>
+        </ul>
+        <p>No resuelvas el reto todavía. Inténtalo primero y luego compara tu solución con la propuesta del curso.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>La resiliencia protege a la aplicación de fallos transitorios.</li>
+          <li>Polly ofrece retry, circuit breaker, timeout, bulkhead y fallback.</li>
+          <li>El retry debe usar backoff exponencial con jitter.</li>
+          <li>El circuit breaker evita saturar un servicio ya caído.</li>
+          <li>Las políticas se combinan con <code>Policy.WrapAsync</code> y el orden importa.</li>
+          <li>La integración con <code>IHttpClientFactory</code> se hace mediante <code>AddPolicyHandler</code>.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+
+        <h3>¿Polly reemplaza a <code>try/catch</code>?</h3>
+        <p>No. Polly encapsula la estrategia de reintentos, pero sigues necesitando manejar errores que no cubre la política o errores de lógica de negocio.</p>
+
+        <h3>¿Debo reintentar errores 404?</h3>
+        <p>No. El 404 indica que el recurso no existe, no un fallo transitorio. Usa <code>HandleTransientHttpError()</code> o filtra explícitamente 5xx y excepciones de red.</p>
+
+        <h3>¿Cómo pruebo un circuit breaker?</h3>
+        <p>Simula varios fallos consecutivos y verifica que la política pasa al estado <em>Open</em>. Luego espera el tiempo de cooldown y comprueba que una llamada de prueba se permite en estado <em>Half-Open</em>.</p>
+
+        <h3>¿Qué alternativas existen a Polly?</h3>
+        <p>En .NET 8 también puedes usar <a href="https://www.nuget.org/packages/Microsoft.Extensions.Http.Resilience">Microsoft.Extensions.Http.Resilience</a>, que incluye estrategias de resiliencia oficiales inspiradas en Polly. Polly sigue siendo más maduro y flexible.</p>
+
+        <h3>¿El bulkhead limita por instancia o globalmente?</h3>
+        <p>Por instancia de política. Si tienes múltiples pods en Kubernetes, cada uno tendrá su propio bulkhead. Para límites globales necesitas un componente centralizado como API Gateway o Redis.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

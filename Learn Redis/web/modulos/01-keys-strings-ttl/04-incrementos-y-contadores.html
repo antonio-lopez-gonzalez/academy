@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="04-incrementos-y-contadores">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>INCR/DECR y contadores atómicos — Módulo 1 · Curso Redis para .NET</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('redis-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>INCR/DECR y contadores atómicos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Keys, Strings y TTL</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Contar cosas en un sistema distribuido es trampa: dos nodos leyendo + sumando + escribiendo pierden incrementos. Redis lo resuelve con <strong>contadores atómicos</strong> (<code>INCR</code>, <code>INCRBY</code>…), porque cada comando se ejecuta sin intercalarse con otros.</p>
+        <p>Verás los comandos, su combinación con TTL para <strong>ventanas</strong> (rate limiting del hub, contadores por minuto) y su uso en .NET (M6).</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La atomicidad</h3>
+        <p>Redis es single-threaded: ejecuta un comando entero sin interrupciones. <code>INCR key</code> es «leer, sumar 1, escribir» como <strong>una</strong> operación. Así, N procesos concurrentes incrementando una misma key nunca pierden conteo, cosa imposible con «GET + INCR local + SET» (read-modify-write).</p>
+
+        <h3>Comandos</h3>
+        <pre><code class="language-redis">INCR key              # +1 (crea con 0 si no existía)
+DECR key              # -1
+INCRBY key 5          # +5
+DECRBY key 5          # -5
+INCRBYFLOAT key 1.5   # para decimales
+GET key               # valor actual</code></pre>
+
+        <h3>Contadores + TTL = ventanas de tiempo</h3>
+        <p>El patrón rey del rate limiting: una key que expira al final de la ventana y un INCR al comenzar.</p>
+        <pre><code class="language-redis"># 1ª petición en la ventana de 60 s:
+INCR rl:user:42:win1     # 1
+EXPIRE rl:user:42:win1 60
+# siguientes peticiones:
+INCR rl:user:42:win1     # 2, 3, 4...
+TTL rl:user:42:win1      # ¿cuánto queda para resetear?
+# → cuando pasa el límite, rechaza</code></pre>
+        <p>La raza aquí la resuelve <code>INCR</code>+<code>EXPIRE</code> de forma aceptable en la práctica (o Lua en casos estrictos, M6-03).</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <pre><code class="language-redis">INCR stats:nodo1:msgs        # 1
+INCR stats:nodo1:msgs        # 2
+INCRBY stats:nodo1:msgs 8    # 10
+DECR stats:nodo1:msgs        # 9
+GET stats:nodo1:msgs         # "9"</code></pre>
+        <p>Dos procesos amigos haciendo <code>INCR</code> nunca dan un total menor del esperado.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el hub: contadores de mensajes por nodo y rate limiting de conexiones por IP (anti «connection flood»).</p>
+        <pre><code class="language-csharp">// Mensajes procesados por nodo
+long received = await db.StringIncrementAsync($"stats:{_nodeId}:msgs");
+
+// Rate limiting de conexiones por IP (máx 20 en 60 s)
+var window = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60; // ventana de minuto
+string rlKey = $"rl:conn:{ip}:{window}";
+long count = await db.StringIncrementAsync(rlKey);
+if (count == 1)
+    await db.KeyExpireAsync(rlKey, TimeSpan.FromSeconds(65)); // +margen
+
+if (count > 20) { CloseConnection(); return; }</code></pre>
+        <p>El contador + TTL resuelve «X eventos por ventana» con dos comandos.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>INCR/INCRBY para contadores compartidos</td><td>GET+SET para incrementar</td><td>La raza del read-modify-write pierde conteo</td></tr>
+            <tr><td>Dar TTL a los contadores de «ventana»</td><td>Contadores eternos por clave dinámica</td><td>Cada ventana nueva debe olvidar la anterior</td></tr>
+            <tr><td>Margen en el TTL de la ventana</td><td><code>EXPIRE k 60</code> justo para una ventana de 60</td><td>La latencia del «último» incremento puede caer fuera</td></tr>
+            <tr><td>Usar INCRBYFLOAT cuando necesites decimales</td><td>Calcular en .NET y guardar el resultado</td><td>Pierdes la atomicidad garantizada</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Leer-modificar-escribir en .NET</h3>
+        <pre><code class="language-csharp">// ❌ Raza entre GET y SET
+long n = (long)await db.StringGetAsync("ct");
+n++;
+await db.StringSetAsync("ct", n);
+
+// ✅ Atómico en Redis
+long n2 = await db.StringIncrementAsync("ct");</code></pre>
+
+        <h3>Contador «de hoy» sin reset</h3>
+        <p>Si el contador no expira, mañana sigue sumando contra el valor de ayer: define la ventana dentro de la propia key (<code>rl:user:42:&lt;windowId&gt;</code>) y déjala expirar.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <ol class="steps">
+          <li><strong>Paso 1:</strong> Con redis-cli crea un contador <code>demo:count</code> y haz 10 INCR.</li>
+          <li><strong>Paso 2:</strong> Añade TTL 20 y verifica que al expirar <code>INCR</code> empieza de nuevo en 1.</li>
+          <li><strong>Paso 3:</strong> Simula rate limiting: INCR 5 veces en «ventana» de 30 s y observa el TTL.</li>
+          <li><strong>Paso 4:</strong> (Solo si tienes 2 terminales) haz INCR concurrente y comprueba que el total final es exacto.</li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rate limiter sin fugas</h3>
+          <p>Investiga la técnica del «fixed window counter» con INCR+EXPIRE frente a «sliding window log» con sorted sets (ZSET+ZREMRANGEBYSCORE). Escribe cuál es más justa y cuál más barata, y dónde pondrías el límite en tu hub (p. ej. 100 conexiones/min/IP).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>INCR/DECR/INCRBY</code> = contadores atómicos (sin raza).</li>
+          <li>Clave + TTL = ventana (rate limiting, contadores por minuto).</li>
+          <li>Margen en el TTL y nombre de key con la ventana para no «arrastrar» valores.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿INCR devuelve el valor nuevo?</summary>
+            <div><p>Sí, devuelve el valor tras el incremento; puedes rechazar directamente si pasa tu umbral.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si la key tiene un valor no numérico?</summary>
+            <div><p>INCR sobre un valor no entero devuelve error (nil). Mantén los contadores «solo número».</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

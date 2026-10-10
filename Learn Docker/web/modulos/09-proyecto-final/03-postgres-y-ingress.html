@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="09" data-lesson="03-postgres-y-ingress">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Postgres en clúster + Ingress — Módulo 9 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Postgres en clúster + Ingress</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 9 · Proyecto final</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección 2 desplegaste API y web, y los dejaste <em>vivos pero no listos</em>: el API reintentaba conectar con una base de datos que aún no existía. Esta lección es la que <strong>dota de alma al sistema</strong>: desplegarás <strong>PostgreSQL</strong> con persistencia real y, con ella, <strong>la puerta de entrada</strong> del clúster: el <strong>Ingress</strong> con el controlador ingress-nginx.</p>
+        <p>Al terminar harás la <strong>primera prueba de extremo a extremo</strong>: una petición <code>curl</code> entra por el Ingress, llega al API, y este lee las tareas de Postgres. Y lo mejor: el API, que llevaba una lección entera esperando, <strong>se pondrá verde solo</strong> gracias a la magia del modelo declarativo y las readiness probes.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué una base de datos "merece su propia lección"?</strong> Porque la persistencia es el reto más delicado de Kubernetes. Un pod sin estado es efímero y barato; un pod con estado arrastra un disco, permisos, inicialización y un orden de arranque. Y el Ingress es el único componente que expone tu servicio al exterior: mal configurado, todo lo demás da igual porque nadie llega. Son dos "puntos de no retorno".</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Errores típicos:</strong> PVC que se queda en <code>Pending</code> (storageClassName mal escrito), contraseñas de Postgres y del API distintas (fallo de auth silencioso), scripts de init que no se ejecutan porque el datadir ya existía, Ingress aplicado sin controlador instalado (404), y olvidar el header <code>Host</code> al probar.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>¿Deployment o StatefulSet para Postgres?</h3>
+        <p>A diferencia del API o la web, un servidor de bases de datos tiene <strong>identidad y orden</strong>. Las opciones:</p>
+        <ul>
+          <li><strong>Deployment + PVC</strong> (lo que usamos): suficiente para una instancia única y un clúster local. El PVC garantiza que el dato sobreviva a la muerte del pod.</li>
+          <li><strong>StatefulSet</strong>: añade identidades estables (<code>postgres-0</code>, <code>postgres-1</code>), arranque y parada ordenados, y es el camino real para réplicas. Se usa con operadores (CloudNativePG, Zalando) para alta disponibilidad.</li>
+        </ul>
+        <p>La regla práctica: <strong>si tu app necesita un solo disco y no tiene réplicas con roles, un Deployment con PVC es perfecto y más simple de razonar</strong>. Este proyecto usa ese camino; el StatefulSet queda como el siguiente escalón cuando necesites varias réplicas con identidad.</p>
+
+        <h3>El ciclo de vida del dato: PVC y StorageClass</h3>
+        <p>El pod de Postgres es un "inquilino" que cambia de IP y de disco cada vez que muere. El <strong>PersistentVolumeClaim</strong> pide almacenamiento de forma declarativa ("quiero 1Gi, lectura/escritura para un solo nodo"); el <strong>StorageClass</strong> decide cómo se materializa ese disco. En kind existe la StorageClass por defecto <code>standard</code>, provisionada por <code>rancher.io/local-path</code>: reserva una carpeta en el propio nodo (que, recuerda, es un contenedor Docker).</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el PVC es "el contrato de alquiler del almacén" y el StorageClass es "el tipo de almacén" (local estándar aquí; en la nube sería un disco rápido SSD). El pod (el barco) cambia, pero el almacén (PVC + disco) permanece firmado y con las llaves.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Límite honesto:</strong> al usar <code>local-path</code> en kind, el "disco" vive dentro del contenedor-nodo. Si borras el clúster con <code>kind delete cluster</code>, el dato desaparece con él. Para un curso local es perfecto (aprendes el <em>flujo</em> de la persistencia); en la nube usarías una StorageClass tolerante (EBS/gp3, etc.) que sobrevive al clúster entero.</p>
+        </div>
+
+        <h3>Cómo se inicializa la base de datos</h3>
+        <p>La imagen oficial de Postgres ejecuta cualquier archivo <code>*.sql</code> (o <code>*.sh</code> ejecutable) que encuentre en <code>/docker-entrypoint-initdb.d/</code> <strong>solo la primera vez que se crea el data dir</strong>. Es el mecanismo perfecto para "migraciones simples": montamos un ConfigMap con nuestro SQL ahí. Detalle clave: si el volumen ya está inicializado (por ejemplo, porque reiniciaste el pod preservando el PVC), <strong>esos scripts NO se vuelven a ejecutar</strong>. Por eso el SQL debe ser idempotente (<code>CREATE TABLE IF NOT EXISTS</code>).</p>
+
+        <h3>El Ingress y su controlador</h3>
+        <p>El Ingress es una <strong>regla declarativa</strong> ("el host X manda /api al Service api y / al Service web"). Las reglas no se cumplen solas: necesita un <strong>controlador</strong>, un proxy real que escucha el puerto 80/443 y aplica esas reglas. En kind instalamos el oficial <strong>ingress-nginx</strong>. El navegador (o <code>curl</code>) llega al Ingress con un <code>Host</code> (el nombre <code>harbor.test</code>); el controlador lee el host y el path y decide el destino:</p>
+        <pre class="diagram">    curl http://localhost:8080/api/tasks   -H "Host: harbor.test"
+                    │
+                    ▼
+         ┌─ ingress-nginx ────────────────────────────┐
+         │  Host: harbor.test        pathType: Prefix │
+         │   "/api"   ──▶ Service api:80 ──▶ Pods api │
+         │   "/"      ──▶ Service web:80 ──▶ Pods web │
+         └────────────────────────────────────────────┘
+         nginx elige el path MÁS específico (/api gana sobre /).</pre>
+        <div class="callout callout--tip">
+          <p><strong>Por qué probar con el header <code>Host</code>:</strong> el enrutado por host es parte de la regla. Con <code>curl -H "Host: harbor.test" http://localhost:8080/</code> simulas exactamente lo que haría un navegador sin tocar <code>/etc/hosts</code> ni necesitar permisos de administrador. Para el navegador (en WSL/Windows) sí conviene añadir <code>127.0.0.1 harbor.test</code> al archivo de hosts.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El "postgres mínimo" con persistencia son <strong>dos objetos</strong>: un PVC que pide el disco y un Deployment que lo monta. Con eso ya tienes una BD cuyo dato sobrevive a los reinicios:</p>
+        <pre><code class="language-yaml"># postgres-minimo.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-mini                      # Nombre del "contrato de alquiler"
+  namespace: harbortasks
+spec:
+  accessModes:
+    - ReadWriteOnce                  # Un solo nodo escribe (suficiente)
+  storageClassName: standard         # StorageClass por defecto de kind (local-path)
+  resources:
+    requests:
+      storage: 1Gi                   # Tamaño del disco solicitado
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-mini
+  namespace: harbortasks
+spec:
+  replicas: 1                        # Una instancia de BD
+  selector:
+    matchLabels:
+      app: pg-mini
+  template:
+    metadata:
+      labels:
+        app: pg-mini
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine   # Imagen oficial, variante ligera
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data   # RUTA INTERNA de datos
+              subPath: pgdata         # Subcarpeta dentro del PVC
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-mini       # Conecta el pod con el "alquiler"
+</code></pre>
+        <p><strong>Línea por línea (lo esencial):</strong> el <code>subPath</code> evita que el entrypoint de Postgres confunda su directorio con los archivos internos de la imagen (permite que el montaje quede "limpio"). El <code>storageClassName: standard</code> es quien dispara el provisionador local de kind; sin él, en algunos clústeres el PVC se queda <code>Pending</code>. Faltan las variables de entorno y las probes, pero la <em>semilla de la persistencia</em> ya está plantada.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Ahora los manifiestos completos de Postgres y del Ingress de HarborTasks, tal como viven en <code>proyectos/harbortasks/k8s/postgres/</code>.</p>
+
+        <h3>Postgres — Secret con la contraseña de la BD</h3>
+        <div class="code-file">k8s/secrets.yaml (compartido)</div>
+        <pre><code class="language-yaml"># secrets.yaml — el mismo Secret que consume el API (harbor-secrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: harbor-secrets
+  namespace: harbortasks
+type: Opaque
+data:
+  # echo -n 'postgres://harbor:harborpass@postgres:5432/harbortasks' | base64
+  database-url: cG9zdGdyZXM6Ly9oYXJib3I6aGFyYm9ycGFzc0Bwb3N0Z3Jlczo1NDMyL2hhcmJvcnRhc2tz
+  # echo -n 'harborpass' | base64
+  postgres-password: aGFyYm9ycGFzcw==
+# El usuario (harbor) y la base (harbortasks) NO son secretos: van como variables
+# literales en el Deployment. Solo la contraseña se guarda en el Secret.
+# Coherencia crítica: el API conecta con `database-url` (harbor:harborpass) y el
+# servidor arranca con la MISMA contraseña (`postgres-password`). Si no coinciden,
+# el API recibe "authentication failed" sin error obvio en sus logs.
+</code></pre>
+
+        <h3>Postgres — PVC, inicialización y Deployment</h3>
+        <div class="code-file">k8s/postgres/pvc.yaml</div>
+        <pre><code class="language-yaml"># pvc.yaml — el disco persistente de las tareas
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: harbortasks
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard        # StorageClass local de kind (rancher.io/local-path)
+  resources:
+    requests:
+      storage: 1Gi                  # Las tareas no pesan; 1Gi es generoso
+</code></pre>
+        <div class="code-file">k8s/postgres/configmap.yaml</div>
+        <pre><code class="language-yaml"># configmap.yaml — migraciones iniciales (se ejecutan SOLO al crear el datadir)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: harbortasks
+data:
+  001-init.sql: |
+    -- Migración inicial de HarborTasks (la "v1" de nuestro esquema)
+    CREATE TABLE IF NOT EXISTS tasks (
+      id         SERIAL PRIMARY KEY,            -- clave autoincremental
+      title      TEXT NOT NULL,                 -- el texto de la tarea
+      done       BOOLEAN NOT NULL DEFAULT FALSE,-- completada o pendiente
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()  -- fecha de creación
+    );
+
+    -- Dos tareas de ejemplo para que la web y el API muestren algo
+    INSERT INTO tasks (title) VALUES
+      ('Desplegar HarborTasks en Kubernetes'),
+      ('Completar el módulo 9');
+# Todo es idempotente (IF NOT EXISTS) por si se vuelve a aplicar sin iniciar
+# de cero. Los INSERT no son idempotentes: si se ejecutan dos veces duplicarían
+# filas; por eso solo corren en el primer arranque del datadir.
+</code></pre>
+        <div class="code-file">k8s/postgres/deployment.yaml</div>
+        <pre><code class="language-yaml"># deployment.yaml — servidor PostgreSQL con persistencia real
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: harbortasks
+  labels:
+    app: postgres
+spec:
+  replicas: 1                      # Una instancia: suficiente para HarborTasks
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 70                # GID del usuario "postgres" en la imagen alpine
+        # Nota: NO ponemos runAsNonRoot como en la web/API. El entrypoint
+        # oficial necesita arrancar como root para preparar PGDATA (chown) y
+        # luego BAJA privilegios al usuario postgres (uid 70). Es la excepción
+        # documentada; en producción se usa una imagen no-root o el operador.
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER          # No es secreto: configuración literal
+              value: harbor
+            - name: POSTGRES_DB
+              value: harbortasks
+            - name: POSTGRES_PASSWORD      # Solo la contraseña viene del Secret
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-secrets
+                  key: postgres-password
+          volumeMounts:
+            - name: pg-data
+              mountPath: /var/lib/postgresql/data  # Datos persistentes
+              subPath: pgdata              # Carpeta dedicada dentro del PVC
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d  # Migraciones iniciales
+          readinessProbe:                  # "Acepto conexiones y la BD responde"
+            exec:
+              command: ["pg_isready", "-U", "harbor", "-d", "harbortasks"]
+            initialDelaySeconds: 10        # initdb tarda unos segundos
+            periodSeconds: 5
+          livenessProbe:                   # "El servidor no está colgado"
+            exec:
+              command: ["pg_isready", "-U", "harbor"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: pg-data
+          persistentVolumeClaim:
+            claimName: postgres-data   # El disco del PVC
+        - name: init-sql
+          configMap:
+            name: postgres-init       # Las migraciones en un ConfigMap
+</code></pre>
+        <div class="code-file">k8s/postgres/service.yaml</div>
+        <pre><code class="language-yaml"># service.yaml — nombre DNS estable para la BD (SOLO interno)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: harbortasks
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+# No se expone al exterior: lo consume únicamente el API vía "postgres:5432".
+</code></pre>
+
+        <h3>El Ingress — la puerta de entrada del clúster</h3>
+        <div class="code-file">k8s/ingress.yaml</div>
+        <pre><code class="language-yaml"># ingress.yaml — enrutado por host y path hacia api y web
+apiVersion: networking.k8s.io/v1   # API estable de Ingress
+kind: Ingress
+metadata:
+  name: harbortasks
+  namespace: harbortasks
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"   # Peticiones grandes OK
+spec:
+  ingressClassName: nginx          # Usa el controlador ingress-nginx
+  rules:
+    - host: harbor.test            # Nombre virtual (Host header)
+      http:
+        paths:
+          - path: /api             # Tráfico de API
+            pathType: Prefix       # /api, /api/tasks, /api/tasks/1...
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80       # Service api:80 → pods :3000
+          - path: /                # Resto: la web
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80       # Service web:80 → pods :80
+# El controlador nginx aplica la regla MÁS específica: /api gana sobre /,
+# así que /api/tasks SIEMPRE va al API aunque / también coincida.
+</code></pre>
+
+        <h3>Instalación y prueba end-to-end</h3>
+        <pre><code class="language-bash"># 0. Instalar el controlador ingress-nginx (el manifiesto kind oficial)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/kind/deploy.yaml
+
+# 1. Postgres: secret → pvc → init → deployment → service (ese orden lógico)
+kubectl apply -f k8s/postgres/secret.yaml
+kubectl apply -f k8s/postgres/pvc.yaml
+kubectl apply -f k8s/postgres/configmap.yaml
+kubectl apply -f k8s/postgres/deployment.yaml
+kubectl apply -f k8s/postgres/service.yaml
+
+# 2. El descriptor del controlador
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=120s
+
+# 3. El Ingress de HarborTasks
+kubectl apply -f k8s/ingress.yaml
+
+# 4. Canal de prueba hacia el controlador (sin tocar /etc/hosts)
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
+
+# 5. Primera prueba de extremo a extremo
+curl -i http://localhost:8080/api/tasks -H "Host: harbor.test"   # → 200 + JSON
+curl -i http://localhost:8080/            -H "Host: harbor.test"   # → 200 + HTML
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Momento clave:</strong> al arrancar Postgres, sus pods de API (creados en la lección 2) pasan de <code>0/2 Ready</code> a <code>2/2 Ready</code> <strong>sin que hagas nada</strong>. Las readiness probes dejan de fallar y el Service api empieza a mandarles tráfico. Es la demostración más bonita del modelo declarativo: declaras el estado deseado de cada pieza y Kubernetes encaja el puzzle.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Mantén idénticas las credenciales del API y de Postgres (mismo usuario <code>harbor</code> y misma contraseña)</td>
+              <td>Contraseñas distintas "por si acaso"</td>
+              <td>Un desajuste produce <code>authentication failed</code> en el API; parece un problema de red cuando es de credenciales</td>
+            </tr>
+            <tr>
+              <td>Usa <code>subPath</code> para el datadir de Postgres</td>
+              <td>Montar el PVC directo en <code>/var/lib/postgresql/data</code></td>
+              <td>La imagen aloja archivos propios en esa ruta; sin <code>subPath</code> tu PVC los "sobrescribe" y Postgres no arranca o pierde permisos</td>
+            </tr>
+            <tr>
+              <td>Escribe migraciones idempotentes (<code>IF NOT EXISTS</code>)</td>
+              <td>Scripts pensados para ejecutarse "una sola vez" asumiendo orden</td>
+              <td>El entrypoint los corre en el primer boot; con idempotencia puedes rectificar y reaplicar sin romper el datadir</td>
+            </tr>
+            <tr>
+              <td>Verifica <code>kubectl get pvc</code> → <code>Bound</code> antes de mirar el pod</td>
+              <td>Revisar solo el Deployment y los pods</td>
+              <td>Si el PVC está <code>Pending</code>, el pod quedará <code>Pending</code> para siempre sin que el propio pod parezca roto</td>
+            </tr>
+            <tr>
+              <td>Prueba el Ingress con <code>curl -H "Host: harbor.test"</code> + port-forward</td>
+              <td>Probar a <code>curl http://localhost/</code> sin host</td>
+              <td>Sin el Host correcto (o sin él), el enrutamiento no encuentra regla y responde 404</td>
+            </tr>
+            <tr>
+              <td>Apuerta Postgres solo internamente</td>
+              <td>Exponer la BD con LoadBalancer o Ingress</td>
+              <td>La BD es el activo crítico; debe hablar únicamente con el API (aquí) o con la red de datos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>PVC atascado en Pending</h3>
+        <pre><code class="language-bash"># Reflexiona: kubectl get pvc → STATUS Pending sin avanzar
+kubectl get pvc -n harbortasks
+# NAME            STATUS   VOLUME  CAPACITY  ACCESS MODES STORAGECLASS AGE
+# postgres-data   Pending  <none>  <empty>   <none>       <none>       3m
+# Observa STORAGECLASS &lt;none&gt;: ¡no hay ninguna StorageClass!
+
+# ❌ Por qué: aplicar los manifests ANTES de que exista la StorageClass,
+#    o escribir storageClassName mal (p. ej. "local" en vez de "standard").
+# ✅ Solución: confirma el nombre real de la StorageClass de kind y reaplica
+kubectl get storageclass                      # kind suele llamarse "standard"
+kubectl apply -f k8s/postgres/pvc.yaml        # el reclamo "enlaza" el disco
+</code></pre>
+
+        <h3>El API no puede autenticarse (pero parece todo "verde")</h3>
+        <pre><code class="language-bash"># Síntomas: pods api Ready, pero GET /api/tasks → 500 "password authentication failed"
+kubectl logs -n harbortasks deployment/api --tail=20 | grep -i password
+
+# ❌ Postgres creó el usuario con una contraseña y el API usa otra
+# ✅ Las dos piezas deben ser coherentes (esto es configuración, no magia):
+kubectl get secret harbor-secrets -n harbortasks -o jsonpath="{.data.postgres-password}" | base64 -d
+# Compara ambas salidas: tienen que ser idénticas.
+</code></pre>
+
+        <h3>Los scripts de init "no corren" la segunda vez</h3>
+        <pre><code class="language-bash"># Creas una migración nueva en postgres-init, haces rollout restart... y nada cambia.
+
+# ❌ Por qué: /docker-entrypoint-initdb.d SOLO se ejecuta la primera vez que se
+#    crea el datadir. Un PVC que ya tiene data inicializada NO vuelve a correrlos.
+# ✅ Vías correctas:
+#   1) Cambiar el esquema con una migración "normal" (aplicada por la app),
+#   2) borrar el PVC conscientemente para "recrear de cero",
+#   3) usar un initContainer que aplique SQL vía psql (migraciones versionadas).
+
+kubectl delete pvc postgres-data -n harbortasks   # ⚠️ SOLO en desarrollo: borra TODO el dato
+kubectl delete pod -n harbortasks -l app=postgres # el Deployment lo recrea e inicia de nuevo
+</code></pre>
+
+        <h3>Ingress 404: el controlador no está escuchando</h3>
+        <pre><code class="language-bash">curl -i http://localhost:8080/ -H "Host: harbor.test"   # → 404 not found
+
+# ❌ Aplicaste el Ingress pero NO instalaste ingress-nginx (la regla no se cumple sola)
+kubectl get pods -n ingress-nginx        # ¿Existe el namespace siquiera?
+
+# ✅ Instala el manifiesto kind oficial y espera al controlador
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/kind/deploy.yaml
+kubectl wait -n ingress-nginx --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=120s
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> completar el stack con Postgres + Ingress y probar por primera vez el flujo completo de datos.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Desplegar Postgres en orden y ver el PVC enlazar:</strong>
+            <pre><code class="language-bash">kubectl apply -f k8s/postgres/secret.yaml
+kubectl apply -f k8s/postgres/pvc.yaml
+kubectl apply -f k8s/postgres/configmap.yaml
+kubectl apply -f k8s/postgres/deployment.yaml
+kubectl apply -f k8s/postgres/service.yaml
+
+kubectl get pvc -n harbortasks               # postgres-data → Bound
+kubectl get pods -n harbortasks -w           # postgres → Running + Ready (1/1)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Ver la "resurrección" del API (el momento estrella):</strong>
+            <pre><code class="language-bash">kubectl get pods -n harbortasks
+# API: 0/2 Ready (lección 2) → 2/2 Ready AHORA. Sin tocar nada.
+kubectl logs -n harbortasks deployment/api --tail=10   # conexión a postgres OK
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Comprobar que la migración inicial se aplicó:</strong>
+            <pre><code class="language-bash">kubectl exec -n harbortasks deploy/postgres -- \
+  psql -U harbor -d harbortasks -c "\dt"
+# Lista de relaciones: debe aparecer la tabla "tasks"
+kubectl exec -n harbortasks deploy/postgres -- \
+  psql -U harbor -d harbortasks -c "SELECT * FROM tasks;"
+# Deben estar las dos tareas de ejemplo sembradas por 001-init.sql
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Instalar el controlador, aplicar el Ingress y probar:</strong>
+            <pre><code class="language-bash">kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/kind/deploy.yaml
+kubectl wait -n ingress-nginx --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=120s
+
+kubectl apply -f k8s/ingress.yaml
+kubectl get ingress -n harbortasks          # host harbor.test, 2 paths
+
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Prueba end-to-end con curl (línea por línea):</strong>
+            <pre><code class="language-bash"># 1) La web responde HTML
+curl -i http://localhost:8080/ -H "Host: harbor.test"
+
+# 2) El API devuelve las tareas de la BD (los datos atraviesan TODO el stack)
+curl -i http://localhost:8080/api/tasks -H "Host: harbor.test"
+
+# 3) Creamos una tarea nueva por el Ingress
+curl -X POST http://localhost:8080/api/tasks \
+  -H "Host: harbor.test" -H "Content-Type: application/json" \
+  -d '{"title":"Probar el flujo completo"}'
+
+# 4) La volvemos a listar: debe aparecer con id 3
+curl http://localhost:8080/api/tasks -H "Host: harbor.test"
+</code></pre>
+            <p><strong>Resultado esperado (resumen de la verificación):</strong></p>
+            <ul>
+              <li><code>/</code> → <code>200</code> con el HTML de la web.</li>
+              <li><code>/api/tasks</code> → <code>200</code> con JSON: las 2 tareas sembradas.</li>
+              <li><code>POST /api/tasks</code> → <code>201</code> con la tarea creada.</li>
+              <li><code>GET /api/tasks</code> de nuevo → 3 tareas: el INSERT se persistió.</li>
+            </ul>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Para replicar en navegador (WSL/Windows):</strong> añade <code>127.0.0.1 harbor.test</code> a <code>/etc/hosts</code> (necesita permisos de admin/root) y abre <code>http://harbor.test/</code> manteniendo el port-forward del controlador. Es el mismo tráfico que acabas de probar con curl.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Añade TLS a harbor.test</h3>
+          <p>Genera un certificado autofirmado para <code>harbor.test</code>, súbelo como Secret de tipo <code>kubernetes.io/tls</code> y completa el Ingress con una sección <code>tls</code> y <code>port: 443</code>. Prueba luego con <code>curl -k</code> (que ignora la firma) y con <code>-v</code> para ver el handshake.</p>
+          <p><em>Pista: usa <code>openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=harbor.test" -keyout tls.key -out tls.crt</code> y luego <code>kubectl create secret tls harbor-tls --cert=tls.crt --key=tls.key</code>. El controlador ingress-nginx redirige HTTP→HTTPS por defecto cuando existe la sección <code>tls</code>. En producción real este Secret lo gestionaría cert-manager con Let's Encrypt.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Persistencia</strong> = PVC (contrato) + StorageClass (tipo de disco) + subPath montado en el pod. El dato sobrevive a reinicios de pod.</li>
+          <li><strong>Deployment + PVC es correcto</strong> para una instancia única; StatefulSet es el escalón hacia réplicas con identidad.</li>
+          <li>Las migraciones iniciales viven en <code>/docker-entrypoint-initdb.d</code> y corren <strong>una sola vez</strong>: por eso se escriben idempotentes.</li>
+          <li>Las credenciales de Postgres deben <strong>coincidir</strong> con las que consume el API (<code>harbor-secrets</code>).</li>
+          <li>El <strong>Ingress</strong> declara reglas; el <strong>controlador</strong> (ingress-nginx) las ejecuta; nginx elige el path más específico.</li>
+          <li>Al crear Postgres, los pods del API pasan a <code>Ready</code> solos: el modelo declarativo "encaja" las piezas.</li>
+          <li>Probar con <code>-H "Host: harbor.test"</code> + port-forward evita tocar <code>/etc/hosts</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -f k8s/postgres/...</code></td><td>Despliega Secret, PVC, init, Deployment y Service de la BD</td></tr>
+            <tr><td><code>kubectl get pvc -n harbortasks</code></td><td>Verifica que el reclamo quedó <code>Bound</code></td></tr>
+            <tr><td><code>kubectl exec deploy/postgres -- psql -U ... -c "\dt"</code></td><td>Lista tablas dentro del pod de Postgres</td></tr>
+            <tr><td><code>kubectl apply -f .../ingress-nginx/.../kind/deploy.yaml</code></td><td>Instala el controlador ingress-nginx en kind</td></tr>
+            <tr><td><code>kubectl apply -f k8s/ingress.yaml</code></td><td>Crea las reglas del Ingress (host + paths)</td></tr>
+            <tr><td><code>kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80</code></td><td>Canal de prueba hacia el controlador</td></tr>
+            <tr><td><code>curl -i ... -H "Host: harbor.test"</code></td><td>Prueba end-to-end simulando el navegador</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar un StatefulSet para Postgres en este proyecto?</summary>
+            <div>
+              <p>Puedes, y es el siguiente paso natural. Un StatefulSet te da nombre estable (<code>postgres-0</code>), un PVC por réplica y arranque ordenado. Para una sola instancia, el Deployment con PVC que usa el proyecto es más simple y suficiente. Migrar a StatefulSet es un delta futuro: cambio de <code>kind</code>, <code>volumeClaimTemplates</code> en lugar del PVC separado, y un Service headless.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué tengo que recordar dónde se monta el datadir de Postgres?</summary>
+            <div>
+              <p>Porque es una ruta interna de la imagen: <code>/var/lib/postgresql/data</code> en las versiones modernas (antes era <code>/var/lib/postgresql/data</code> con otra subestructura según la variante). La imagen oficial documenta exactamente esa ruta; montar el PVC ahí es lo que hace que el "disco" y el proceso se hablen. Listo para que no lo memorices como un dogma: <code>docker run --rm postgres:16-alpine</code> con un <code>docker inspect</code> te muestra los <code>VOLUME</code> declarados.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Me da miedo borrar el PVC: ¿pierdo las tareas?</summary>
+            <div>
+              <p>Sí. Borrar el PVC borra el dato persistente (en kind, la carpeta local-path). Debes hacerlo solo cuando sea tu intención: "reset del proyecto". Es justo el momento de aprender a hacer <strong>backups</strong>: con <code>pg_dump</code> exportas el esquema y los datos a un archivo antes de destruir nada. En la próxima lección verás el backup como parte del checklist de producción, y el reto de la lección 8 te lo hará tunear.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué en el Ingress las reglas de /api y / no chocan?</summary>
+            <div>
+              <p>Porque el controlador nginx usa coincidencia por <strong>prefijo más específico</strong>: <code>/api/tasks</code> empieza con <code>/api</code> y con <code>/</code>, pero <code>/api</code> es más largo y gana. Es la misma lógica de rutas en Express o Rails. Por eso el orden de las reglas no importa en nginx (a diferencia de otros controladores), y por eso también se documenta como buena práctica declarar los paths específicos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El controlador ingress-nginx es lo mismo que un LoadBalancer?</summary>
+            <div>
+              <p>No, se complementan. En kind el controlador se expone con un Service tipo <code>NodePort</code>: ese es el punto de entrada físico (puerto 80/443 del nodo). El Ingress añade <strong>enrutado inteligente por host y path</strong> por encima. En la nube, el Service del controlador suele ser <code>LoadBalancer</code> (el proveedor crea el LB real) o sea: LoadBalancer te "trae al clúster"; Ingress te dice "a qué servicio dentro".</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="03-dependencias-y-healthchecks">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>depends_on y healthchecks entre servicios — Módulo 4 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>depends_on y healthchecks entre servicios</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Docker Compose</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Cuando un sistema tiene varios contenedores, el <strong>orden de arranque importa</strong>: la API no puede vivir sin su base de datos. Compose tiene dos mecanismos para coordinar esto: <code>depends_on</code> (declara <em>quién necesita a quién</em>) y <code>healthcheck</code> (declara <em>cuándo un servicio está de verdad listo</em>).</p>
+        <p>La trampa clásica: <code>depends_on</code> por defecto solo espera a que el contenedor dependido <strong>haya arrancado</strong>, no a que <strong>esté listo para trabajar</strong>. Por eso las conexiones se «niegan» al levantar un stack. En esta lección aprenderás a distinguir «arranque» de «listo», a escribir healthchecks correctos y a combinar ambas piezas con <code>condition: service_healthy</code>.</p>
+        <div class="callout callout--why">
+          <span class="callout__title">¿Por qué importa tanto esta lección?</span>
+          <p>Es la diferencia entre un stack que «funciona a veces» y uno reproducible. El mismo concepto —liveness y readiness— reaparecerá en Kubernetes con las probes (Módulo 6). Si hoy entiendes <em>arranque ≠ listo</em>, las probes de Kubernetes te parecerán familiares.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Arranque ≠ listo: dos estados muy distintos</h3>
+        <p>Docker conoce el estado del <strong>proceso</strong> de un contenedor (created, running, exited…). Que el proceso de Postgres esté <em>running</em> solo significa que el binario se lanzó y usa CPU. Pero Postgres, antes de aceptar conexiones, tiene que: leer config, abrir el <code>pgdata</code>, recuperar el estado del último apagado, levantar el listener de red… Eso tarda varios segundos. Durante ese intervalo, el puerto 5432 <strong>existe físicamente</strong> pero <strong>rechaza conexiones</strong>.</p>
+        <div class="callout callout--analogy">
+          <span class="callout__title">Analogía: el chef y la mesa preparada</span>
+          <p><code>depends_on</code> sin condición es como decirle a los comensales «el chef ya ha llegado a la cocina, sentaos». El restaurante funciona cuando el chef <strong>ha servido la comida</strong>. Un healthcheck es el «¿está la mesa lista?» que preguntamos cada pocos segundos antes de dejar pasar a los siguientes.</p>
+        </div>
+
+        <h3>depends_on: la forma corta (y su límite)</h3>
+        <pre><code class="language-yaml">services:
+  api:
+    # FORMA CORTA: equivale a "arranca postgres antes que la api", sin más
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine</code></pre>
+        <p>Con la forma corta, Compose <strong>crea y arranca <code>postgres</code> antes</strong>, pero no espera a nada más: la api arranca «justo después», con la base aún cerrando su arranque. Resultado típico:</p>
+        <pre><code class="language-bash">api-1       | Error: connect ECONNREFUSED 172.18.0.2:5432   ← conexión RECHAZADA
+api-1       |     at TCPConnectWrap.afterConnect [as oncomplete] (net.js:…)
+api-1 exited with code 1</code></pre>
+        <p>Ese <code>ECONNREFUSED</code> es, con diferencia, el error más visto al arrancar stacks multi-contenedor. <code>depends_on</code> ha cumplido su parte (orden), pero nadie le dijo al orquestador cuándo puede abrir la puerta.</p>
+
+        <h3>healthcheck: el «¿estás listo?» periódico</h3>
+        <p>Un healthcheck es un comando que Docker ejecuta cada <code>interval</code> dentro del contenedor. Si sale <code>0</code>, el contenedor está sano; si sale distinto de <code>0</code>, cuenta un fallo. Claves:</p>
+        <table>
+          <thead><tr><th>Clave</th><th>Significado</th><th>Recomendación</th></tr></thead>
+          <tbody>
+            <tr><td><code>test</code></td><td>El comando de salud: <code>["CMD", "prog", "arg"]</code> (directo, sin shell) o <code>["CMD-SHELL", "shell_prog"]</code></td><td>Usa CMD-SHELL cuando necesites shell o tuberías</td></tr>
+            <tr><td><code>interval</code></td><td>Frecuencia entre comprobaciones</td><td>5–10s en local; recuerda: es ruido de proceso cada X</td></tr>
+            <tr><td><code>timeout</code></td><td>Tiempo máximo del test antes de contar como fallo</td><td>5s (debe ser menor que interval)</td></tr>
+            <tr><td><code>retries</code></td><td>Fallos consecutivos para pasar a <code>unhealthy</code></td><td>3–5 (evita parpadeos ante un fallo puntual)</td></tr>
+            <tr><td><code>start_period</code></td><td>Periodo de gracia inicial: los fallos durante este tiempo <strong>no cuentan</strong></td><td>En servicios lentos (bases de datos) es clave</td></tr>
+          </tbody>
+        </table>
+        <p>Estados posibles: <code>starting</code> (dentro de <code>start_period</code>), <code>healthy</code> y <code>unhealthy</code>. Puedes verlos con <code>docker compose ps</code> (columna <code>STATUS</code> muestra <code>Up (healthy)</code>) o con <code>docker inspect</code>.</p>
+
+        <h3>depends_on con condition: la forma larga</h3>
+        <pre><code class="language-yaml">services:
+  api:
+    # FORMA LARGA: la api NO arranca hasta que postgres esté "healthy"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    healthcheck:
+      # probamos el listener de red con -h; sin él cae al socket (falso positivo)
+      test: ["CMD-SHELL", "pg_isready -h localhost -U harbor -d harbortasks"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s</code></pre>
+        <p><code>condition</code> acepta tres valores:</p>
+        <ul>
+          <li><code>service_started</code>: el comportamiento por defecto (solo «arrancado»).</li>
+          <li><code>service_healthy</code>: esperar a que el healthcheck pase → <strong>el que usaremos</strong>.</li>
+          <li><code>service_completed_successfully</code>: esperar a que un contenedor de una sola tarea termine con éxito (migraciones, seeders).</li>
+        </ul>
+        <div class="callout callout--tip">
+          <span class="callout__title">docker compose up --wait</span>
+          <p>Compose v2 añadió el flag <code>--wait</code>: <code>docker compose up -d --wait</code> no «termina» hasta que todos los servicios con healthcheck están <code>healthy</code> (o fallan). Perfecto para scripts de verificación.</p>
+        </div>
+
+        <h3>Redes personalizadas en Compose</h3>
+        <p>Si no declaras redes, Compose crea una red bridge por proyecto y conecta todos los servicios a ella. Pero cuando declaras <code>networks:</code> en un servicio, <strong>ese servicio sale de la red por defecto</strong> y se conecta solo a las que declares. Esto permite separar tráfico (api→postgres por una red, api→internet por otra):</p>
+        <pre><code class="language-yaml">networks:                 # nivel superior: se declaran una vez
+  harbor-net:
+    driver: bridge         # explícito (es el default, pero queda documentado)
+
+services:
+  api:
+    networks:
+      - harbor-net
+  postgres:
+    networks:
+      - harbor-net</code></pre>
+        <p>La regla práctica: todos los servicios que deban hablarse entre sí comparten <strong>la misma red con nombre</strong>; los servicios que no se hablan pueden estar en redes distintas o directamente en la red por defecto.</p>
+        <div class="callout callout--note">
+          <span class="callout__title">El healthcheck depende de la red</span>
+          <p><code>condition: service_healthy</code> solo se puede aplicar entre servicios que viven en la <strong>misma red</strong>. Si la api está aislada, Compose ni siquiera puede observar la salud del otro. La red compartida no es cosmética: es el cable que permite la dependencia.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El stack mínimo que resuelve el ECONNREFUSED: una base con healthcheck y un servicio que espera a que esté <em>lista</em>. Como «cliente» de prueba usamos la propia imagen de Postgres (trae <code>pg_isready</code>):</p>
+        <div class="code-file">compose.yaml</div>
+        <pre><code class="language-yaml">name: orden-de-arranque
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: harbor
+      POSTGRES_PASSWORD: harborpass
+      POSTGRES_DB: harbortasks
+    healthcheck:
+      # probamos el listener de TCP con el cliente oficial (exit 0 = listo)
+      test: ["CMD-SHELL", "pg_isready -h localhost -U harbor -d harbortasks"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s   # durante 10s un fallo NO cuenta (arranque lento)
+
+  verifier:
+    image: postgres:16-alpine    # reutilizamos la imagen solo por sus clientes
+    command: ["sh", "-c",
+              "pg_isready -h postgres -U harbor -d harbortasks && echo '✔ postgres listo para conexiones'"]
+    depends_on:
+      postgres:
+        condition: service_healthy   # ← la magia: esperar a "healthy", no a "running"</code></pre>
+        <p><strong>Línea a línea del healthcheck:</strong> <code>test</code> con la forma <code>CMD-SHELL</code> ejecuta <code>pg_isready -h localhost -U harbor -d harbortasks</code>; <code>pg_isready</code> devuelve <code>0</code> cuando Postgres acepta conexiones. El <code>start_period</code> da 10 segundos de gracia (Postgres tarda más en el primer arranque). El servicio <code>verifier</code> queda <em>bloqueado</em> hasta que el estado de postgres pase a <code>healthy</code>.</p>
+        <pre><code class="language-bash">docker compose up
+# El orden real que verás en pantalla:
+#   postgres  | database system is ready to accept connections   ← "embrague" de PG
+#   verifier  | ✔ postgres listo para conexiones                 ← SOLO al ser healthy</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado a HarborTasks: la <code>api</code> (Express) depende de <code>postgres</code> con condición <code>service_healthy</code>, en una red personalizada, y con su propio healthcheck para que dependientes futuros (worker, proxies) puedan esperarla también:</p>
+        <div class="code-file">compose.yaml</div>
+        <pre><code class="language-yaml">name: harbortasks
+
+networks:
+  harbor-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: harbor
+      POSTGRES_PASSWORD: harborpass
+      POSTGRES_DB: harbortasks
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - harbor-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U harbor -d harbortasks"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://harbor:harborpass@postgres:5432/harbortasks
+      PORT: "3000"
+    networks:
+      - harbor-net
+    ports:
+      - "3000:3000"       # publicado: el navegador y tú usáis localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy   # la api espera a PG LISTO, no a PG "vivo"
+    healthcheck:
+      # Su propia salud: GET /health responde 200 → healthy
+      test: ["CMD", "node", "-e",
+             "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s   # la api espera a postgres; da margen a ese "embalaje"</code></pre>
+        <p><strong>Decisiones tomadas:</strong></p>
+        <ul>
+          <li><strong><code>pg_isready</code> sobre <code>localhost</code></strong>: probamos el listener TCP real (<code>-h localhost</code> fuerza red, no socket). Sin él, el test podría dar positivo antes de exponer el puerto.</li>
+          <li><strong>El healthcheck de la api</strong> usa <code>["CMD", …]</code> (sin shell) y llama a <code>/health</code>: un endpoint de verdad que tu Express expone en una línea: <code>app.get('/health', (_req,res) =&gt; res.send('ok'))</code>. Probar «lo que el negocio necesita», no solo que el proceso respira.</li>
+          <li><strong><code>start_period</code> en api (15s)</strong>: la api arranca tarde (esperó a PG) y durante ese tiempo sus primeros «checks» no deben contarse como fallos.</li>
+          <li><strong>Red explícita <code>harbor-net</code></strong>: encapsula la comunicación; en una red real aislarías además la de la api pública de la de datos.</li>
+        </ul>
+        <h3>Inspección del estado de salud</h3>
+        <pre><code class="language-bash">docker compose up -d --build
+docker compose ps                # STATUS: "Up (healthy)" en postgres y api
+
+# Detalle del historial de salud (JSON con el último check)
+docker inspect --format '{{json .State.Health}}' harbor-postgres-1
+
+# Script de arranque seguro para tu CI: no acaba hasta que TODO esté healthy
+docker compose up -d --wait</code></pre>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Combinar healthcheck + <code>condition: service_healthy</code></td><td>Depender solo de <code>depends_on</code> por lista</td><td>«Arrancado» no es «listo»; sin condicionar, el contenedor dependiente arranca con la conexión rota</td></tr>
+            <tr><td>Probar lo que el negocio necesita (pg_isready, GET /health)</td><td>Tests que solo comprueban que el proceso vive</td><td>Un proceso vivo puede no aceptar conexiones; el test debe probar el servicio real</td></tr>
+            <tr><td>Razonar <code>interval</code>, <code>timeout</code> y <code>retries</code> juntos</td><td>Copiar/pegar valores sin pensarlos</td><td><code>timeout</code> &gt; <code>interval</code> y retries bajos producen <code>unhealthy</code> falsos</td></tr>
+            <tr><td>Usar <code>start_period</code> en servicios lentos (bases de datos)</td><td>Marcar unhealthy un servicio que aún se está «embalando»</td><td>Los fallos dentro de <code>start_period</code> no cuentan: es la gracia de arranque</td></tr>
+            <tr><td>Conectar servicios dependientes en la <strong>misma red declarada</strong></td><td>Dependencias cruzadas entre redes distintas</td><td><code>condition: service_healthy</code> solo opera dentro de la misma red</td></tr>
+            <tr><td>Probar el arranque con <code>docker compose up -d --wait</code></td><td>Adivinar con <code>sleep</code> cuánto tarda cada servicio</td><td><code>--wait</code> te da una señal objetiva: todo healthy o error claro</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Confiar en depends_on sin condition</h3>
+        <pre><code class="language-yaml"># ❌ MAL: garantiza el ORDEN, no la DISPONIBILIDAD
+services:
+  api:
+    depends_on:
+      - postgres          # postgres "arrancado", no "listo"
+
+# ✅ BIEN: esperar al estado healthy
+services:
+  api:
+    depends_on:
+      postgres:
+        condition: service_healthy</code></pre>
+
+        <h3>El healthcheck que da positivo antes de tiempo</h3>
+        <pre><code class="language-bash"># ❌ MAL: sin -h, pg_isready prueba el socket UNIX (/var/run/postgresql).
+#    El socket existe ANTES de que el listener TCP acepte conexiones remotas.
+test: ["CMD-SHELL", "pg_isready -U harbor"]
+
+# ✅ BIEN: forzamos la interfaz de red (puerto 5432 típico)
+test: ["CMD-SHELL", "pg_isready -h localhost -U harbor -d harbortasks"]</code></pre>
+
+        <h3>timeout mayor que interval (checks que se pisan)</h3>
+        <pre><code class="language-yaml"># ❌ MAL: interval es 5s pero el timeout es 10s → el siguiente check arranca
+#    mientras el anterior sigue colgado; el estado salta a unhealthy
+healthcheck:
+  test: ["CMD", "pg_isready", "-h", "localhost"]
+  interval: 5s
+  timeout: 10s
+
+# ✅ BIEN: timeout menor que interval
+healthcheck:
+  test: ["CMD", "pg_isready", "-h", "localhost"]
+  interval: 10s
+  timeout: 5s</code></pre>
+
+        <h3>Retries y start_period para uno-shot vs largo plazo</h3>
+        <pre><code class="language-yaml"># ❌ MAL: retries bajos y sin gracia de arranque: en el primer arranque una base
+#    lenta acumula 2 fallos y pasa a unhealthy aunque el arranque vaya bien
+healthcheck:
+  retries: 2           # un solo tropiezo en arranque = unhealthy
+  # (sin start_period)
+
+# ✅ BIEN: gracia de arranque + tolerancia a tropiezos puntuales
+healthcheck:
+  retries: 5
+  start_period: 10s</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar un stack <code>postgres + verifier</code> con healthcheck y <code>condition: service_healthy</code>, y comprobar los tres estados de salud con las herramientas de Docker.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto con la base y su healthcheck</strong> (copia el «ejemplo mínimo» de la sección 3).</li>
+          <li>
+            <strong>Levanta solo la base y observa la máquina de estados</strong>:
+            <pre><code class="language-bash">docker compose up -d postgres
+docker compose ps            # STATUS: Up (healthy) tras unos segundos
+docker inspect --format '{{json .State.Health}}' $(docker compose ps -q postgres)
+# devuelve el JSON con "Status": "healthy" y el "log" del último check</code></pre>
+          </li>
+          <li>
+            <strong>Añade el servicio <code>verifier</code> y baja todo</strong>:
+            <pre><code class="language-bash">docker compose down
+docker compose up            # (en primer plano): espera hasta "healthy" y corre verifier</code></pre>
+          </li>
+          <li>
+            <strong>Demuestra el «arranque ≠ listo»</strong>: detén la base mientras el verifier espera:
+            <pre><code class="language-bash">docker compose up -d
+docker compose stop postgres        # la base pasa a unhealthy
+docker compose run verifier         # ⏳ se queda BLOQUEADO esperando a postgres…
+docker compose start postgres       # …y al volver, salud a healthy → verifier corre
+docker compose run verifier         # ✔ postgres listo para conexiones</code></pre>
+            <div class="callout callout--tip">
+              <span class="callout__title">Si el verifier se queda esperando demasiado</span>
+              <p>Es el comportamiento correcto: <code>condition: service_healthy</code> bloquea hasta que haya señal real de salud. Si quieres cortar, <kbd>Ctrl+C</kbd>. En un script real usarías <code>timeout 60 docker compose up</code> o <code>--wait</code>.</p>
+            </div>
+          </li>
+          <li>
+            <strong>Cierra el escenario</strong>:
+            <pre><code class="language-bash">docker compose down</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cadena de dependencias con tres servicios</h3>
+          <p>Añade a tu stack un servicio <code>worker</code> (imagen <code>node:22-alpine</code>, comando que imprima <code>worker arrancado</code>) que dependa de la <code>api</code> con <code>condition: service_healthy</code>. Necesitarás dar a la api su propio healthcheck (el <code>GET /health</code> de la sección 4) y conectar los tres servicios a la misma red <code>harbor-net</code>. Comprueba con <code>docker compose up</code> que el orden real es <code>postgres → api → worker</code>.</p>
+          <p><em>Pistas: sin un endpoint <code>/health</code> la api no puede volverse «healthy»; revisa qué pasa si el worker depende de la api que a su vez depende de postgres — el orden se resuelve en cascada. Y recuerda: los tres deben compartir red.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Arranque ≠ listo</strong>: <code>depends_on</code> corto solo garantiza el orden de creación; el contenedor dependiente arranca con la conexión aún rechazada (<code>ECONNREFUSED</code>).</li>
+          <li><strong><code>healthcheck</code></strong> define el «¿estás listo?»: <code>test</code>, <code>interval</code>, <code>timeout</code>, <code>retries</code>, <code>start_period</code>.</li>
+          <li><strong><code>condition: service_healthy</code></strong> (forma larga de <code>depends_on</code>) bloquea el arranque del dependiente hasta que el healthcheck pase.</li>
+          <li>Test que prueba lo que el negocio usa: <code>pg_isready</code>, <code>GET /health</code>… y con <code>-h</code> para forzar la red.</li>
+          <li>Las <strong>redes personalizadas</strong> organizan el tráfico; la dependencia con condición exige red compartida.</li>
+          <li>El mismo patrón (liveness/readiness) aparece en Kubernetes con las probes (Módulo 6).</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker compose up -d --wait</code></td><td>Arranca y no retorna hasta que todos los healthchecks pasen</td></tr>
+            <tr><td><code>docker compose ps</code></td><td>Muestra <code>Up (healthy/unhealthy)</code> de cada servicio</td></tr>
+            <tr><td><code>docker inspect --format '{{json .State.Health}}' &lt;cnt&gt;</code></td><td>Historial JSON del healthcheck (status + últimos tests)</td></tr>
+            <tr><td><code>docker compose stop &lt;svc&gt;</code></td><td>Detiene un servicio (pasa a unhealthy) sin borrarlo</td></tr>
+            <tr><td><code>docker compose start &lt;svc&gt;</code></td><td>Reanuda un servicio detenido</td></tr>
+            <tr><td><code>docker compose run &lt;svc&gt;</code></td><td>Ejecuta un contenedor de una sola pasada (respetando depends_on)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo se usa service_completed_successfully?</summary>
+            <div>
+              <p>Cuando la dependencia es una tarea de una sola pasada que debe terminar bien antes de continuar: migraciones de base de datos, seeders o jobs de inicialización. El dependiente espera a que ese contenedor salga con código 0, no a que esté «arrancado» (que nunca «está activo» porque muere al acabar).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Equivale depends_on con condición a healthchecks nativos de K8s?</summary>
+            <div>
+              <p>Conceptualmente sí, pero en Kubernetes la coordinación es distinta: cada Pod declara sus propias probes (liveness/readiness) y el <em>Service</em> no envía tráfico a Pods que no están listos. Aquí Compose simplemente ordena el arranque; en un clúster, la orquestación es continua. Es el salto conceptual del Módulo 6.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Mi healthcheck da unhealthy pero la app responde. ¿Qué pasa?</summary>
+            <div>
+              <p>Tres causas típicas: el test no usa el comando correcto (falta <code>-h</code> en <code>pg_isready</code>, o la url del <code>/health</code> es otra), el <code>timeout</code> es demasiado corto para el arranque, o faltaba <code>start_period</code>. Depura ejecutando el test a mano dentro del contenedor: <code>docker compose exec postgres pg_isready -h localhost -U harbor</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo poner healthcheck a todos los servicios?</summary>
+            <div>
+              <p>No todos necesitan uno. Solo tiene sentido si (a) algo depende de su «estar listo» y lo condicionas, o (b) quieres que el stack te avise en <code>docker compose ps</code>. Un nginx estático que no tiene dependientes no gana nada con un healthcheck. La regla: <strong>healthcheck en lo que es dependencia de otros</strong>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué api necesita condition service_healthy si ya reintenta conexiones?</summary>
+            <div>
+              <p>Porque «reintentar» es imperativo, lento y opaco (logs llenos de <code>ECONNREFUSED</code>, tiempos a ojo). Con la condición, el arranque queda declarado y determinista: la api solo empieza cuando la base acepta conexiones. Además, la api puede ser a su vez <em>dependencia de otros</em> servicios: entonces su propio healthcheck cuenta doble.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

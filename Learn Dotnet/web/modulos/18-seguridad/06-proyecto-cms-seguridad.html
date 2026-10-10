@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="es" data-module="18" data-lesson="06-proyecto-cms-seguridad" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: auditoría de seguridad — Módulo 18 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: auditoría de seguridad</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 18 · Seguridad en APIs (OWASP)</span><span>55 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección final del módulo vamos a auditar el CMS que hemos construido a lo largo del curso. Revisaremos cada endpoint, cada servicio y cada pieza de configuración a la luz del OWASP Top 10 para APIs. Al terminar, el CMS contará con cabeceras de seguridad, rate limiting, autorización a nivel de objeto, gestión segura de secretos y un checklist de auditoría.</p>
+        <p><strong>¿Qué problema resuelve?</strong> Evita que vulnerabilidades comunes lleguen a producción aplicando una revisión sistemática. La auditoría no es un evento único; es una práctica continua.</p>
+        <p><strong>¿Cuándo se utiliza?</strong> Antes de cada despliegue importante, tras cambios en autenticación/autorización, o como parte de un pipeline de CI/CD. También es recomendable hacer auditorías trimestrales.</p>
+        <div class="callout callout--warning">
+          <strong>Errores típicos:</strong> hacer la auditoría solo al final del proyecto, no automatizarla, confiar en que "el framework ya lo hace", o no revisar endpoints deprecados y dependencias antiguas.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <p>Una auditoría de seguridad no es solo un checklist; es un proceso que combina revisión manual, análisis estático, pruebas automatizadas y revisión de configuración. Para el CMS nos centraremos en los puntos más críticos:</p>
+        <pre><code class="language-text">
+Checklist de auditoría de seguridad para el CMS
+───────────────────────────────────────────────
+☐ Autenticación: JWT bien configurado, expiración, refresh tokens
+☐ Autorización: BOLA resuelto en todos los endpoints con recursos
+☐ Autorización funcional: policies y roles correctos
+☐ Propiedades sensibles: DTOs específicos, nunca entidades completas
+☐ Rate limiting: por usuario, por endpoint, con Retry-After
+☐ SQL Injection: LINQ o SQL parametrizado
+☐ XSS/CSRF: cabeceras de seguridad, JSON como salida
+☐ SSRF: validación de URLs externas
+☐ Secretos: user-secrets/env vars/Key Vault, nada en el repo
+☐ Logs: no filtran secretos ni datos sensibles
+☐ CORS: orígenes restringidos
+☐ Versionado: endpoints versionados y deprecados documentados
+☐ Dependencias: sin paquetes con vulnerabilidades conocidas
+☐ Headers de seguridad: middleware global configurado
+☐ Health checks: no exponen información sensible
+☐ Errores: respuestas genéricas en producción, detalles en desarrollo
+        </code></pre>
+        <p>El objetivo no es alcanzar la seguridad perfecta, sino reducir la superficie de ataque y aplicar defensa en profundidad. Cada punto del checklist es una capa adicional de protección.</p>
+        <h3>Enfoque práctico</h3>
+        <p>Para el CMS, seguiremos un enfoque iterativo: primero revisaremos autenticación y autorización, luego configuración y headers, después rate limiting y finalmente dependencias y secretos. Este orden prioriza los riesgos más críticos y explotables.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Veamos un fragmento mínimo de la configuración segura del CMS en <code>Program.cs</code>. Este código combina autenticación, autorización, rate limiting y cabeceras de seguridad.</p>
+        <pre><code class="language-csharp">var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("PostOwnerOrAdmin", policy =>
+        policy.Requirements.Add(new PostOwnerOrAdminRequirement()));
+
+    options.AddPolicy("CanEditPosts", policy =>
+        policy.RequireRole("Admin", "Editor"));
+});
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddSlidingWindowLimiter("general", opts =>
+    {
+        opts.PermitLimit = 100;
+        opts.Window = TimeSpan.FromMinutes(1);
+        opts.SegmentsPerWindow = 4;
+    });
+});
+
+var app = builder.Build();
+
+app.UseMiddleware&lt;SecurityHeadersMiddleware&gt;();
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+app.Run();</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>A continuación aplicamos las correcciones más importantes en los endpoints del CMS.</p>
+        <h3>4.1 Autorización a nivel de objeto (A01)</h3>
+        <pre><code class="language-csharp">app.MapPut("/api/v1/posts/{id:guid}", async (
+    Guid id,
+    UpdatePostRequest request,
+    IMediator mediator,
+    IAuthorizationService authorization,
+    ClaimsPrincipal user,
+    CancellationToken cancellationToken) =>
+{
+    var post = await mediator.Send(new GetPostQuery(id), cancellationToken);
+    if (post is null) return Results.NotFound();
+
+    var auth = await authorization.AuthorizeAsync(user, post, Operations.Update);
+    if (!auth.Succeeded) return Results.Forbid();
+
+    await mediator.Send(request with { Id = id }, cancellationToken);
+    return Results.NoContent();
+})
+.RequireAuthorization("CanEditPosts");</code></pre>
+        <h3>4.2 Rate limiting en endpoints sensibles (A04, A06)</h3>
+        <pre><code class="language-csharp">app.MapPost("/api/v1/posts", async (CreatePostRequest request, IMediator mediator) =>
+{
+    var postId = await mediator.Send(request);
+    return Results.Created($"/api/v1/posts/{postId}", postId);
+})
+.RequireAuthorization("CanEditPosts")
+.RequireRateLimiting("create-post");
+
+app.MapPost("/api/auth/login", (LoginRequest request) => Results.Ok())
+   .RequireRateLimiting("strict")
+   .AllowAnonymous();</code></pre>
+        <h3>4.3 Middleware de cabeceras de seguridad (A08)</h3>
+        <pre><code class="language-csharp">public class SecurityHeadersMiddleware(RequestDelegate next)
+{
+    public Task InvokeAsync(HttpContext context)
+    {
+        var headers = context.Response.Headers;
+
+        headers.Append("X-Frame-Options", "DENY");
+        headers.Append("X-Content-Type-Options", "nosniff");
+        headers.Append("X-XSS-Protection", "0");
+        headers.Append("Referrer-Policy", "strict-origin-when-cross-origin");
+        headers.Append("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+        headers.Append("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+        headers.Append("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()");
+
+        return next(context);
+    }
+}</code></pre>
+        <h3>4.4 Gestión de secretos</h3>
+        <pre><code class="language-csharp">// appsettings.json: nunca incluyas secretos
+{
+  "Jwt": {
+    "Issuer": "CmsApi",
+    "Audience": "CmsClients"
+  },
+  "ConnectionStrings": {
+    "Default": "Host=localhost;Database=cms;Username=cms_user"
+  }
+}
+
+// Program.cs: obtener secreto desde configuración
+var jwtSecret = builder.Configuration["Jwt:SecretKey"]
+    ?? throw new InvalidOperationException("Jwt:SecretKey no configurado.");
+
+// Validación de longitud mínima para JWT HMAC
+if (jwtSecret.Length &lt; 32)
+    throw new InvalidOperationException("Jwt:SecretKey debe tener al menos 32 caracteres.");</code></pre>
+        <h3>4.5 CORS restrictivo</h3>
+        <pre><code class="language-csharp">builder.Services.AddCors(options =>
+{
+    options.AddPolicy("CmsCorsPolicy", policy =>
+    {
+        policy.WithOrigins("https://cms.example.com", "https://admin.example.com")
+              .WithMethods("GET", "POST", "PUT", "DELETE")
+              .WithHeaders("Authorization", "Content-Type", "X-Requested-With")
+              .AllowCredentials();
+    });
+});
+
+app.UseCors("CmsCorsPolicy");</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Auditoría periódica:</strong> repasa el checklist antes de cada release y trimestralmente.</li>
+          <li><strong>Automatiza lo que puedas:</strong> <code>dotnet list package --vulnerable</code>, secret scanning en GitHub, análisis estático.</li>
+          <li><strong>Prueba la seguridad:</strong> escribe tests que intenten acceder a recursos ajenos y esperen 403/404.</li>
+          <li><strong>Documenta las decisiones:</strong> un ADR de seguridad ayuda a mantener el conocimiento.</li>
+          <li><strong>Principio de mínimo privilegio:</strong> cada servicio, usuario de BD y API key debe tener solo los permisos necesarios.</li>
+          <li><strong>Monitorea:</strong> usa OpenTelemetry y Serilog para detectar patrones de ataque (muchos 401/429/403).</li>
+          <li><strong>Respuestas de error controladas:</strong> en producción, nunca devuelvas stack traces ni detalles internos.</li>
+          <li><strong>Endpoints deprecados:</strong> desactívalos o documenta claramente que no deben usarse.</li>
+          <li><strong>Health checks seguros:</strong> no expongan información sensible sobre la infraestructura.</li>
+          <li><strong>Revisión de roles:</strong> asegúrate de que cada rol tenga exactamente los permisos que necesita.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <strong>Consejo:</strong> crea un proyecto de tests de seguridad separado con escenarios de ataque: BOLA, inyección SQL, fuerza bruta y SSRF. Estos tests deben ejecutarse en cada pull request.
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <table>
+          <thead>
+            <tr><th>Incorrecto</th><th>Por qué está mal</th><th>Correcto</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Endpoint de actualización sin verificar propiedad</td>
+              <td>Cualquier editor puede modificar cualquier post (BOLA)</td>
+              <td>Authorization handler por recurso</td>
+            </tr>
+            <tr>
+              <td>No rate limiting en login</td>
+              <td>Permite ataques de fuerza bruta</td>
+              <td>Límite estricto por IP/usuario</td>
+            </tr>
+            <tr>
+              <td>Devolver entidades EF completas</td>
+              <td>Expone campos internos (A03)</td>
+              <td>DTOs específicos por operación</td>
+            </tr>
+            <tr>
+              <td>Secretos en appsettings.Production.json</td>
+              <td>Puede subirse al repositorio</td>
+              <td>Variables de entorno o Key Vault</td>
+            </tr>
+            <tr>
+              <td>CORS abierto a <code>*</code></td>
+              <td>Permite que cualquier sitio web llame a la API</td>
+              <td>Orígenes explícitos y métodos restringidos</td>
+            </tr>
+            <tr>
+              <td>No versionar endpoints</td>
+              <td>Imposible deprecar cambios con seguridad</td>
+              <td>API versioning con deprecación documentada</td>
+            </tr>
+            <tr>
+              <td>Stack traces en respuestas de error</td>
+              <td>Filtra información interna al atacante</td>
+              <td>ProblemDetails genéricos en producción</td>
+            </tr>
+            <tr>
+              <td>Logs con tokens o connection strings</td>
+              <td>Filtración de secretos</td>
+              <td>Enmascarar valores sensibles en Serilog</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Vamos a completar la auditoría del CMS paso a paso.</p>
+        <ol>
+          <li><strong>Revisa autenticación:</strong> verifica que el JWT tiene expiración corta (15 min) y refresh tokens rotan.</li>
+          <li><strong>Revisa autorización:</strong> asegúrate de que todos los endpoints con <code>{id}</code> verifican propiedad del recurso.</li>
+          <li><strong>Revisa DTOs:</strong> ningún endpoint debe devolver la entidad EF completa.</li>
+          <li><strong>Añade cabeceras de seguridad:</strong> registra el middleware global.</li>
+          <li><strong>Configura rate limiting:</strong> políticas generales y estrictas para auth/creación.</li>
+          <li><strong>Revisa secretos:</strong> mueve <code>Jwt:SecretKey</code> y connection strings a user-secrets/env vars.</li>
+          <li><strong>Configura CORS:</strong> restringe a orígenes conocidos y métodos necesarios.</li>
+          <li><strong>Ejecuta <code>dotnet list package --vulnerable</code></strong> y actualiza paquetes vulnerables.</li>
+          <li><strong>Escribe tests de seguridad:</strong> un usuario no debe poder editar el post de otro.</li>
+          <li><strong>Revisa health checks:</strong> no expongan información sensible.</li>
+        </ol>
+        <pre><code class="language-bash"># Comando para detectar paquetes vulnerables
+dotnet list package --vulnerable --include-transitive
+
+# Ejecutar tests de seguridad
+dotnet test tests/Cms.Api.SecurityTests
+
+# Verificar cabeceras de seguridad
+curl -I https://localhost:5001/api/v1/posts</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Implementa un <strong>pipeline de seguridad en CI/CD</strong> para el CMS. El pipeline debe:</p>
+        <ul>
+          <li>Ejecutar <code>dotnet list package --vulnerable</code> y fallar si hay vulnerabilidades de alto severity.</li>
+          <li>Activar secret scanning de GitHub y revisar los alertas.</li>
+          <li>Correr los tests de seguridad antes de permitir el merge.</li>
+          <li>Generar un reporte de cabeceras de seguridad con <code>curl -I</code> contra el entorno de staging.</li>
+          <li>Implementar un scan de puertos o vulnerabilidades básico en la imagen Docker.</li>
+        </ul>
+        <p>No resuelvas el reto todavía. Diseña primero el workflow de GitHub Actions y luego implementa cada paso.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>La auditoría de seguridad del CMS combina autorización, rate limiting, headers y gestión de secretos.</li>
+          <li>Cada endpoint con recursos propios debe verificar BOLA.</li>
+          <li>Los DTOs y el mapeo manual/AutoMapper previenen la exposición accidental de datos.</li>
+          <li>Rate limiting, headers de seguridad y gestión de secretos son obligatorios en producción.</li>
+          <li>Automatiza la seguridad en CI/CD para mantenerla en el tiempo.</li>
+          <li>La seguridad del CMS es un proceso continuo, no un evento puntual.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Con esto el CMS es 100% seguro?</summary>
+          <p>No. La seguridad es un proceso continuo. Esta auditoría cubre los riesgos más comunes, pero siempre pueden aparecer nuevos vectores. Mantén la vigilancia y actualiza controles.</p>
+        </details>
+        <details>
+          <summary>¿Debo auditar también dependencias de frontend?</summary>
+          <p>Si tu API sirve SPA o documentación, sí. En este curso nos centramos en el backend, pero un despliegue real requiere auditar todo el stack.</p>
+        </details>
+        <details>
+          <summary>¿Con qué frecuencia ejecuto <code>dotnet list package --vulnerable</code>?</summary>
+          <p>Como mínimo una vez por sprint y siempre en el pipeline de CI/CD. Las dependencias nuevas también deben revisarse antes de añadirse.</p>
+        </details>
+        <details>
+          <summary>¿Dónde almaceno los tests de seguridad?</summary>
+          <p>En un proyecto de tests separado, por ejemplo <code>Cms.Api.SecurityTests</code>, usando <code>WebApplicationFactory</code> para pruebas de integración.</p>
+        </details>
+        <details>
+          <summary>¿Qué hago si el secret scanning detecta un secreto histórico?</summary>
+          <p>Considera el secreto comprometido. Rótalo, revoca accesos y borra el secreto del historial si es posible. En GitHub, usa el mecanismo de revocación asistida.</p>
+        </details>
+        <details>
+          <summary>¿Debo desactivar Swagger en producción?</summary>
+          <p>Depende del caso. Si Swagger expone detalles internos de la API, es mejor desactivarlo en producción o protegerlo con autenticación. Considera usarlo solo en entornos internos.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

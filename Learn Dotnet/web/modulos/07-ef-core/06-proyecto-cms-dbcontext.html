@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="es" data-module="07" data-lesson="06-proyecto-cms-dbcontext" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: DbContext + repositorios — Módulo 7 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: DbContext + repositorios</h1>
+        <div class="lesson-header__meta"><span class="badge">Módulo 7 · Entity Framework Core</span><span>50 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En esta lección del proyecto práctico vamos a dar el salto definitivo a la persistencia. Construiremos el <code>DbContext</code> del CMS, configuraremos todas las relaciones entre entidades, crearemos las migraciones iniciales y conectaremos las interfaces de repositorio que diseñamos en el Módulo 6 con implementaciones reales basadas en EF Core.</p>
+        <p>Veremos:</p>
+        <ul>
+          <li>Cómo estructurar el <code>CmsDbContext</code> en el proyecto de infraestructura.</li>
+          <li>Configuración de entidades con archivos <code>IEntityTypeConfiguration&lt;T&gt;</code>.</li>
+          <li>Modelo de dominio: <code>Post</code>, <code>Category</code>, <code>Tag</code>, <code>User</code>, <code>PostTag</code>.</li>
+          <li>Implementación de repositorios EF Core.</li>
+          <li>Registro del contexto en el contenedor de DI.</li>
+          <li>Generación y aplicación de la migración inicial.</li>
+        </ul>
+        <div class="callout info">
+          <strong>Arquitectura:</strong> seguimos Clean Architecture. El <code>DbContext</code> y los repositorios concretos viven en <code>Cms.Infrastructure</code>. Las interfaces de repositorio viven en <code>Cms.Domain</code> o <code>Cms.Application</code>.
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+
+        <h3>2.1 Ubicación del DbContext en Clean Architecture</h3>
+        <p>En Clean Architecture, la capa de infraestructura depende de la capa de aplicación y dominio, pero no al revés. El <code>DbContext</code> es un detalle de infraestructura: pertenece al proyecto <code>Cms.Infrastructure</code>.</p>
+        <pre><code class="language-ascii">Cms.Api
+    │
+    ▼
+Cms.Application  ← interfaces de repositorio (IRepository, IUnitOfWork)
+    │
+    ▼
+Cms.Domain     ← entidades puras y contratos de dominio
+    │
+    ▼
+Cms.Infrastructure  ← CmsDbContext, EF Core, repositorios concretos</code></pre>
+
+        <h3>2.2 Separación de configuración</h3>
+        <p>En lugar de poner todo en <code>OnModelCreating</code>, creamos una clase de configuración por entidad. Esto mejora la mantenibilidad y permite que cada entidad evolucione de forma independiente.</p>
+        <pre><code class="language-csharp">// Cms.Infrastructure/Data/Configurations/PostConfiguration.cs
+public class PostConfiguration : IEntityTypeConfiguration&lt;Post&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Post&gt; entity)
+    {
+        entity.ToTable("posts", "cms");
+        entity.HasKey(p =&gt; p.Id);
+        entity.HasIndex(p =&gt; p.Slug).IsUnique();
+        entity.Property(p =&gt; p.Title).HasMaxLength(200).IsRequired();
+        entity.Property(p =&gt; p.Slug).HasMaxLength(200).IsRequired();
+        entity.Property(p =&gt; p.Content).HasColumnType("text");
+        entity.Property(p =&gt; p.Status).HasConversion&lt;string&gt;().HasMaxLength(20);
+        entity.Property(p =&gt; p.CreatedAt).HasDefaultValueSql("now()");
+        entity.Property(p =&gt; p.RowVersion).IsConcurrencyToken().ValueGeneratedOnAddOrUpdate();
+
+        entity.HasOne(p =&gt; p.Author)
+              .WithMany(u =&gt; u.Posts)
+              .HasForeignKey(p =&gt; p.AuthorId)
+              .OnDelete(DeleteBehavior.Restrict);
+
+        entity.HasOne(p =&gt; p.Category)
+              .WithMany(c =&gt; c.Posts)
+              .HasForeignKey(p =&gt; p.CategoryId)
+              .OnDelete(DeleteBehavior.SetNull);
+    }
+}</code></pre>
+
+        <h3>2.3 Relaciones del CMS</h3>
+        <p>El modelo del CMS tiene las siguientes relaciones:</p>
+        <ul>
+          <li><strong>User</strong> 1:N <strong>Post</strong>: un autor tiene muchos posts. Usamos <code>Restrict</code> para no borrar posts al eliminar un usuario.</li>
+          <li><strong>Category</strong> 1:N <strong>Post</strong>: una categoría tiene muchos posts. Usamos <code>SetNull</code> porque un post puede quedar sin categoría.</li>
+          <li><strong>Post</strong> N:N <strong>Tag</strong> mediante <strong>PostTag</strong>: tabla intermedia explícita con metadatos.</li>
+        </ul>
+
+        <h3>2.4 Repositorios con EF Core</h3>
+        <p>Los repositorios encapsulan el acceso a datos. Reciben el <code>DbContext</code> por constructor y exponen métodos orientados al dominio. No exponen <code>IQueryable</code> para evitar que la lógica de filtrado se disperse.</p>
+        <pre><code class="language-csharp">public interface IPostRepository
+{
+    Task&lt;Post?&gt; GetByIdAsync(int id, CancellationToken cancellationToken = default);
+    Task&lt;IReadOnlyList&lt;Post&gt;&gt; GetPublishedAsync(int page, int pageSize, CancellationToken cancellationToken = default);
+    Task AddAsync(Post post, CancellationToken cancellationToken = default);
+    Task UpdateAsync(Post post, CancellationToken cancellationToken = default);
+    Task DeleteAsync(Post post, CancellationToken cancellationToken = default);
+}
+
+public class EfPostRepository : IPostRepository
+{
+    private readonly CmsDbContext _context;
+    public EfPostRepository(CmsDbContext context) =&gt; _context = context;
+
+    public async Task&lt;Post?&gt; GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        return await _context.Posts
+            .AsNoTracking()
+            .Include(p =&gt; p.Category)
+            .Include(p =&gt; p.Author)
+            .Include(p =&gt; p.PostTags)
+            .ThenInclude(pt =&gt; pt.Tag)
+            .FirstOrDefaultAsync(p =&gt; p.Id == id, cancellationToken);
+    }
+
+    public async Task&lt;IReadOnlyList&lt;Post&gt;&gt; GetPublishedAsync(int page, int pageSize, CancellationToken cancellationToken = default)
+    {
+        return await _context.Posts
+            .AsNoTracking()
+            .Where(p =&gt; p.Status == PostStatus.Published)
+            .OrderByDescending(p =&gt; p.PublishedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Include(p =&gt; p.Category)
+            .Include(p =&gt; p.Author)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task AddAsync(Post post, CancellationToken cancellationToken = default)
+    {
+        await _context.Posts.AddAsync(post, cancellationToken);
+    }
+
+    public Task UpdateAsync(Post post, CancellationToken cancellationToken = default)
+    {
+        _context.Posts.Update(post);
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteAsync(Post post, CancellationToken cancellationToken = default)
+    {
+        _context.Posts.Remove(post);
+        return Task.CompletedTask;
+    }
+}</code></pre>
+
+        <h3>2.5 Unidad de trabajo con DbContext</h3>
+        <p>En lugar de llamar a <code>SaveChanges</code> dentro de cada repositorio, el <code>DbContext</code> actúa como unidad de trabajo. Los handlers CQRS llaman a <code>SaveChangesAsync</code> tras coordinar las operaciones de los repositorios.</p>
+        <pre><code class="language-csharp">public interface IUnitOfWork
+{
+    Task&lt;int&gt; SaveChangesAsync(CancellationToken cancellationToken = default);
+}
+
+// CmsDbContext implementa IUnitOfWork directamente.
+public class CmsDbContext : DbContext, IUnitOfWork
+{
+    public CmsDbContext(DbContextOptions&lt;CmsDbContext&gt; options) : base(options) { }
+
+    public DbSet&lt;Post&gt; Posts =&gt; Set&lt;Post&gt;();
+    public DbSet&lt;Category&gt; Categories =&gt; Set&lt;Category&gt;();
+    public DbSet&lt;Tag&gt; Tags =&gt; Set&lt;Tag&gt;();
+    public DbSet&lt;User&gt; Users =&gt; Set&lt;User&gt;();
+    public DbSet&lt;PostTag&gt; PostTags =&gt; Set&lt;PostTag&gt;();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(CmsDbContext).Assembly);
+        base.OnModelCreating(modelBuilder);
+    }
+}</code></pre>
+
+        <h3>2.6 Configuración en DI</h3>
+        <p>Registramos el <code>DbContext</code>, los repositorios y la unidad de trabajo en el contenedor de DI de la aplicación.</p>
+        <pre><code class="language-csharp">// Program.cs
+builder.Services.AddDbContext&lt;CmsDbContext&gt;((provider, options) =&gt;
+{
+    var connectionString = builder.Configuration.GetConnectionString("CmsDatabase")!;
+    options.UseNpgsql(connectionString, npgsql =&gt;
+    {
+        npgsql.MigrationsAssembly("Cms.Infrastructure");
+        npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "cms");
+    });
+});
+
+builder.Services.AddScoped&lt;IPostRepository, EfPostRepository&gt;();
+builder.Services.AddScoped&lt;ICategoryRepository, EfCategoryRepository&gt;();
+builder.Services.AddScoped&lt;ITagRepository, EfTagRepository&gt;();
+builder.Services.AddScoped&lt;IUnitOfWork, CmsDbContext&gt;();
+
+// appsettings.json
+{
+  "ConnectionStrings": {
+    "CmsDatabase": "Host=localhost;Database=cmsdb;Username=cms;Password=secret;SearchPath=cms,public"
+  }
+}</code></pre>
+        <div class="callout warning">
+          <strong>Nota:</strong> especificamos el <code>MigrationsAssembly</code> porque el <code>DbContext</code> está en <code>Cms.Infrastructure</code>, pero el proyecto de inicio es <code>Cms.Api</code>.
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>El <code>DbContext</code> mínimo del CMS con dos entidades y una relación.</p>
+        <pre><code class="language-csharp">public class CmsDbContext : DbContext
+{
+    public CmsDbContext(DbContextOptions&lt;CmsDbContext&gt; options) : base(options) { }
+    public DbSet&lt;Post&gt; Posts =&gt; Set&lt;Post&gt;();
+    public DbSet&lt;Category&gt; Categories =&gt; Set&lt;Category&gt;();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity&lt;Post&gt;(entity =&gt;
+        {
+            entity.ToTable("posts", "cms");
+            entity.HasKey(p =&gt; p.Id);
+            entity.Property(p =&gt; p.Title).HasMaxLength(200).IsRequired();
+        });
+
+        modelBuilder.Entity&lt;Category&gt;(entity =&gt;
+        {
+            entity.ToTable("categories", "cms");
+            entity.HasKey(c =&gt; c.Id);
+            entity.Property(c =&gt; c.Name).HasMaxLength(100).IsRequired();
+        });
+    }
+}</code></pre>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>A continuación se muestra el modelo de dominio completo del CMS, las configuraciones de EF Core y los repositorios concretos.</p>
+
+        <h3>4.1 Modelo de dominio</h3>
+        <pre><code class="language-csharp">// Cms.Domain/Entities/Post.cs
+public class Post
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Slug { get; set; } = string.Empty;
+    public string Content { get; set; } = string.Empty;
+    public PostStatus Status { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime? UpdatedAt { get; set; }
+    public DateTime? PublishedAt { get; set; }
+    public byte[] RowVersion { get; set; } = null!;
+
+    public int AuthorId { get; set; }
+    public User Author { get; set; } = null!;
+
+    public int? CategoryId { get; set; }
+    public Category? Category { get; set; }
+
+    public List&lt;PostTag&gt; PostTags { get; set; } = new();
+}
+
+public enum PostStatus { Draft, Published, Archived }
+
+// Cms.Domain/Entities/Category.cs
+public class Category
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Slug { get; set; } = string.Empty;
+    public List&lt;Post&gt; Posts { get; set; } = new();
+}
+
+// Cms.Domain/Entities/Tag.cs
+public class Tag
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Slug { get; set; } = string.Empty;
+    public List&lt;PostTag&gt; PostTags { get; set; } = new();
+}
+
+// Cms.Domain/Entities/PostTag.cs
+public class PostTag
+{
+    public int PostId { get; set; }
+    public Post Post { get; set; } = null!;
+    public int TagId { get; set; }
+    public Tag Tag { get; set; } = null!;
+    public DateTime AssignedAt { get; set; }
+}
+
+// Cms.Domain/Entities/User.cs
+public class User
+{
+    public int Id { get; set; }
+    public string Email { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public UserRole Role { get; set; }
+    public List&lt;Post&gt; Posts { get; set; } = new();
+}
+
+public enum UserRole { Admin, Editor, Author }</code></pre>
+
+        <h3>4.2 Configuraciones</h3>
+        <pre><code class="language-csharp">// Cms.Infrastructure/Data/Configurations/UserConfiguration.cs
+public class UserConfiguration : IEntityTypeConfiguration&lt;User&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;User&gt; entity)
+    {
+        entity.ToTable("users", "cms");
+        entity.HasKey(u =&gt; u.Id);
+        entity.HasIndex(u =&gt; u.Email).IsUnique();
+        entity.Property(u =&gt; u.Email).HasMaxLength(255).IsRequired();
+        entity.Property(u =&gt; u.DisplayName).HasMaxLength(150).IsRequired();
+        entity.Property(u =&gt; u.Role).HasConversion&lt;string&gt;().HasMaxLength(20);
+    }
+}
+
+// Cms.Infrastructure/Data/Configurations/CategoryConfiguration.cs
+public class CategoryConfiguration : IEntityTypeConfiguration&lt;Category&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Category&gt; entity)
+    {
+        entity.ToTable("categories", "cms");
+        entity.HasKey(c =&gt; c.Id);
+        entity.HasIndex(c =&gt; c.Slug).IsUnique();
+        entity.Property(c =&gt; c.Name).HasMaxLength(100).IsRequired();
+        entity.Property(c =&gt; c.Slug).HasMaxLength(100).IsRequired();
+    }
+}
+
+// Cms.Infrastructure/Data/Configurations/TagConfiguration.cs
+public class TagConfiguration : IEntityTypeConfiguration&lt;Tag&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;Tag&gt; entity)
+    {
+        entity.ToTable("tags", "cms");
+        entity.HasKey(t =&gt; t.Id);
+        entity.HasIndex(t =&gt; t.Slug).IsUnique();
+        entity.Property(t =&gt; t.Name).HasMaxLength(50).IsRequired();
+        entity.Property(t =&gt; t.Slug).HasMaxLength(50).IsRequired();
+    }
+}
+
+// Cms.Infrastructure/Data/Configurations/PostTagConfiguration.cs
+public class PostTagConfiguration : IEntityTypeConfiguration&lt;PostTag&gt;
+{
+    public void Configure(EntityTypeBuilder&lt;PostTag&gt; entity)
+    {
+        entity.ToTable("post_tags", "cms");
+        entity.HasKey(pt =&gt; new { pt.PostId, pt.TagId });
+        entity.Property(pt =&gt; pt.AssignedAt).HasDefaultValueSql("now()");
+
+        entity.HasOne(pt =&gt; pt.Post)
+              .WithMany(p =&gt; p.PostTags)
+              .HasForeignKey(pt =&gt; pt.PostId)
+              .OnDelete(DeleteBehavior.Cascade);
+
+        entity.HasOne(pt =&gt; pt.Tag)
+              .WithMany(t =&gt; t.PostTags)
+              .HasForeignKey(pt =&gt; pt.TagId)
+              .OnDelete(DeleteBehavior.Cascade);
+    }
+}</code></pre>
+
+        <h3>4.3 Migraciones</h3>
+        <pre><code class="language-bash"># Desde la raíz del proyecto, usando Cms.Api como startup
+dotnet ef migrations add InitialCreate --project src/Cms.Infrastructure --startup-project src/Cms.Api
+
+# Aplicar en desarrollo
+dotnet ef database update --project src/Cms.Infrastructure --startup-project src/Cms.Api
+
+# Generar script SQL para producción
+dotnet ef migrations script 0 InitialCreate --idempotent --project src/Cms.Infrastructure --startup-project src/Cms.Api --output migrate.sql
+
+# Crear bundle
+dotnet ef migrations bundle --project src/Cms.Infrastructure --startup-project src/Cms.Api --self-contained -r linux-x64</code></pre>
+
+        <h3>4.4 Repositorios</h3>
+        <pre><code class="language-csharp">// Cms.Infrastructure/Data/Repositories/EfCategoryRepository.cs
+public class EfCategoryRepository : ICategoryRepository
+{
+    private readonly CmsDbContext _context;
+    public EfCategoryRepository(CmsDbContext context) =&gt; _context = context;
+
+    public async Task&lt;Category?&gt; GetByIdAsync(int id, CancellationToken cancellationToken = default)
+    {
+        return await _context.Categories
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c =&gt; c.Id == id, cancellationToken);
+    }
+
+    public async Task&lt;Category?&gt; GetBySlugAsync(string slug, CancellationToken cancellationToken = default)
+    {
+        return await _context.Categories
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c =&gt; c.Slug == slug, cancellationToken);
+    }
+
+    public async Task&lt;IReadOnlyList&lt;Category&gt;&gt; GetAllAsync(CancellationToken cancellationToken = default)
+    {
+        return await _context.Categories
+            .AsNoTracking()
+            .OrderBy(c =&gt; c.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task AddAsync(Category category, CancellationToken cancellationToken = default)
+    {
+        await _context.Categories.AddAsync(category, cancellationToken);
+    }
+
+    public Task UpdateAsync(Category category, CancellationToken cancellationToken = default)
+    {
+        _context.Categories.Update(category);
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteAsync(Category category, CancellationToken cancellationToken = default)
+    {
+        _context.Categories.Remove(category);
+        return Task.CompletedTask;
+    }
+}</code></pre>
+
+        <h3>4.5 Handler CQRS que usa repositorios</h3>
+        <pre><code class="language-csharp">public class CreatePostHandler : IRequestHandler&lt;CreatePostCommand, Result&lt;int&gt;&gt;
+{
+    private readonly IPostRepository _postRepository;
+    private readonly ICategoryRepository _categoryRepository;
+    private readonly IUnitOfWork _unitOfWork;
+
+    public CreatePostHandler(
+        IPostRepository postRepository,
+        ICategoryRepository categoryRepository,
+        IUnitOfWork unitOfWork)
+    {
+        _postRepository = postRepository;
+        _categoryRepository = categoryRepository;
+        _unitOfWork = unitOfWork;
+    }
+
+    public async Task&lt;Result&lt;int&gt;&gt; Handle(CreatePostCommand request, CancellationToken cancellationToken)
+    {
+        var category = await _categoryRepository.GetByIdAsync(request.CategoryId, cancellationToken);
+        if (category is null)
+            return Result&lt;int&gt;.Failure("Category.NotFound", "La categoría no existe.");
+
+        var post = new Post
+        {
+            Title = request.Title,
+            Slug = request.Slug,
+            Content = request.Content,
+            AuthorId = request.AuthorId,
+            CategoryId = category.Id,
+            Status = PostStatus.Draft
+        };
+
+        await _postRepository.AddAsync(post, cancellationToken);
+        await _unitOfWork.SaveChangesAsync(cancellationToken);
+
+        return Result&lt;int&gt;.Success(post.Id);
+    }
+}</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Organiza las configuraciones en archivos separados:</strong> una clase por entidad mejora la legibilidad y reduce conflictos en el control de versiones.</li>
+          <li><strong>Usa esquemas de base de datos:</strong> el esquema <code>cms</code> agrupa las tablas del proyecto y evita colisiones con otros módulos.</li>
+          <li><strong>Implementa las interfaces de dominio en infraestructura:</strong> la capa de aplicación no debe conocer EF Core.</li>
+          <li><strong>Evita llamar a SaveChanges dentro de los repositorios:</strong> deja que el handler o la unidad de trabajo coordinen la transacción.</li>
+          <li><strong>Usa <code>AsNoTracking</code> en consultas de solo lectura:</strong> mejora el rendimiento.</li>
+          <li><strong>Configura índices y claves únicas:</strong> <code>Slug</code> y <code>Email</code> son buenos candidatos.</li>
+          <li><strong>Genera migraciones en la capa de infraestructura:</strong> el modelo pertenece a esa capa.</li>
+          <li><strong>No uses <code>Database.EnsureCreated</code> en producción:</strong> usa migraciones o scripts idempotentes.</li>
+        </ul>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+        <h3>Error 1: Referenciar EF Core desde la capa de aplicación</h3>
+        <pre><code class="language-csharp">// ❌ Mal: Application conoce EF Core.
+public class CreatePostHandler : IRequestHandler&lt;CreatePostCommand, int&gt;
+{
+    private readonly CmsDbContext _context; // Dependencia de infraestructura.
+}</code></pre>
+        <pre><code class="language-csharp">// ✅ Bien: Application depende de abstracciones.
+public class CreatePostHandler : IRequestHandler&lt;CreatePostCommand, int&gt;
+{
+    private readonly IPostRepository _postRepository;
+}</code></pre>
+
+        <h3>Error 2: SaveChanges dentro del repositorio</h3>
+        <p>Si el repositorio llama a <code>SaveChanges</code>, no puedes coordinar varias operaciones en una misma transacción. Usa una unidad de trabajo.</p>
+
+        <h3>Error 3: Olvidar <code>MigrationsAssembly</code></h3>
+        <p>Si el <code>DbContext</code> está en <code>Cms.Infrastructure</code> pero el proyecto de inicio es <code>Cms.Api</code>, las migraciones deben especificar el ensamblado correcto.</p>
+
+        <h3>Error 4: Materializar todo y filtrar en memoria</h3>
+        <p>Los repositorios deben exponer consultas que EF Core traduzca a SQL, no listas materializadas que luego se filtren en memoria.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Completa el proyecto del CMS con los siguientes pasos:</p>
+        <ol>
+          <li>Crea el proyecto <code>Cms.Infrastructure</code> y añade las referencias a <code>Cms.Domain</code> y <code>Cms.Application</code>.</li>
+          <li>Instala los paquetes de EF Core y Npgsql.</li>
+          <li>Crea el <code>CmsDbContext</code>, las configuraciones de entidad y el interceptor de auditoría.</li>
+          <li>Implementa <code>EfPostRepository</code>, <code>EfCategoryRepository</code>, <code>EfTagRepository</code> y <code>EfUserRepository</code>.</li>
+          <li>Registra todo en el contenedor de DI de <code>Cms.Api</code>.</li>
+          <li>Genera la migración inicial y aplícala en una base de datos PostgreSQL local.</li>
+          <li>Implementa un handler <code>CreateCategory</code> y otro <code>GetPublishedPosts</code> que usen los repositorios.</li>
+        </ol>
+        <pre><code class="language-bash"># Instalar paquetes en Cms.Infrastructure
+dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL --version 8.0.0
+dotnet add package Microsoft.EntityFrameworkCore.Design --version 8.0.0
+
+# Crear migración
+dotnet ef migrations add InitialCreate --project src/Cms.Infrastructure --startup-project src/Cms.Api
+
+# Aplicar
+dotnet ef database update --project src/Cms.Infrastructure --startup-project src/Cms.Api</code></pre>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <p>Añade al CMS una entidad <code>Comment</code> relacionada con <code>Post</code> (1:N). Configura la relación con <code>DeleteBehavior.Cascade</code> para que al borrar un post se eliminen sus comentarios. Implementa un repositorio, un handler para crear comentarios y una migración llamada <code>AddComments</code>. Luego, prueba a generar un bundle de migraciones para despliegue.</p>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>El <code>DbContext</code> del CMS vive en <code>Cms.Infrastructure</code> siguiendo Clean Architecture.</li>
+          <li>Las configuraciones se separan con <code>IEntityTypeConfiguration&lt;T&gt;</code>.</li>
+          <li>El modelo incluye <code>Post</code>, <code>Category</code>, <code>Tag</code>, <code>User</code> y <code>PostTag</code>.</li>
+          <li>Los repositorios concretos usan EF Core pero exponen abstracciones del dominio.</li>
+          <li>El <code>DbContext</code> actúa como unidad de trabajo.</li>
+          <li>Las migraciones se generan en la capa de infraestructura y se aplican con la CLI de EF Core.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Por qué el DbContext no está en Cms.Application?</summary>
+          <p>Porque EF Core es un detalle de infraestructura. La capa de aplicación solo depende de interfaces para mantener la arquitectura limpia.</p>
+        </details>
+        <details>
+          <summary>¿Por qué no llamar a SaveChanges en el repositorio?</summary>
+          <p>Para que un handler CQRS pueda coordinar varias operaciones (por ejemplo, crear un post y registrar auditoría) en una misma transacción.</p>
+        </details>
+        <details>
+          <summary>¿Cómo decido entre IQueryable y Listas en repositorios?</summary>
+          <p>Los repositorios del dominio suelen devolver <code>Task&lt;IReadOnlyList&lt;T&gt;&gt;</code> o <code>Task&lt;T?&gt;</code>. No exponen <code>IQueryable</code> para evitar lógica de filtrado dispersa entre capas.</p>
+        </details>
+        <details>
+          <summary>¿Puedo tener varios DbContext en la misma aplicación?</summary>
+          <p>Sí, y es común en aplicaciones grandes. Cada contexto gestiona su propio modelo y cadena de conexión.</p>
+        </details>
+        <details>
+          <summary>¿Dónde coloco las migraciones si el DbContext está en Infrastructure?</summary>
+          <p>Usa <code>MigrationsAssembly("Cms.Infrastructure")</code> en la configuración de Npgsql y ejecuta los comandos con <code>--project src/Cms.Infrastructure</code> y <code>--startup-project src/Cms.Api</code>.</p>
+        </details>
+        <details>
+          <summary>¿Es necesario un repository pattern con EF Core?</summary>
+          <p>No es obligatorio. Para aplicaciones pequeñas, <code>DbContext</code> puede actuar como unidad de trabajo y repositorio. En proyectos grandes, el patrón repositorio mejora el testing y la separación de responsabilidades.</p>
+        </details>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

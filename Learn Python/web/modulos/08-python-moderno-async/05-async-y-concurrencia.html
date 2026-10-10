@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="05-async-y-concurrencia">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Concurrencia: GIL, threading y asyncio — Módulo 8 · Curso Python</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('py-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Concurrencia: GIL, threading y asyncio</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Python moderno y asincronía</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora el código corría de principio a fin, una instrucción tras otra. Pero hay tareas que <strong>esperan</strong>: descargar un fichero, leer de disco, consultar una API. Mientras esperas, la CPU está ociosa. La <strong>concurrencia</strong> consiste en aprovechar esa espera para hacer otras cosas —y en Python tiene una particularidad que confunde a todo el mundo: el <strong>GIL</strong>.</p>
+        <p>En esta lección desmontamos el mito «los hilos en Python no sirven para nada», entendemos qué es el GIL y qué implica de verdad, y aprendemos los <strong>tres modelos</strong> de concurrencia de la stdlib: <code>threading</code> (I/O-bound), <code>multiprocessing</code> (CPU-bound) y <code>asyncio</code> (muchas I/O concurrentes en un solo hilo). Terminaremos importando datos a Biblioteca en paralelo con <code>asyncio.gather</code>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe el GIL?</strong> El <em>Global Interpreter Lock</em> es un candado que garantiza que <strong>un solo hilo ejecute bytecode de Python a la vez</strong>. Existe para simplificar la gestión de memoria de CPython (recuento de referencias) y de las estructuras internas: sin él, cada operación tendría que ser thread-safe. El precio es que los hilos no aceleran el código que <em>calcula</em>… pero sí el que <em>espera</em>, porque el GIL se libera durante las operaciones de I/O.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Concurrencia no es paralelismo</h3>
+        <table>
+          <thead><tr><th>Término</th><th>Significa</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td>Concurrencia</td><td>Varias tareas <strong>progresan</strong> entrelazadas (puede ser en un solo núcleo).</td><td>Un camarero atiende 6 mesas alternando.</td></tr>
+            <tr><td>Paralelismo</td><td>Varias tareas se ejecutan <strong>a la vez</strong> en varios núcleos.</td><td>Seis camareros, una mesa cada uno.</td></tr>
+          </tbody>
+        </table>
+        <p>La clave para elegir modelo es la naturaleza de la tarea: ¿pasa el tiempo <strong>esperando</strong> (I/O-bound) o <strong>calculando</strong> (CPU-bound)?</p>
+
+        <h3>El GIL, en un diagrama</h3>
+        <div class="diagram">
+  Dos hilos, un GIL (un solo hilo ejecuta bytecode a la vez):
+
+  Hilo A  [====GIL====]..............[====GIL====].....
+  Hilo B  .............[====GIL====]..............[====GIL====]
+                        ↑
+           Cuando A hace I/O (leer socket/fichero),
+           LIBERA el GIL y B puede ejecutar.
+           Si A solo CALCULA, no lo suelta hasta su «turno» (sys.setswitchinterval).
+
+  Consecuencia:
+   - CPU-bound (math pura): los hilos NO paralelizan; el GIL serializa. -> multiprocessing
+   - I/O-bound (red/disco): los hilos SÍ solapan la espera.           -> threading / asyncio
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Matiz importante:</strong> existe una propuesta (<em>free-threaded</em> / PEP 703) que en versiones recientes de Python permite compilar <em>sin GIL</em> como modo experimental. En el Python estándar que usas en este curso (3.12/3.13, build por defecto) <strong>el GIL sigue presente</strong>. Aunque desapareciera, el criterio I/O vs CPU seguiría guiando la elección de modelo.</p>
+        </div>
+
+        <h3>Modelo 1 — <code>threading</code>: hilos para I/O</h3>
+        <p>Los hilos comparten memoria (cuidado con las condiciones de carrera) y son ideales cuando la tarea <strong>espera</strong>. Para lanzar varios y esperar a todos, la forma cómoda es <code>concurrent.futures.ThreadPoolExecutor</code>, que gestiona el pool y devuelve <em>futures</em>:</p>
+        <pre><code class="language-python">from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [pool.submit(descargar, url) for url in urls]
+    resultados = [f.result() for f in futures]   # espera y recoge
+        </code></pre>
+        <p>El GIL se libera al hacer la llamada de red, así que los cuatro hilos se solapan. Con CPU pura, en cambio, se turnarían sin ganar tiempo.</p>
+
+        <h3>Modelo 2 — <code>multiprocessing</code>: procesos para CPU</h3>
+        <p>Cada proceso tiene su <strong>propio intérprete y su propio GIL</strong>, así que sí hay paralelismo real entre núcleos. El precio: no comparten memoria (los datos se <em>serializan</em> al pasar de uno a otro, con <code>pickle</code>) y arrancar un proceso es caro. Se usa para cálculo intensivo: comprimir imágenes, procesar millones de filas, <em>hashing</em> pesado.</p>
+        <pre><code class="language-python">from concurrent.futures import ProcessPoolExecutor
+
+if __name__ == "__main__":        # OBLIGATORIO en Windows/macOS
+    with ProcessPoolExecutor() as pool:
+        resultados = list(pool.map(calcular_pesado, datos))
+        </code></pre>
+        <div class="callout callout--warning">
+          <p><strong>En Windows y macOS (spawn):</strong> el punto de entrada debe estar protegido por <code>if __name__ == "__main__":</code>. Sin esa guarda, al crear cada proceso se reimporta el módulo y se vuelven a lanzar procesos <strong>en cascada</strong> (bucle infinito de procesos). Es el error clásico de <code>multiprocessing</code> en Windows.</p>
+        </div>
+
+        <h3>Modelo 3 — <code>asyncio</code>: un hilo, muchas esperas</h3>
+        <p>Con <code>asyncio</code> una sola hebra de ejecución maneja miles de operaciones de I/O. La idea: cuando una tarea va a esperar, <strong>cede el control</strong> cooperativamente al <em>event loop</em>, que ejecuta otra. No hay hilos ni carreras de datos entre tareas, pero <strong>debe haber una sola tarea ejecutando a la vez</strong> y todo el camino debe ser <em>cooperativo</em> (<code>async</code>/<code>await</code>).</p>
+        <div class="diagram">
+  asyncio.run(main())  ->  crea el EVENT LOOP y ejecuta main()
+
+  Event Loop (un solo hilo):
+    ├─ tareaA: fetch(url1) ──await──▶ cede .......... listo → sigue
+    ├─ tareaB: fetch(url2) ──await──▶ cede ..... listo → sigue
+    └─ tareaC: fetch(url3) ──await──▶ cede ........... listo → sigue
+
+  Mientras una espera, el loop avanza las demás. Un solo hilo
+  puede tener decenas de miles de conexiones abiertas.
+
+  Regla: si haces algo BLOQUEANTE (time.sleep, requests, open pesado)
+  dentro de una corrutina, BLOQUEAS TODO el loop.
+        </div>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th></tr></thead>
+          <tbody>
+            <tr><td><code>async def</code></td><td>Declara una <strong>corrutina</strong> (no se ejecuta al llamarla; devuelve un objeto awaitable).</td></tr>
+            <tr><td><code>await expr</code></td><td>Cede el control hasta que <code>expr</code> esté listo. Solo dentro de <code>async def</code>.</td></tr>
+            <tr><td><code>asyncio.run(coro)</code></td><td>Punto de entrada: crea el loop, ejecuta la corrutina y lo cierra.</td></tr>
+            <tr><td><code>asyncio.gather(*coros)</code></td><td>Ejecuta varias corrutinas <strong>concurrentemente</strong> y espera a todas.</td></tr>
+            <tr><td><code>asyncio.create_task(coro)</code></td><td>Agenda una corrutina para que corra «por detrás».</td></tr>
+            <tr><td><code>asyncio.to_thread(func)</code></td><td>Ejecuta en un hilo una función <strong>bloqueante</strong> sin congelar el loop.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>La alternativa moderna a <code>gather</code></strong> es <code>asyncio.TaskGroup</code> (Python 3.11+), un <em>context manager</em> que cancela las tareas hermanas si una falla y agrupa sus errores. Es más seguro que <code>gather</code> para código nuevo; en esta lección usamos <code>gather</code> por ser el más difundido y el que verás por todas partes.</p>
+        </div>
+
+        <h3>¿Cuál uso? La decisión en una tabla</h3>
+        <table>
+          <thead><tr><th>Escenario</th><th>Modelo</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Descargar 50 URLs</td><td><code>asyncio</code> o <code>threading</code></td><td>I/O-bound; espera solapada. asyncio escala a muchísimas más.</td></tr>
+            <tr><td>Operaciones de disco locales sencillas</td><td><code>threading</code></td><td>I/O-bound; simple y suficiente. No fuerces async si no hay beneficio.</td></tr>
+            <tr><td>Comprimir 10 000 imágenes</td><td><code>multiprocessing</code></td><td>CPU-bound; necesita paralelismo real entre núcleos.</td></tr>
+            <tr><td>Servidor con miles de conexiones</td><td><code>asyncio</code></td><td>Un hilo escala mejor que miles de hilos.</td></tr>
+            <tr><td>Llamar a una librería bloqueante desde async</td><td><code>asyncio.to_thread</code></td><td>Evita congelar el event loop con código que no es async.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p><strong>Por qué <code>asyncio</code> no es «mejor»:</strong> no acelera el cálculo (sigue siendo un hilo), obliga a que todo el camino sea async y hace más difícil depurar una pila de corrutinas. Se elige cuando hay <strong>muchas</strong> operaciones de I/O y quieres evitar la sobrecarga de miles de hilos. Para dos descargas, <code>threading</code> es más simple; para pura CPU, <code>multiprocessing</code> es la única que paraleliza.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El <code>asyncio</code> más pequeño posible: dos corrutinas que «esperan» (simulando I/O de red con <code>asyncio.sleep</code>) y se ejecutan <strong>concurrentemente</strong> con <code>gather</code>. Fíjate en que el tiempo total es ~1&nbsp;s, no ~2&nbsp;s.</p>
+        <pre><code class="language-python">import asyncio
+import time
+
+async def fetch(name, seconds):
+    """Simula una descarga que tarda 'seconds' (I/O, NO CPU)."""
+    print(f"  inicio {name}")
+    await asyncio.sleep(seconds)        # cede el control al loop mientras espera
+    print(f"  fin    {name}")
+    return f"{name}:ok"
+
+async def main():
+    start = time.perf_counter()
+    # gather lanza las dos corrutinas A LA VEZ y espera a ambas
+    results = await asyncio.gather(
+        fetch("A", 1),
+        fetch("B", 1),
+    )
+    elapsed = time.perf_counter() - start
+    print("resultados:", results)
+    print(f"tiempo total: {elapsed:.1f}s  (no 2.0s)")
+
+asyncio.run(main())                     # punto de entrada
+        </code></pre>
+        <pre><code class="language-text">  inicio A
+  inicio B
+  fin    A
+  fin    B
+resultados: ['A:ok', 'B:ok']
+tiempo total: 1.0s  (no 2.0s)
+        </code></pre>
+        <p>Línea por línea: <code>async def</code> define corrutinas que no se ejecutan al llamarlas; <code>asyncio.gather</code> las agenda en el loop, que las va avanzando mientras esperan; <code>await asyncio.sleep</code> libera el control (a diferencia de <code>time.sleep</code>, que <strong>bloquearía</strong> todo). <code>asyncio.run(main())</code> arranca el loop. Ambas «descargas» se solapan: el total es el máximo, no la suma.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Biblioteca importa ítems desde <strong>varias fuentes</strong> (un fichero local lento, un servicio remoto…). Hacerlo secuencialmente tardaría la suma de todos; con <code>asyncio.gather</code> tarda el máximo. La descarga real usa <code>urllib</code> (bloqueante), así que la aislamos con <code>asyncio.to_thread</code> para no congelar el loop.</p>
+        <div class="code-file">biblioteca/importer.py</div>
+        <pre><code class="language-python">import asyncio
+import json
+import time
+from urllib.request import urlopen
+
+# --- Fuentes ficticias (en producción serían rutas/servicios reales) ---
+# Cada función "descarga" es BLOQUEANTE: por eso va en un hilo aparte.
+def _fetch_local(path: str) -> list:
+    time.sleep(0.5)                       # simula lectura lenta de disco
+    return [{"id": "b1", "title": "1984", "kind": "book"}]
+
+def _fetch_remote(url: str) -> list:
+    time.sleep(0.5)                       # simula latencia de red
+    return [{"id": "m1", "title": "Dune", "kind": "movie"}]
+
+async def fetch_async(func, arg):
+    """Ejecuta una función BLOQUEANTE en un hilo, sin bloquear el loop."""
+    return await asyncio.to_thread(func, arg)
+
+async def import_catalog() -> list:
+    """Importa de varias fuentes EN PARALELO y combina los resultados."""
+    start = time.perf_counter()
+
+    # gather: las dos "descargas" progresan a la vez
+    local, remote = await asyncio.gather(
+        fetch_async(_fetch_local, "data/local.json"),
+        fetch_async(_fetch_remote, "https://example.com/items"),
+    )
+
+    elapsed = time.perf_counter() - start
+    print(f"Importadas {len(local) + len(remote)} fuentes en {elapsed:.1f}s")
+    return local + remote
+
+def main():
+    items = asyncio.run(import_catalog())     # punto de entrada
+    for item in items:
+        print(f"  {item['id']}: {item['title']} ({item['kind']})")
+
+if __name__ == "__main__":
+    main()
+        </code></pre>
+        <pre><code class="language-text">Importadas 2 fuentes en 0.5s
+  b1: 1984 (book)
+  m1: Dune (movie)
+        </code></pre>
+        <p>Decisiones que vale la pena entender:</p>
+        <ul>
+          <li><strong><code>asyncio.to_thread</code> para código bloqueante:</strong> <code>urlopen</code> y las lecturas de disco no son async. Ejecutarlas directamente dentro de una corrutina bloquearía el loop entero (ninguna otra tarea avanzaría). <code>to_thread</code> las mueve a un hilo y devuelve un <em>awaitable</em>.</li>
+          <li><strong><code>gather</code> sobre las dos fuentes:</strong> el tiempo total es ~0.5&nbsp;s (el máximo), no ~1.0&nbsp;s (la suma). Ese es el ahorro real de la concurrencia en I/O.</li>
+          <li><strong><code>asyncio.run</code> solo en el punto de entrada:</strong> se llama <em>una</em> vez, en <code>main</code>. Nunca dentro de código que ya corre en un loop.</li>
+          <li><strong>La lógica de combinación es síncrona:</strong> una vez tenemos los datos, unir dos listas no necesita async. La concurrencia se aplica solo a la espera, no a todo el programa.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>La versión <code>threading</code> (más simple si no quieres async):</strong> con <code>ThreadPoolExecutor(max_workers=2)</code> envías <code>_fetch_local</code> y <code>_fetch_remote</code> a dos hilos y recoges con <code>f.result()</code>; también tarda ~0.5&nbsp;s. Para dos operaciones, <code>threading</code> es más directo; <code>asyncio</code> brilla con decenas o miles de operaciones simultáneas.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Elige por naturaleza: I/O → threading/asyncio; CPU → multiprocessing</td>
+              <td>Usar hilos para cálculo puro esperando que vaya más rápido</td>
+              <td>El GIL serializa el bytecode: con CPU-bound, los hilos no ganan nada y añaden complejidad.</td>
+            </tr>
+            <tr>
+              <td>Usa <code>asyncio.to_thread</code> para código bloqueante dentro de async</td>
+              <td>Llamar <code>time.sleep</code>/<code>requests</code> dentro de una corrutina</td>
+              <td>Una llamada bloqueante congela el event loop entero: ninguna otra tarea avanza.</td>
+            </tr>
+            <tr>
+              <td><code>asyncio.run</code> una sola vez, en el <code>main</code></td>
+              <td>Llamar <code>asyncio.run</code> dentro de código que ya corre en un loop</td>
+              <td>Lanza <code>RuntimeError: asyncio.run() cannot be called from a running event loop</code> y además duplica loops.</td>
+            </tr>
+            <tr>
+              <td>Protege el entrypoint con <code>if __name__ == "__main__":</code> en multiprocessing</td>
+              <td>Crear procesos a nivel de módulo en Windows/macOS</td>
+              <td>Con el arranque «spawn», el módulo se reimporta en cada proceso: sin la guarda, se lanzan procesos en cascada.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Async contagia.</strong> Una función async solo puede llamar con <code>await</code> a otras async; si necesitas una síncrona pesada, la envuelves con <code>to_thread</code>. Por eso migrar a asyncio afecta a toda la cadena de llamadas: decide pronto y con criterio, no «por moda».</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Creer que los hilos aceleran el cálculo (CPU-bound)</h3>
+        <pre><code class="language-python">import threading, time
+
+def cpu_task():
+    total = 0
+    for i in range(20_000_000):       # solo CPU, sin I/O
+        total += i
+    return total
+
+# ❌ Dos hilos NO terminan en la mitad de tiempo: el GIL los serializa.
+start = time.perf_counter()
+threads = [threading.Thread(target=cpu_task) for _ in range(2)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"hilos: {time.perf_counter() - start:.2f}s")   # ~ similar a secuencial
+
+# ✅ Para CPU, usa procesos: paralelismo real entre núcleos.
+# from concurrent.futures import ProcessPoolExecutor
+# if __name__ == "__main__":
+#     with ProcessPoolExecutor() as pool:
+#         pool.submit(cpu_task).result()
+        </code></pre>
+
+        <h3>Bloquear el event loop con <code>time.sleep</code></h3>
+        <pre><code class="language-python">import asyncio, time
+
+async def bad():
+    time.sleep(2)          # ❌ ¡congela TODO el loop 2 segundos!
+    return "listo"
+
+async def good():
+    await asyncio.sleep(2) # ✅ cede el control: otras tareas avanzan
+    return "listo"
+
+# Si el código bloqueante es inevitable (una librería síncrona):
+#   resultado = await asyncio.to_thread(time.sleep, 2)
+        </code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir de verdad la diferencia entre secuencial y concurrente en una tarea I/O-bound, y comprobar que el tiempo total baja del orden de la suma al orden del máximo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Escribe el comparador.</strong>
+            <div class="code-file">concurrency_bench.py</div>
+            <pre><code class="language-python">import asyncio
+import time
+
+async def fetch(name, seconds):
+    """Simula una fuente que tarda 'seconds' en responder."""
+    await asyncio.sleep(seconds)
+    return f"{name}:ok"
+
+async def sequential(sources):
+    """Versión 1: una detrás de otra (await dentro del bucle)."""
+    start = time.perf_counter()
+    results = []
+    for name, secs in sources:
+        results.append(await fetch(name, secs))   # espera cada una entera
+    return results, time.perf_counter() - start
+
+async def concurrent(sources):
+    """Versión 2: todas a la vez con gather."""
+    start = time.perf_counter()
+    results = await asyncio.gather(*(fetch(name, secs) for name, secs in sources))
+    return list(results), time.perf_counter() - start
+
+async def main():
+    sources = [("A", 0.4), ("B", 0.4), ("C", 0.4)]
+
+    _, t_seq = await sequential(sources)
+    _, t_con = await concurrent(sources)
+
+    print(f"secuencial: {t_seq:.1f}s")   # ~1.2s (suma)
+    print(f"concurrente: {t_con:.1f}s")  # ~0.4s (máximo)
+
+asyncio.run(main())
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Ejecuta y comprueba.</strong>
+            <pre><code class="language-bash">python concurrency_bench.py
+# Salida esperada:
+# secuencial: 1.2s
+# concurrente: 0.4s
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Interpreta.</strong> La versión secuencial espera cada <code>fetch</code> completo antes de empezar el siguiente: 0.4 + 0.4 + 0.4 = 1.2&nbsp;s. La concurrente lanza las tres y espera a que terminen <em>a la vez</em>: 0.4&nbsp;s, el máximo. Ese es exactamente el patrón que hace eficiente importar de varias fuentes o llamar a varias APIs.
+          </li>
+          <li>
+            <strong>Paso 4 — Verificación.</strong> Cambia los tiempos a <code>("A", 0.1), ("B", 0.5), ("C", 0.2)</code>. El secuencial dará ~0.8&nbsp;s y el concurrente ~0.5&nbsp;s (el mayor). Si el concurrente te diera la suma, sería señal de que algo está bloqueando el loop en serie (por ejemplo, un <code>time.sleep</code> en lugar de <code>asyncio.sleep</code>).
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Cómo comprobarlo:</strong> si al pasar a <code>gather</code> el tiempo no baja, sospecha de bloqueo. Sustituye <code>await asyncio.sleep</code> por <code>time.sleep</code> (sin <code>await</code>) y verás que el «concurrente» vuelve a tardar la suma: la corrutina bloquea el loop y <code>gather</code> no puede solapar nada.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Importador con límite de concurrencia y errores</h3>
+          <p>Amplía el importador de Biblioteca para descargar <strong>20 fuentes</strong> con <code>asyncio</code>, pero con dos requisitos: (1) como máximo <strong>5 descargas simultáneas</strong> a la vez, y (2) si una fuente falla, las demás deben <strong>completarse igualmente</strong> y devolver la lista de las que fallaron. Además, mide el tiempo total y demuestra que con límite 5 es más lento que sin límite (si las fuentes tardan lo mismo).</p>
+          <p><em>Pista 1:</em> <code>asyncio.Semaphore</code> es el patrón clásico para limitar concurrencia: <code>async with sem:</code> dentro de cada tarea. <em>Pista 2:</em> <code>asyncio.gather(..., return_exceptions=True)</code> no aborta por la primera excepción: las devuelve en la lista. <em>Pista 3:</em> <code>asyncio.TaskGroup</code> (3.11+) es la alternativa moderna, pero <em>cancela</em> las hermanas al fallar una: para «seguir pese a fallos», <code>gather(return_exceptions=True)</code> es más directo. <em>Bonus:</em> limita también el número de hilos con <code>ThreadPoolExecutor(max_workers=5)</code> si usas <code>to_thread</code>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La concurrencia solapa <strong>esperas</strong>; el paralelismo ejecuta en varios núcleos. No son lo mismo.</li>
+          <li>El <strong>GIL</strong> deja que un solo hilo ejecute bytecode a la vez; se libera durante la I/O.</li>
+          <li><strong>I/O-bound</strong> → <code>threading</code> o <code>asyncio</code>; <strong>CPU-bound</strong> → <code>multiprocessing</code>.</li>
+          <li><code>threading</code> comparte memoria (ojo con las carreras); usa <code>ThreadPoolExecutor</code>.</li>
+          <li><code>multiprocessing</code> paraleliza de verdad, pero serializa datos y exige <code>if __name__ == "__main__":</code>.</li>
+          <li><code>asyncio</code>: un hilo + event loop; <code>async</code>/<code>await</code>, <code>gather</code>, <code>asyncio.run</code> en el borde, <code>to_thread</code> para bloquear sin congelar.</li>
+          <li>No bloquees el loop: <code>asyncio.sleep</code> sí, <code>time.sleep</code> no.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Herramienta</th><th>Para qué sirve</th></tr></thead>
+          <tbody>
+            <tr><td><code>ThreadPoolExecutor</code></td><td>Pool de hilos para muchas tareas I/O.</td></tr>
+            <tr><td><code>ProcessPoolExecutor</code></td><td>Pool de procesos para tareas CPU-bound (paralelismo real).</td></tr>
+            <tr><td><code>async def</code> / <code>await</code></td><td>Declarar corrutinas y ceder el control al esperar.</td></tr>
+            <tr><td><code>asyncio.run(main())</code></td><td>Punto de entrada: crea y cierra el event loop.</td></tr>
+            <tr><td><code>asyncio.gather(*coros)</code></td><td>Ejecutar varias corrutinas a la vez y esperar a todas.</td></tr>
+            <tr><td><code>asyncio.to_thread(func, ...)</code></td><td>Ejecutar código bloqueante sin congelar el loop.</td></tr>
+            <tr><td><code>asyncio.Semaphore(n)</code></td><td>Limitar cuántas tareas corren a la vez.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Documentación oficial:</strong> <code>docs.python.org/3/library/asyncio.html</code> (y su «Task Group», «Coroutines and Tasks»), <code>threading</code>, <code>concurrent.futures</code> y <code>multiprocessing</code>. La página de <code>asyncio</code> es la referencia para <code>gather</code>, <code>TaskGroup</code>, timeouts y sincronización async.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El GIL significa que los hilos son inútiles en Python?</summary>
+            <div>
+              <p>No. Es un mito muy extendido. Los hilos son <strong>muy útiles para I/O</strong>, porque el GIL se libera mientras se espera una respuesta de red o de disco, y otro hilo aprovecha ese hueco. Lo que el GIL impide es <strong>paralelizar cálculo puro</strong> con hilos; para eso están los procesos. La frase correcta es «los hilos no aceleran el código CPU-bound», no «no sirven».</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>asyncio</code> usa varios hilos?</summary>
+            <div>
+              <p>Por defecto, no: <code>asyncio</code> corre en <strong>un solo hilo</strong> con un event loop cooperativo. La concurrencia viene de que las tareas ceden el control al esperar, no de tener varios hilos. Si necesitas ejecutar algo bloqueante, <code>asyncio.to_thread</code> sí usa un hilo del pool interno, pero el loop sigue siendo uno. Eso es lo que le permite manejar miles de conexiones con poca memoria.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo uso <code>threading</code> y cuándo <code>asyncio</code> para I/O?</summary>
+            <div>
+              <p>Regla práctica: si la tarea es <strong>puntual</strong> y el código ya es síncrono, <code>threading</code> (o <code>ThreadPoolExecutor</code>) es más simple. Si necesitas <strong>miles</strong> de operaciones concurrentes, o tu stack ya es async (por ejemplo, un framework web async), usa <code>asyncio</code>. También importa el ecosistema: si dependes de librerías síncronas, async te obligará a envolverlas con <code>to_thread</code> constantemente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>await</code> solo funciona dentro de <code>async def</code>?</summary>
+            <div>
+              <p>Porque <code>await</code> necesita un event loop en marcha para suspender y reanudar la corrutina. Fuera de una función async no hay loop, y Python lo prohíbe con un <code>SyntaxError</code>. El puente entre el mundo síncrono y el async es <code>asyncio.run(...)</code>, que se llama una sola vez desde el punto de entrada. Si partís de una librería síncrona y quieres «llamar a async», ese <code>asyncio.run</code> es el borde.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y los <em>free-threaded</em> builds de Python 3.13?</summary>
+            <div>
+              <p>Son una modalidad experimental que compila CPython <strong>sin GIL</strong>. Prometen hilos con paralelismo real, pero tienen costes (rendimiento en un solo hilo, compatibilidad de extensiones) y aún no son el modo por defecto. Para este curso, asume GIL en el intérprete estándar; si en el futuro se generaliza, el criterio de elegir modelo según I/O vs CPU seguirá siendo válido. Consulta la documentación oficial si necesitas detalles actualizados.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

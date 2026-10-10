@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-yaml-declarativo">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YAML declarativo y reconciliación — Módulo 5 · Curso Docker y Kubernetes</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dk-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>YAML declarativo y reconciliación</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · De Docker a Kubernetes</span>
+          <span>⏱ 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior usaste <code>kubectl create deployment</code>: le ordenaste a Kubernetes <em>qué hacer</em>. Ese estilo <strong>imperativo</strong> funciona para probar, pero no define cómo trabajan los profesionales. En producción no se dice «crea esto»: se <strong>declara</strong> el estado deseado en un manifest — un archivo YAML — y la plataforma se encarga de que la realidad coincida con él, para siempre.</p>
+        <p>Esta lección es el corazón del modelo mental del curso. Aprenderás la anatomía de un manifest propiama (`apiVersion`, `kind`, `metadata`, `spec`), el <strong>control loop</strong> (deseo ↔ realidad), la <strong>idempotencia</strong> de `kubectl apply`, y el trío de herramientas que te salvará la vida: `get -o yaml`, `diff` y `dry-run`.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el 90% de los errores de Kubernetes vienen de dos confusiones: (1) mezclar imperativo con declarativo (gente que «arregla a mano» un Deployment que declaraba otra cosa), y (2) no entender que `kubectl apply` <em>no crea de nuevo</em> sino que <em>ajusta</em>. Esta lección te libra de ambas para el resto del curso.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Imperativo vs declarativo: dos fidelidades a un estado</h3>
+        <ul>
+          <li><strong>Imperativo:</strong> dices los pasos. <code>kubectl create deployment web --image=nginx</code>. Si algo cambia, nadie lo vuelve a ejecutar; cada paso es un hecho irrepetible.</li>
+          <li><strong>Declarativo:</strong> dices el resultado. En un archivo escribes «quiero un Deployment llamado web con 2 réplicas de nginx». Kubernetes <em>converge</em> hacia ello y lo mantiene.</li>
+        </ul>
+        <p>La metáfora que nunca falla: el imperativo es dar direcciones a un taxi («gira, gira, sigue recto»); el declarativo es dar la dirección destino («llévame a la estación»). Si cierran una calle, el taxista declarativo encuentra otra ruta; el imperativo se queda atascado.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía del termostato:</strong> el control loop de Kubernetes es un termostato: declaras 22 °C (estado deseado), él mide 18 °C (estado real) y enciende la calefacción (acción). Cada pocos segundos repite la medición. Nadie «le dice» a la calefacción cuándo encenderse; el bucle lo decide. Kubernetes hace exactamente esto con réplicas, imágenes, servicios y nodos… pero sobre todo el clúster.</p>
+        </div>
+
+        <h3>La anatomía de un manifest: cuatro campos que se repiten</h3>
+        <p>Todo objeto de Kubernetes se escribe con la misma estructura. Aprender estos cuatro campos es aprender a leer cualquier archivo YAML del ecosistema:</p>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué es</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><code>apiVersion</code></td><td>El «contrato» de la API: qué esquema valida este objeto</td><td><code>v1</code> (recursos núcleo) / <code>apps/v1</code> (Deployment, ReplicaSet)</td></tr>
+            <tr><td><code>kind</code></td><td>El tipo de objeto que quieres</td><td><code>Pod</code>, <code>Deployment</code>, <code>Service</code>, <code>ConfigMap</code>…</td></tr>
+            <tr><td><code>metadata</code></td><td>La «carné de identidad»: nombre, namespace, etiquetas, anotaciones</td><td><code>name: api</code>, <code>labels: app: api</code></td></tr>
+            <tr><td><code>spec</code></td><td>El deseo: qué quieres que sea ese objeto (varía según el kind)</td><td><code>replicas: 3</code>, <code>containers: …</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Por qué `apiVersion` es lo primero:</strong> porque es el campo que el apiserver usa para saber <em>cómo validarte</em>. Los `kind` núcleos (Pod, Service, ConfigMap, Secret) son <code>v1</code>; los Deployments se estabilizaron en <code>apps/v1</code> (la era <code>extensions/v1beta1</code> y <code>apps/v1beta1</code> se eliminó en K8s 1.16). Si pones un contrato antiguo, el apiserver lo rechaza en seco.</p>
+        </div>
+
+        <h3>El control loop: deseo vs realidad</h3>
+        <div class="diagram">
+        ESTADO DESEADO                        ESTADO REAL
+      (tu manifiesto YAML)              (lo que existE en el clúster)
+    ┌──────────────────────┐           ┌──────────────────────┐
+    │ Deployment "web"     │           │ Deployment "web"     │
+    │ replicas: 2          │           │ replicas: 2          │
+    │ image: nginx:1.27    │           │ image: nginx:1.26    │
+    │                      │           │ 1 Pod Running        │
+    │                      │           │ 1 Pod CrashLoopBackOff│
+    └──────────┬───────────┘           └──────────┬───────────┘
+               │                                  │
+               └───────────────┬──────────────────┘
+                               ▼
+                 CONTROL LOOP (controller-manager)
+                 «compara lo que HAY con lo que PIDO»
+                               │
+        ├── faltan réplicas ──▶ crea Pods nuevos
+        ├── sobran réplicas ──▶ elimina Pods extra
+        ├── imagen distinta ──▶ nuevo ReplicaSet (rolling update)
+        └── Pod caído ────────▶ lo reemplaza (self-healing)
+                               │
+                               ▼
+                    el bucle se repite cada pocos segundos
+        </div>
+        <p>El controller-manager no es una pieza mágica: es el conjunto de bucles que leen el estado real (desde el apiserver) vs el deseado (etcd) y emiten cambios de reconciliación. La diferencia entre tu YAML y la realidad <em>nunca</em> queda «abandonada»: el bucle la vuelve a ver una y otra vez.</p>
+
+        <h3>kubectl apply: no crea «de cero», reconcilia <em>también</em> el archivo</h3>
+        <p>El nombre lo dice todo: `apply` != `create`. `kubectl create` crea un objeto y falla si existe («AlreadyExists»). `kubectl apply -f` tiene tres modos de acción sobre el objeto:</p>
+        <ul>
+          <li><strong>No existe</strong> → lo crea.</li>
+          <li><strong>Existe igual</strong> → no hace nada (sale con el mensaje «unchanged»). Aquí nace la <strong>idempotencia</strong>: aplicar el mismo archivo mil veces produce el mismo resultado, sin errores ni duplicados.</li>
+          <li><strong>Existe y difiere</strong> → calcula la diferencia y actualiza <em>solo los campos que cambian</em> (reconciliación del propio manifest).</li>
+        </ul>
+        <p>La herramienta idempotente es condición sine qua non para el GitOps: el estado del clúster equivale al contenido de tus archivos versionados. Puedes volver a aplicar tras un fallo sin miedo a «re-crear» nada.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El manifest más pequeño con sentido es un <strong>Pod</strong>: la unidad mínima desplegable. Léelo línea a línea, que es la habilidad que vas a practicar:</p>
+        <pre><code class="language-yaml"># pod-hello.yaml — el «hello world» de Kubernetes (Pod, ~15 líneas)
+apiVersion: v1            # contrato de API: los Pods son del grupo núcleo (v1)
+kind: Pod                 # qué objeto quiero: UN Pod (un contenedor o varios)
+metadata:                 # carné de identidad
+  name: hello-pod         # nombre ÚNICO dentro del namespace
+  labels:                 # etiquetas: pares clave/valor para selección
+    app: hello            #   · «mi Pod se busca con app=hello»
+spec:                     # el deseo: cómo es este Pod por dentro
+  containers:             # lista de contenedores del Pod (aquí, uno)
+    - name: hello         # nombre del contenedor (único dentro del Pod)
+      image: nginx:1.27   # qué imagen correr (el runtime la descarga si falta)
+      ports:              # información DECLARATIVA (documenta el puerto)
+        - containerPort: 80   # no «abre» nada solo con esto: es documentación
+</code></pre>
+        <p>Ahora la prueba de fuego del modelo declarativo: <code>kubectl apply</code> puede aplicarse una y otra vez sin romper nada:</p>
+        <pre><code class="language-bash"># Aplica el manifest (el apiserver valida y persiste el deseo en etcd)
+kubectl apply -f pod-hello.yaml
+#    pod/hello-pod created
+
+# Lo aplicas DE NUEVO, sin cambios: nadie lo «recrea», nada falla
+kubectl apply -f pod-hello.yaml
+#    pod/hello-pod unchanged        ← idempotencia en su máxima expresión
+
+# Comprueba la realidad y observa el self-healing en un Pod:
+kubectl get pods -l app=hello
+kubectl delete pod hello-pod     # ⚠️ un Pod NO se auto-repara… ver teoría 4
+</code></pre>
+        <p>Nota importante — <strong>por qué un Pod no se auto-repara solo</strong>: el Pod describe «quiero que este contenedor exista», pero nada vigila el Pod. La vigilancia llega con un objeto de nivel superior: el <strong>Deployment</strong> (ejemplo real de esta misma lección). Esa es una de las confusiones más caras en K8s.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Manifest de producción de la API de HarborTasks como <strong>Deployment</strong>. Añade la reconciliación que el Pod solo no tenía: replicas, selección, y el bucle de auto-reparación.</p>
+        <pre><code class="language-yaml"># k8s/api/deployment.yaml — Deployment de la API de HarborTasks
+apiVersion: apps/v1                  # contrato estable de Deployments
+kind: Deployment                     # controla ReplicaSets → Pods
+metadata:
+  name: api                          # nombre del Deployment (único)
+  namespace: harbortasks             # dónde vive (namespace de la app)
+  labels:
+    app: api                         # etiqueta del PROPIO Deployment
+spec:                                # ← el deseo
+  replicas: 3                        # quiero SIEMPRE 3 réplicas (el control
+                                     #   loop lo sostiene; si se cae una, crea otra)
+  selector:                          # ⚠️ el ancla del Deployment:
+    matchLabels:                     #   «cuento como MÍOS los Pods con…»
+      app: api                       #   … app=api. Debe coincidir con la
+                                     #   etiqueta de la plantilla (abajo).
+  template:                          # la «receta» de Pods que gestiona
+    metadata:
+      labels:                        # las etiquetas que pone a CADA Pod
+        app: api                     #  ← debe encajar con matchLabels
+    spec:                            # spec del Pod (igual que el Pod suelto)
+      containers:
+        - name: api
+          image: ghcr.io/tu-usuario/harbortasks-api:1.2.0   # imagen real
+          ports:
+            - containerPort: 3000    # el puerto de Express (documentación)
+          env:                       # config por variables (solo un ejemplo;
+            - name: PORT             #   ConfigMaps y Secrets llegan en Módulo 7)
+              value: "3000"
+          resources:                 # peticiones/limites (el scheduler lo usa)
+            requests:
+              cpu: 100m              # 0.1 CPU garantizada de partida
+              memory: 128Mi
+            limits:
+              memory: 256Mi          # cap: si se pasa, OOMKilled
+</code></pre>
+        <p>Decisiones tomadas:</p>
+        <ul>
+          <li><strong>`apps/v1` y no `extensions/v1beta1`:</strong> contrato moderno y estable; el antiguo ya no se acepta.</li>
+          <li><strong>`selector.matchLabels` + etiqueta de template idénticas:</strong> son el pegamento que le dice al Deployment «estos Pods los controlo yo». Si no coinciden, el apiserver <strong>rechaza el manifest</strong> (lo verás en errores).</li>
+          <li><strong>`replicas: 3`:</strong> declaro el número, no «cómo lograrlo». Si borro un Pod, el ReplicaSet del Deployment crea otro con la receta de la template.</li>
+          <li><strong>`resources.requests`:</strong> el scheduler elige nodo según esto; los `limits` protegen al clúster de una api hambrienta de memoria.</li>
+        </ul>
+        <p>Posturas en la terminal:</p>
+        <pre><code class="language-bash">kubectl apply -f k8s/api/deployment.yaml          # created (primera vez)
+kubectl get deployment api -n harbortasks          # 3/3 READY
+kubectl rollout status deployment api -n harbortasks   # espera al rollout
+kubectl get pods -n harbortasks                    # los 3 Pods con sufijo aleatorio
+</code></pre>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Escribir <strong>un recurso por archivo</strong>, en carpetas por pieza</td><td>Un YAML gigante con todos los objetos</td><td>Facilita `apply -f directorio/`, revisión en PR y que Git trace cada cambio</td></tr>
+            <tr><td>Usar <code>kubectl apply</code> siempre</td><td>Mezclar con <code>kubectl create</code> por costumbre</td><td>Apply es idempotente y reconciliador; create rompe al segundo intento</td></tr>
+            <tr><td>Antes de aplicar, <code>kubectl diff</code> y <code>--dry-run=client</code></td><td>«Ya veremos qué pasa» al aplicar a ciegas</td><td>El diff es el cambio que harás; te evita sorpresas en un clúster compartido</td></tr>
+            <tr><td>Etiquetar todo con <code>app</code> y <code>tier</code>/<code>env</code></td><td>Seleccionar por nombres sueltos o anotaciones</td><td>Labels + healthy selectors son la base de selectores, Services y operaciones</td></tr>
+            <tr><td>Versionar los manifests en Git desde el día 1</td><td>Guardar el YAML «solo en mi máquina»</td><td>GitOps: el clúster converge al repo; auditable y recuperable</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>El selector no coincide con las etiquetas de la template</h3>
+        <pre><code class="language-yaml"># ❌ El Deployment busca Pods con app=API y tú etiquetas los Pods app=api
+spec:
+  selector:
+    matchLabels:
+      app: API          # ← mayúscula/distinta de la template
+  template:
+    metadata:
+      labels:
+        app: api        # ← no coincide
+# Error del apiserver: selector do not match template labels
+
+# ✅ Mismo par en los dos sitios
+spec:
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+</code></pre>
+
+        <h3>Usar un contrato de API viejo para Deployments</h3>
+        <pre><code class="language-yaml"># ❌ apiVersion: extensions/v1beta1    # se eliminó en K8s 1.16: error directo
+apiVersion: extensions/v1beta1
+kind: Deployment
+
+# ✅ El contrato moderno de Deployments (estable desde hace años)
+apiVersion: apps/v1
+kind: Deployment
+</code></pre>
+
+        <h3>Creer que un Pod suelto se auto-repara (y que create es idempotente)</h3>
+        <pre><code class="language-bash"># ❌ "Borro el Pod y el sistema lo devolverá" → un Pod suelto NO se recrea
+kubectl delete pod hello-pod     # desaparece para siempre (sin Deployment)
+
+# ✅ Quiere que te lo vigile un nivel superior:
+#    kubectl apply -f deployment.yaml  → borra uno de sus Pods y verás
+#    cómo el ReplicaSet lo reemplaza solito.
+
+# ❌ kubectl create -f hero.yaml  (segunda vez) → error AlreadyExists
+# ✅ kubectl apply -f hero.yaml   (n veces)     → created / unchanged / configured
+</code></pre>
+
+        <h3>Editar «a mano» un recurso que declaraste en un archivo</h3>
+        <pre><code class="language-bash"># ❌ kubectl edit deployment api      # cambio in-situ que NADIE tiene en Git
+# ❌ kubectl scale deployment api --replicas=5    # no reflejado en el YAML
+
+# ✅ Punto de referencia único: el archivo. Cambia replicas en el YAML y…
+kubectl apply -f k8s/api/deployment.yaml    # …el clúster converge al archivo
+# (Si algo externo lo tocó, apply reconcilia: "configured")
+</code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> escribir un Deployment mínimo desde cero, aplicarlo, escalarlo y demostrar que la plataforma converge y se repara sola.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea el archivo</strong> <code>deploy-echo.yaml</code> con este contenido exacto:
+            <pre><code class="language-yaml"># deploy-echo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      containers:
+        - name: echo
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Aplica y espera a que converja:</strong>
+            <pre><code class="language-bash"># Necesitas un clúster: si no lo tienes, "kind create cluster" (lección 03)
+kubectl apply -f deploy-echo.yaml          # deployment.apps/echo created
+kubectl rollout status deployment/echo     # … "succesfully rolled out"
+kubectl get deploy,rs,pods -l app=echo     # Deployment + ReplicaSet + 2 Pods
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Escala editando el archivo (declarativo puro):</strong> cambia <code>replicas: 2</code> → <code>replicas: 3</code> y vuelve a aplicar:
+            <pre><code class="language-bash">kubectl apply -f deploy-echo.yaml          # deployment.apps/echo configured
+kubectl get pods -l app=echo               # ahora 3
+# 🎉 no hiciste "scale": dijiste 3 y el bucle lo sostiene
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Prueba la auto-reparación:</strong>
+            <pre><code class="language-bash">POD=$(kubectl get pods -l app=echo -o jsonpath='{.items[0].metadata.name}')
+echo "Borrando $POD" ; kubectl delete pod "$POD"
+sleep 8 && kubectl get pods -l app=echo    # un Pod NUEVO (sufijo distinto)
+# como el Deployment pedía 3, la réplica se reconstruye sola
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Contrasta el mundo declarativo con diff/dry-run:</strong>
+            <pre><code class="language-bash"># Hacer UN CAMBIO pequeño en el YAML (por ejemplo image: nginx:1.26)
+# y ANTES de aplicar…:
+kubectl diff -f deploy-echo.yaml          # te muestra exactamente el cambio
+#   ± image: nginx:1.26  (el resto «intacto»)
+kubectl apply -f deploy-echo.yaml --dry-run=client -o yaml | grep -A3 'metadata:'
+#   = ensayo del apply sin tocar el clúster («dry run»)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — No olvides la salida limpia:</strong>
+            <pre><code class="language-bash">kubectl delete -f deploy-echo.yaml   # borra lo que creó el manifest
+kind delete cluster --name academy   # si usaste el del reto de la lección 3
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Verificación esperada:</strong> en el paso 2, un Deployment con `<code>READY 2/2</code>` tras el rollout; en el paso 3 pasa a 3 sin touching; en el paso 4, al borrar un Pod aparece otro con sufijo al azar distinto; en el paso 5, `diff` muestra solo la línea de imagen y el `dry-run` imprime el objeto sin cambiarlo. Todo ello demuestra el ciclo declarativo del que habla esta lección.</p>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Escribe el manifiesto de la feature «opcional»</h3>
+          <p>Por tu cuenta, escribe en un solo archivo un Deployment llamado <code>sidecar</code> con 2 réplicas que corran la imagen <code>busybox:1.36</code>, preparado para: (a) exponer la documentación del puerto 8080, (b) pedir 50m de CPU y 64Mi de RAM como requests, y (c) una etiqueta <code>tier: background</code> añadida a los Pods, con su selector coherente. Cuando lo tengas, predecí por escrito: <em>¿qué salida exacta verías al aplicar el mismo archivo por segunda vez? ¿Y qué verías si solo cambias el número de réplicas a 5, sin tocar nada más?</em> — y compruébalo en tu clúster con <code>kubectl apply -f</code> y <code>kubectl diff</code>.</p>
+          <p><em>Pista: no adivines el mensaje de la segunda aplicación — vuelve a la sección de teoría, a la definición de idempotencia; y recuerda que busybox es una imagen de utilidades que tiene que quedarse despierta… o no (pista extra: busca «busybox sleep infinity» si algo no te converge).</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Todo manifest tiene 4 bloques: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code> y <code>spec</code>.</li>
+          <li>Modelo <strong>declarativo</strong>: declaras el destino; la plataforma decide la ruta.</li>
+          <li>El <strong>control loop</strong> (controller-manager) compara deseo ↔ realidad y actúa; de ahí sale self-healing, escalado y rolling updates.</li>
+          <li><code>kubectl apply</code> es <strong>idempotente</strong>: crear / no-op / configurar, sin efectos duplicados.</li>
+          <li>Los <strong>Deployments</strong> (apps/v1) vigilan ReplicaSets → Pods; un Pod suelto no se recobra solo.</li>
+          <li>El <strong>selector + etiqueta</strong> es el pegamento que ata Deployment a sus Pods; si no calzan, el apiserver rechaza el archivo.</li>
+          <li>Antes de aplicar: <code>kubectl diff</code>; para ensayar: <code>--dry-run=client -o yaml</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -f archivo.yaml</code></td><td>Crea, no-op o «configured» según el estado (idempotente)</td></tr>
+            <tr><td><code>kubectl create -f archivo.yaml</code></td><td>Creación imperativa: falla si el objeto ya existe</td></tr>
+            <tr><td><code>kubectl get deployment/api -o yaml</code></td><td>Dump del estado REAL del objeto (con campos que el apiserver añade)</td></tr>
+            <tr><td><code>kubectl get deployment/api -o jsonpath=…</code></td><td>Extrae un campo concreto (p. ej. nombre del primer Pod)</td></tr>
+            <tr><td><code>kubectl diff -f archivo.yaml</code></td><td>Simula la diferencia que haría apply, sin aplicar</td></tr>
+            <tr><td><code>kubectl apply -f archivo.yaml --dry-run=client -o yaml</code></td><td>Ensayo del apply (valida y muestra el objeto) sin tocar el clúster</td></tr>
+            <tr><td><code>kubectl rollout status deployment/api</code></td><td>Espera a que el Deployment termine de converger</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Puente con el módulo siguiente:</strong> acabas de «descifrar» el idioma de Kubernetes. En el Módulo 6 vas a operar con estas piezas: Pods, Deployments con rolling updates, Services y probes — todo ya cono esta sintaxis. Continúa con <a href="../06-workloads/01-pods.html">Pods: la unidad mínima</a>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué `kubectl create deployment` sigue existiendo si lo bueno es apply?</summary>
+            <div>
+              <p>Por comodidad y enseñanza. <code>create deployment</code> te genera un Deployment operativo en una línea (imperativo), y hasta te guarda un registro de la orden. Pero produce estado que <em>no está en ningún archivo</em>, por eso la práctica profesional es: úsalo para explorar y luego <code>kubectl get deployment web -o yaml</code> para copiar la forma, pero mantén el archivo como única fuente de verdad con <code>apply</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿`apply` sobrescribe lo que hice a mano con `kubectl edit`?</summary>
+            <div>
+              <p>Depende: apply hace reconciliación de los campos que tú declaras en el archivo (la famosa «triple fusión» con el último apply registrado en anotaciones), y respeta campos que el sistema genera. En la práctica, la regla es clara: <em>todo lo que quieras controlar, ponlo en el archivo</em>. Si solo haces <code>kubectl edit</code>, el archivo y el clúster se descuerdan y aplicas sorpresas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es exactamente la «triple fusión» de apply?</summary>
+            <div>
+              <p>Cuando aplicas, Kubernetes compara tres cosas: (1) el estado declarado por tu archivo <em>anterior</em> (guardado en una anotación del objeto), (2) el estado <em>actual</em> del clúster (posiblemente editado por otra persona o el sistema), y (3) tu nuevo archivo. Solo aplica las diferencias de (3) sobre (2), sin pisar lo que no declaras. Así un `apply` no rompe campos gestionados por el propio clúster.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito `kubectl diff` siempre antes de aplicar?</summary>
+            <div>
+              <p>Al principio, sí: es la forma de verte actuar y de que los errores sean temas aburridos. Con experiencia, lo harás en cambios delicados (producción, configmaps, secrets, quotas) y te saltarás el ritual de ida y vuelta en demo. La recomendación firme: en cualquier acción con impacto, antes de `apply`, un `diff` y un razonamiento de «¿es exactamente esto lo que quiero?».</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si aplico un YAML con un error YAML sintáctico?</summary>
+            <div>
+              <p>Cometes un «error YAML» antes de que Kubernetes se entere: `kubectl apply` validará la sintaxis y te dirá algo como <code>error: error validating "x.yaml": error parsing</code>. Los errores de indentación (que en YAML son sagrados: 2 espacios, nunca tabs) son la causa número uno. Mi consejo: haz <code>kubectl apply --dry-run=client -o yaml</code> como mínimo, o valida con una librería antes de llegar al apiserver.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

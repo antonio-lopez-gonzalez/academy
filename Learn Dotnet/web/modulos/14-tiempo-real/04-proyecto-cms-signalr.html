@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="es" data-module="14" data-lesson="04-proyecto-cms-signalr" data-project="true">
+<head>
+  <meta charset="UTF-8">
+  <title>Proyecto CMS: notificaciones en tiempo real — Módulo 14 · Curso .NET 8</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('dn8-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Proyecto CMS: notificaciones en tiempo real</h1>
+        <div class="lesson-header__meta"><span class="badge badge--project">Módulo 14 · Proyecto</span><span>50 min</span></div>
+      </header>
+
+      <section id="introduccion">
+        <h2>1. Introducción</h2>
+        <p>En el CMS que estamos construyendo a lo largo del curso, varios usuarios pueden estar editando simultáneamente. Queremos que cuando un autor publique un nuevo post o un lector añada un comentario, los editores y otros usuarios relevantes reciban una notificación inmediata sin tener que recargar la página.</p>
+        <p>En esta lección integraremos <strong>SignalR</strong> en el proyecto final del CMS. Crearemos un <code>NotificationHub</code>, usaremos grupos para segmentar por roles, configuraremos Redis como backplane para producción y conectaremos un cliente JavaScript de prueba.</p>
+
+        <div class="callout callout--goal">
+          <h4>Objetivos del proyecto</h4>
+          <ul>
+            <li>Crear un <code>NotificationHub</code> en <code>Cms.Api</code> con métodos tipados.</li>
+            <li>Enviar notificaciones cuando se publique un nuevo post o un comentario.</li>
+            <li>Notificar a los roles <code>Author</code>, <code>Editor</code> y <code>Admin</code>.</li>
+            <li>Permitir que un cliente JS se suscriba a notificaciones con autenticación JWT.</li>
+            <li>Integrar el envío desde un handler de MediatR para mantener la arquitectura limpia.</li>
+            <li>Configurar Redis como backplane en el entorno de producción.</li>
+          </ul>
+        </div>
+
+        <h3>Errores típicos</h3>
+        <ul>
+          <li>Colocar la lógica de notificaciones directamente en el controlador en lugar de un handler.</li>
+          <li>Enviar notificaciones a <code>Clients.All</code> sin segmentar por rol o por suscripción.</li>
+          <li>Olvidar el token JWT en la conexión SignalR y que <code>Context.User</code> esté vacío.</li>
+          <li>No usar backplane en producción, causando notificaciones perdidas en despliegues multi-instancia.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2>2. Teoría</h2>
+        <h3>2.1. Arquitectura del CMS</h3>
+        <p>Recordamos la estructura del proyecto final:</p>
+        <ul>
+          <li><strong>Cms.Domain:</strong> entidades como <code>Post</code>, <code>Comment</code>, <code>User</code>.</li>
+          <li><strong>Cms.Application:</strong> commands, queries, handlers, validadores y DTOs.</li>
+          <li><strong>Cms.Infrastructure:</strong> EF Core, repositorios, Redis, email.</li>
+          <li><strong>Cms.Api:</strong> hubs, endpoints, middleware, configuración.</li>
+        </ul>
+        <p>Los <strong>hubs</strong> y la configuración de SignalR viven en <code>Cms.Api</code>. Sin embargo, el <strong>envío de notificaciones</strong> desde la lógica de negocio se hace a través de un servicio de aplicación o un handler de MediatR que inyecta <code>IHubContext</code>. Así respetamos la regla de dependencias de Clean Architecture.</p>
+
+        <h3>2.2. Flujo de una notificación</h3>
+        <div class="diagram">Navegador                         Cms.Api              Cms.Application
+   │                                 │                         │
+   │  WebSocket /hubs/notifications  │                         │
+   │ ═══════════════════════════════>│                         │
+   │  JWT via query string           │                         │
+   │                                 │                         │
+   │                                 │ <── PublishPostCommand ───│
+   │                                 │  handler invoca INotificationService
+   │                                 │                         │
+   │  ← ReceivePostPublished         │ <── IHubContext         │
+   │ ═══════════════════════════════<│                         │</div>
+
+        <h3>2.3. Decisiones de diseño</h3>
+        <ul>
+          <li><strong>Hub tipado:</strong> <code>NotificationHub : Hub&lt;INotificationClient&gt;</code> para detectar errores en tiempo de compilación.</li>
+          <li><strong>Grupos por rol:</strong> al conectarse, el usuario se une automáticamente a grupos como <code>authors</code>, <code>editors</code> y <code>admins</code>.</li>
+          <li><strong>Notificaciones selectivas:</strong> los comentarios en un post notifican a los autores de ese post; los posts publicados notifican a editores y admins.</li>
+          <li><strong>Backplane condicional:</strong> en desarrollo usamos la memoria interna; en producción añadimos Redis.</li>
+        </ul>
+
+        <div class="callout callout--tip">
+          <h4>Consejo del proyecto</h4>
+          <p>Define un contrato de notificaciones claro en <code>Cms.Application</code> (por ejemplo, una interfaz <code>INotificationService</code>) e implementa el envío real en <code>Cms.Infrastructure</code> usando <code>IHubContext</code>. La capa de aplicación no debe depender de SignalR.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2>3. Ejemplo mínimo</h2>
+        <p>Antes de integrar todo, veamos el hub más pequeño del CMS: un método que se une a grupos por rol y recibe un mensaje de bienvenida.</p>
+
+        <div class="code-file">Cms.Api/Hubs/INotificationClient.cs</div>
+        <pre><code class="language-csharp">namespace Cms.Api.Hubs;
+
+public interface INotificationClient
+{
+    Task PostPublished(Guid postId, string title, string authorName);
+    Task CommentAdded(Guid postId, string commentAuthor, string excerpt);
+    Task SystemMessage(string message);
+}</code></pre>
+
+        <div class="code-file">Cms.Api/Hubs/NotificationHub.cs</div>
+        <pre><code class="language-csharp">using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace Cms.Api.Hubs;
+
+[Authorize]
+public sealed class NotificationHub : Hub<INotificationClient>
+{
+    public override async Task OnConnectedAsync()
+    {
+        // Nos unimos a grupos basados en roles de claims
+        if (Context.User?.IsInRole("Author") == true)
+            await Groups.AddToGroupAsync(Context.ConnectionId, "authors");
+
+        if (Context.User?.IsInRole("Editor") == true)
+            await Groups.AddToGroupAsync(Context.ConnectionId, "editors");
+
+        if (Context.User?.IsInRole("Admin") == true)
+            await Groups.AddToGroupAsync(Context.ConnectionId, "admins");
+
+        await Clients.Caller.SystemMessage($"Conectado como {Context.User?.Identity?.Name}");
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        // SignalR elimina automáticamente la conexión de los grupos,
+        // pero podemos hacer limpieza adicional si fuera necesario.
+        await base.OnDisconnectedAsync(exception);
+    }
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El hub está protegido con <code>[Authorize]</code>, por lo que el cliente debe enviar un JWT válido. Al conectarse, el usuario se une a los grupos que corresponden a sus roles. Esto permite enviar notificaciones dirigidas más tarde.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2>4. Ejemplo real</h2>
+        <p>Integramos SignalR con el resto del CMS: configuración de JWT para WebSockets, registro del hub, servicio de notificaciones en infraestructura y handler de MediatR.</p>
+
+        <h3>4.1. Configuración de autenticación para SignalR</h3>
+        <div class="code-file">Cms.Api/Program.cs (extracto)</div>
+        <pre><code class="language-csharp">using Cms.Api.Hubs;
+using Cms.Application;
+using Cms.Infrastructure;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddApplication();
+builder.Services.AddInfrastructure(builder.Configuration);
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = JwtTokenValidation.BuildParameters(builder.Configuration);
+
+        // SignalR no puede enviar cabeceras en el handshake WebSocket
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken))
+                    context.Token = accessToken;
+                return Task.CompletedTask;
+            }
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+var signalRBuilder = builder.Services.AddSignalR();
+
+// En producción, activamos el backplane de Redis
+if (builder.Environment.IsProduction())
+{
+    var redis = builder.Configuration.GetConnectionString("Redis")
+        ?? throw new InvalidOperationException("Redis connection string is missing in production.");
+
+    signalRBuilder.AddStackExchangeRedis(redis, options =>
+    {
+        options.Configuration.ChannelPrefix = "CmsSignalR";
+    });
+}
+
+builder.Services.AddControllers();
+
+var app = builder.Build();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler();
+    app.UseHsts();
+}
+
+app.UseHttpsRedirection();
+app.UseCors("CmsFrontend");
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapHub<NotificationHub>("/hubs/notifications")
+   .RequireAuthorization();
+
+app.MapControllers();
+app.Run();</code></pre>
+
+        <h3>4.2. Servicio de notificaciones en infraestructura</h3>
+        <div class="code-file">Cms.Application/Interfaces/INotificationService.cs</div>
+        <pre><code class="language-csharp">namespace Cms.Application.Interfaces;
+
+public interface INotificationService
+{
+    Task NotifyPostPublishedAsync(Guid postId, string title, string authorName, CancellationToken cancellationToken = default);
+    Task NotifyCommentAddedAsync(Guid postId, string commentAuthor, string excerpt, CancellationToken cancellationToken = default);
+}</code></pre>
+
+        <div class="code-file">Cms.Infrastructure/Realtime/SignalRNotificationService.cs</div>
+        <pre><code class="language-csharp">using Cms.Api.Hubs;
+using Cms.Application.Interfaces;
+using Microsoft.AspNetCore.SignalR;
+
+namespace Cms.Infrastructure.Realtime;
+
+public sealed class SignalRNotificationService : INotificationService
+{
+    private readonly IHubContext<NotificationHub, INotificationClient> _hubContext;
+    private readonly ILogger<SignalRNotificationService> _logger;
+
+    public SignalRNotificationService(
+        IHubContext<NotificationHub, INotificationClient> hubContext,
+        ILogger<SignalRNotificationService> logger)
+    {
+        _hubContext = hubContext;
+        _logger = logger;
+    }
+
+    public async Task NotifyPostPublishedAsync(Guid postId, string title, string authorName, CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Notificando publicación del post {PostId}", postId);
+
+        // Editores y admins reciben notificación de nuevos posts pendientes de revisión
+        await _hubContext.Clients.Groups("editors", "admins")
+            .PostPublished(postId, title, authorName);
+    }
+
+    public async Task NotifyCommentAddedAsync(Guid postId, string commentAuthor, string excerpt, CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Notificando comentario en el post {PostId}", postId);
+
+        // Autores del post reciben notificación de nuevos comentarios
+        await _hubContext.Clients.Groups("authors")
+            .CommentAdded(postId, commentAuthor, excerpt);
+    }
+}</code></pre>
+
+        <h3>4.3. Handler de MediatR que dispara la notificación</h3>
+        <div class="code-file">Cms.Application/Posts/Commands/PublishPost/PublishPostCommandHandler.cs</div>
+        <pre><code class="language-csharp">using Cms.Application.Interfaces;
+using Cms.Domain.Entities;
+using Cms.Domain.Interfaces;
+using MediatR;
+
+namespace Cms.Application.Posts.Commands.PublishPost;
+
+public sealed record PublishPostCommand(Guid PostId) : IRequest;
+
+public sealed class PublishPostCommandHandler : IRequestHandler<PublishPostCommand>
+{
+    private readonly IPostRepository _postRepository;
+    private readonly INotificationService _notifications;
+    private readonly ILogger<PublishPostCommandHandler> _logger;
+
+    public PublishPostCommandHandler(
+        IPostRepository postRepository,
+        INotificationService notifications,
+        ILogger<PublishPostCommandHandler> logger)
+    {
+        _postRepository = postRepository;
+        _notifications = notifications;
+        _logger = logger;
+    }
+
+    public async Task Handle(PublishPostCommand request, CancellationToken cancellationToken)
+    {
+        var post = await _postRepository.GetByIdAsync(request.PostId, cancellationToken)
+            ?? throw new NotFoundException($"Post {request.PostId} no encontrado");
+
+        post.Publish();
+        await _postRepository.SaveChangesAsync(cancellationToken);
+
+        _logger.LogInformation("Post {PostId} publicado", request.PostId);
+
+        // Notificación en tiempo real a editores y admins
+        await _notifications.NotifyPostPublishedAsync(
+            post.Id,
+            post.Title,
+            post.AuthorName,
+            cancellationToken);
+    }
+}</code></pre>
+
+        <h3>4.4. Cliente JavaScript de prueba</h3>
+        <div class="code-file">wwwroot/cms-notifications.html</div>
+        <pre><code class="language-html"><!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>CMS Notificaciones</title>
+</head>
+<body>
+  <h1>Notificaciones del CMS</h1>
+  <ul id="notifications"></ul>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+  <script>
+    const token = localStorage.getItem("cms_access_token") || "TU_TOKEN_AQUI";
+
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("/hubs/notifications?access_token=" + encodeURIComponent(token))
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on("PostPublished", (postId, title, authorName) => {
+      append(`Nuevo post: ${title} por ${authorName}`);
+    });
+
+    connection.on("CommentAdded", (postId, commentAuthor, excerpt) => {
+      append(`Nuevo comentario de ${commentAuthor}: ${excerpt}`);
+    });
+
+    connection.on("SystemMessage", (message) => {
+      append(`Sistema: ${message}`);
+    });
+
+    function append(text) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      document.getElementById("notifications").appendChild(li);
+    }
+
+    async function start() {
+      try {
+        await connection.start();
+      } catch (err) {
+        console.error("Error de conexión:", err);
+        setTimeout(start, 5000);
+      }
+    }
+
+    connection.onclose(start);
+    start();
+  </script>
+</body>
+</html></code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Qué ocurre aquí?</h4>
+          <p>El handler de publicación cambia el estado del post, guarda y luego notifica. La infraestructura envía el mensaje a través del hub. El cliente JS recibe el mensaje si pertenece a los grupos <code>editors</code> o <code>admins</code>. En producción, Redis replica el mensaje entre instancias.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2>5. Buenas prácticas</h2>
+        <ul>
+          <li><strong>Abstrae SignalR detrás de una interfaz de aplicación.</strong> La capa de aplicación no debe depender de ASP.NET Core SignalR.</li>
+          <li><strong>Notifica después de persistir.</strong> No envíes notificaciones antes de confirmar que la operación de negocio fue exitosa.</li>
+          <li><strong>Usa grupos en lugar de listas de connectionIds.</strong> SignalR gestiona los grupos de forma eficiente y los sincroniza con el backplane.</li>
+          <li><strong>Segmenta las notificaciones.</strong> No envíes todo a <code>Clients.All</code>; envía solo a quienes necesitan la información.</li>
+          <li><strong>Protege el hub con autorización.</strong> Las notificaciones suelen contener datos sensibles.</li>
+          <li><strong>Configura Redis en producción.</strong> Un solo servidor en memoria no escala.</li>
+          <li><strong>Registra las notificaciones enviadas.</strong> Útil para debugging y auditoría.</li>
+        </ul>
+
+        <div class="callout callout--warning">
+          <h4>No envíes todo el DTO</h4>
+          <p>Envía solo los datos necesarios en la notificación (id, título, autor). Si el cliente necesita más detalle, puede hacer una petición REST al API. Esto reduce el tamaño de los mensajes y mantiene el contrato estable.</p>
+        </div>
+      </section>
+
+      <section id="errores-habituales">
+        <h2>6. Errores habituales</h2>
+
+        <h3>6.1. Notificar desde el controlador</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">[HttpPost("posts/{id}:publish")]
+public async Task<IActionResult> Publish(Guid id, [FromServices] IHubContext<NotificationHub> hub)
+{
+    await _mediator.Send(new PublishPostCommand(id));
+    await hub.Clients.All.SendAsync("PostPublished", id);
+    return NoContent();
+}</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">[HttpPost("posts/{id}:publish")]
+public async Task<IActionResult> Publish(Guid id)
+{
+    await _mediator.Send(new PublishPostCommand(id));
+    return NoContent();
+}
+
+// La notificación se dispara desde el handler de aplicación a través de INotificationService</code></pre>
+
+        <h3>6.2. Enviar a todos sin segmentar</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">await _hubContext.Clients.All.PostPublished(postId, title, authorName);</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-csharp">await _hubContext.Clients.Groups("editors", "admins")
+    .PostPublished(postId, title, authorName);</code></pre>
+
+        <h3>6.3. Olvidar el token en la conexión SignalR</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-javascript">const connection = new signalR.HubConnectionBuilder()
+    .withUrl("/hubs/notifications")
+    .build();</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-javascript">const connection = new signalR.HubConnectionBuilder()
+    .withUrl("/hubs/notifications?access_token=" + encodeURIComponent(token))
+    .build();</code></pre>
+
+        <h3>6.4. No usar backplane en producción</h3>
+        <p>El siguiente código funciona en local pero fallará en Kubernetes con múltiples pods:</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-csharp">builder.Services.AddSignalR(); // sin Redis</code></pre>
+        <p>La solución es la configuración condicional del ejemplo real.</p>
+      </section>
+
+      <section id="ejercicio-guiado">
+        <h2>7. Ejercicio guiado</h2>
+        <p>Implementa una notificación para el evento "comentario añadido" que informe al autor del post. El autor puede no tener el rol <code>Author</code>, así que usaremos <code>Clients.User</code> en lugar de un grupo.</p>
+
+        <div class="code-file">Cms.Application/Interfaces/INotificationService.cs</div>
+        <pre><code class="language-csharp">public interface INotificationService
+{
+    Task NotifyPostPublishedAsync(Guid postId, string title, string authorName, CancellationToken cancellationToken = default);
+    Task NotifyCommentAddedAsync(Guid postId, string commentAuthor, string excerpt, CancellationToken cancellationToken = default);
+    Task NotifyAuthorOfCommentAsync(string authorId, Guid postId, string commentAuthor, string excerpt, CancellationToken cancellationToken = default);
+}</code></pre>
+
+        <div class="code-file">Cms.Infrastructure/Realtime/SignalRNotificationService.cs</div>
+        <pre><code class="language-csharp">public async Task NotifyAuthorOfCommentAsync(string authorId, Guid postId, string commentAuthor, string excerpt, CancellationToken cancellationToken = default)
+{
+    await _hubContext.Clients.User(authorId)
+        .CommentAdded(postId, commentAuthor, excerpt);
+}</code></pre>
+
+        <div class="code-file">Cms.Application/Comments/Commands/AddComment/AddCommentCommandHandler.cs</div>
+        <pre><code class="language-csharp">public async Task<Guid> Handle(AddCommentCommand request, CancellationToken cancellationToken)
+{
+    var post = await _postRepository.GetByIdAsync(request.PostId, cancellationToken)
+        ?? throw new NotFoundException("Post no encontrado");
+
+    var comment = post.AddComment(request.Content, request.AuthorId, request.AuthorName);
+    await _postRepository.SaveChangesAsync(cancellationToken);
+
+    await _notifications.NotifyCommentAddedAsync(
+        post.Id,
+        request.AuthorName,
+        request.Content[..Math.Min(100, request.Content.Length)],
+        cancellationToken);
+
+    await _notifications.NotifyAuthorOfCommentAsync(
+        post.AuthorId,
+        post.Id,
+        request.AuthorName,
+        request.Content[..Math.Min(100, request.Content.Length)],
+        cancellationToken);
+
+    return comment.Id;
+}</code></pre>
+
+        <div class="callout callout--info">
+          <h4>¿Por qué usar <code>Clients.User</code> para el autor?</h4>
+          <p>El autor del post puede tener cualquier rol o incluso estar desconectado. Al usar el <code>userId</code> basado en <code>NameIdentifier</code>, SignalR envía la notificación a todas las conexiones activas de ese usuario, independientemente de sus roles.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2>8. Reto</h2>
+        <div class="challenge">
+          <h3>Reto: panel de actividad en tiempo real</h3>
+          <p>Implementa un hub adicional llamado <code>ActivityHub</code> que envíe a los administradores un resumen de actividad cada vez que se publica un post, se añade un comentario o se registra un usuario. El resumen debe incluir el tipo de evento, el timestamp y el usuario responsable. Asegúrate de que el backplane de Redis lo propague entre instancias y de que solo los usuarios con rol <code>Admin</code> reciban estos eventos.</p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2>9. Resumen</h2>
+        <ul>
+          <li>Integrar SignalR en el CMS mantiene la arquitectura limpia usando <code>INotificationService</code> en aplicación y <code>SignalRNotificationService</code> en infraestructura.</li>
+          <li>El hub se protege con <code>[Authorize]</code> y el token JWT se envía por query string en WebSockets.</li>
+          <li>Los usuarios se unen a grupos según sus roles para recibir notificaciones segmentadas.</li>
+          <li>Los handlers de MediatR disparan notificaciones después de persistir la operación.</li>
+          <li>Redis actúa como backplane en producción para escalar horizontalmente.</li>
+          <li>El cliente JavaScript se reconecta automáticamente y escucha eventos tipados.</li>
+        </ul>
+      </section>
+
+      <section id="preguntas-frecuentes">
+        <h2>10. Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no poner el hub en la capa de aplicación?</summary>
+            <div>
+              <p>El hub es infraestructura web de ASP.NET Core. La capa de aplicación define la interfaz <code>INotificationService</code> y la infraestructura la implementa. Esto mantiene la regla de dependencias de Clean Architecture.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el handler de MediatR notifica antes de guardar?</summary>
+            <div>
+              <p>El cliente podría recibir una notificación de un post que aún no existe en base de datos. Por eso notificamos <strong>después</strong> de <code>SaveChangesAsync</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo el hub sin un navegador?</summary>
+            <div>
+              <p>Puedes usar el cliente .NET de SignalR o escribir tests de integración con <code>WebApplicationFactory</code> y un cliente de SignalR. También puedes invocar directamente <code>IHubContext</code> en tests unitarios usando un <code>TestHubContext</code> mock.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito un endpoint REST para obtener el historial?</summary>
+            <div>
+              <p>Sí. SignalR es para eventos en tiempo real; el historial debe consultarse por REST o GraphQL. No intentes reconstruir el historial a partir de notificaciones perdidas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar SignalR desde Minimal APIs?</summary>
+            <div>
+              <p>Sí, con <code>app.MapHub&lt;T&gt;("/ruta")</code>. La autenticación y autorización funcionan igual que con controladores.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
