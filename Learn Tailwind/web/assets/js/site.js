@@ -86,6 +86,7 @@
     const topbar = document.createElement("header");
     topbar.className = "topbar";
     topbar.innerHTML = `
+      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
         <svg class="topbar__logo" viewBox="0 0 100 100" aria-hidden="true">
@@ -94,7 +95,6 @@
         </svg>
         <span>${COURSE.title}</span>
       </a>
-      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <div class="topbar__search">
         <input type="search" placeholder="buscar lección…" data-search aria-label="Buscar lección">
       </div>

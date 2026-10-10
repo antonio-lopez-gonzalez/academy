@@ -86,12 +86,12 @@
     const topbar = document.createElement("header");
     topbar.className = "topbar";
     topbar.innerHTML = `
+      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
         <span class="topbar__logo">⚛</span>
         <span>${COURSE.title}</span>
       </a>
-      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <div class="topbar__search">
         <input type="search" placeholder="Buscar lección…  (ej: useState)" data-search aria-label="Buscar lección">
       </div>
