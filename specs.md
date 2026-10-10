@@ -46,6 +46,7 @@ curso y en su `AGENTS.md`.
 | `Learn SDD` | Spec-Driven Development | `spec.md` | `sdd-theme/progress` | 8 | 32 | `proyectos/lumen` |
 | `Learn Tailwind` | Tailwind CSS v4 | `AGENTS.md` | `tw-theme/progress` | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
 | `Learn TypeScript` | TypeScript profesional | `AGENTS.md` | `ts-theme/progress` | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| `Learn IA` | IA aplicada: LLM, RAG, agentes, MCP, evals | `spec.md` | `ia-theme/progress` | 9 | 36 | `proyectos/copiloto` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.
@@ -265,7 +266,7 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 # 12. Página principal (`index.html` de la raíz)
 
 - Portada tipo grid de `.card`; cada tarjeta enlaza a `Learn <Curso>/web/index.html`.
-- `<footer>` indica el número de cursos disponibles (hoy **11**).
+- `<footer>` indica el número de cursos disponibles (hoy **12**).
 - Al añadir un curso, añadir su tarjeta y actualizar el contador.
 
 ---
