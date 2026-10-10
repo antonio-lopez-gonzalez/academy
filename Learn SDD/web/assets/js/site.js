@@ -89,10 +89,7 @@
       <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
-        <svg class="topbar__logo" viewBox="0 0 100 100" aria-hidden="true">
-          <rect x="4" y="4" width="92" height="92" rx="18"/>
-          <text x="50" y="70" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="800" text-anchor="middle">SD</text>
-        </svg>
+        <svg class="topbar__logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="#F59E0B" d="M7 2h8l5 5v13a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z"/><path d="M15 2v4a1 1 0 0 0 1 1h4" fill="none" stroke="#171a21" stroke-width="2" stroke-linecap="round"/><path d="m7.5 13 2.5 2.5 5.5-6" fill="none" stroke="#171a21" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>${COURSE.title}</span>
       </a>
       <div class="topbar__search">
