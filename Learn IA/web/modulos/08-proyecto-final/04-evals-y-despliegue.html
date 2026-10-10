@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="04-evals-y-despliegue">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Evals y despliegue — Módulo 8 · Curso IA</title>
+  <meta name="description" content="El dataset de evals del Copiloto, cómo correr las evaluaciones, la CLI copiloto, una API mínima y la puesta en producción con control de coste y latencia.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Evals y despliegue</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Proyecto final: Copiloto</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El Copiloto ya responde con RAG, usa tools y tiene memoria. Pero «funciona» es una opinión hasta que lo mides: ¿acierta las preguntas del corpus?, ¿se abstiene cuando debe?, ¿cuánto tarda?, ¿cuánto cuesta?, ¿sigue funcionando después de cambiar el prompt o el modelo? Esta lección cierra el curso poniendo <strong>números</strong> a esas preguntas y dejando el Copiloto <strong>listo para usar</strong>: por CLI y por una API mínima.</p>
+        <p>Dos piezas. La primera es la <strong>evaluación</strong>: un dataset de preguntas reales con respuesta esperada, una batería de comprobaciones (unas deterministas, otras con juez) y un <em>pass rate</em> que se convierte en <strong>puerta de calidad</strong>: si baja, la versión no sale. La segunda es el <strong>despliegue</strong>: empaquetar todo en una CLI cómoda (<code>copiloto</code>) y una API que un front o un script puedan llamar, con control de coste y latencia.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el curso entero ha repetido una idea: <em>sin medir, no hay ingeniería</em>. Esta es donde se convierte en hábito. Un Copiloto con evals es un proyecto que puedes mejorar con confianza; uno sin evals es una demo que da miedo tocar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La analogía: la revisión técnica antes de la ITV</h3>
+        <div class="callout callout--analogy">
+          <p>Un coche no sale a la carretera porque «parece que va bien», sino porque pasa una <strong>revisión con puntos concretos</strong>: frenos, luces, emisiones. Si algo falla, no pasa. Las evals son tu revisión: una lista de casos concretos con su criterio de éxito. Y como el coche cambia (ruedas nuevas, otra ECU), la revisión se repite <strong>cada vez</strong>, no una sola. Un cambio que «no rompe nada a ojo» suele romper algo en la revisión.</p>
+        </div>
+
+        <h3>El dataset: preguntas reales con respuesta esperada</h3>
+        <p>El dataset del Copiloto es una lista de casos, en JSONL (una línea por caso). Cada caso describe una pregunta y <strong>qué debe pasar</strong>:</p>
+        <div class="code-file">proyectos/copiloto/evals/dataset.jsonl</div>
+        <pre><code class="language-json">{"id": "q001", "question": "¿Qué es la fidelidad en un RAG?", "expect_lesson": "03-citas-y-fidelidad", "expect_abstain": false, "tags": ["rag"]}
+{"id": "q002", "question": "¿Cómo se trocea un documento para indexarlo?", "expect_lesson": "03-chunking", "expect_abstain": false, "tags": ["chunking"]}
+{"id": "q003", "question": "¿Qué tools tiene el Copiloto?", "expect_lesson": "03-tools-y-agente", "expect_abstain": false, "tags": ["agent"]}
+{"id": "q004", "question": "¿Cuánto cuesta el plan Premium de OpenAI?", "expect_lesson": null, "expect_abstain": true, "tags": ["out-of-corpus"]}
+{"id": "q005", "question": "¿Quién ganó el mundial de 1998?", "expect_lesson": null, "expect_abstain": true, "tags": ["out-of-corpus"]}
+</code></pre>
+        <p>Un buen dataset mezcla tres tipos de caso, y todos importan:</p>
+        <table>
+          <thead><tr><th>Tipo de caso</th><th>Qué comprueba</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Dentro del corpus</strong></td><td>Que recupera y cita la lección correcta</td><td>«¿Qué es un embedding?»</td></tr>
+            <tr><td><strong>Fuera del corpus</strong></td><td>Que se abstiene en vez de inventar</td><td>«¿Capital de Australia?»</td></tr>
+            <tr><td><strong>Ambiguo / multi-paso</strong></td><td>Que el agente elige bien la tool o reformula</td><td>«¿Qué lecciones tiene el módulo 5?»</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p>El dataset no se escribe de una vez: crece. Cada vez que un alumno (o tú) hace una pregunta que el Copiloto responde mal, esa pregunta <strong>entra al dataset</strong> como caso de regresión. Así el sistema no vuelve a fallar dos veces en lo mismo.</p>
+        </div>
+
+        <h3>Dos tipos de comprobación: determinista y juez</h3>
+        <table>
+          <thead><tr><th></th><th>Determinista (código)</th><th>Juez (LLM)</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Qué mide</strong></td><td>Abstención, lección citada, citas en rango, formato</td><td>Fidelidad, relevancia, corrección «blanda»</td></tr>
+            <tr><td><strong>Coste</strong></td><td>Cero (sin inferencia)</td><td>Una llamada extra por caso</td></tr>
+            <tr><td><strong>Fiabilidad</strong></td><td>Alta y reproducible</td><td>Media; hay que calibrarlo (módulo 7)</td></tr>
+            <tr><td><strong>Cuándo</strong></td><td>Siempre, en cada ejecución y en CI</td><td>Antes de un <em>release</em> o al ajustar prompts</td></tr>
+          </tbody>
+        </table>
+        <p>La regla: <strong>maximiza lo determinista</strong>. «¿Se abstuvo?» o «¿citó la lección esperada?» son comprobaciones exactas, gratis y sin sesgo. El juez se reserva para lo que el código no puede decidir: si una respuesta <em>fundamentada</em> es fiel al contexto.</p>
+
+        <h3>Métricas que importan</h3>
+        <ul>
+          <li><strong>Pass rate</strong>: fracción de casos que cumplen todas sus comprobaciones. Es la métrica de cabecera.</li>
+          <li><strong>Abstention accuracy</strong>: cuántas preguntas fuera del corpus se abstienen de verdad (y cuántas del corpus se abstienen por error).</li>
+          <li><strong>Citation accuracy</strong>: fracción de respuestas que citan la lección esperada.</li>
+          <li><strong>Latencia</strong> p50/p95 y <strong>tokens/coste</strong> por caso.</li>
+        </ul>
+        <p>No optimices una métrica en solitario: bajar la latencia recortando contexto suele subir la alucinación. Mira siempre el <strong>cuadro completo</strong>.</p>
+
+        <h3>La puerta de calidad (regression gate)</h3>
+        <p>El valor real de las evals aparece cuando se convierten en un <strong>umbral automático</strong>: si el pass rate cae por debajo de, digamos, 0,9, el proceso sale con código de error y el cambio no se despliega. En CI, esto es una línea:</p>
+        <pre><code class="language-bash">uv run copiloto eval --dataset evals/dataset.jsonl --min-pass-rate 0.9
+# → exit 0 si pasa; exit 1 si baja del umbral (bloquea el merge)
+</code></pre>
+        <div class="callout callout--warning">
+          <p>Un pass rate del 100 % en un dataset pequeño <strong>no significa</strong> que el sistema sea perfecto: significa que tu dataset aún no cubre los casos difíciles. Un dataset que crece y un pass rate del 90 % valen más que un dataset trivial con 100 %.</p>
+        </div>
+
+        <h3>Despliegue: CLI y API mínima</h3>
+        <p>El Copiloto se usa de dos formas. La <strong>CLI</strong> (<code>copiloto</code>) para uso interactivo y para las tareas internas (indexar, evaluar). La <strong>API mínima</strong> para que un front o un script lo consuman por HTTP. Ambas comparten las mismas capas; solo cambia la puerta de entrada:</p>
+        <pre class="diagram">
+   web/CLI ─┐                     ┌─ index   (construir el índice)
+            ├─► copiloto (core) ─┤─ rag     (responder con citas)
+   HTTP  ───┘                     ├─ tools   (acciones)
+                                  └─ agent   (bucle + memoria)
+
+   CLI  : uv run copiloto ask "…"      (typer + rich)
+   API  : uv run uvicorn copiloto.api:app   (FastAPI, /ask, /health)
+        </pre>
+
+        <h3>Coste y latencia en producción</h3>
+        <p>Local con Ollama, el coste por token es <strong>cero</strong> pero la latencia depende de tu máquina. En la nube, cada token de entrada y salida se paga, y el bucle del agente multiplica las llamadas. Tres controles básicos:</p>
+        <ol class="steps">
+          <li><strong>Cache</strong>: guarda respuestas de preguntas idénticas (o casi, con caché semántica) para no repetir inferencia.</li>
+          <li><strong>Límites</strong>: <code>max_iterations</code> y presupuesto de tokens (lección 03).</li>
+          <li><strong>Medición</strong>: registra tokens, latencia y coste por petición; sin registro no puedes optimizar ni presupuestar.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un evaluador <strong>sin LLM y sin coste</strong>: lee un dataset y aplica solo comprobaciones deterministas sobre respuestas ya generadas (que aquí simulamos). Es la parte de las evals que siempre puedes permitirte correr.</p>
+        <div class="code-file">eval_minimo.py</div>
+        <pre><code class="language-python"># eval_minimo.py — checks deterministas sobre un dataset de evaluación.
+import json
+from pathlib import Path
+
+ABSTENTION = "No lo sé con el contexto disponible."
+
+# Casos de ejemplo (en el Copiloto vienen de evals/dataset.jsonl).
+CASES = [
+    {"id": "q001", "expect_lesson": "03-citas-y-fidelidad", "expect_abstain": False},
+    {"id": "q004", "expect_lesson": None, "expect_abstain": True},
+]
+
+# Respuestas simuladas (en el Copiloto las produce copiloto.rag.answer).
+RESULTS = {
+    "q001": {"text": "La fidelidad es… [1]", "sources": [{"lesson": "03-citas-y-fidelidad"}]},
+    "q004": {"text": ABSTENTION, "sources": []},
+}
+
+
+def check(case: dict, result: dict) -&gt; list[str]:
+    """Devuelve los problemas del caso (vacío = pasa)."""
+    problems: list[str] = []
+    abstained = result["text"].strip() == ABSTENTION
+    if case["expect_abstain"] and not abstained:
+        problems.append("debería haberse abstenido")
+    if not case["expect_abstain"]:
+        if abstained:
+            problems.append("se abstuvo pero había respuesta")
+        else:
+            cited = {s["lesson"] for s in result["sources"]}
+            if case["expect_lesson"] not in cited:
+                problems.append(f"no cita la lección esperada: {case['expect_lesson']}")
+    return problems
+
+
+passed = 0
+for case in CASES:
+    problems = check(case, RESULTS[case["id"]])
+    passed += not problems
+    print(f"{case['id']}  {'OK ' if not problems else 'FAIL'}  {problems}")
+
+print(f"pass rate: {passed}/{len(CASES)} = {passed / len(CASES):.0%}")
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">q001  OK    []
+q004  OK    []
+pass rate: 2/2 = 100%
+</code></pre>
+        <p>Dos comprobaciones exactas, cero coste. El juez se añade encima para lo que el código no resuelve, pero <strong>esta batería es la que nunca se apaga</strong>.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Primero la capa <code>evals.py</code> con las comprobaciones deterministas, un juez opcional y una puerta de calidad. Después la CLI completa y una API mínima para producción.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/evals.py</div>
+        <pre><code class="language-python">"""Capa evals: mide la calidad del Copiloto y bloquea regresiones."""
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from copiloto.answer import ask                 # responde con citas y abstención
+from copiloto.llm import get_llm
+
+ABSTENTION = "No lo sé con el contexto disponible."
+
+
+class Case(BaseModel):
+    id: str
+    question: str
+    expect_lesson: str | None = None
+    expect_abstain: bool = False
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CaseResult:
+    case: Case
+    passed: bool
+    problems: list[str]
+    latency_ms: float
+
+
+def load_dataset(path: Path) -&gt; list[Case]:
+    return [Case.model_validate_json(line)
+            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def check(case: Case, answer) -&gt; list[str]:
+    """Comprobaciones deterministas: abstención, lección citada, citas válidas."""
+    problems: list[str] = []
+    abstained = answer.text.strip() == ABSTENTION
+    if case.expect_abstain and not abstained:
+        problems.append("debería abstenerse")
+    if not case.expect_abstain:
+        if abstained:
+            problems.append("se abstuvo habiendo respuesta")
+        else:
+            cited = {s.lesson for s in answer.sources}
+            if case.expect_lesson and case.expect_lesson not in cited:
+                problems.append(f"no cita {case.expect_lesson}")
+    return problems
+
+
+def judge_faithfulness(question: str, answer_text: str, context: str) -&gt; float:
+    """Juez LLM (0-1): ¿se apoya la respuesta solo en el contexto? (módulo 7)."""
+    prompt = (f"Contexto:\n{context}\n\nRespuesta:\n{answer_text}\n\n"
+              "Puntúa 0-1 cuánto se apoya la respuesta en el contexto. "
+              'Devuelve JSON: {"score": &lt;número&gt;}.')
+    llm = get_llm()
+    return float(llm.json([{"role": "user", "content": prompt}], {}).get("score", 0.0))
+
+
+def run(dataset_path: Path, use_judge: bool = False) -&gt; list[CaseResult]:
+    results: list[CaseResult] = []
+    for case in load_dataset(dataset_path):
+        start = time.perf_counter()
+        answer = ask(case.question)             # pipeline RAG real
+        latency = (time.perf_counter() - start) * 1000
+        problems = check(case, answer)
+        if use_judge and not problems:
+            score = judge_faithfulness(case.question, answer.text,
+                                       "\n".join(f.text for f in answer.fragments))
+            if score &lt; 0.7:
+                problems.append(f"fidelidad baja: {score:.2f}")
+        results.append(CaseResult(case, not problems, problems, latency))
+    return results
+
+
+def report(results: list[CaseResult]) -&gt; dict:
+    passed = sum(r.passed for r in results)
+    return {
+        "total": len(results),
+        "passed": passed,
+        "pass_rate": passed / len(results) if results else 0.0,
+        "p50_ms": sorted(r.latency_ms for r in results)[len(results) // 2] if results else 0.0,
+        "failures": [{"id": r.case.id, "problems": r.problems}
+                     for r in results if not r.passed],
+    }
+</code></pre>
+
+        <div class="code-file">proyectos/copiloto/src/copiloto/cli.py</div>
+        <pre><code class="language-python">"""CLI del Copiloto: indexar, preguntar, conversar y evaluar."""
+from pathlib import Path
+
+import typer
+
+from copiloto import evals
+from copiloto.agent import run as run_agent
+from copiloto.answer import ask
+from copiloto.index import build_index
+
+app = typer.Typer(help="Copiloto de la Academy: RAG + tools + evals.")
+
+
+@app.command()
+def index() -&gt; None:
+    """Reindexa los cursos y construye la base vectorial."""
+    typer.echo(f"Indexados {build_index()} chunks.")
+
+
+@app.command()
+def ask_cmd(question: str, k: int = 4) -&gt; None:
+    """Responde una pregunta con citas a las lecciones."""
+    answer = ask(question, k=k)
+    typer.echo(answer.text)
+    for source in answer.sources:
+        typer.echo(f"  [{source.n}] {source.lesson} · {source.section}")
+
+
+@app.command()
+def agent() -&gt; None:
+    """Conversa con el Copiloto (con memoria entre turnos)."""
+    from copiloto.agent import SYSTEM_PROMPT
+    memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+    while (question := typer.prompt("Tú")) not in {"salir", "exit"}:
+        reply, memory = run_agent(question, memory=memory)
+        typer.echo(f"Copiloto: {reply}")
+
+
+@app.command()
+def eval(dataset: Path = Path("evals/dataset.jsonl"),
+         min_pass_rate: float = 0.9, judge: bool = False) -&gt; None:
+    """Corre las evals y falla (exit 1) si baja del umbral (puerta de calidad)."""
+    summary = evals.report(evals.run(dataset, use_judge=judge))
+    typer.echo(f"pass rate: {summary['pass_rate']:.0%} ({summary['passed']}/{summary['total']})")
+    typer.echo(f"latencia p50: {summary['p50_ms']:.0f} ms")
+    for failure in summary["failures"]:
+        typer.echo(f"  FAIL {failure['id']}: {failure['problems']}")
+    if summary["pass_rate"] &lt; min_pass_rate:
+        raise typer.Exit(code=1)                # ← bloquea el release
+</code></pre>
+
+        <div class="code-file">proyectos/copiloto/src/copiloto/api.py</div>
+        <pre><code class="language-python">"""API mínima del Copiloto (FastAPI): un endpoint para preguntar."""
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from copiloto.answer import ask
+
+app = FastAPI(title="Copiloto API")
+
+
+class AskRequest(BaseModel):
+    question: str
+
+
+class Source(BaseModel):
+    n: int
+    lesson: str
+    section: str
+
+
+class AskResponse(BaseModel):
+    text: str
+    sources: list[Source]
+    answered: bool
+
+
+@app.get("/health")
+def health() -&gt; dict:
+    return {"status": "ok"}
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask_endpoint(req: AskRequest) -&gt; AskResponse:
+    answer = ask(req.question)
+    return AskResponse(text=answer.text,
+                       sources=[Source(n=s.n, lesson=s.lesson, section=s.section)
+                                for s in answer.sources],
+                       answered=answer.answered)
+</code></pre>
+
+        <p>Uso completo:</p>
+        <pre><code class="language-bash">uv run copiloto index
+uv run copiloto ask "¿Cómo funciona el bucle agentic?"
+uv run copiloto eval --dataset evals/dataset.jsonl --min-pass-rate 0.9
+uv run uvicorn copiloto.api:app --host 0.0.0.0 --port 8000
+curl -X POST localhost:8000/ask -H "Content-Type: application/json" \
+     -d '{"question": "¿Qué es un embedding?"}'
+</code></pre>
+        <pre><code class="language-text">pass rate: 92% (23/25)
+latencia p50: 640 ms
+  FAIL q018: ['no cita 02-retrieval-y-reranking']
+  FAIL q022: ['debería abstenerse']
+# exit code 0 (92% &gt;= 90%) → el release pasa
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Comprobaciones deterministas primero</strong>: abstención, lección citada y citas válidas son exactas y gratis; el juez es opcional (<code>--judge</code>).</li>
+          <li><strong>Puerta de calidad con <code>typer.Exit(1)</code></strong>: el mismo comando sirve en local y en CI; el <em>exit code</em> es lo que bloquea el despliegue.</li>
+          <li><strong>Mismo core para CLI y API</strong>: <code>ask()</code> es el mismo en ambos; no hay dos implementaciones que se desincronicen.</li>
+          <li><strong>API con modelos pydantic</strong>: la respuesta se valida y se documenta sola (FastAPI genera el <em>schema</em>).</li>
+          <li><strong>Latencia medida por caso</strong>: sin números no puedes saber si una optimización mejora o empeora.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>En producción, el índice se construye una vez en el despliegue (<code>copiloto index</code>), los secretos llegan por variables de entorno y el modelo puede seguir siendo Ollama en una máquina con GPU o un proveedor en la nube. El <strong>código es el mismo</strong>; solo cambia el entorno.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Dataset con casos dentro y fuera del corpus</td>
+              <td>Solo preguntas «fáciles» del corpus</td>
+              <td>Sin casos fuera del corpus no mides la abstención</td>
+            </tr>
+            <tr>
+              <td>Comprobaciones deterministas siempre activas</td>
+              <td>Depender solo de un juez</td>
+              <td>El juez cuesta, tarda y varía; el código no</td>
+            </tr>
+            <tr>
+              <td>Puerta de calidad con umbral en CI</td>
+              <td>Mirar el pass rate «a ojo»</td>
+              <td>Un umbral automático evita regresiones silenciosas</td>
+            </tr>
+            <tr>
+              <td>Añadir cada fallo real al dataset</td>
+              <td>Arreglar y olvidar</td>
+              <td>Un caso de regresión evita reincidir</td>
+            </tr>
+            <tr>
+              <td>Mismo núcleo para CLI y API</td>
+              <td>Duplicar lógica en el endpoint</td>
+              <td>Dos implementaciones acaban divergiendo</td>
+            </tr>
+            <tr>
+              <td>Medir latencia y coste por petición</td>
+              <td>Optimizar sin datos</td>
+              <td>No puedes mejorar lo que no mides</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Optimizar sin dataset (a ojo)</h3>
+        <p>Cambiar el prompt «porque suena mejor» sin medir es cómo se rompen sistemas que funcionaban.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "Este prompt parece mejor": nadie lo comprueba.
+SYSTEM_PROMPT = "Responde de forma muy clara y detallada sobre los cursos…"
+# … y a producción.
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-bash"># ✅ Se cambia el prompt y se corren las evals antes de fusionar.
+uv run copiloto eval --dataset evals/dataset.jsonl --min-pass-rate 0.9
+</code></pre>
+
+        <h3>6.2. Medir solo con el juez</h3>
+        <p>El juez introduce coste, latencia y ruido. Lo que el código puede comprobar, que lo compruebe el código.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Todo depende del juez, incluso la abstención (que es exacta).
+passed = judge_faithfulness(q, answer, ctx) &gt; 0.7
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Primero lo determinista; el juez solo si el código no decide.
+problems = check(case, answer)
+if not problems and use_judge:
+    problems = [] if judge_faithfulness(...) &gt;= 0.7 else ["fidelidad baja"]
+</code></pre>
+
+        <h3>6.3. Reimplementar la lógica en el endpoint HTTP</h3>
+        <p>Copiar el pipeline dentro de la API crea dos verdades que divergen en el primer cambio.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ La API vuelve a montar el contexto y a llamar al modelo.
+@app.post("/ask")
+def ask_endpoint(req: AskRequest):
+    frags = retrieve(req.question)          # ¿y las citas? ¿y la abstención?
+    return {"text": chat(build(frags))}
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ La API solo adapta la entrada/salida del mismo core.
+@app.post("/ask", response_model=AskResponse)
+def ask_endpoint(req: AskRequest) -&gt; AskResponse:
+    answer = ask(req.question)              # mismo pipeline que la CLI
+    return AskResponse(text=answer.text, sources=answer.sources, answered=answer.answered)
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un dataset de 10 casos, correr las evals contra el Copiloto real y obtener un <em>pass rate</em> con su puerta de calidad. Al terminar tendrás la última pieza del curso: medir y bloquear regresiones.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — crea el dataset.</strong> Escribe <code>evals/dataset.jsonl</code> con 10 casos: 6 dentro del corpus (que citen una lección concreta), 3 fuera del corpus (que deban abstenerse) y 1 ambiguo.
+            <pre><code class="language-json">{"id": "q001", "question": "¿Qué es un token?", "expect_lesson": "02-tokens-contexto-sampling", "expect_abstain": false, "tags": ["basico"]}
+{"id": "q007", "question": "¿Cuál es la capital de Portugal?", "expect_lesson": null, "expect_abstain": true, "tags": ["out-of-corpus"]}
+</code></pre>
+            <p>Guarda también tus 5 preguntas del módulo 4 (lección 03) como casos: ya conoces su respuesta esperada.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — implementa <code>evals.py</code> y el comando <code>eval</code>.</strong> Copia los módulos del ejemplo real. Asegúrate de que <code>check()</code> cubre los tres tipos de caso.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — corre las evals.</strong> Con el índice construido:
+            <pre><code class="language-bash">uv run copiloto index
+uv run copiloto eval --dataset evals/dataset.jsonl --min-pass-rate 0.9
+</code></pre>
+            <p>Esperado: un <em>pass rate</em> y, si hay fallos, el caso y el problema concretos. Ejecuta dos veces: el pass rate debe ser <strong>estable</strong> (si fluctúa mucho, hay casos ambiguos o falta determinismo).</p>
+          </li>
+          <li>
+            <strong>Paso 4 — arregla un fallo y vuelve a medir.</strong> Toma una pregunta fallida. Mira la traza de recuperación (<code>ask --no-llm</code>): ¿el fragmento correcto estaba en el top-k? Si no, es un problema de <em>chunking/index</em>; si estaba, es del <em>prompt</em>. Cambia una sola cosa y vuelve a correr las evals. ¿Subió el pass rate? ¿Bajó otra cosa?</p>
+          </li>
+          <li>
+            <strong>Paso 5 — convierte las evals en puerta de calidad.</strong> Comprueba el <em>exit code</em> con un umbral imposible:
+            <pre><code class="language-bash">uv run copiloto eval --min-pass-rate 1.0 ; echo "exit=$?"
+# → exit=1 (falla en cuanto hay un caso mal): esto es lo que bloquea un merge
+</code></pre>
+            <p><strong>Resultado esperado:</strong> el comando devuelve <code>exit=0</code> con un umbral razonable y <code>exit=1</code> con uno imposible. Acabas de cerrar el bucle completo: <strong>construir, usar y medir</strong>.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Ejecuta las evals también en tu CI con Ollama en local o un proveedor de nube en un <em>runner</em>. La regla es simple: <strong>ningún cambio de prompt, modelo o chunking llega a <code>main</code> sin pasar la puerta</strong>. Ese hábito es lo que separa un proyecto de IA de un juguete.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Pipeline de evaluación con juez calibrado y puerta en CI</h3>
+          <p>Cierra el Copiloto con un pipeline de evaluación de nivel producción. Requisitos:</p>
+          <ul>
+            <li>Amplía el dataset a <strong>30 casos</strong> etiquetados por <code>tags</code> (rag, chunking, agent, out-of-corpus) y reporta el <em>pass rate</em> <strong>por etiqueta</strong>, no solo global: así ves qué capa falla.</li>
+            <li>Integra el <strong>juez</strong> (módulo 7) para fidelidad <strong>solo</strong> en los casos que pasan las comprobaciones deterministas, y <strong>calíbralo</strong> contra 10 veredictos humanos: mide la concordancia y ajusta el umbral.</li>
+            <li>Escribe un <em>job</em> de CI (GitHub Actions) que corra <code>copiloto eval --min-pass-rate 0.9</code> en cada <em>pull request</em> y bloquee el merge si falla.</li>
+            <li>Publica un informe <code>evals/report.md</code> generado automáticamente con: pass rate por etiqueta, p50/p95 de latencia, tokens y coste estimado.</li>
+          </ul>
+          <p><em>Pista: guarda el historial de resultados (un JSON por ejecución con fecha y <em>commit</em>) para ver tendencias: un pass rate que baja poco a poco es una regresión lenta, la más peligrosa. Para calibrar el juez, no confíes en un umbral «que suena bien»: compara sus veredictos con los humanos y elige el punto que maximice la concordancia (módulo 7). Y recuerda: un dataset de 30 casos es el <strong>inicio</strong>, no el final; el objetivo del reto es dejar el <em>mecanismo</em> para que crezca.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>dataset</strong> tiene casos dentro del corpus (citar la lección), fuera (abstenerse) y ambiguos (elegir bien la tool).</li>
+          <li>Prioriza <strong>comprobaciones deterministas</strong> (gratis y exactas); usa el <strong>juez</strong> solo para la fidelidad que el código no decide.</li>
+          <li>Métricas clave: <strong>pass rate</strong>, abstention accuracy, citation accuracy, latencia p50/p95 y coste.</li>
+          <li>La <strong>puerta de calidad</strong> convierte las evals en un <em>exit code</em> que bloquea regresiones en CI.</li>
+          <li>El Copiloto se expone por <strong>CLI</strong> (<code>copiloto</code>) y por una <strong>API mínima</strong>, compartiendo el mismo core.</li>
+          <li>En producción: índice persistente, secretos por entorno, <strong>límites</strong> y <strong>medición</strong> de coste y latencia.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Dataset</td><td><code>evals/dataset.jsonl</code> validado con pydantic</td></tr>
+            <tr><td>Checks deterministas</td><td><code>evals.check()</code> (abstención, cita, rango)</td></tr>
+            <tr><td>Juez opcional</td><td><code>evals.judge_faithfulness()</code></td></tr>
+            <tr><td>Puerta de calidad</td><td><code>copiloto eval --min-pass-rate</code> (<code>Exit(1)</code>)</td></tr>
+            <tr><td>CLI</td><td><code>cli.py</code> con <code>typer</code> (<code>index</code>, <code>ask</code>, <code>agent</code>, <code>eval</code>)</td></tr>
+            <tr><td>API mínima</td><td><code>api.py</code> con <code>fastapi</code> (<code>/ask</code>, <code>/health</code>)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos casos necesita el dataset para ser útil?</summary>
+            <div>
+              <p>Empieza con <strong>10–30</strong> y céntrate en la cobertura, no en el número: dentro del corpus, fuera, ambiguos y multi-paso. Un dataset pequeño pero con buenos casos detecta la mayoría de las regresiones; crece solo, añadiendo cada fallo real. Perseguir «cien casos» antes de tener el mecanismo es tiempo perdido; lo importante es que el mecanismo exista y se ejecute en cada cambio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito un LLM-juez o me bastan los checks de código?</summary>
+            <div>
+              <p>Depende de qué quieras medir. Para <strong>abstención, citas correctas y formato</strong>, el código es mejor: exacto, gratis y sin sesgo. El juez aporta para la <strong>fidelidad</strong> (¿la respuesta se apoya solo en el contexto?) y la relevancia, que el código no puede juzgar con precisión. Úsalo como complemento, con umbral calibrado, no como única fuente de verdad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo despliego el Copiloto si no tengo GPU?</summary>
+            <div>
+              <p>Tres opciones. Con <strong>Ollama</strong> en una máquina con GPU (aunque sea modesta) para coste cero; con un <strong>proveedor en la nube</strong> (OpenAI/Anthropic) para no gestionar hardware, pagando por token; o híbrido: <strong>embeddings y búsqueda en local</strong> (baratos) y <strong>generación en la nube</strong> (la parte que más calidad aporta). Como el proveedor es una variable de entorno, puedes empezar con uno y cambiar sin tocar el core.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo controlo el coste en la nube?</summary>
+            <div>
+              <p>Con cuatro medidas: <strong>cache</strong> de respuestas repetidas, <strong>límites</strong> de contexto e iteraciones, <strong>medición</strong> por petición (tokens y latencia) y un <strong>presupuesto</strong> que corte antes de dispararse. Además, no envíes modelos grandes a tareas triviales: enruta lo fácil a un modelo pequeño y reserva el grande para las preguntas difíciles. El objetivo no es gastar menos a ciegas, sino saber exactamente cuánto cuesta cada respuesta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Merece la pena una API si solo lo uso yo?</summary>
+            <div>
+              <p>Si solo lo usas por terminal, la CLI basta y es más simple. La API se justifica cuando quieres <strong>integrarlo</strong>: una extensión de VSCode, un widget web, un bot, otro servicio. Como el core es compartido, añadir la API es barato (unas decenas de líneas) y no duplica lógica. Añádela cuando exista un consumidor real, no «por si acaso».</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-llm-as-judge">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM-as-judge — Módulo 7 · Curso IA</title>
+  <meta name="description" content="Usa un modelo como juez con una rúbrica, conoce y mitiga sus sesgos (verbosidad, posición), calíbralo con juicios humanos y mide el coste del juez.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>LLM-as-judge</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Evals, calidad y producción</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La lección 01 cerró los criterios que se deciden con código: esquema, tools, citas, abstención. Pero queda una zona que el código no puede tocar: <strong>¿la respuesta es útil, clara y fiel?</strong> Ahí entra el <strong>LLM-as-judge</strong>: usamos un modelo como evaluador, con una <strong>rúbrica</strong> explícita.</p>
+        <p>Es una herramienta potente y peligrosa a la vez. Potente porque escala el juicio subjetivo a miles de casos. Peligrosa porque <strong>un juez sin calibrar es una opinión más</strong>, y los jueces tienen sesgos sistemáticos: puntúan más alto lo largo, lo que va primero y lo que se parece a ellos.</p>
+        <ul>
+          <li><strong>Rúbrica</strong>: los criterios escritos que el juez debe aplicar, con anclas para cada nivel.</li>
+          <li><strong>Sesgos</strong>: verbosidad, posición (orden), preferencia propia, indulgencia.</li>
+          <li><strong>Calibración</strong>: medir el acuerdo entre el juez y juicios <strong>humanos</strong> antes de confiar en él.</li>
+          <li><strong>Coste</strong>: cada juicio son tokens; el juez puede costar más que el sistema que evalúa.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el juez es la pieza que hace que las evals cubran la <em>calidad</em>, no solo el formato. Pero para que valga como medida, hay que tratarlo como un instrumento de laboratorio: calibrarlo, conocer su error y controlar su coste. Si no, estás cambiando una intuición por un sesgo con uniforme de dato.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Cómo funciona un juez</h3>
+        <p>Un juez es, mecánicamente, una llamada al modelo con tres entradas y una salida estructurada:</p>
+        <pre class="diagram">
+  ENTRADA AL JUEZ                              SALIDA (structured output)
+  ───────────────────────────────────────      ───────────────────────────
+  · la pregunta / la tarea                     { "score": 0..1,
+  · la respuesta a evaluar (o dos, para A/B)     "reason": "...",
+  · la rúbrica (criterios + anclas)              "criterion": "faithfulness" }
+        </pre>
+        <p>El patrón es idéntico al de la salida estructurada del módulo 1: prompt con la rúbrica, pedimos JSON, validamos con pydantic y, si no valida, reintentamos. La diferencia es que aquí el modelo <em>juzga</em> en vez de <em>responder</em>.</p>
+        <div class="callout callout--analogy">
+          <p>Piensa en el juez como un <strong>árbitro</strong>. Un buen árbitro no decide «si le gusta» el partido: aplica un reglamento (la rúbrica) y señala la falta concreta. Si el reglamento es vago, cada árbitro decide distinto y la medida es ruido. La rúbrica es el reglamento del juez.</p>
+        </div>
+
+        <h3>Diseñar la rúbrica</h3>
+        <p>La calidad del juez depende casi por completo de la rúbrica. Reglas que funcionan:</p>
+        <ul>
+          <li><strong>Criterios discretos</strong>: evalúa un aspecto por juicio (faithfulness, o relevancia, o tono). No los mezcles en un solo <em>score</em>.</li>
+          <li><strong>Anclas concretas</strong>: para cada nivel, un ejemplo o descripción. «1–5» sin anclas es ruido.</li>
+          <li><strong>Binario o pocos niveles</strong>: <em>sí/no</em> o 1–3 se calibran mejor que 1–10. Menos grados, menos ambigüedad.</li>
+          <li><strong>Pide la razón</strong>: obligar a justificar reduce juicios a la ligera y da diagnóstico.</li>
+          <li><strong>Referencia cuando la tengas</strong>: si existe una respuesta dorada, el juez compara contra ella (<em>reference-based</em>); si no, juzga por la rúbrica (<em>reference-free</em>).</li>
+        </ul>
+        <table>
+          <thead><tr><th>Escala</th><th>Cuándo</th><th>Problema</th></tr></thead>
+          <tbody>
+            <tr><td>Binaria (sí/no)</td><td>Faithfulness, abstención, PII</td><td>Pierde matiz, pero casi no tiene sesgo de escala</td></tr>
+            <tr><td>1–3 o 1–5 con anclas</td><td>Utilidad, claridad</td><td>Sin anclas, todos puntúan un «4»</td></tr>
+            <tr><td>1–10 o 1–100</td><td>Comparar muchas variantes</td><td>Falsa precisión; el juez no distingue 84 de 86</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Los sesgos del juez (lo que tienes que vigilar)</h3>
+        <p>No son bugs accidentales: son tendencias reproducibles de los modelos al evaluar. Conocerlos es la mitad del trabajo:</p>
+        <ul>
+          <li><strong>Sesgo de posición</strong>: en una comparación A/B, el juez prefiere la respuesta que va primero (o a veces la segunda). Si no lo controlas, mides el orden, no la calidad.</li>
+          <li><strong>Sesgo de verbosidad</strong>: las respuestas largas tienden a puntuar más alto, aunque digan lo mismo. Premiar la longitud sin darte cuenta es un clásico.</li>
+          <li><strong>Sesgo de auto-preferencia</strong>: un modelo prefiere textos que se parecen a los suyos. Un juez del mismo modelo que el sistema puede ser indulgente consigo mismo.</li>
+          <li><strong>Indulgencia / centralidad</strong>: el juez evita extremos y da muchos «4/5» o «3/3», aplanando la señal.</li>
+          <li><strong>Sesgo de formato</strong>: prefiere respuestas con listas, negritas o markdown, independientemente del contenido.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p>El sesgo de <strong>posición</strong> se mitiga con un truco barato y efectivo: evalúa el par <strong>en los dos órdenes</strong> (A/B y B/A) y quédate con el resultado consistente. Si el juez cambia de opinión al invertir el orden, ese caso es un empate técnico: no tienes señal. Es la versión barata del «control de posición» en psicología experimental.</p>
+        </div>
+
+        <h3>Calibrar con juicios humanos</h3>
+        <p>Un juez es un instrumento; hay que medir su error antes de usarlo. El método:</p>
+        <ol class="steps">
+          <li>Etiqueta <strong>a mano</strong> 30–50 casos (pasa/falla o un nivel), idealmente por dos personas para tener acuerdo humano.</li>
+          <li>Pasa esos mismos casos por el juez.</li>
+          <li>Compara: <strong>acuerdo</strong> (porcentaje), y una matriz de confusión (¿falla más en falsos positivos o negativos?).</li>
+          <li>Ajusta la rúbrica donde discrepe más y vuelve a medir. Repite hasta que el acuerdo sea aceptable.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Para dos anotadores (o juez vs humano) usa el <strong>kappa de Cohen</strong>, no solo el porcentaje de acuerdo: descuenta el acuerdo que ocurriría por azar. Guía práctica: kappa &gt; 0,6 es decente para una tarea subjetiva; &gt; 0,8 es bueno. El porcentaje de acuerdo engaña cuando una clase es mayoritaria (si el 90% de casos pasan, decir «siempre pasa» acierta el 90%).</p>
+        </div>
+
+        <h3>Cuándo un juez binario es mejor que una nota</h3>
+        <p>Para <em>puertas de calidad</em> (¿bloqueo el merge?), un juez binario con rúbrica es más fácil de calibrar y de defender. Las notas finas (1–5) sirven para <em>ordenar</em> variantes, pero su varianza suele ser mayor que las diferencias que pretendes detectar. Empieza binario; sube de escala solo si necesitas discriminación fina y el juez ya está calibrado.</p>
+
+        <h3>El coste del juez</h3>
+        <p>El juez es una llamada más, y puede ser la más cara de tu pipeline de evals. Cuenta los tokens como en el módulo 2:</p>
+        <pre class="diagram">
+  coste_por_corrida = n_casos × (tokens_juez_entrada + tokens_juez_salida) × precio
+                      × nº_de_criterios × nº_de_pasadas_por_sesgo
+        </pre>
+        <p>Un dataset de 200 casos, con 3 criterios y validación de posición (×2), son <strong>1.200 llamadas al juez</strong> por corrida. Estrategias para bajarlo:</p>
+        <ul>
+          <li><strong>Juez más barato</strong> para lo fácil (¿formato?), reservando el modelo bueno para lo difícil.</li>
+          <li><strong>Muestreo</strong>: juzga una muestra (p. ej. 100 casos) en cada PR y el dataset completo de noche.</li>
+          <li><strong>Caché</strong>: si el caso no cambió, reutiliza el juicio (lección 04).</li>
+          <li><strong>Deterministas primero</strong>: nunca mandes al juez lo que ya pasó por una aserción.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Regla de oro de coste: el juez solo debe juzgar <strong>lo que ya pasó los criterios deterministas</strong>. Si una respuesta no cita la fuente o llama a la tool equivocada, no gastes un juicio caro en puntuar su fidelidad: ya sabes que es incorrecta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un juez mínimo con <strong>rúbrica binaria</strong> y salida estructurada, más una demostración del <strong>sesgo de posición</strong>: el mismo par evaluado en los dos órdenes puede dar distinto ganador.</p>
+        <div class="code-file">judge_minimo.py</div>
+        <pre><code class="language-python"># judge_minimo.py — juez binario + control de sesgo de posición.
+import json
+from dataclasses import dataclass
+
+
+RUBRIC = """\
+Eres un juez. Recibes una PREGUNTA y una RESPUESTA.
+Criterio: la respuesta debe contestar EXACTAMENTE la pregunta, sin añadir temas.
+Responde SOLO con JSON: {"passes": true|false, "reason": "..."}."""
+
+
+def judge(question: str, answer: str) -> dict:
+    """Simula una llamada al modelo. En la lección real usaríamos chat_json()."""
+    prompt = f"{RUBRIC}\n\nPREGUNTA: {question}\nRESPUESTA: {answer}"
+    return json.loads(_fake_llm(prompt))
+
+
+def judge_pair_robust(question: str, a: str, b: str) -> str:
+    """Compara A y B en los dos órdenes para neutralizar el sesgo de posición."""
+    first = judge(question, a)["passes"]
+    second = judge(question, b)["passes"]
+    # En un juez comparativo real, invertiríamos A/B y B/A y exigiríamos consistencia.
+    if first and not second:
+        return "A"
+    if second and not first:
+        return "B"
+    return "empate"          # el orden cambió el veredicto => sin señal
+
+
+if __name__ == "__main__":
+    q = "¿Qué es el chunking?"
+    a = "Trocear documentos [03-chunking]."
+    b = ("El chunking es un tema fascinante con múltiples matices históricos y "
+         "consideraciones teóricas profundas que conviene explorar con calma y "
+         "detalle, abarcando aspectos conceptuales, prácticos y filosóficos.")
+    print("veredicto:", judge_pair_robust(q, a, b))
+</code></pre>
+        <p>Salida esperada (con el sesgo de verbosidad activo):</p>
+        <pre><code class="language-text">veredicto: B
+</code></pre>
+        <p>La respuesta <strong>B es peor</strong> que A —divaga y no cita— pero gana porque es más larga y «suena profunda». Ese es el <strong>sesgo de verbosidad</strong> en acción, y es exactamente el motivo por el que un juez sin control te hará optimizar la longitud en vez de la calidad. Añade a la rúbrica «una respuesta larga sin información nueva no puntúa más» y vuelve a medir.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Un juez con rúbrica de <strong>faithfulness</strong> (binaria, con anclas), salida validada con pydantic, control de posición y un script de <strong>calibración</strong> que mide el acuerdo con etiquetas humanas.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/judge.py</div>
+        <pre><code class="language-python">"""Juez con rúbrica del Copiloto: binario, calibrable y con control de sesgo."""
+from pydantic import BaseModel
+
+from copiloto.llm import chat_json
+
+FAITHFUL_RUBRIC = """\
+Eres un evaluador experto. Evalúa FAITHFULNESS (fidelidad al contexto).
+
+Criterio: pasa=true SOLO si TODAS las afirmaciones de la RESPUESTA
+están respaldadas por el CONTEXTO. Una sola afirmación inventada
+o no respaldada => pasa=false.
+
+Anclas:
+  true  : toda frase se puede verificar en el contexto.
+  false : hay al menos una cifra, nombre o afirmación ausente del contexto.
+
+Nota: la longitud NO es calidad. Una respuesta larga sin información
+nueva del contexto no debe puntuar más.
+
+Responde JSON: {"passes": bool, "reason": str, "evidence": str}."""
+
+
+class Verdict(BaseModel):
+    passes: bool
+    reason: str
+    evidence: str = ""
+
+
+def judge_faithful(context: str, answer: str) -> Verdict:
+    return chat_json(
+        [{"role": "system", "content": FAITHFUL_RUBRIC},
+         {"role": "user", "content": f"CONTEXTO:\n{context}\n\nRESPUESTA:\n{answer}"}],
+        model=Verdict, temperature=0.0,
+    )
+</code></pre>
+        <p>El juez comparativo con <strong>control de posición</strong>: se evalúa el par en los dos órdenes y solo hay ganador si el veredicto es consistente.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/judge.py (continuación)</div>
+        <pre><code class="language-python">PAIR_RUBRIC = """\
+Compara las RESPUESTAS A y B para la PREGUNTA. ¿Cuál es mejor según:
+fidelidad, relevancia y concisión? Responde JSON {"winner": "A"|"B"|"tie"}."""
+
+
+def compare_robust(question: str, a: str, b: str) -> str:
+    """Neutraliza el sesgo de posición comparando A/B y B/A."""
+    forward = chat_json(
+        [{"role": "system", "content": PAIR_RUBRIC},
+         {"role": "user", "content": f"PREGUNTA: {question}\n\nA: {a}\nB: {b}"}],
+        model={"winner": str}, temperature=0.0,
+    )["winner"]
+    backward = chat_json(
+        [{"role": "system", "content": PAIR_RUBRIC},
+         {"role": "user", "content": f"PREGUNTA: {question}\n\nA: {b}\nB: {a}"}],
+        model={"winner": str}, temperature=0.0,
+    )["winner"]
+    # backward usa A/B invertidos: si coinciden en "el mismo texto", hay señal.
+    consistent = (forward, backward) in {("A", "B"), ("B", "A")}
+    return forward if consistent else "tie"
+</code></pre>
+        <p>La <strong>calibración</strong>: comparar el juez con etiquetas humanas y calcular acuerdo y matriz de confusión.</p>
+        <div class="code-file">proyectos/copiloto/evals/calibrate.py</div>
+        <pre><code class="language-python">"""Mide el acuerdo entre el juez y juicios humanos (calibración)."""
+import json
+from pathlib import Path
+
+from copiloto.judge import judge_faithful
+
+
+def cohen_kappa(pairs: list[tuple[bool, bool]]) -> float:
+    n = len(pairs)
+    agree = sum(h == j for h, j in pairs) / n
+    p_human = sum(h for h, _ in pairs) / n
+    p_judge = sum(j for _, j in pairs) / n
+    expected = p_human * p_judge + (1 - p_human) * (1 - p_judge)
+    return (agree - expected) / (1 - expected) if expected &lt; 1 else 1.0
+
+
+def main() -> None:
+    # labels.jsonl: {"context": ..., "answer": ..., "human": true|false}
+    rows = [json.loads(l) for l in
+            Path("evals/labels.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    pairs = []
+    tp = fp = fn = tn = 0
+    for r in rows:
+        j = judge_faithful(r["context"], r["answer"]).passes
+        h = r["human"]
+        pairs.append((h, j))
+        tp += h and j
+        fp += (not h) and j
+        fn += h and (not j)
+        tn += (not h) and (not j)
+
+    agree = sum(h == j for h, j in pairs) / len(pairs)
+    print(f"acuerdo = {agree:.0%}   kappa = {cohen_kappa(pairs):.2f}")
+    print(f"matriz: TP={tp} FP={fp} FN={fn} TN={tn}")
+    print(f"falsos positivos (juez indulgente) = {fp}   falsos negativos = {fn}")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+        <p>Ejecución (con 40 casos etiquetados a mano):</p>
+        <pre><code class="language-bash">uv run python -m copiloto.evals.calibrate
+# acuerdo = 82%   kappa = 0.63
+# matriz: TP=20 FP=2 FN=5 TN=13
+# → el juez es algo indulgente (2 FP) y algo estricto con los largos (5 FN)
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Rúbrica binaria con anclas</strong>: <code>passes</code> solo si <em>todas</em> las afirmaciones están respaldadas. Fácil de calibrar y de defender ante un revisor.</li>
+          <li><strong>Nota explícita sobre longitud</strong>: ataca el sesgo de verbosidad en la propia rúbrica, no después.</li>
+          <li><strong>Control de posición</strong>: el comparativo exige consistencia al invertir A/B; si no, <code>tie</code>. Barato (×2) y elimina el sesgo dominante.</li>
+          <li><strong>Calibración con kappa</strong>: no basta el acuerdo; el kappa descuenta el azar y evita el autoengaño.</li>
+          <li><strong>Matriz de confusión</strong>: saber si el juez es indulgente (FP) o severo (FN) orienta el ajuste de la rúbrica.</li>
+          <li><strong>Etiquetas humanas versionadas</strong> en <code>evals/labels.jsonl</code>: la calibración es reproducible y se repite cuando cambia la rúbrica.</li>
+          <li><strong>Modelo distinto para juzgar</strong> que para responder: reduce el sesgo de auto-preferencia.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Esta rúbrica es la que ya usamos, de forma simplificada, en la evaluación de RAG del módulo 4. La novedad del módulo 7 no es el juez, sino <strong>tratarlo como instrumento</strong>: medir sus sesgos, calibrarlo contra humanos y contarle el coste.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Calibrar el juez con etiquetas humanas</td>
+              <td>Confiar en el juez a la primera</td>
+              <td>Un juez sin calibrar es una opinión más</td>
+            </tr>
+            <tr>
+              <td>Rúbrica binaria con anclas</td>
+              <td>Escalas 1–10 sin descripción</td>
+              <td>Menos grados, mejor calibración y defensa</td>
+            </tr>
+            <tr>
+              <td>Controlar el sesgo de posición (A/B y B/A)</td>
+              <td>Comparar en un solo orden</td>
+              <td>Si no, mides el orden, no la calidad</td>
+            </tr>
+            <tr>
+              <td>Prohibir en la rúbrica premiar la longitud</td>
+              <td>Ignorar el sesgo de verbosidad</td>
+              <td>La longitud no es calidad</td>
+            </tr>
+            <tr>
+              <td>Usar un modelo distinto para juzgar</td>
+              <td>Que juzgue el mismo modelo que responde</td>
+              <td>Auto-preferencia: se prefiere a sí mismo</td>
+            </tr>
+            <tr>
+              <td>Juzgar solo lo que ya pasó lo determinista</td>
+              <td>Mandar al juez casos ya fallidos</td>
+              <td>Gasta tokens en algo que ya sabes que falla</td>
+            </tr>
+            <tr>
+              <td>Medir el coste por corrida del juez</td>
+              <td>Corridas completas en cada commit</td>
+              <td>El juez puede costar más que el producto</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Confiar en el juez sin calcular el kappa</h3>
+        <p>El porcentaje de acuerdo puedes mirarlo cuando las clases están balanceadas; con clases desbalanceadas engaña.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "acuerdo 90%" cuando el 92% de los casos pasan: el juez casi siempre dice sí.
+agree = mean(h == j for h, j in pairs)
+assert agree &gt; 0.8          # engañoso
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Kappa descuenta el acuerdo por azar y revela al falso juez.
+k = cohen_kappa(pairs)
+assert k &gt; 0.6, f"juez poco fiable: kappa={k:.2f}"   # mira también la matriz
+</code></pre>
+
+        <h3>6.2. Comparar A y B en un solo orden</h3>
+        <p>El sesgo de posición decide el ganador y crees que has medido la calidad.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Un único orden: si B va primero, gana B.
+winner = judge_pair(q, a, b)["winner"]
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Los dos órdenes; solo hay ganador si coinciden.
+winner = compare_robust(q, a, b)      # "tie" si el orden cambia el veredicto
+</code></pre>
+
+        <h3>6.3. Pedirle al juez un número fino sin anclas</h3>
+        <p>Una escala 1–10 sin descripción produce puntuaciones que no se pueden reproducir ni defender.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "Puntúa de 1 a 10" sin criterios: números inventados.
+score = judge("Del 1 al 10, ¿qué tal?", answer)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Binario con anclas, y con la razón para poder auditar.
+verdict = judge_faithful(context, answer)     # {"passes", "reason", "evidence"}
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir la rúbrica de faithfulness del Copiloto, calibrarla contra 30–40 juicios humanos y corregir sus sesgos. Al terminar tendrás un juez en el que puedes confiar (y sabrás cuánto cuesta).</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — escribe la rúbrica con anclas.</strong> Empieza por una sola dimensión (faithfulness) y define <code>true</code>/<code>false</code> con un ejemplo de cada:
+            <pre><code class="language-python">FAITHFUL_RUBRIC = """\
+Evalúa si TODAS las afirmaciones de la RESPUESTA se apoyan en el CONTEXTO.
+- true: cada frase es verificable en el contexto.
+- false: hay una cifra, nombre o afirmación que NO aparece en el contexto.
+La longitud no es calidad. Responde JSON {"passes": bool, "reason": str}."""
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — etiqueta a mano 30 casos.</strong> Ejecuta el Copiloto sobre 30 preguntas y etiqueta tú (o dos personas) si la respuesta es fiel. Guárdalo en <code>evals/labels.jsonl</code>:
+            <pre><code class="language-json">{"id": "l01", "context": "...", "answer": "...", "human": true}
+{"id": "l02", "context": "...", "answer": "...", "human": false}
+</code></pre>
+            <p>Si tienes un segundo anotador, guarda también su etiqueta: el acuerdo entre humanos es el techo que puede alcanzar el juez.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — mide el acuerdo.</strong>
+            <pre><code class="language-bash">uv run python -m copiloto.evals.calibrate
+</code></pre>
+            <p>Esperado al principio: kappa entre 0,4 y 0,6 y bastantes <strong>falsos positivos</strong> (el juez es más indulgente que tú). Anota la matriz de confusión.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — ajusta la rúbrica y repite.</strong> Según la matriz, endurece lo que corresponda: si hay falsos positivos, añade «si dudas, <code>passes=false</code>»; si hay falsos negativos, añade un ejemplo de afirmación <em>inferible</em> del contexto (que sí debe pasar). Vuelve a correr:
+            <pre><code class="language-text">antes:   acuerdo = 74%   kappa = 0.48   FP=6 FN=2
+después: acuerdo = 86%   kappa = 0.71   FP=2 FN=3
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — mide el coste del juez y compáralo con el del producto.</strong> Cuenta tokens por juicio y calcula el coste de una corrida completa:
+            <pre><code class="language-bash">uv run python -m copiloto.evals.cost --cases 200 --criteria 3 --swaps 2
+# juez: 1.200 llamadas · ~180 M tokens in + 12 M out · ≈ $X por corrida
+</code></pre>
+            <p>Si el coste es alto, aplica las estrategias: juez más barato, muestreo en PR y full de noche, caché de juicios repetidos.</p>
+            <p><strong>Resultado esperado:</strong> una rúbrica calibrada (kappa &gt; 0,6), una matriz de confusión entendida y un coste por corrida conocido. Ya tienes un juez que es una <em>medida</em>, no una opinión.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un panel de jueces con voto y detección de sesgos</h3>
+          <p>Construye un sistema de evaluación más robusto que un solo juez. Requisitos:</p>
+          <ul>
+            <li>Un <strong>panel de al menos dos jueces</strong> de modelos distintos que evalúan cada caso por separado.</li>
+            <li>Una regla de <strong>agregación</strong> explícita: unanimidad, mayoría o media ponderada. Documenta por qué eliges una.</li>
+            <li>Un <strong>test automático de sesgo</strong>: toma respuestas idénticas en contenido pero de distinta longitud y comprueba que el juez no premia la longitud (y haz lo mismo con el orden, invirtiendo A/B).</li>
+            <li>Un informe de <strong>desacuerdo</strong>: qué casos los jueces no comparten y por qué. Esos son los casos límite que valen oro.</li>
+          </ul>
+          <p><em>Pista: reutiliza <code>compare_robust</code> para el orden y añade pares «paráfrasis larga vs corta» para la verbosidad. El panel multiplica el coste: mide si el aumento de fiabilidad compensa los tokens (módulo 2). Si dos jueces discrepan sistemáticamente, probablemente la rúbrica es ambigua, no que uno esté mal. No resuelvas el reto usando el modelo más caro para todo: el objetivo es fiabilidad medible, no gasto. Antes de confiar en el panel, calíbralo como en el ejercicio.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>juez</strong> cubre la calidad que el código no puede medir: fidelidad, relevancia, tono.</li>
+          <li>Su calidad depende de la <strong>rúbrica</strong>: criterios discretos, anclas concretas y la razón del veredicto.</li>
+          <li>Los jueces tienen <strong>sesgos</strong>: posición, verbosidad, auto-preferencia, indulgencia, formato.</li>
+          <li><strong>Calibra siempre</strong> con etiquetas humanas y mide el <strong>kappa</strong>, no solo el porcentaje de acuerdo.</li>
+          <li>Un juez <strong>binario</strong> es más fácil de calibrar y defender que una nota fina sin anclas.</li>
+          <li>El juez <strong>cuesta tokens</strong>: juzga solo lo que ya pasó lo determinista y controla el coste por corrida.</li>
+          <li>El juez es un <strong>instrumento</strong>: conoce su error antes de tomar decisiones con él.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Rúbrica binaria</td><td><code>judge_faithful</code> con <code>chat_json</code> (pydantic)</td></tr>
+            <tr><td>Control de posición</td><td><code>compare_robust</code> (A/B y B/A)</td></tr>
+            <tr><td>Calibración</td><td><code>evals/calibrate.py</code> + <code>cohen_kappa</code></td></tr>
+            <tr><td>Etiquetas humanas</td><td><code>evals/labels.jsonl</code> versionado</td></tr>
+            <tr><td>Diagnóstico de sesgo</td><td>Matriz de confusión (FP/FN)</td></tr>
+            <tr><td>Coste del juez</td><td><code>evals/cost.py</code> (tokens × criterios × swaps)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué kappa es «suficientemente bueno» para confiar en el juez?</summary>
+            <div>
+              <p>Depende de la subjetividad de la tarea. Como guía: <code>kappa &gt; 0,6</code> es aceptable para calidad (faithfulness, relevancia) y <code>&gt; 0,8</code> es bueno. Compara siempre con el <strong>techo humano</strong>: si dos personas solo coinciden al 70% en esa tarea, pedirle al juez un 90% es imposible. El objetivo no es la perfección, sino que el juez sea <em>tan fiable como un anotador humano</em>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar el mismo modelo para responder y para juzgar?</summary>
+            <div>
+              <p>Funciona, pero introduce <strong>sesgo de auto-preferencia</strong>: el modelo tiende a puntuar mejor textos parecidos a los suyos. Si tu presupuesto lo permite, usa un modelo distinto (incluso de otro proveedor) para juzgar. Si no, al menos <strong>calíbralo</strong> y mira si es sistemáticamente indulgente; a veces el sesgo es pequeño y aceptable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El juez puede evaluar también el <em>retrieval</em> (RAG) o solo la respuesta?</summary>
+            <div>
+              <p>Ambos. Para el retrieval, el juez puede valorar la <strong>relevancia de cada fragmento</strong> recuperado respecto a la pregunta (¿era pertinente esta lección?). Para la generación, juzga la respuesta. Eso sí: donde puedas usar una métrica determinista (<code>recall@k</code>, gold presente), hazlo; reserva al juez para lo que no se puede contar. La evaluación de RAG del módulo 4 es el ejemplo de esa mezcla.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que el juez y el sistema se «pongan de acuerdo» para darse buena nota?</summary>
+            <div>
+              <p>Con tres controles: (1) usa un <strong>modelo distinto</strong> para juzgar; (2) calibra contra <strong>humanos</strong>, que no pueden ser engañados por el sistema; y (3) incluye <strong>casos de control</strong> cuya calidad conoces (algunos claramente buenos y otros claramente malos) y comprueba que el juez los distingue. Si el juez aprueba también los malos conocidos, no sirve.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Merece la pena un panel de jueces o es sobreingeniería?</summary>
+            <div>
+              <p>Para decisiones de alto valor (un cambio de modelo base, un rediseño de prompt) un panel de dos modelos reduce la varianza y detecta rúbricas ambiguas. Para el día a día del CI, un juez bien calibrado es más barato y suficiente. Empieza con uno, mide su kappa y su coste, y sube a panel <strong>solo si</strong> la decisión lo justifica. Como todo en IA aplicada: mide antes de añadir complejidad.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

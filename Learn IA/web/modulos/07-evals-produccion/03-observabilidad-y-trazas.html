@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-observabilidad-y-trazas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observabilidad y trazas — Módulo 7 · Curso IA</title>
+  <meta name="description" content="Registra cada llamada (prompt, tokens, latencia, coste), traza el pipeline RAG y del agente, reproduce una mala respuesta y exporta telemetría con OpenTelemetry.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Observabilidad y trazas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Evals, calidad y producción</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora evaluamos el comportamiento en <strong>lote</strong>: corremos el dataset y miramos los números. Pero en producción los fallos llegan de uno en uno, con entradas que no anticipaste, y una pregunta aparece en la cabeza: <strong>«¿por qué esta respuesta salió mal?»</strong>. Sin un registro de lo que pasó por dentro, esa pregunta no tiene respuesta.</p>
+        <p>La <strong>observabilidad</strong> es registrar cada paso del sistema para poder reconstruirlo después. En una app con IA, un «paso» es mucho más que un log: es una <strong>traza</strong> con todas las llamadas encadenadas y sus números.</p>
+        <ul>
+          <li><strong>Registrar cada llamada</strong>: prompt, tokens, latencia, coste, modelo, motivo de parada.</li>
+          <li><strong>Trazar el pipeline</strong>: retrieval → reranking → generación → tools, como un árbol de pasos.</li>
+          <li><strong>Reproducir una mala respuesta</strong>: con las entradas, versiones y semilla que la produjeron.</li>
+          <li><strong>OpenTelemetry</strong>: el estándar para exportar trazas sin atarte a un proveedor.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque no puedes arreglar lo que no puedes ver. El módulo 2 te enseñó a <em>medir</em> una llamada; esta lección te enseña a <strong>guardar esas medidas</strong> para toda la vida del sistema y a reconstruir cualquier incidente. Es lo que separa «creo que el retrieval falló» de «el retrieval devolvió 0 fragmentos porque el índice estaba vacío: aquí está la traza».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Del log a la traza: el árbol de pasos</h3>
+        <p>Un <em>log</em> es una línea suelta. Una <strong>traza</strong> es un árbol: una raíz (la petición del usuario) con hijos (cada paso), cada uno con su duración y sus datos. Un <strong>span</strong> es un nodo del árbol.</p>
+        <pre class="diagram">
+  TRACE  run_id=7f3a…  (pregunta: "¿qué es el chunking?")
+  │
+  ├─ span  retrieve          42 ms   fragmentos=4
+  ├─ span  rerank            18 ms   top=3
+  ├─ span  llm.chat         980 ms   in=1240 out=180  $0.0021
+  ├─ span  tool.search_lessons  85 ms  ok
+  └─ span  llm.chat          610 ms   in=980  out=95   $0.0014
+</pre>
+        <p>Con ese árbol, un fallo se localiza en segundos: si <code>retrieve</code> devuelve 0 fragmentos, el problema es de índice, no del modelo; si <code>llm.chat</code> tardó 12 s, es latencia del proveedor.</p>
+        <div class="callout callout--analogy">
+          <p>Una traza es como el <strong>registro de una consulta médica</strong>: no solo la conclusión («tienes X»), sino qué pruebas se hicieron, en qué orden, cuánto tardaron y qué salió en cada una. Con la conclusión sola, un segundo médico no puede reproducir el diagnóstico; con el registro completo, sí.</p>
+        </div>
+
+        <h3>Qué registrar en cada llamada al modelo</h3>
+        <p>El mínimo profesional por cada llamada (<em>span</em> de tipo LLM):</p>
+        <table>
+          <thead><tr><th>Atributo</th><th>Ejemplo</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>gen_ai.system</code></td><td><code>ollama</code> / <code>openai</code></td><td>Saber qué proveedor sirvió la llamada</td></tr>
+            <tr><td><code>gen_ai.request.model</code></td><td><code>llama3.1:8b</code></td><td>Atribuir calidad y coste a una versión</td></tr>
+            <tr><td><code>gen_ai.usage.input_tokens</code></td><td><code>1240</code></td><td>Coste y ajuste de contexto</td></tr>
+            <tr><td><code>gen_ai.usage.output_tokens</code></td><td><code>180</code></td><td>Coste y verbosidad</td></tr>
+            <tr><td><code>latency_ms</code></td><td><code>980</code></td><td>Diagnóstico de lentitud</td></tr>
+            <tr><td><code>cost_usd</code></td><td><code>0.0021</code></td><td>Presupuesto (lección 04)</td></tr>
+            <tr><td><code>prompt_hash</code></td><td><code>sha256:ab12…</code></td><td>Saber qué versión del prompt se usó</td></tr>
+            <tr><td><code>finish_reason</code></td><td><code>stop</code> / <code>length</code></td><td>Detectar truncamiento</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p>Guarda el <strong>hash del prompt</strong> y del contexto, no el texto entero, si el volumen o la privacidad lo piden. Un hash te dice «mismo prompt que ayer» sin almacenar el contenido. Cuando necesites reproducir, guardas el <strong>texto completo solo de los casos muestreados o de los fallos</strong>.</p>
+        </div>
+
+        <h3>Los tres pilares: trazas, métricas y logs</h3>
+        <p>Se complementan; no pongas todo en el mismo sitio:</p>
+        <ul>
+          <li><strong>Trazas</strong>: el detalle de <em>una</em> petición (esta respuesta concreta). Para depurar.</li>
+          <li><strong>Métricas</strong>: agregados en el tiempo (latencia p95, coste/día, tasa de abstención). Para vigilar.</li>
+          <li><strong>Logs</strong>: eventos sueltos y errores (un timeout, un reintento). Para contexto puntual.</li>
+        </ul>
+        <p>Un incidente se investiga así: una <strong>métrica</strong> se dispara («la latencia p95 subió»), entras en los <strong>logs</strong>, coges un <em>run_id</em>, y abres su <strong>traza</strong> para ver qué paso se salió de madre.</p>
+
+        <h3>Reproducir una mala respuesta</h3>
+        <p>Reproducir es recrear el fallo exacto. Necesitas capturar todo lo que influyó:</p>
+        <ul>
+          <li><strong>La entrada</strong>: la pregunta y el contexto recuperado (las mismas lecciones).</li>
+          <li><strong>Las versiones</strong>: modelo, versión del prompt, versión del índice, parámetros de sampling.</li>
+          <li><strong>La semilla</strong>: si el proveedor la soporta, para acercarte al mismo muestreo.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p>Los modelos no garantizan reproducibilidad bit a bit ni con temperatura 0. «Reproducir» significa <strong>acercarse lo suficiente para diagnosticar</strong>, no obtener el carácter exacto. Por eso la traza guarda también el <em>output</em> original: aunque no puedes recrearlo, sí puedes analizarlo.</p>
+        </div>
+
+        <h3>OpenTelemetry: el estándar para no atarte</h3>
+        <p>Podrías inventar tu propio formato de trazas. Pero <strong>OpenTelemetry (OTel)</strong> ya resuelve el modelo de datos, la propagación de contexto y los exportadores (a Jaeger, Grafana, Datadog, etc.). Adoptarlo te da:</p>
+        <ul>
+          <li><strong>Vendor-neutral</strong>: cambias de backend sin tocar el código.</li>
+          <li><strong>Spans anidados</strong> con context manager (<code>with tracer.start_as_current_span(...)</code>).</li>
+          <li><strong>Convenciones semánticas</strong> para IA generativa: nombres de atributos como <code>gen_ai.*</code> que las herramientas ya entienden.</li>
+          <li><strong>Correlación</strong> con el resto de tu sistema (HTTP, base de datos) en la misma traza.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>No necesitas OTel el primer día: una versión propia con <code>dataclasses</code> y un <code>run_id</code> ya aporta el 80%. Pero si el sistema va a producción de verdad, OTel evita reinventar y te conecta con el ecosistema de observabilidad que ya usa tu equipo para el resto de servicios.</p>
+        </div>
+
+        <h3>Cuidado con la PII en las trazas</h3>
+        <p>Las trazas guardan prompts y respuestas, que pueden contener datos personales. Trátalas como datos sensibles: <strong>redacta</strong> antes de almacenar, controla el acceso y define retención. La lección 04 amplía el tema de PII; aquí basta la regla: <em>si no lo guardarías en un log, no lo guardes en la traza</em>.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una traza <strong>sin dependencias</strong>: spans anidados con <code>dataclasses</code> y un <code>run_id</code>. Es la idea de OTel en treinta líneas, para ver la mecánica antes de usar el SDK.</p>
+        <div class="code-file">trace_minimo.py</div>
+        <pre><code class="language-python"># trace_minimo.py — trazas propias para entender spans anidados.
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Span:
+    name: str
+    attrs: dict[str, object] = field(default_factory=dict)
+    start: float = 0.0
+    end: float = 0.0
+    children: list["Span"] = field(default_factory=list)
+
+    @property
+    def ms(self) -> float:
+        return (self.end - self.start) * 1000
+
+
+class Tracer:
+    def __init__(self) -> None:
+        self.run_id = uuid.uuid4().hex[:8]
+        self.root: Span | None = None
+        self._stack: list[Span] = []
+
+    @contextmanager
+    def span(self, name: str, **attrs: object):
+        s = Span(name=name, attrs=attrs, start=time.perf_counter())
+        if self._stack:
+            self._stack[-1].children.append(s)
+        else:
+            self.root = s
+        self._stack.append(s)
+        try:
+            yield s
+        finally:
+            s.end = time.perf_counter()
+            self._stack.pop()
+
+    def render(self, span: Span | None = None, depth: int = 0) -> None:
+        span = span or self.root
+        if span is None:
+            return
+        attrs = " ".join(f"{k}={v}" for k, v in span.attrs.items())
+        print(f"{'  ' * depth}├─ {span.name:&lt;18} {span.ms:6.0f} ms  {attrs}")
+        for child in span.children:
+            self.render(child, depth + 1)
+
+
+if __name__ == "__main__":
+    t = Tracer()
+    with t.span("run", question="¿qué es el chunking?"):
+        with t.span("retrieve"):
+            time.sleep(0.04)
+        with t.span("llm.chat", model="llama3.1:8b", tokens=1420):
+            time.sleep(0.12)
+    print(f"run_id={t.run_id}")
+    t.render()
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">run_id=7f3a91c2
+├─ run                question=¿qué es el chunking?
+  ├─ retrieve          42 ms
+  ├─ llm.chat         120 ms  model=llama3.1:8b tokens=1420
+</code></pre>
+        <p>Ya tienes lo esencial: un árbol con tiempos y atributos, anidado con un context manager. El <code>run_id</code> es la llave para encontrar la traza cuando un usuario reporta un problema. OTel hará lo mismo, pero exportable y con convenciones.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Instrumentamos el pipeline con <strong>OpenTelemetry</strong>: un span raíz por pregunta, spans hijos por paso y atributos <code>gen_ai.*</code> en las llamadas al modelo. Añadimos un envoltorio <code>traced_chat</code> que registra tokens, latencia y coste.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/telemetry.py</div>
+        <pre><code class="language-python">"""Configuración de OpenTelemetry para el Copiloto."""
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def setup_tracing(endpoint: str = "http://localhost:4318/v1/traces") -> trace.Tracer:
+    """Registra un TracerProvider y devuelve un tracer listo para usar."""
+    resource = Resource.create({"service.name": "copiloto"})
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    trace.set_tracer_provider(provider)
+    return trace.get_tracer("copiloto")
+
+
+tracer = setup_tracing()
+</code></pre>
+        <div class="code-file">proyectos/copiloto/src/copiloto/llm.py (instrumentado)</div>
+        <pre><code class="language-python">"""Llamada al modelo envuelta en un span con tokens, latencia y coste."""
+import time
+
+from copiloto.telemetry import tracer
+
+# Precio en USD por 1M tokens (ejemplo local: 0; nube: precios reales).
+PRICE = {"in": 0.15 / 1_000_000, "out": 0.60 / 1_000_000}
+
+
+def traced_chat(messages: list[dict], model: str, temperature: float = 0.0) -> dict:
+    with tracer.start_as_current_span("llm.chat") as span:
+        span.set_attribute("gen_ai.system", "ollama")
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("gen_ai.request.temperature", temperature)
+
+        start = time.perf_counter()
+        response = _call_model(messages, model, temperature)   # SDK real
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        usage = response["usage"]
+        cost = usage["input_tokens"] * PRICE["in"] + usage["output_tokens"] * PRICE["out"]
+        span.set_attribute("gen_ai.usage.input_tokens", usage["input_tokens"])
+        span.set_attribute("gen_ai.usage.output_tokens", usage["output_tokens"])
+        span.set_attribute("gen_ai.response.finish_reasons", [response["finish_reason"]])
+        span.set_attribute("copiloto.latency_ms", latency_ms)
+        span.set_attribute("copiloto.cost_usd", cost)
+        return response
+</code></pre>
+        <p>El pipeline completo como traza: cada paso abre su propio span hijo y queda anidado bajo el <code>run</code>.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/agent.py (instrumentado)</div>
+        <pre><code class="language-python">from copiloto.llm import traced_chat
+from copiloto.retrieval import retrieve
+from copiloto.telemetry import tracer
+
+
+def run_agent(question: str) -> "Answer":
+    with tracer.start_as_current_span("run") as root:
+        root.set_attribute("copiloto.question", question)
+
+        with tracer.start_as_current_span("retrieve") as s:
+            fragments = retrieve(question)
+            s.set_attribute("copiloto.fragments", len(fragments))   # ¡clave! si es 0, es el índice
+
+        context = "\n\n".join(f.text for f in fragments)
+        with tracer.start_as_current_span("generate") as s:
+            answer = traced_chat(build_messages(question, context), model="llama3.1:8b")
+            s.set_attribute("copiloto.answered", bool(answer["content"]))
+
+        return Answer(text=answer["content"], fragments=fragments)
+</code></pre>
+        <p>Contrato para <strong>reproducir</strong> cualquier mala respuesta: la traza guarda las entradas y las versiones; un comando las vuelve a ejecutar.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/replay.py</div>
+        <pre><code class="language-python">"""Reproduce una traza pasada para diagnosticar una mala respuesta."""
+from copiloto.agent import run_agent
+
+# El `run.json` se guarda por caso muestreado/fallido: entrada + versiones.
+def replay(run: dict) -> None:
+    print("versiones:", run["model"], run["prompt_version"], run["index_version"])
+    fresh = run_agent(run["question"])
+    print("respuesta original:", run["answer"][:200])
+    print("respuesta actual  :", fresh.text[:200])
+    # Compara: ¿cambió el retrieval? ¿el prompt? ¿el modelo?
+</code></pre>
+        <p>Ejemplo de traza exportada (vista de árbol en Jaeger/Grafana):</p>
+        <pre><code class="language-text">run                                      1.24 s
+├─ retrieve            fragments=0       3 ms     ← ¡aquí está el fallo!
+├─ generate            answered=true   1.10 s
+│  └─ llm.chat  in=210 out=140  $0.0001  1.05 s
+</code></pre>
+        <p><code>retrieve</code> devolvió <strong>0 fragmentos</strong>: el modelo respondió sin contexto y por eso alucinó. La traza te ahorró horas de conjeturas. Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Span raíz por pregunta</strong> (<code>run</code>): un <code>run_id</code> que liga todos los pasos, correlacionable con la sesión del usuario.</li>
+          <li><strong>Spans hijos por paso</strong>: <code>retrieve</code>, <code>generate</code>, <code>llm.chat</code>; el árbol localiza el fallo al instante.</li>
+          <li><strong>Atributos <code>gen_ai.*</code></strong>: convención que las herramientas de observabilidad entienden sin configuración extra.</li>
+          <li><strong>Tokens, latencia y coste por llamada</strong>: alimentan las métricas y el presupuesto de la lección 04.</li>
+          <li><strong>Bandera de fragmentos</strong>: el atributo más usado en el día a día; distingue fallo de retrieval de fallo de generación.</li>
+          <li><strong>Replay con versiones</strong>: sin la versión del prompt y del índice, «reproducir» es imposible.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Fíjate en cómo encajan las lecciones: el módulo 2 medía una llamada (<code>coste_usd</code>, <code>latency_ms</code>); aquí esos números <strong>se guardan en cada span</strong>. La observabilidad es la memoria del sistema; las evals son sus exámenes.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un <code>run_id</code> por petición</td>
+              <td>Logs sueltos sin correlación</td>
+              <td>Sin llave no puedes reconstruir el incidente</td>
+            </tr>
+            <tr>
+              <td>Un span por paso del pipeline</td>
+              <td>Un único span «responder»</td>
+              <td>El árbol localiza dónde falló</td>
+            </tr>
+            <tr>
+              <td>Registrar tokens, latencia y coste</td>
+              <td>Solo guardar la respuesta final</td>
+              <td>Sin números no hay diagnóstico ni presupuesto</td>
+            </tr>
+            <tr>
+              <td>Guardar versiones (prompt, modelo, índice)</td>
+              <td>Confiar en «el código actual»</td>
+              <td>Todo evoluciona; sin versión no reproduces</td>
+            </tr>
+            <tr>
+              <td>Redactar PII antes de almacenar</td>
+              <td>Guardar prompts/respuestas tal cual</td>
+              <td>La traza es un dato sensible</td>
+            </tr>
+            <tr>
+              <td>Usar OpenTelemetry en producción</td>
+              <td>Formato propio atado a un backend</td>
+              <td>Vendor-neutral y con ecosistema</td>
+            </tr>
+            <tr>
+              <td>Muestrear el volumen alto</td>
+              <td>Guardar todo el texto de todas las peticiones</td>
+              <td>Coste de almacenamiento y privacidad</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Guardar solo la respuesta final</h3>
+        <p>Si no registras los pasos intermedios, un fallo es un misterio.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Log único: no sabes si falló el retrieval o el modelo.
+print("respuesta:", run_agent(q).text)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Span por paso: fragmentos, tokens y latencia quedan registrados.
+with tracer.start_as_current_span("retrieve") as s:
+    fragments = retrieve(q)
+    s.set_attribute("copiloto.fragments", len(fragments))   # 0 => fallo de índice
+</code></pre>
+
+        <h3>6.2. No guardar las versiones</h3>
+        <p>El sistema cambia a diario; sin versión, el «replay» reproduce otra cosa y confunde más que ayuda.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Reejecutar con el prompt de hoy una traza de ayer.
+replay(run)                 # ¿qué prompt usó ayer? no lo sabes
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ La traza lleva la versión; el replay la usa.
+run = {"question": q, "prompt_version": "v3", "index_version": "2026-10-01", "model": "llama3.1:8b"}
+</code></pre>
+
+        <h3>6.3. Volcar el prompt completo sin redactar</h3>
+        <p>Las trazas acaban en un backend externo; el prompt puede llevar datos personales.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Guardar el texto con datos del usuario tal cual.
+span.set_attribute("copiloto.prompt", full_prompt_with_pii)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Hash para correlacionar; el texto solo en casos muestreados y redactado.
+span.set_attribute("copiloto.prompt_hash", sha256(full_prompt))
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> instrumentar el Copiloto con OpenTelemetry, localizar un fallo real por su traza y reproducirlo. Al terminar podrás responder «¿por qué salió mal esta respuesta?» con evidencia, no con opiniones.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — levanta un backend y configura el tracer.</strong> Un contenedor con Jaeger o Grafana Tempo es suficiente:
+            <pre><code class="language-bash">docker run -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+uv add opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+</code></pre>
+            <p>Importa <code>setup_tracing()</code> al arrancar el Copiloto y comprueba que aparece el servicio <code>copiloto</code> en el panel.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — instrumenta los pasos.</strong> Envuelve <code>retrieve</code>, <code>generate</code> y cada llamada en un span con sus atributos. Añade como mínimo <code>fragments</code>, <code>input_tokens</code>, <code>output_tokens</code> y <code>latency_ms</code>:
+            <pre><code class="language-python">with tracer.start_as_current_span("retrieve") as s:
+    frags = retrieve(q)
+    s.set_attribute("copiloto.fragments", len(frags))
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — provoca y localiza un fallo.</strong> Borra el índice vectorial (o apunta a uno vacío) y haz una pregunta. Abre la traza en el panel:
+            <pre><code class="language-text">run                                   1.1 s
+├─ retrieve          fragments=0       2 ms   ← el retrieval no devolvió nada
+└─ generate          answered=true   1.0 s
+</code></pre>
+            <p>Esperado: ves <code>fragments=0</code> y entiendes que el problema es de <strong>índice</strong>, no del modelo. Repuebla el índice y repite: ahora <code>fragments=4</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — reproduce una respuesta mala.</strong> Fuerza una respuesta infiel (prompt sin contexto, o temperatura alta) y guarda el <code>run.json</code> con entrada y versiones. Ejecuta el replay:
+            <pre><code class="language-bash">uv run python -m copiloto.replay runs/7f3a91c2.json
+# versiones: llama3.1:8b prompt=v3 index=2026-10-01
+# original: "El chunking divide en trozos de 512 tokens de Borges..."   (inventado)
+# actual  : "El chunking trocea documentos con solape [03-chunking]."
+</code></pre>
+            <p>Compara: el original alucinó porque el retrieve vino vacío. Documenta la causa raíz con la traza delante.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — convierte el fallo en métrica y en caso.</strong> Añade una métrica (contador de <code>fragments=0</code>) para vigilar el índice, y un caso de eval (lección 01) para la regresión. Cierra el bucle: <strong>observar → diagnosticar → reproducir → vigilar</strong>.
+            <p><strong>Resultado esperado:</strong> un Copiloto que exporta trazas con tokens, latencia y coste; un fallo localizado por su traza; un replay con versiones; y una métrica que vigila la causa raíz. Acabas de hacer el sistema observable.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un panel de coste y latencia por versión</h3>
+          <p>Convierte las trazas en un panel que te diga, de un vistazo, cómo va el sistema en producción. Requisitos:</p>
+          <ul>
+            <li>Una métrica de <strong>coste acumulado por día y por modelo</strong>, a partir de los atributos de los spans.</li>
+            <li>Una métrica de <strong>latencia p50/p95</strong> desglosada por paso (<code>retrieve</code> vs <code>llm.chat</code>): quieres saber si la lentitud es de tu código o del proveedor.</li>
+            <li>Un <strong>desglose por versión de prompt</strong> (usando <code>prompt_hash</code>): ¿la v3 es más cara o más lenta que la v2?</li>
+            <li>Una <strong>alerta</strong> cuando la tasa de <code>fragments=0</code> supera un umbral (índice roto o desincronizado).</li>
+          </ul>
+          <p><em>Pista: OTel también exporta <strong>métricas</strong> (no solo trazas); o agrega los spans en tu backend. Para el desglose por versión, basta con agrupar por el atributo <code>prompt_hash</code>. Recuerda redactar PII antes de agregar y muestrear si el volumen es alto. No resuelvas el reto con un <code>print</code> en cada llamada: el objetivo es una señal agregada y duradera, no ruido. Y cuidado con optimizar el coste a costa de la calidad: compáralo con las evals de las lecciones 01 y 02.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>traza</strong> es un árbol de <strong>spans</strong>: cada paso del sistema con su duración y sus datos.</li>
+          <li>Registra por llamada: <strong>modelo, tokens, latencia, coste, hash del prompt y motivo de parada</strong>.</li>
+          <li>Los tres pilares: <strong>trazas</strong> (una petición), <strong>métricas</strong> (agregados) y <strong>logs</strong> (eventos).</li>
+          <li><strong>Reproducir</strong> exige capturar entrada, versiones (prompt, modelo, índice) y parámetros de sampling.</li>
+          <li><strong>OpenTelemetry</strong> da spans anidados, atributos <code>gen_ai.*</code> y exportación vendor-neutral.</li>
+          <li>Un <code>fragments=0</code> en el span de retrieval distingue un fallo de <strong>índice</strong> de un fallo de <strong>modelo</strong>.</li>
+          <li><strong>Redacta PII</strong> y muestrea: la traza es un dato sensible, no un vertedero.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Spans anidados</td><td><code>tracer.start_as_current_span</code> (OpenTelemetry)</td></tr>
+            <tr><td>Atributos estándar</td><td><code>gen_ai.*</code> (system, model, usage)</td></tr>
+            <tr><td>Coste y latencia</td><td><code>copiloto.cost_usd</code>, <code>copiloto.latency_ms</code></td></tr>
+            <tr><td>Exportación</td><td><code>OTLPSpanExporter</code> + <code>BatchSpanProcessor</code></td></tr>
+            <tr><td>Reproducir un fallo</td><td><code>replay.py</code> con entrada y versiones</td></tr>
+            <tr><td>Versiones</td><td><code>prompt_version</code>, <code>index_version</code>, <code>model</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿En qué se diferencia una traza de un log normal?</summary>
+            <div>
+              <p>Un log es una línea suelta; una <strong>traza</strong> es un árbol de pasos relacionados por un mismo <code>run_id</code>, con duración y jerarquía. El log te dice «ocurrió un evento»; la traza te dice «esta petición pasó por retrieve (3 ms), generate (1 s) y esta llamada tardó 980 ms». Para depurar un pipeline con IA, la jerarquía es imprescindible: necesitas saber <em>en qué paso</em> se rompió.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito OpenTelemetry o me vale un formato propio?</summary>
+            <div>
+              <p>Un formato propio con <code>dataclasses</code> y un <code>run_id</code> cubre la mayoría de las necesidades locales y es un buen punto de partida. Pero en producción, OTel aporta <strong>exportadores</strong>, <strong>convenciones</strong> (<code>gen_ai.*</code>), <strong>correlación</strong> con HTTP/base de datos y neutralidad de proveedor. Si vas a integrarte con el equipo de plataforma, usa OTel desde el principio. Si estás aprendiendo, empieza por lo propio y migra cuando duela.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo reproducir exactamente la misma respuesta?</summary>
+            <div>
+              <p>No de forma garantizada. Ni con <code>temperature=0</code> los proveedores aseguran reproducibilidad bit a bit (batching, hardware, versiones del modelo). «Reproducir» aquí significa <strong>recrear el contexto suficiente para diagnosticar</strong>: mismas entradas, versiones y parámetros, y comparar salidas. Por eso la traza guarda también el <em>output</em> original: aunque no puedas regenerarlo idéntico, sí puedes analizarlo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto texto debo guardar en las trazas?</summary>
+            <div>
+              <p>Depende de tu privacidad y presupuesto. Estrategia pragmática: guarda siempre los <strong>atributos numéricos</strong> (tokens, latencia, coste) y los <strong>hashes</strong>; guarda el <strong>texto completo</strong> solo de una <strong>muestra</strong> y de los <strong>casos fallidos</strong>, con PII redactada y una política de retención clara. Así puedes reproducir los incidentes que importan sin almacenar todo el tráfico.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Las trazas afectan al coste o a la latencia del producto?</summary>
+            <div>
+              <p>Diseñadas bien, no. El exportador usa <strong>batching</strong>: los spans se acumulan y se envían en lote en segundo plano, sin bloquear la petición. El impacto es mínimo si evitas serializar textos enormes en el hilo de respuesta. Ojo con el <strong>muestreo</strong>: en volumen alto, exportar el 100% de las trazas puede costar en el backend y en ancho de banda, aunque no en el modelo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-tool-function-calling">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Tool / function calling: declarar herramientas con JSON Schema, cómo el modelo propone la llamada, cómo tu código la ejecuta y devuelve el resultado, y el bucle mínimo de una herramienta.">
+  <title>Tool / function calling — Módulo 2 · Curso IA</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Tool / function calling</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · APIs y SDKs</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un LLM solo predice texto. No puede consultar tu base de datos, mirar la hora ni ejecutar código. Pero hay un truco que cambia todo: le enseñas una <strong>lista de herramientas</strong> («funciones») y, cuando cree que necesita una, <em>no la ejecuta</em>; en su lugar responde con un <strong>nombre de función y unos argumentos</strong>. Tu código lee esa propuesta, ejecuta la función de verdad y le devuelve el resultado. El modelo continúa la conversación con información nueva.</p>
+        <p>Esto es <strong>tool calling</strong> (o <em>function calling</em>). Es el puente entre la <em>inferencia</em> (lo que el modelo decide) y la <em>lógica determinista</em> (lo que tu código hace). Sin él no hay agentes, ni RAG con búsqueda, ni nada que toque el mundo real.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el malentendido más común es creer que «el modelo ejecuta funciones». No lo hace, y no puede. El modelo <em>propone</em>; tú <em>ejecutas</em>. Tener clarísimo ese reparto es lo que te permite construir, depurar y asegurar agentes.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Local primero:</strong> los ejemplos usan <strong>Ollama</strong> con un modelo que soporte tools (p. ej. <code>llama3.2</code> o <code>qwen2.5</code>). El mismo patrón, con otro nombre de campo, aplica a OpenAI y Anthropic.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El reparto de responsabilidades</h3>
+        <p>Grábate esto: <strong>el modelo decide, tú haces</strong>. El ciclo tiene cuatro piezas:</p>
+        <table>
+          <thead><tr><th>Pieza</th><th>Quién</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td>Declaración de tools</td><td>Tu código</td><td>Describe nombre, propósito y esquema de argumentos en JSON Schema</td></tr>
+            <tr><td>Propuesta de llamada</td><td>El modelo</td><td>Devuelve <code>tool_calls</code>: nombre + argumentos (en texto/JSON)</td></tr>
+            <tr><td>Ejecución</td><td>Tu código</td><td>Valida los argumentos y llama a la función real</td></tr>
+            <tr><td>Resultado</td><td>Tu código</td><td>Añade un mensaje <code>role="tool"</code> con el resultado y vuelve a llamar</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el modelo es un cliente en un restaurante que <em>pide</em> «un solomillo al punto». El camarero (tu código) es quien va a la cocina, comprueba que hay solomillo y lo trae. El cliente no entra en la cocina: solo elige del menú. La <em>carta</em> es el JSON Schema: define qué se puede pedir.</p>
+        </div>
+
+        <h3>El esquema: la carta de herramientas</h3>
+        <p>Cada tool se describe con <strong>JSON Schema</strong>. Lo mínimo es un nombre, una descripción y los parámetros con sus tipos. La descripción es para el modelo, así que <strong>escríbela pensando en él</strong>:</p>
+        <div class="code-file">tools_example.json</div>
+        <pre><code class="language-json">{
+  "type": "function",
+  "function": {
+    "name": "search_lessons",
+    "description": "Busca lecciones del curso por una consulta de texto y devuelve las más relevantes.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Términos de búsqueda, en lenguaje natural."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Número máximo de resultados (1-10).",
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}
+</code></pre>
+        <div class="callout callout--tip">
+          <p>Fíjate en <code>required</code> y en <code>minimum</code>/<code>maximum</code>: los límites en el esquema <strong>guían</strong> al modelo, pero <strong>no lo obligan</strong>. Validarás los argumentos en tu código de todos modos (esa es la parte determinista).</p>
+        </div>
+
+        <h3>El bucle mínimo de una herramienta</h3>
+        <p>La conversación crece en cada vuelta. Este es el ciclo, con los mensajes que se van añadiendo:</p>
+        <pre class="diagram">
+  messages = [ user: "¿Cuántas lecciones tiene el módulo 2?" ]
+        │
+        ▼
+  [ modelo ] ──► assistant.tool_calls = [ { name: "search_lessons",
+                                             arguments: { "query": "módulo 2 lecciones" } } ]
+        │
+        ▼  TU CÓDIGO: valida argumentos → ejecuta → obtiene "4 lecciones"
+        │
+  messages += assistant(tool_calls)
+  messages += { role: "tool", content: "4 lecciones", tool_name: "search_lessons" }
+        │
+        ▼
+  [ modelo ] ──► assistant.content = "El módulo 2 tiene 4 lecciones."
+        │
+        ▼
+      FIN (stop_reason sin tool_calls)
+        </pre>
+        <div class="callout callout--warning">
+          <p><strong>El bucle es lo que hace un agente.</strong> Aquí verás una sola herramienta y pocas vueltas. En el módulo 5 el bucle se generaliza (varias tools, memoria, límite de iteraciones) y en el 6 se expone por MCP. El corazón, sin embargo, es <em>este</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La forma más corta en Ollama: defines una función Python con anotaciones de tipo y <em>docstring</em> estilo Google, y la librería la convierte en tool. Tú ejecutas la función cuando el modelo la pide.</p>
+        <div class="code-file">ejemplos/tool_minimo.py</div>
+        <pre><code class="language-python"># tool_minimo.py — una sola herramienta, un solo turno de ejecución.
+from ollama import Client
+
+
+def add_two_numbers(a: int, b: int) -&gt; int:
+    """Suma dos números.
+
+    Args:
+        a: Primer número.
+        b: Segundo número.
+
+    Returns:
+        La suma de a y b.
+    """
+    return int(a) + int(b)
+
+
+client = Client()
+
+# 1) Enviamos la pregunta Y la herramienta disponible.
+response = client.chat(
+    model="llama3.2",
+    messages=[{"role": "user", "content": "¿Cuánto es 30 + 12?"}],
+    tools=[add_two_numbers],   # la función se convierte en tool (JSON Schema)
+)
+
+# 2) El modelo NO ha sumado: ha PROPUESTO llamar a la herramienta.
+if response.message.tool_calls:
+    call = response.message.tool_calls[0]
+    name = call.function.name                 # "add_two_numbers"
+    args = call.function.arguments            # {"a": 30, "b": 12}
+    print(f"El modelo propone: {name}({args})")
+
+    # 3) La ejecución la hacemos NOSOTROS (código determinista).
+    result = add_two_numbers(**args)
+    print(f"Resultado real: {result}")
+else:
+    print("El modelo respondió directamente:", response.message.content)
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">El modelo propone: add_two_numbers({'a': 30, 'b': 12})
+Resultado real: 42
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>def add_two_numbers(a: int, b: int) -&amp;gt; int</code></strong>: las anotaciones de tipo definen los tipos del esquema (<code>integer</code>).</li>
+          <li><strong>Docstring Google</strong>: la sección <code>Args:</code> describe cada parámetro. Todo eso se convierte en la carta que ve el modelo.</li>
+          <li><strong><code>tools=[add_two_numbers]</code></strong>: pasamos la función, no una llamada. La librería la traduce a JSON Schema.</li>
+          <li><strong><code>response.message.tool_calls</code></strong>: si viene lleno, el modelo quiere ejecutar algo. Puede venir vacío y responder en texto.</li>
+          <li><strong><code>call.function.arguments</code></strong>: un diccionario ya parseado. En otros SDKs llega como <em>string</em> JSON y debes hacer <code>json.loads</code>.</li>
+          <li><strong><code>add_two_numbers(**args)</code></strong>: aquí está la verdad. Lo que suma es tu código, no el modelo.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Este ejemplo muestra <em>una</em> vuelta: no devolvemos el resultado al modelo para que responda con palabras. El siguiente ejemplo añade ese paso y ya tienes el bucle completo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el <strong>Copiloto</strong>, la primera herramienta útil es <code>search_lessons</code>: dado un texto, devuelve las lecciones más relevantes de la Academy. Aquí usamos el esquema explícito y un <em>dispatcher</em>, porque tener el control total del JSON Schema es lo que harás en producción.</p>
+        <div class="code-file">src/copiloto/tools.py</div>
+        <pre><code class="language-python"># src/copiloto/tools.py
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Any
+
+# Catálogo simulado de lecciones (en el módulo 4 será un índice real con embeddings).
+LESSONS = [
+    {"id": "02-01", "title": "Llamadas y streaming", "module": "02"},
+    {"id": "02-02", "title": "Tool / function calling", "module": "02"},
+    {"id": "02-03", "title": "Multiproveedor y errores", "module": "02"},
+    {"id": "02-04", "title": "Coste, latencia y tokens", "module": "02"},
+]
+
+
+def search_lessons(query: str, limit: int = 5) -&gt; list[dict[str, str]]:
+    """Devuelve lecciones cuyo título contenga algún término de la query."""
+    terms = [t.lower() for t in query.split() if t]
+    hits = [ls for ls in LESSONS if any(t in ls["title"].lower() for t in terms)]
+    return hits[: max(1, min(limit, 10))]
+
+
+# El esquema que ve el modelo. Descripción clara = mejores llamadas.
+SEARCH_LESSONS_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_lessons",
+        "description": "Busca lecciones del curso por texto y devuelve las más relevantes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Términos de búsqueda."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Máximo de resultados (1-10).",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# El dispatcher: nombre → función Python real. Es nuestro, no del modelo.
+HANDLERS: dict[str, Callable[..., Any]] = {
+    "search_lessons": search_lessons,
+}
+
+
+def run_tool(name: str, arguments: str | dict[str, Any]) -&gt; str:
+    """Ejecuta una tool propuesta por el modelo y devuelve el resultado como texto."""
+    if name not in HANDLERS:
+        return json.dumps({"error": f"tool desconocida: {name}"})
+
+    args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    try:
+        result = HANDLERS[name](**args)          # validación + ejecución
+        return json.dumps(result, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        # Devolvemos el ERROR al modelo para que pueda corregir su llamada.
+        return json.dumps({"error": str(exc)})
+</code></pre>
+        <div class="code-file">src/copiloto/agent.py — bucle con una tool</div>
+        <pre><code class="language-python"># src/copiloto/agent.py
+from __future__ import annotations
+
+from ollama import Client
+
+from copiloto.tools import SEARCH_LESSONS_SCHEMA, run_tool
+
+MODEL = "llama3.2"
+MAX_STEPS = 4   # cinturón de seguridad: nunca dejamos el bucle sin límite
+
+
+def answer_with_tools(question: str) -&gt; str:
+    client = Client()
+    messages: list[dict] = [
+        {"role": "system", "content": "Eres el Copiloto de la Academy. Usa las tools cuando aporten datos."},
+        {"role": "user", "content": question},
+    ]
+
+    for _ in range(MAX_STEPS):
+        response = client.chat(model=MODEL, messages=messages, tools=[SEARCH_LESSONS_SCHEMA])
+        msg = response.message
+
+        # Caso A: ya no pide tools → respuesta final en lenguaje natural.
+        if not msg.tool_calls:
+            return msg.content or ""
+
+        # Caso B: pidió tools → las ejecutamos TODAS y devolvemos los resultados.
+        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls})
+        for call in msg.tool_calls:
+            result = run_tool(call.function.name, call.function.arguments)
+            messages.append({
+                "role": "tool",
+                "content": result,
+                "tool_name": call.function.name,
+            })
+
+    return "No pude cerrar la respuesta dentro del límite de pasos."
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Esquema explícito + <code>HANDLERS</code></strong>: en producción casi nunca pasas la función cruda; prefieres el esquema a la vista y un mapa nombre→función. Así controlas qué es ejecutable y qué no.</li>
+          <li><strong><code>run_tool</code> devuelve texto, incluso el error</strong>: el modelo necesita <em>leer</em> el resultado. Devolverle un error útil (no lanzar la excepción) le permite corregir sus argumentos.</li>
+          <li><strong><code>MAX_STEPS</code></strong>: nunca un bucle <code>while True</code>. Un límite de iteraciones te salva de bucles infinitos, de coste desbocado y de cuelgues.</li>
+          <li><strong>Se ejecutan todas las <code>tool_calls</code></strong>: los modelos modernos pueden pedir varias a la vez; ignorar la segunda rompería el protocolo.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Nube como alternativa:</strong> en OpenAI el esquema es el mismo pero envuelto en <code>tools=[{"type": "function", "function": …}]</code> y los argumentos llegan como <em>string</em> en <code>tool_call.function.arguments</code>; en Anthropic se llama <code>input_schema</code> y el resultado se devuelve en un bloque <code>tool_result</code> con <code>tool_use_id</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Descripciones claras y en imperativo («Busca…», «Devuelve…»)</td>
+              <td>Nombres crípticos o descripciones vacías</td>
+              <td>El modelo elige la tool <em>por la descripción</em>; es documentación para él</td>
+            </tr>
+            <tr>
+              <td>Pocas tools, bien separadas</td>
+              <td>Una tool «haz_cualquier_cosa»</td>
+              <td>Demasiadas opciones solapadas confunden la selección</td>
+            </tr>
+            <tr>
+              <td>Validar los argumentos en tu código</td>
+              <td>Confiar en que el modelo acierta el esquema</td>
+              <td>El esquema orienta, no garantiza; tú eres la última línea</td>
+            </tr>
+            <tr>
+              <td>Devolver el resultado como texto/JSON pequeño</td>
+              <td>Volcar 10 MB de datos en <code>content</code></td>
+              <td>Todo lo que devuelves entra en el contexto y cuesta tokens</td>
+            </tr>
+            <tr>
+              <td>Límite de iteraciones + timeout</td>
+              <td><code>while True</code> hasta que el modelo pare</td>
+              <td>Un bucle sin tope es una factura y un cuelgue esperando a pasar</td>
+            </tr>
+            <tr>
+              <td>Devolver errores útiles al modelo</td>
+              <td>Lanzar la excepción y matar la conversación</td>
+              <td>El modelo puede reintentar con argumentos corregidos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Creer que el modelo ejecuta la función</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ "El modelo ya habrá sumado; leo el resultado del texto."
+response = client.chat(model="llama3.2", messages=messages, tools=[add_two_numbers])
+# ...y si tool_calls existe, NO sumó: solo propuso. Además, sin ejecutar nada,
+# el modelo no sabe el resultado y puede inventárselo (alucinación).
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ El modelo propone; tú ejecutas y devuelves el resultado.
+if response.message.tool_calls:
+    call = response.message.tool_calls[0]
+    result = add_two_numbers(**call.function.arguments)
+    # ... y devuelves 'result' al modelo en un mensaje role="tool".
+</code></pre>
+
+        <h3>No devolver el resultado al modelo</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Ejecutas la tool pero cortas el bucle: el usuario no ve la respuesta.
+for call in response.message.tool_calls:
+    run_tool(call.function.name, call.function.arguments)
+print(response.message.content)   # vacío: el modelo aún no ha hablado
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Añades el resultado y vuelves a llamar para que el modelo redacte.
+messages.append(result_as_tool_message)
+final = client.chat(model=model, messages=messages, tools=[schema])
+print(final.message.content)
+</code></pre>
+
+        <h3>Bucle sin límite</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ El modelo puede pedir tools indefinidamente: factura y cuelgue.
+while True:
+    response = client.chat(model=model, messages=messages, tools=tools)
+    if not response.message.tool_calls:
+        break
+    # ...
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Tope duro de iteraciones, siempre.
+for _ in range(MAX_STEPS):
+    response = client.chat(model=model, messages=messages, tools=tools)
+    if not response.message.tool_calls:
+        break
+    # ...
+else:
+    return "No pude cerrar la respuesta dentro del límite de pasos."
+</code></pre>
+
+        <h3>Comparar argumentos del modelo sin validarlos</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Confías en el esquema y usas los argumentos tal cual.
+#    El modelo puede mandar limit=99 o query=123 aunque no toque.
+hits = search_lessons(**call.function.arguments)
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Valida (pydantic o a mano) antes de tocar tu sistema.
+from pydantic import BaseModel, Field
+
+class SearchArgs(BaseModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=5, ge=1, le=10)
+
+hits = search_lessons(**SearchArgs.model_validate(call.function.arguments).model_dump())
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> cerrar el bucle completo —el modelo pide una tool, tú la ejecutas y devuelves el resultado— partiendo del ejemplo mínimo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Punto de partida.</strong> Guarda el <code>tool_minimo.py</code> de la sección 3 y confirma que el modelo propone las tools (no que responde en texto). Si tu modelo no soporta tools, cambia a <code>qwen2.5</code> o <code>llama3.2</code>.
+          </li>
+          <li>
+            <strong>Paso 2 — Añade el resultado y vuelve a llamar.</strong> Completa el script así:
+            <pre><code class="language-python">import json
+from ollama import Client
+
+def add_two_numbers(a: int, b: int) -&gt; int:
+    """Suma dos números.
+
+    Args:
+        a: Primer número.
+        b: Segundo número.
+
+    Returns:
+        La suma de a y b.
+    """
+    return int(a) + int(b)
+
+client = Client()
+messages = [{"role": "user", "content": "¿Cuánto es 30 + 12? Después explica el resultado."}]
+tools = [add_two_numbers]
+
+for step in range(4):
+    response = client.chat(model="llama3.2", messages=messages, tools=tools)
+    msg = response.message
+
+    if not msg.tool_calls:
+        print("FINAL:", msg.content)
+        break
+
+    messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls})
+    for call in msg.tool_calls:
+        args = call.function.arguments
+        result = add_two_numbers(**args)
+        messages.append({
+            "role": "tool",
+            "content": json.dumps({"result": result}),
+            "tool_name": call.function.name,
+        })
+        print(f"[tool] {call.function.name}({args}) -&gt; {result}")
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Ejecuta.</strong>
+            <pre><code class="language-bash">uv run tool_loop.py
+</code></pre>
+            <p>Resultado esperado: una línea <code>[tool] add_two_numbers({'a': 30, 'b': 12}) -&amp;gt; 42</code> y, después, una línea <code>FINAL:</code> con una frase del modelo que usa el 42. Si el modelo no llama a la tool y responde «42» de memoria, plantéale una operación que no pueda calcular bien de cabeza (p. ej. <code>3847 * 2911</code>) para forzar la llamada.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Rompe a propósito.</strong> Llama a <code>add_two_numbers</code> con un argumento inválido (p. ej. <code>a="hola"</code>) desde <code>run_tool</code> y comprueba que devuelves el error al modelo en vez de romper el programa.
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> confirma que, en cada vuelta, <code>messages</code> crece con <em>un mensaje de assistant con tool_calls</em> y <em>uno o más mensajes role="tool"</em>. Ese es el protocolo correcto.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Dos tools y elección autónoma</h3>
+          <p>Añade al Copiloto una segunda herramienta, <code>count_progress(module: str)</code>, que devuelva cuántas lecciones completadas hay en un módulo (inventa una pequeña tabla en memoria). Deja que el modelo reciba <strong>ambas</strong> tools y responde con la más adecuada sin que tú se la indiques. Prueba con preguntas que requieran una, la otra y quizá las dos («¿en qué módulo del 2 al 3 hay más lecciones completadas?»).</p>
+          <p><em>Pista: no cambies el bucle; solo amplía el <code>HANDLERS</code> y la lista de esquemas. El mérito del reto es comprobar que el modelo <strong>elige</strong> según las descripciones, y entender por qué una descripción ambigua provoca la tool equivocada. Añade un registro de qué tool se llamó en cada paso para estudiarlo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>En tool calling, el modelo <strong>propone</strong> una llamada (nombre + argumentos) y tu código la <strong>ejecuta</strong>: nunca al revés.</li>
+          <li>Las tools se declaran con <strong>JSON Schema</strong>; la <strong>descripción</strong> es la documentación que el modelo lee para elegir.</li>
+          <li>El <strong>bucle</strong> es: llamar → si hay <code>tool_calls</code>, ejecutar y añadir un mensaje <code>role="tool"</code> → repetir hasta que <code>tool_calls</code> esté vacío.</li>
+          <li>Los argumentos del modelo llegan como texto/JSON: <strong>valídalos siempre</strong> antes de tocar tus sistemas.</li>
+          <li>Pon un <strong>límite de iteraciones</strong> y devuelve <strong>errores útiles</strong> al modelo para que pueda corregirse.</li>
+          <li>Este bucle mínimo es la semilla del <strong>agente</strong> del módulo 5 y del <strong>servidor MCP</strong> del módulo 6.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar tools</td><td><code>tools=[schema]</code> (JSON Schema)</td></tr>
+            <tr><td>Leer la propuesta</td><td><code>response.message.tool_calls</code></td></tr>
+            <tr><td>Nombre y args</td><td><code>call.function.name</code> / <code>call.function.arguments</code></td></tr>
+            <tr><td>Ejecutar</td><td>Tu dispatcher <code>HANDLERS[name](**args)</code></td></tr>
+            <tr><td>Devolver resultado</td><td>Mensaje <code>{"role": "tool", "content": …}</code></td></tr>
+            <tr><td>Validar</td><td><code>pydantic</code> (módulo 1)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El modelo «ve» mi código cuando le paso una tool?</summary>
+            <div>
+              <p>No ve el código, solo el <strong>esquema</strong> que generas a partir de él (nombre, descripción y parámetros). Puede llamar a la tool, pero la ejecución ocurre siempre en tu proceso. Si tu función hace algo peligroso, el riesgo no es que el modelo lo ejecute: es que tú lo ejecutes sin validar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi modelo responde en texto en vez de llamar a la tool?</summary>
+            <div>
+              <p>Tres causas típicas: el modelo no soporta tools (usa uno que sí, p. ej. <code>llama3.2</code>/<code>qwen2.5</code>), la descripción es ambigua o no deja claro <em>cuándo</em> usarla, o la pregunta se puede responder sin datos externos (el modelo prefiere contestar de memoria). Refuerza la descripción y, si hace falta, instruye en el <code>system</code> que use las tools para datos concretos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántas tools puedo declarar?</summary>
+            <div>
+              <p>Técnicamente muchas; en la práctica, pocas y bien diferenciadas. Cada esquema ocupa contexto (cuesta tokens) y demasiadas opciones solapadas empeoran la elección. Si tienes decenas, agrúpalas en «namespaces» o usa varias llamadas, en lugar de volcar el catálogo entero.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los argumentos son seguros de usar directamente?</summary>
+            <div>
+              <p>No. Son una propuesta del modelo y pueden traer tipos raros, valores fuera de rango o inyección. Valídalos con <code>pydantic</code> y aplica el principio de mínima confianza: tu función debe comprobar sus precondiciones aunque el esquema diga que el dato es un entero entre 1 y 10.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿En qué se diferencia esto de un agente?</summary>
+            <div>
+              <p>En nada esencial, solo en escala. Un agente es este bucle con más pasos, varias tools, memoria de conversación y, a veces, planificación. El tool calling es el ladrillo; el agente es la construcción. Lo verás en el módulo 5.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

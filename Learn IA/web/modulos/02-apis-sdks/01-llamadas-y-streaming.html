@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="01-llamadas-y-streaming">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Cómo funciona una llamada a un LLM: parámetros, streaming token a token, cancelación y timeouts. Por qué el streaming mejora la latencia percibida.">
+  <title>Llamadas y streaming — Módulo 2 · Curso IA</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Llamadas y streaming</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · APIs y SDKs</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Una llamada a un LLM parece trivial: le mandas un texto, te devuelve otro. Pero entre esas dos cosas hay una <strong>petición HTTP</strong>, una cola de <em>tokens</em> que el modelo genera uno a uno y una respuesta que puede tardar segundos. Si tu interfaz se queda congelada esperando la respuesta completa, la sensación es de lentitud aunque el modelo vaya rápido. El <strong>streaming</strong> es la técnica que convierte esa espera en texto que aparece en pantalla.</p>
+        <p>En esta lección verás la anatomía de una llamada (modelo, mensajes, <code>options</code>), cómo funciona el streaming token a token, cómo <strong>cancelar</strong> una generación a medias y cómo poner <strong>timeouts</strong> para no colgar tu programa. Es la base sobre la que se apoya todo lo demás del módulo: sin entender la llamada, el resto es copiar y pegar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todas las decisiones raras de las apps de IA (<em>«¿por qué tarda?»</em>, <em>«¿por qué se queda colgado?»</em>, <em>«¿por qué el usuario cree que no funciona?»</em>) se explican aquí. Latencia, cancelación y timeouts son ingeniería, no detalles.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Local primero:</strong> todos los ejemplos corren contra <strong>Ollama</strong> en tu máquina, sin API key. Donde el código cambie para OpenAI/Anthropic lo verás indicado con un callout.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Anatomía de una llamada</h3>
+        <p>Toda llamada a un LLM, sea local o en la nube, tiene la misma forma lógica. Cambia el nombre del campo, pero no la idea:</p>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Qué es</th><th>Por qué importa</th></tr></thead>
+          <tbody>
+            <tr><td><code>model</code></td><td>Qué modelo usas (p. ej. <code>llama3.2</code>)</td><td>Determina calidad, velocidad, coste y si cabe en tu máquina</td></tr>
+            <tr><td><code>messages</code></td><td>Lista de turnos con <code>role</code> (<code>system</code>, <code>user</code>, <code>assistant</code>)</td><td>Es el <strong>contexto</strong> que ve el modelo en cada llamada</td></tr>
+            <tr><td><code>options</code></td><td>Controles de sampling: <code>temperature</code>, <code>num_predict</code>, etc.</td><td>Ajustan creatividad y longitud máxima de la respuesta</td></tr>
+            <tr><td><code>stream</code></td><td>Si quieres la respuesta completa o troceada</td><td>Cambia la experiencia de usuario y cómo consumes la API</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una llamada <em>sin</em> streaming es pedir una pizza y esperar sentado hasta que esté entera para comer. Una llamada <em>con</em> streaming es comer por raciones que te van saliendo de la cocina. Tarda lo mismo en total, pero la experiencia es completamente distinta.</p>
+        </div>
+
+        <h3>El modelo no «responde de golpe»</h3>
+        <p>Por dentro, un LLM genera la respuesta <strong>token a token</strong>: predice el siguiente fragmento, lo añade, y con eso predice el siguiente. La API normalmente <em>acumula</em> todo y te lo devuelve al final. El streaming expone ese goteo tal cual ocurre.</p>
+        <pre class="diagram">
+  petición ──► [ modelo genera token 1 ] ──► token 2 ──► token 3 ──► … ──► done
+                    │
+       sin stream  │  esperas… esperas… esperas… y recibes TODO de golpe
+       con stream  │  recibes: "La" → " respuesta" → " es" → … según se generan
+        </pre>
+        <p>Por eso hay <strong>dos latencias</strong> distintas que conviene no confundir (lo mediremos en la lección 4):</p>
+        <ul>
+          <li><strong>TTFT</strong> (<em>Time To First Token</em>): cuánto tardas en ver el primer trozo. Depende sobre todo de la carga del modelo y del tamaño del prompt.</li>
+          <li><strong>Latencia total</strong>: cuánto tardas en tener toda la respuesta. Depende del número de tokens generados.</li>
+        </ul>
+
+        <h3>Por qué el streaming mejora la percepción</h3>
+        <p>Con TTFT de 600 ms y una respuesta de 8 segundos, la interfaz bloqueada parece «colgada» 8 segundos. Con streaming, a los 600 ms ya hay texto y el usuario percibe <strong>inmediatez</strong>. La velocidad real no cambió; cambió lo que el usuario ve.</p>
+        <div class="callout callout--why">
+          <p>En una CLI o una web, <strong>el primer token es tu mejor indicador de salud</strong>. Si aparece rápido, el usuario confía; si no aparece nada, piensa que se rompió. El streaming no es estética: es gestión de expectativas.</p>
+        </div>
+
+        <h3>Cancelación y timeouts: que tu programa no se quede colgado</h3>
+        <p>Un stream es un <strong>iterador</strong>: tú decides cuándo dejas de leerlo. Salir del bucle <em>cancela</em> la generación (dejas de consumir). Además, conviene poner un <strong>timeout</strong> de conexión y un <strong>deadline</strong> propio por si el modelo se atasca:</p>
+        <ul>
+          <li><strong>Timeout de socket</strong>: corta si no hay bytes durante demasiado tiempo.</li>
+          <li><strong>Deadline lógico</strong>: <em>«no quiero esperar más de N segundos en total»</em>, lo compruebas tú con un reloj.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>No confundas</strong> <code>num_predict</code> (cuántos tokens puede generar como máximo) con un timeout. Un modelo lento puede tardar 30 s en 50 tokens; un límite de tokens no te protege del tiempo, y un timeout no te protege del coste.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ejemplo más pequeño que demuestra el streaming contra Ollama. Fíjate en <code>stream=True</code> y en que la respuesta ya no es un objeto único, sino un <strong>iterador</strong>.</p>
+        <div class="code-file">ejemplos/stream_minimo.py</div>
+        <pre><code class="language-python"># stream_minimo.py — la llamada más pequeña con streaming.
+from ollama import Client
+
+client = Client()  # por defecto apunta a http://localhost:11434
+
+# stream=True NO devuelve una respuesta, devuelve un iterador de fragmentos.
+stream = client.chat(
+    model="llama3.2",
+    messages=[{"role": "user", "content": "Explica en dos frases qué es un token."}],
+    options={"temperature": 0.2},   # 0 = determinista, valores altos = más variado
+    stream=True,
+)
+
+# Iteramos: cada 'part' trae un trocito de texto en part.message.content.
+for part in stream:
+    print(part.message.content or "", end="", flush=True)  # sin salto, sin esperar
+
+print()  # un salto final al terminar la respuesta
+</code></pre>
+        <p>Salida esperada (varía según el modelo): el texto aparece poco a poco en la terminal.</p>
+        <pre><code class="language-text">Un token es la unidad mínima de texto que procesa un modelo: puede ser una palabra, parte de ella o un signo. El modelo no lee letras, lee tokens.
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>Client()</code></strong>: crea el cliente apuntando al servidor local. No hay clave de API porque el modelo corre en tu máquina.</li>
+          <li><strong><code>stream=True</code></strong>: cambia el contrato. En vez de esperar la respuesta completa, recibes un iterador de fragmentos.</li>
+          <li><strong><code>options={"temperature": 0.2}</code></strong>: controla el <em>sampling</em>. Baja temperatura = respuestas más estables y repetibles (útil para tareas técnicas).</li>
+          <li><strong><code>for part in stream</code></strong>: aquí está la magia. Cada iteración bloquea solo hasta el siguiente trocito, no hasta el final.</li>
+          <li><strong><code>end="", flush=True</code></strong>: evita el salto de línea y fuerza a Python a volcar el texto al instante. Sin <code>flush</code>, puede quedar en un búfer y parecer que no se escribe nada.</li>
+          <li><strong><code>or ""</code></strong>: el fragmento final a veces trae contenido vacío (<code>None</code>); lo normalizamos para no imprimir <em>None</em>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Nube como alternativa:</strong> con OpenAI el patrón es el mismo, cambia el nombre. <code>client.chat.completions.create(..., stream=True)</code> y dentro del bucle <code>chunk.choices[0].delta.content or ""</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <strong>Copiloto</strong> (el asistente que responde sobre los cursos de la Academy) muestra la respuesta en una CLI. Queremos tres cosas: ver el primer token cuanto antes, mostrar cuánto tardó, y poder cortar con un deadline. Todo con código determinista alrededor de la inferencia.</p>
+        <div class="code-file">src/copiloto/llm.py — stream_response()</div>
+        <pre><code class="language-python"># src/copiloto/llm.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from ollama import Client
+
+DEFAULT_MODEL = "llama3.2"
+
+
+@dataclass
+class StreamStats:
+    """Métricas de una generación. Medir siempre, aunque sea barato."""
+
+    ttft_ms: float          # tiempo hasta el primer token
+    total_ms: float         # tiempo total de la respuesta
+    chunks: int             # nº de fragmentos recibidos (≈ tokens generados)
+    cancelled: bool         # ¿cortamos antes de terminar?
+
+
+def stream_response(
+    messages: list[dict[str, str]],
+    *,
+    model: str = DEFAULT_MODEL,
+    max_seconds: float = 30.0,   # deadline lógico propio
+) -&gt; StreamStats:
+    """Genera una respuesta por streaming con deadline y métricas."""
+    client = Client()
+    t0 = time.perf_counter()
+    first: float | None = None
+    chunks = 0
+    cancelled = False
+
+    stream = client.chat(model=model, messages=messages, stream=True)
+    for part in stream:
+        # 1) Deadline: código nuestro, NO del modelo. Cortamos si nos pasamos.
+        if time.perf_counter() - t0 &gt; max_seconds:
+            cancelled = True
+            break   # salir del bucle deja de consumir el stream (cancela)
+
+        text = part.message.content or ""
+        if not text:
+            continue
+
+        # 2) Medimos solo la primera vez: ahí está el TTFT.
+        if first is None:
+            first = time.perf_counter() - t0
+
+        chunks += 1
+        print(text, end="", flush=True)   # la UI reacciona ya
+
+    total = time.perf_counter() - t0
+    print()
+    return StreamStats(
+        ttft_ms=(first or 0.0) * 1000,
+        total_ms=total * 1000,
+        chunks=chunks,
+        cancelled=cancelled,
+    )
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Deadline con <code>time.perf_counter()</code></strong>: es un reloj monótono, ideal para medir intervalos. El deadline es <em>nuestra</em> lógica determinista; el modelo no lo conoce.</li>
+          <li><strong><code>break</code> = cancelar</strong>: dejar de iterar el stream corta la generación. No necesitas una llamada especial de cancelación en el caso simple.</li>
+          <li><strong>Medir TTFT y total</strong>: son las dos cifras que explicarás en la lección 4. Aquí solo las capturamos.</li>
+          <li><strong><code>@dataclass</code></strong>: agrupar métricas evita pasar cinco variables sueltas y hace el resultado inspeccionable y testeable.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p>El Copiloto imprimirá cada token según llega (<strong>percepción de velocidad</strong>) y devolverá un <code>StreamStats</code> que luego se registra y se evalúa. Esta mezcla —UI reactiva + métricas— es exactamente lo que separa un juguete de una herramienta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usar <code>stream=True</code> en cualquier UI interactiva</td>
+              <td>Bloquear la interfaz hasta la respuesta completa</td>
+              <td>El primer token es tu mejor señal de que todo va bien</td>
+            </tr>
+            <tr>
+              <td><code>flush=True</code> en cada escritura</td>
+              <td>Confiar en el búfer por defecto</td>
+              <td>Sin flush, el texto puede quedar retenido y parecer «colgado»</td>
+            </tr>
+            <tr>
+              <td>Poner un deadline propio además del timeout de red</td>
+              <td>Un único <code>timeout</code> enorme «por si acaso»</td>
+              <td>Proteges tiempo y coste con dos límites distintos</td>
+            </tr>
+            <tr>
+              <td>Medir TTFT y total desde el principio</td>
+              <td>Optimizar «a ojo» sin números</td>
+              <td>Sin medir no sabes si el problema es el modelo, la red o tu código</td>
+            </tr>
+            <tr>
+              <td>Normalizar fragmentos vacíos (<code>or ""</code>)</td>
+              <td>Asumir que <code>content</code> siempre es <code>str</code></td>
+              <td>El chunk final suele venir vacío o <code>None</code></td>
+            </tr>
+            <tr>
+              <td>Guardar la respuesta ensamblada para evaluar/log</td>
+              <td>Desechar el texto porque solo lo «pintaste»</td>
+              <td>Necesitas la respuesta completa para trazas y evals</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Esperar la respuesta completa «porque es más simple»</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <div class="code-file">antipatron/blocking.py</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Sin streaming: la UI no muestra NADA hasta que termina.
+response = client.chat(model="llama3.2", messages=messages)
+print(response.message.content)   # aparece de golpe tras 8 segundos
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <div class="code-file">correcto/streaming.py</div>
+        <pre class="code-right"><code class="language-python"># ✅ Con streaming: el texto aparece desde el primer token.
+for part in client.chat(model="llama3.2", messages=messages, stream=True):
+    print(part.message.content or "", end="", flush=True)
+print()
+</code></pre>
+
+        <h3>Olvidar <code>flush</code> y creer que no funciona</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Sin flush, Python puede acumular en búfer. En scripts largos
+#    parece que la respuesta no llega aunque el modelo ya generó texto.
+for part in stream:
+    print(part.message.content or "", end="")
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ flush=True fuerza a escribir en pantalla en cada fragmento.
+for part in stream:
+    print(part.message.content or "", end="", flush=True)
+</code></pre>
+
+        <h3>Usar un timeout gigante en vez de uno razonable</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ "timeout": 9999 no protege: si algo se atasca, esperas 2h47m.
+client = Client(host="http://localhost:11434", timeout=9999)
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Timeout corto de red + deadline lógico de negocio separados.
+client = Client(host="http://localhost:11434", timeout=5.0)  # seg de socket
+
+deadline = time.monotonic() + 30.0   # tope de negocio
+for part in stream:
+    if time.monotonic() &gt; deadline:
+        break
+</code></pre>
+
+        <h3>Capturar una excepción a mitad de stream y perder lo ya escrito</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Si algo falla a mitad, tiramos TODO el texto parcial a la basura.
+buffer = ""
+for part in stream:
+    buffer += part.message.content or ""
+print(buffer)   # si el bucle peta, no se ha mostrado nada
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Acumula Y muestra según llega; el parcial nunca se pierde.
+buffer = ""
+try:
+    for part in stream:
+        text = part.message.content or ""
+        buffer += text
+        print(text, end="", flush=True)
+except Exception as exc:
+    print(f"\n[interrumpido tras {len(buffer)} caracteres: {exc}]")
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir el TTFT y la latencia total de una respuesta con streaming, con tu propio código.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Entorno.</strong> Confirma que Ollama está corriendo y tienes un modelo:
+            <pre><code class="language-bash">ollama list
+ollama run llama3.2 "hola"   # si no lo tienes: ollama pull llama3.2
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Crea el script.</strong> Guarda esto como <code>medir_stream.py</code>:
+            <pre><code class="language-python">import time
+from ollama import Client
+
+client = Client()
+messages = [{"role": "user", "content": "Cuenta del 1 al 20, solo los números."}]
+
+t0 = time.perf_counter()
+first = None
+n = 0
+texto = []
+for part in client.chat(model="llama3.2", messages=messages, stream=True):
+    piece = part.message.content or ""
+    if not piece:
+        continue
+    if first is None:
+        first = time.perf_counter() - t0
+    n += 1
+    texto.append(piece)
+    print(piece, end="", flush=True)
+
+total = time.perf_counter() - t0
+print()
+print(f"TTFT: {first*1000:.0f} ms | total: {total*1000:.0f} ms | chunks: {n}")
+print(f"tokens/s ≈ {n / total:.1f}")
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Ejecuta y observa.</strong>
+            <pre><code class="language-bash">uv run medir_stream.py
+</code></pre>
+            <p>Resultado esperado: el texto aparece progresivamente y al final una línea con TTFT, total, número de fragmentos y tokens por segundo aproximados. El TTFT suele ser bastante mayor que el tiempo por token: por eso el streaming «se siente» rápido.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Compara.</strong> Cambia el prompt por uno de 200 palabras y repite. Observa que el <strong>TTFT</strong> apenas cambia pero el <strong>total</strong> crece: estás generando más tokens.
+          </li>
+          <li>
+            <strong>Paso 5 — Verificación.</strong> Añade <code>max_seconds=3.0</code> (o un <code>if time.perf_counter() - t0 &gt; 3: break</code>) y confirma que la generación se corta y no esperas indefinidamente.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Streaming cancelable desde el teclado</h3>
+          <p>Construye una pequeña CLI del Copiloto que haga streaming de la respuesta, imprima el TTFT al primer token y permita <strong>cancelar</strong> la generación pulsando <code>Ctrl+C</code> sin perder lo ya generado. Al cancelar debe imprimir un resumen con los caracteres recibidos y si la cancelación fue del usuario o por deadline.</p>
+          <p><em>Pista: captura <code>KeyboardInterrupt</code> alrededor del bucle y guarda el texto acumulado antes de salir. Para no bloquear el hilo principal, mira cómo leer la entrada en otro hilo o usa una señal simple; no necesitas nada sofisticado, solo que el bucle pueda detenerse de forma limpia.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una llamada a un LLM siempre lleva <strong>modelo, mensajes y opciones</strong>; el streaming solo cambia <em>cómo</em> recibes la respuesta.</li>
+          <li>El modelo genera <strong>token a token</strong>; el streaming expone ese goteo y mejora la <strong>latencia percibida</strong>.</li>
+          <li>Hay dos latencias: <strong>TTFT</strong> (hasta el primer token) y <strong>total</strong> (hasta el último). Mídelas, no las adivines.</li>
+          <li><strong>Cancelar</strong> es dejar de iterar el stream; un <strong>deadline</strong> propio protege el tiempo de negocio y un <strong>timeout</strong> de red protege la conexión.</li>
+          <li><code>flush=True</code> es obligatorio en cualquier salida interactiva: sin él, puede parecer que no se escribe nada.</li>
+          <li>Siempre <strong>acumula</strong> el texto completo aunque lo muestres por trozos: lo necesitarás para trazas y evals.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td>Llamada básica</td><td><code>client.chat(model, messages)</code></td></tr>
+            <tr><td>Streaming</td><td><code>stream=True</code> + bucle <code>for part in stream</code></td></tr>
+            <tr><td>TTFT / total</td><td><code>time.perf_counter()</code></td></tr>
+            <tr><td>Cancelar</td><td><code>break</code> en el bucle (y dejar de consumir)</td></tr>
+            <tr><td>Deadline</td><td>Comparar contra <code>time.monotonic()</code></td></tr>
+            <tr><td>Timeout de red</td><td><code>Client(timeout=…)</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El streaming hace que el modelo responda más rápido?</summary>
+            <div>
+              <p>No. Tarda lo mismo en generar la respuesta completa. Lo que cambia es cuándo <em>ves</em> el resultado: empiezas a ver texto desde el primer token en vez de esperar al último. Mejora la latencia percibida, no la real.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo hacer streaming y a la vez pedir salida estructurada (JSON)?</summary>
+            <div>
+              <p>Sí, pero combínalo con cuidado: el JSON solo es válido cuando termina. Puedes mostrar el progreso crudo y, al acabar, validar el texto completo con <code>pydantic</code>. Si la salida debe ser JSON estricto, a menudo interesa más la respuesta completa que el streaming (lo verás en el módulo 1, lección de salida estructurada).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo cancelo de verdad una generación en la nube?</summary>
+            <div>
+              <p>Salir del iterador cierra la conexión y el servidor deja de enviarte datos. Los SDKs suelen exponer un gestor de contexto (<code>with client.chat.completions.stream(...)</code> en OpenAI) que al salir cierra el stream de forma ordenada. Para cancelación cooperativa desde otra parte de tu app, guarda una referencia al stream y ciérralo o rompe el bucle.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué timeout elijo?</summary>
+            <div>
+              <p>Depende de la tarea, pero un punto de partida sano: timeout de red corto (5-10 s) para detectar conexiones muertas y un deadline de negocio (15-60 s) según cuánto estás dispuesto a esperar. Mídelo con datos reales antes de fijarlo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>num_predict</code> es lo mismo que un límite de tiempo?</summary>
+            <div>
+              <p>No. <code>num_predict</code> limita cuántos tokens puede generar el modelo como máximo. Ahorra coste y evita respuestas eternas, pero no garantiza tiempo: 50 tokens de un modelo cargado pueden tardar mucho. Para el tiempo necesitas timeout y/o deadline.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

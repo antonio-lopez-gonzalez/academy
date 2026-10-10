@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-evaluacion-de-rag">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Evaluación de RAG — Módulo 4 · Curso IA</title>
+  <meta name="description" content="Dataset de preguntas del Copiloto, recall de recuperación y faithfulness de la respuesta: cómo medir RAG antes y después de cada cambio.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Evaluación de RAG</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · RAG</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hemos construido el pipeline, afinado el retrieval, añadido citas y abstención. Ahora la pregunta binaria de la ingeniería: <strong>¿funciona mejor que antes?</strong> «Yo creo que sí» no es una respuesta. RAG tiene <strong>dos mitades que se evalúan por separado</strong> —la recuperación y la generación— y sin medirlas estás cambiando prompts a ciegas.</p>
+        <p>En esta lección montamos el arnés de evaluación del Copiloto:</p>
+        <ul>
+          <li>Un <strong>dataset de preguntas</strong> con la lección que contiene la respuesta (el <em>gold</em>) y una respuesta de referencia.</li>
+          <li>Métricas de <strong>recuperación</strong>: <code>recall@k</code>, <em>hit rate</em>, MRR —deterministas y baratas.</li>
+          <li>Métricas de <strong>generación</strong>: <em>faithfulness</em> y relevancia de la respuesta, apoyadas en un juez automático.</li>
+          <li>El hábito de <strong>medir antes y después</strong> de cada cambio, con un número comparable.</li>
+        </ul>
+        <p>El objetivo no es tener muchas métricas, sino tener <strong>una o dos que te digan la verdad</strong> y ejecutarlas cada vez que tocas el pipeline. Es la diferencia entre un RAG de demo y uno que aguanta en producción.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque la evaluación es parte del curso, no un anexo. Todo lo que hicimos en el módulo 4 —elegir <code>k</code>, calibrar umbrales, reranquear, endurecer el prompt— se decide con números. Sin un dataset y un arnés, cada «mejora» es una superstición.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos mitades, cuatro familias de métricas</h3>
+        <p>Un fallo de RAG está en la <strong>recuperación</strong> (no se trajo el fragmento correcto) o en la <strong>generación</strong> (se trajo y la respuesta lo ignoró). Por eso evaluamos las dos por separado. Las cuatro familias canónicas:</p>
+        <pre class="diagram">
+  RECUPERACIÓN (¿traje lo que debía?)        GENERACIÓN (¿respondí bien?)
+  ───────────────────────────────────        ────────────────────────────
+  · relevance  : ¿lo traído era relevante?   · faithfulness: ¿se apoya en el contexto?
+  · recall     : ¿estaba el gold en el pool? · answer relevance: ¿responde a la pregunta?
+        </pre>
+        <table>
+          <thead><tr><th>Métrica</th><th>Pregunta</th><th>Tipo</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>recall@k</strong></td>
+              <td>¿El fragmento gold está entre los <code>k</code> recuperados?</td>
+              <td>Determinista</td>
+              <td>Bajo</td>
+            </tr>
+            <tr>
+              <td><strong>hit rate</strong></td>
+              <td>Fracción de preguntas con al menos un acierto</td>
+              <td>Determinista</td>
+              <td>Bajo</td>
+            </tr>
+            <tr>
+              <td><strong>MRR</strong></td>
+              <td>Posición media del primer acierto (1/rank)</td>
+              <td>Determinista</td>
+              <td>Bajo</td>
+            </tr>
+            <tr>
+              <td><strong>faithfulness</strong></td>
+              <td>¿Cada afirmación se apoya en el contexto?</td>
+              <td>Juez / LLM</td>
+              <td>Medio</td>
+            </tr>
+            <tr>
+              <td><strong>answer relevance</strong></td>
+              <td>¿La respuesta contesta la pregunta?</td>
+              <td>Juez / LLM</td>
+              <td>Medio</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Métricas de recuperación: recall@k, hit rate y MRR</h3>
+        <p>Necesitan el <strong>gold</strong>: para cada pregunta, qué fragmento (o lección) contiene la respuesta. Tres definiciones que conviene tener claras:</p>
+        <ul>
+          <li><strong><code>recall@k</code></strong>: proporción de preguntas cuyo gold aparece en los primeros <code>k</code> recuperados. Responde a «¿tengo la información a mano para el paso siguiente?».</li>
+          <li><strong>hit rate@k</strong>: igual pero contando solo si hay <em>al menos un</em> acierto. Con un único gold por pregunta, coincide con <code>recall@k</code>.</li>
+          <li><strong>MRR</strong> (<em>Mean Reciprocal Rank</em>): promedio de <code>1/rank</code> del primer acierto. Un gold en la posición 1 aporta 1.0; en la 5, 0.2. Premia <em>ordenar</em> bien, no solo <em>encontrar</em>.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><code>recall</code> te dice si el gold está en el pool; <strong>MRR</strong> te dice si el reranking lo sube arriba. Si el recall es alto y el MRR bajo, tu problema es de <em>orden</em> (reranking). Si el recall es bajo, es de <em>presencia</em> (chunking, modelo, híbrida). Es el diagnóstico de la lección 02, ahora con nombre y número.</p>
+        </div>
+
+        <h3>Métricas de generación: faithfulness y relevancia</h3>
+        <p>Aquí no basta con comparar cadenas: dos respuestas distintas pueden ser ambas correctas. Por eso se usa un <strong>juez automático</strong> (un LLM con una rúbrica) o un modelo entrenado para evaluar. En esta lección usamos el juez; en el módulo 7 lo calibramos a fondo.</p>
+        <ul>
+          <li><strong>Faithfulness</strong> (o <em>groundedness</em>): de todas las afirmaciones de la respuesta, ¿cuántas se derivan del contexto recuperado? Es la métrica que hemos perseguido en la lección 03.</li>
+          <li><strong>Answer relevance</strong>: ¿la respuesta ataca <em>la pregunta hecha</em>? Una respuesta fiel al contexto pero que habla de otro tema tiene baja relevancia.</li>
+          <li><strong>Correctness</strong> frente a una respuesta de referencia: útil si tienes un <em>gold answer</em>, pero cara de escribir y sensible al juez. Empieza por faithfulness + relevance.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Puedes tener <strong>faithfulness 1.0 y relevancia 0.2</strong>: la respuesta no inventa nada, pero no contesta. Y al revés: relevante pero infiel, es decir, contesta inventando. Medir las dos evita optimizar una a costa de la otra.</p>
+        </div>
+
+        <h3>El dataset: el activo más valioso</h3>
+        <p>Todo lo anterior necesita un <strong>conjunto dorado</strong> (<em>golden set</em>): preguntas reales con su gold. Reglas para construirlo bien:</p>
+        <ul>
+          <li><strong>Preguntas reales</strong>, formuladas como las haría un usuario, no copiadas literales de las lecciones (si no, el retrieval parece mejor de lo que es).</li>
+          <li><strong>Gold de recuperación</strong>: qué lección o sección contiene la respuesta. Barato de anotar y habilita las métricas deterministas.</li>
+          <li><strong>Respuesta de referencia</strong> (opcional): la respuesta correcta, para <em>correctness</em> y para calibrar el juez.</li>
+          <li><strong>Preguntas sin respuesta</strong> (<em>unanswerable</em>): fuera del corpus, para medir la <strong>abstención</strong>. Sin estos casos, no sabes si el sistema se calla cuando debe.</li>
+          <li><strong>Tamaño inicial manejable</strong>: 30–50 casos ya revelan problemas; 100+ permiten comparar cambios finos. Mejor 30 bien anotados que 300 a ojo.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p>No uses las mismas tres preguntas con las que programaste. El sistema está «ajustado» a ellas y te darán una falsa sensación de calidad. Reserva casos que <strong>no</strong> hayas mirado al afinar el prompt; son los que te dicen la verdad.</p>
+        </div>
+
+        <h3>Determinista vs. juez: empieza por lo barato</h3>
+        <p>Las métricas deterministas (recall, hit rate, MRR, y la verificación de citas de la lección 03) no cuestan tokens ni tienen sesgo. Agótalas antes de recurrir al juez. El juez aporta donde el código no llega (¿está realmente respaldada esta afirmación?), pero introduce coste, latencia y necesidad de calibración.</p>
+
+        <h3>Medir antes y después: el ritual</h3>
+        <p>La evaluación no es un evento: es un <strong>ritual</strong>. Cada cambio en el pipeline (otro modelo de embeddings, otro <code>k</code>, un reranker, un prompt nuevo) debe medirse contra el mismo dataset y compararse con el número anterior:</p>
+        <pre class="diagram">
+  cambio  →  correr evals  →  comparar con la línea base  →  decidir
+     ▲                                                          │
+     └──────────────── si mejora, queda; si no, se revierte ────┘
+        </pre>
+        <p>Si el número no se mueve, el cambio no aporta. Si baja, has aprendido algo por el precio de una ejecución. Los cambios «que seguro mejoran» y no se miden son la fuente número uno de regresiones silenciosas.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un arnés de evaluación <strong>determinista</strong> en treinta líneas: dado un dataset pequeño con gold, calcula <code>recall@k</code>, <em>hit rate</em> y <strong>MRR</strong> simulando recuperaciones. Sin LLM y sin embeddings reales, para ver la mecánica.</p>
+        <div class="code-file">eval_minimo.py</div>
+        <pre><code class="language-python"># eval_minimo.py — métricas de recuperación sobre un dataset con gold.
+from dataclasses import dataclass
+
+
+@dataclass
+class Case:
+    question: str
+    gold: str          # id de la lección que contiene la respuesta, o None
+
+
+# Dataset pequeño: 3 con respuesta, 1 sin respuesta (unanswerable).
+CASES = [
+    Case("¿Qué es el chunking?", "03-chunking"),
+    Case("¿Cómo reduce RAG la alucinación?", "01-pipeline-rag"),
+    Case("¿Qué es el reranking?", "02-retrieval-y-reranking"),
+    Case("¿Capital de Australia?", None),                 # sin respuesta en el corpus
+]
+
+# Recuperaciones simuladas: una lista ordenada de lesson_id por pregunta.
+RETRIEVED: dict[str, list[str]] = {
+    "¿Qué es el chunking?":                 ["02-similitud", "03-chunking", "04-bases"],
+    "¿Cómo reduce RAG la alucinación?":     ["01-pipeline-rag", "03-citas", "02-retrieval"],
+    "¿Qué es el reranking?":               ["04-coste", "02-tokens", "01-prompting"],
+    "¿Capital de Australia?":               ["01-pipeline-rag", "04-rag"],
+}
+
+
+def recall_at(k: int) -> float:
+    """Fracción de preguntas con gold cuyo gold está en los primeros k."""
+    answered = [c for c in CASES if c.gold]
+    hits = sum(c.gold in RETRIEVED[c.question][:k] for c in answered)
+    return hits / len(answered)
+
+
+def mrr() -> float:
+    """Media de 1/posición del primer acierto (0 si no aparece)."""
+    total = 0.0
+    answered = [c for c in CASES if c.gold]
+    for c in answered:
+        rank = next((i for i, d in enumerate(RETRIEVED[c.question], 1) if d == c.gold), 0)
+        total += 1 / rank if rank else 0.0
+    return total / len(answered)
+
+
+def abstention_ok() -> bool:
+    """La pregunta sin respuesta no debe recuperar nada del corpus relevante."""
+    return RETRIEVED["¿Capital de Australia?"] == []
+
+
+print(f"recall@1 = {recall_at(1):.0%}")
+print(f"recall@3 = {recall_at(3):.0%}")
+print(f"MRR      = {mrr():.2f}")
+print(f"abstención correcta = {abstention_ok()}")
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">recall@1 = 33%
+recall@3 = 67%
+MRR      = 0.61
+abstención correcta = False
+</code></pre>
+        <p>Lectura inmediata, sin LLM: el retrieval <strong>encuentra 2 de 3</strong> respuestas en el top-3 (el reranking no sube la primera a la posición 1, MRR 0.61), y la pregunta sin respuesta <strong>no se abstiene</strong> (devuelve fragmentos irrelevantes). Dos problemas distintos, los dos visibles con veinte líneas de código.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Un arnés de evaluación real: lee el dataset desde un JSONL, ejecuta el pipeline completo (retrieval + generación) y calcula las dos mitades. Incluye un <strong>juez de faithfulness</strong> con rúbrica y una <strong>línea base</strong> para comparar cambios.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/evals.py</div>
+        <pre><code class="language-python">"""Arnés de evaluación del Copiloto: recuperación + generación."""
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from copiloto.answer import ask
+from copiloto.llm import chat_json
+from copiloto.retrieval import retrieve
+
+
+class Case(BaseModel):
+    question: str
+    gold_lesson: str | None = None      # None => pregunta sin respuesta
+
+
+class Verdict(BaseModel):
+    faithful: bool
+    reason: str
+
+
+JUDGE_PROMPT = """\
+Eres un evaluador. Te doy un CONTEXTO y una RESPUESTA.
+Di si TODAS las afirmaciones de la respuesta se derivan del contexto.
+Si hay UNA sola afirmación no respaldada, faithful=false.
+Responde JSON con las claves faithful (bool) y reason (str)."""
+
+
+def load_dataset(path: str = "evals/cases.jsonl") -> list[Case]:
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    return [Case.model_validate_json(line) for line in lines if line.strip()]
+
+
+@dataclass
+class Report:
+    recall_at_k: float
+    mrr: float
+    faithfulness: float
+    abstention: float
+    n: int
+
+
+def run(k: int = 4) -> Report:
+    cases = load_dataset()
+    hits = 0
+    rr_total = 0.0
+    faithful_ok = 0
+    answered_cases = 0
+    abstained_ok = 0
+    unanswerable = 0
+
+    for case in cases:
+        fragments = retrieve(case.question)[:k]
+        answer = ask(case.question)
+
+        if case.gold_lesson is None:                        # pregunta sin respuesta
+            unanswerable += 1
+            if not answer.answered:
+                abstained_ok += 1
+            continue
+
+        # --- Mitad de recuperación (determinista) ---
+        lessons = [f.lesson for f in fragments]
+        rank = next((i for i, l in enumerate(lessons, 1)
+                     if l.endswith(case.gold_lesson)), 0)
+        if rank:
+            hits += 1
+            rr_total += 1 / rank
+
+        # --- Mitad de generación (juez) ---
+        answered_cases += 1
+        context = "\n\n".join(f.text for f in fragments)
+        verdict = chat_json(
+            [{"role": "system", "content": JUDGE_PROMPT},
+             {"role": "user", "content": f"CONTEXTO:\n{context}\n\nRESPUESTA:\n{answer.text}"}],
+            model=Verdict,
+        )
+        faithful_ok += int(verdict.faithful)
+
+    return Report(
+        recall_at_k=hits / answered_cases,
+        mrr=rr_total / answered_cases,
+        faithfulness=faithful_ok / answered_cases,
+        abstention=abstained_ok / unanswerable if unanswerable else 1.0,
+        n=len(cases),
+    )
+
+
+def main() -> None:
+    base = run(k=4)
+    print(f"dataset: {base.n} casos")
+    print(f"  recall@4     = {base.recall_at_k:.0%}")
+    print(f"  MRR          = {base.mrr:.2f}")
+    print(f"  faithfulness = {base.faithfulness:.0%}")
+    print(f"  abstención   = {base.abstention:.0%}")
+    print(json.dumps(base.__dict__, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+        <p>El dataset, en formato JSONL (una línea por caso):</p>
+        <div class="code-file">proyectos/copiloto/evals/cases.jsonl</div>
+        <pre><code class="language-json">{"question": "¿Qué es un chunk?", "gold_lesson": "03-chunking"}
+{"question": "¿Cómo reduce RAG la alucinación?", "gold_lesson": "01-pipeline-rag"}
+{"question": "¿Qué es el reranking?", "gold_lesson": "02-retrieval-y-reranking"}
+{"question": "¿Qué hago cuando no hay contexto suficiente?", "gold_lesson": "03-citas-y-fidelidad"}
+{"question": "¿Cuál es la capital de Australia?", "gold_lesson": null}
+</code></pre>
+        <p>Ejecución y comparación antes/después de un cambio:</p>
+        <pre><code class="language-bash">uv run python -m copiloto.evals
+# línea base: recall@4 = 82%  MRR = 0.71  faithfulness = 90%  abstención = 100%
+
+# Cambio: activar búsqueda híbrida + reranker (lección 02)
+uv run python -m copiloto.evals
+# después:    recall@4 = 100% MRR = 0.94  faithfulness = 96%  abstención = 100%
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Dos mitades separadas</strong>: recuperación (recall, MRR) y generación (faithfulness). Un solo número agregado esconde <em>dónde</em> está el problema.</li>
+          <li><strong>Preguntas <code>unanswerable</code> con <code>gold_lesson = null</code></strong>: miden abstención. Es la métrica que evita que «responder siempre» parezca bueno.</li>
+          <li><strong>Juez con rúbrica binaria</strong>: <code>faithful</code> solo si <em>todas</em> las afirmaciones están respaldadas. Más fácil de calibrar que una escala 1–5.</li>
+          <li><strong>Dataset versionado en el repo</strong> (<code>evals/cases.jsonl</code>): la evaluación es código y datos, no una hoja de cálculo suelta. Cambia con el proyecto.</li>
+          <li><strong>Línea base explícita</strong>: el valor de un cambio es la <em>diferencia</em>, no el número absoluto. Sin base, no hay comparación.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>El juez de esta lección es deliberadamente simple. En el módulo 7 (evals y producción) lo calibramos contra juicios humanos, medimos su coste y detectamos sus sesgos (p. ej., favorecer respuestas largas).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Evaluar recuperación y generación por separado</td>
+              <td>Un único «score de RAG»</td>
+              <td>Un número agregado oculta dónde falla</td>
+            </tr>
+            <tr>
+              <td>Incluir preguntas <em>unanswerable</em></td>
+              <td>Evaluar solo lo que el corpus responde</td>
+              <td>Sin ellas, la abstención no se mide</td>
+            </tr>
+            <tr>
+              <td>Formular preguntas como las haría un usuario</td>
+              <td>Copiar frases literales de las lecciones</td>
+              <td>El retrieval parece mejor de lo que es</td>
+            </tr>
+            <tr>
+              <td>Empezar con métricas deterministas (recall, MRR)</td>
+              <td>Ir directo al juez de LLM</td>
+              <td>Gratis, sin sesgo y detecta la mayoría de fallos</td>
+            </tr>
+            <tr>
+              <td>Guardar el dataset y versionarlo en el repo</td>
+              <td>Evaluar «a ojo» en el REPL</td>
+              <td>Sin dataset comparable no hay regresión</td>
+            </tr>
+            <tr>
+              <td>Medir antes y después de cada cambio</td>
+              <td>Asumir que un cambio «mejora»</td>
+              <td>Las regresiones silenciosas son la norma</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Evaluar con las mismas preguntas del desarrollo</h3>
+        <p>El sistema está ajustado a ellas; te dirán que todo va bien.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Las 3 preguntas con las que iteraste el prompt.
+for q in ["¿Qué es RAG?", "¿Chunking?", "¿Top-k?"]:
+    print(ask(q).text)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Dataset reservado, con gold y casos sin respuesta.
+report = run()                 # recall, MRR, faithfulness, abstención
+assert report.recall_at_k &gt;= baseline.recall_at_k   # comparación explícita
+</code></pre>
+
+        <h3>6.2. Medir solo la respuesta final</h3>
+        <p>Si la respuesta es mala, no sabes si falló el retrieval o la generación.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "¿suena bien?" — no localiza el fallo.
+score = judge_quality(ask(q).text)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Separa recall (¿estaba el gold?) de faithfulness (¿lo usó?).
+recall = gold_in(retrieve(q))
+faith = judge_faithful(retrieve(q), ask(q).text)
+</code></pre>
+
+        <h3>6.3. Cambiar varias cosas a la vez</h3>
+        <p>Si tocas modelo de embeddings, <code>k</code> y prompt juntos, no sabrás cuál de los tres movió la aguja.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Tres cambios en un commit: imposible atribuir la mejora.
+embed_model = "bigger"; k = 8; system_prompt = new_prompt
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Un cambio por iteración, con su medida.
+for change in [("hybrid", on), ("rerank", on), ("prompt", new)]:
+    apply(change); print(run())      # delta atribuible a cada uno
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir un dataset de evaluación del Copiloto, medir la línea base y demostrar con números la mejora de un cambio. Al terminar tendrás un ritual reproducible.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — crea el dataset.</strong> Anota 10 preguntas: 8 con gold (lección que contiene la respuesta) y 2 sin respuesta (fuera del corpus). Guárdalas en <code>evals/cases.jsonl</code>:
+            <pre><code class="language-json">{"question": "¿Para qué sirve el chunking?", "gold_lesson": "03-chunking"}
+{"question": "¿Qué métricas mido en RAG?", "gold_lesson": "04-evaluacion-de-rag"}
+{"question": "¿Cómo cito la fuente en la respuesta?", "gold_lesson": "03-citas-y-fidelidad"}
+{"question": "¿Qué es el margen relativo?", "gold_lesson": "02-retrieval-y-reranking"}
+{"question": "¿Cuál es la montaña más alta de Marte?", "gold_lesson": null}
+</code></pre>
+            <p>Añade cinco casos más siguiendo el patrón. Regla: formúlalas <em>como las haría un usuario</em>, no copiando frases de las lecciones.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — corre la línea base.</strong>
+            <pre><code class="language-bash">uv run python -m copiloto.evals
+</code></pre>
+            <p>Anota los cuatro números: <code>recall@4</code>, <code>MRR</code>, <code>faithfulness</code>, <code>abstención</code>. Esta es tu base. No la cambies ni la «mejores» sin volver a correr.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — mira dónde falla.</strong> Para cada caso fallido, imprime la traza del pool:
+            <pre><code class="language-bash">uv run copiloto ask "¿Qué es el margen relativo?" --trace
+</code></pre>
+            <p>Clasifica cada fallo: <em>gold ausente del pool</em> (recuperación), <em>gold presente pero respuesta infiel</em> (generación), o <em>no se abstuvo</em>. Esperado: casi todos los fallos caen en una sola categoría; esa es la que arreglas primero.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — aplica un cambio y vuelve a medir.</strong> Elige un solo cambio según el diagnóstico (subir el pool, activar híbrida, reranking, endurecer el prompt) y corre los evals:
+            <pre><code class="language-bash">uv run python -m copiloto.evals
+</code></pre>
+            <p>Compara las dos tablas. Esperado (ejemplo real):</p>
+            <pre><code class="language-text">métrica        antes   después   delta
+recall@4        80%     100%     +20 pts
+MRR             0.68     0.91     +0.23
+faithfulness    88%      95%      +7 pts
+abstención     100%     100%       0 pts
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — decide con el número, no con la intuición.</strong> Si el delta es positivo, quédate el cambio; si no, revierte. Documenta en el README del proyecto <em>qué cambiaste, la línea base y el resultado</em>. Ese registro es lo que convierte tu RAG en algo que se puede defender.
+            <p><strong>Resultado esperado:</strong> un dataset versionado, cuatro métricas comparables y una decisión justificada por datos. Acabas de cerrar el bucle de ingeniería de RAG.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un informe de evaluación con umbrales de regresión</h3>
+          <p>Convierte el arnés en una <strong>puerta de calidad</strong> que se ejecute en CI y falle si el sistema empeora. Requisitos:</p>
+          <ul>
+            <li>Guarda la línea base en un archivo (<code>evals/baseline.json</code>).</li>
+            <li>Compara cada corrida contra la base y sal con <strong>código de salida 1</strong> si <code>recall@k</code>, <code>faithfulness</code> o <code>abstención</code> bajan más de un margen que definas.</li>
+            <li>Genera un informe <em>por caso</em> (no solo el agregado) en Markdown, destacando las <strong>regresiones</strong> (casos que antes acertaban y ahora fallan).</li>
+            <li>Separa los evals <strong>deterministas</strong> (siempre) de los que usan <strong>juez</strong> (opcionales, por coste).</li>
+          </ul>
+          <p><em>Pista: un fichero JSON de base y una función <code>diff(base, current)</code> que devuelve los casos «acierto → fallo». Para el código de salida, <code>sys.exit(1)</code> desde <code>main()</code>. Cuida la reproducibilidad: fija el modelo y, si el juez introduce varianza, ejecútalo con temperatura 0 (módulo 0). No resuelvas el reto bajando los umbrales hasta que «pase»: el objetivo es que detecte regresiones, no que siempre esté verde.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un RAG se evalúa en <strong>dos mitades</strong>: recuperación (¿traje el gold?) y generación (¿lo usé bien?).</li>
+          <li>Métricas de recuperación <strong>deterministas y baratas</strong>: <code>recall@k</code>, <em>hit rate</em> y <strong>MRR</strong>.</li>
+          <li>Métricas de generación con <strong>juez</strong>: <em>faithfulness</em> y <em>answer relevance</em>. El módulo 7 las calibra.</li>
+          <li>El <strong>dataset dorado</strong> es el activo clave: preguntas reales, gold de recuperación y casos <em>unanswerable</em> para medir abstención.</li>
+          <li><strong>Antes/después siempre</strong>: un cambio sin línea base es una superstición. Un cambio a la vez para atribuir la mejora.</li>
+          <li>Empieza por lo determinista, mide en el papel una y otra vez, y solo entonces añade el juez.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Dataset de casos</td><td><code>evals/cases.jsonl</code> + pydantic <code>Case</code></td></tr>
+            <tr><td>recall@k / MRR</td><td><code>numpy</code> sobre el pool recuperado</td></tr>
+            <tr><td>Abstención</td><td>Casos con <code>gold_lesson = null</code></td></tr>
+            <tr><td>faithfulness</td><td>Juez LLM con rúbrica binaria (<code>chat_json</code>)</td></tr>
+            <tr><td>Línea base y regresión</td><td><code>evals/baseline.json</code> + <code>diff()</code> en CI</td></tr>
+            <tr><td>Propiedades</td><td><code>pytest</code> para las métricas deterministas</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos casos necesito para que la evaluación sea útil?</summary>
+            <div>
+              <p>Con <strong>30–50 casos</strong> bien anotados ya detectas los problemas grandes y comparas cambios con sentido. Menos de 20, un solo fallo mueve el porcentaje demasiado y las diferencias no son fiables. Más de 100 solo cuando necesites distinguir mejoras finas. La calidad de la anotación importa más que el volumen: un gold equivocado contamina todas las métricas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Faithfulness con juez o con reglas?</summary>
+            <div>
+              <p>Con ambas si puedes: las reglas deterministas (verificar citas, solape semántico) son gratis y atrapan lo burdo; el juez capta afirmaciones sutilmente no respaldadas. Empieza por reglas; añade el juez cuando necesites matiz. Y recuerda calibrarlo (módulo 7): un juez sin calibrar es una opinión más.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si un cambio «mejora» y no es ruido?</summary>
+            <div>
+              <p>Dos protecciones. Primera, <strong>deterministas siempre</strong>: <code>recall@k</code> y MRR no tienen varianza (mismo índice → mismo resultado), así que cualquier cambio es real. Segunda, para el <strong>juez</strong>: usa temperatura 0 y, si puedes, corre el juez varias veces y mira la variación; solo declara una mejora si el delta supera ese ruido. Nunca compares números de datasets distintos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Evaluación offline o en producción?</summary>
+            <div>
+              <p>Las dos, y miden cosas distintas. La <strong>offline</strong> (este módulo) es reproducible y la usas en CI antes de desplegar. La <strong>online</strong> mide usuarios reales (preguntas que no anticipaste, distribución de temas) y puede detectar <em>drift</em>. Lo que aprendes online se convierte en nuevos casos para el dataset offline. El módulo 7 une las dos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo medir «correctness» contra una respuesta de referencia?</summary>
+            <div>
+              <p>Sí, si escribes <em>gold answers</em>, pero es caro de anotar y muy sensible al juez (dos respuestas correctas con distinta redacción). Para empezar, <strong>faithfulness + answer relevance</strong> te dan más señal por el esfuerzo. Añade correctness cuando tu producto lo exija (p. ej., respuestas factuales cortas con respuesta única) y cuando el juez esté calibrado.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

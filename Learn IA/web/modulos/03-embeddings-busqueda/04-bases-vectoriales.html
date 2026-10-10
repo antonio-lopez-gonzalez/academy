@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-bases-vectoriales">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bases vectoriales — Módulo 3 · Curso IA</title>
+  <meta name="description" content="Índices vectoriales (flat, HNSW, IVF), pgvector y sqlite-vec, filtrado por metadato y búsqueda híbrida (vectorial + BM25). Cuándo usar cada una.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Bases vectoriales</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Embeddings y búsqueda semántica</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección 2 buscamos vecinos con un array de <code>numpy</code> y un <code>argsort</code>. Funciona… mientras el corpus viva en memoria y quepa en un proceso. Pero Copiloto necesita <strong>persistencia</strong> (los vectores sobreviven al reinicio), <strong>filtros</strong> («busca solo en el módulo 4»), <strong>actualizaciones incrementales</strong> (cambió una lección) y, algún día, quizá <strong>millones</strong> de vectores. Eso es una <strong>base vectorial</strong>.</p>
+        <p>Buenas noticias: <strong>no siempre necesitas una base vectorial dedicada</strong>. Con PostgreSQL (<code>pgvector</code>) o SQLite (<code>sqlite-vec</code>) tienes vectores, metadatos y SQL en el mismo sitio. Esta lección te da el criterio para elegir, el SQL concreto y el patrón que casi siempre gana en calidad: la <strong>búsqueda híbrida</strong> (vectorial + BM25).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque aquí es donde se decide «qué motor» y mucha gente salta directo a una base vectorial de moda para un corpus de 5.000 chunks, añadiendo infra que no aporta nada. Queremos que elijas <strong>por datos y por restricciones</strong>, no por hype.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Definición:</strong> una <strong>base vectorial</strong> es un almacén que guarda vectores junto a metadatos y responde a consultas del tipo «los <em>k</em> vectores más cercanos a este», con opción de <strong>filtrar</strong> por campos. Por debajo usa un <strong>índice vectorial</strong> (o búsqueda plana) para acelerar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Índices vectoriales: exacto vs. aproximado</h3>
+        <p>Buscar los <em>k</em> vecinos más cercanos de verdad, comparando contra todos, es la búsqueda <strong>exacta</strong> (<em>flat</em> / fuerza bruta): O(N·d). Es perfecta y simple; solo se vuelve lenta cuando N es enorme. Los <strong>índices aproximados</strong> (ANN, <em>Approximate Nearest Neighbors</em>) sacrifican un poco de exactitud a cambio de mucha velocidad y menos memoria:</p>
+        <table>
+          <thead><tr><th>Índice</th><th>Cómo funciona</th><th>Ventaja</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Flat</strong> (exacto)</td>
+              <td>Compara contra todos los vectores</td>
+              <td>100% de recall; cero parámetros</td>
+              <td>O(N·d): lento e inviable a gran escala</td>
+            </tr>
+            <tr>
+              <td><strong>HNSW</strong></td>
+              <td>Grafo navegable por capas (estilo «saltos»)</td>
+              <td>Excelente recall y latencia; el estándar</td>
+              <td>Más memoria; construcción más lenta; parámetros (<code>m</code>, <code>ef</code>)</td>
+            </tr>
+            <tr>
+              <td><strong>IVF</strong></td>
+              <td>Agrupa vectores en «listas» y busca solo en las cercanas</td>
+              <td>Poca memoria; rápido de construir</td>
+              <td>Hay que «entrenarlo»; recall depende de las listas visitadas</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>La idea que hay que llevarse: <strong>flat cuando el corpus cabe</strong>; HNSW cuando crece. El Copiloto, con unos miles de chunks, funciona de sobra con flat dentro de <code>pgvector</code> o <code>sqlite-vec</code> (que también indexan sin índice ANN).</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> buscar en un diccionario. <strong>Flat</strong> es leerlo entero hasta encontrar la palabra: infalible y lento. <strong>HNSW</strong> es un índice con «saltos»: abres por la letra y afinas: casi siempre llegas a la palabra correcta en unos pocos pasos, pero en casos raros te pasas de largo. La aproximación no es un defecto: es un intercambio deliberado.</p>
+        </div>
+
+        <h3>pgvector: vectores dentro de PostgreSQL</h3>
+        <p><code>pgvector</code> es una extensión de PostgreSQL que añade el tipo <code>vector(n)</code> y operadores de distancia. Su gran baza: vives en <strong>una sola base de datos</strong> para vectores, metadatos, filtros, joins y transacciones. Define los operadores (¡ojo, devuelven <strong>distancia</strong>: menor es mejor!):</p>
+        <table>
+          <thead><tr><th>Operador</th><th>Distancia</th><th>Índice</th></tr></thead>
+          <tbody>
+            <tr><td><code>&lt;-&gt;</code></td><td>Euclídea (L2)</td><td><code>vector_l2_ops</code></td></tr>
+            <tr><td><code>&lt;=&gt;</code></td><td><strong>Coseno</strong></td><td><code>vector_cosine_ops</code></td></tr>
+            <tr><td><code>&lt;#&gt;</code></td><td>Producto interno negativo</td><td><code>vector_ip_ops</code></td></tr>
+          </tbody>
+        </table>
+        <div class="code-file">copiloto/sql/schema.sql</div>
+        <pre><code class="language-sql">-- 1. Habilitar la extension (una vez por base de datos).
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 2. Tabla de chunks: vector + metadatos en la misma fila.
+CREATE TABLE chunks (
+    chunk_id     text PRIMARY KEY,          -- p. ej. '03-04::s2::c1'
+    lesson_id    text NOT NULL,             -- '03-04'
+    module_id    text NOT NULL,             -- '03'
+    section      text,                      -- titulo de la seccion
+    source_path  text NOT NULL,
+    model        text NOT NULL,             -- con que modelo se genero
+    content      text NOT NULL,             -- el texto del chunk
+    embedding    vector(384) NOT NULL       -- la dimension debe coincidir con el modelo
+);
+
+-- 3. Indice HNSW para distancia coseno (omitelo si usas busqueda plana).
+--    Opera sobre vecores normalizados -> la distancia coseno es la que queremos.
+CREATE INDEX chunks_embedding_idx ON chunks
+    USING hnsw (embedding vector_cosine_ops);
+
+-- 4. Indice de metadatos para filtros rapidos por modulo/leccion.
+CREATE INDEX chunks_module_idx ON chunks (module_id);
+</code></pre>
+        <p>Y así se busca desde Python con <code>psycopg</code> y <code>pgvector</code>. La consulta devuelve los vecinos ordenados por <strong>distancia coseno ascendente</strong>:</p>
+        <div class="code-file">copiloto/src/copiloto/store_pg.py (fragmento)</div>
+        <pre><code class="language-python"># store_pg.py — insertar y buscar chunks en PostgreSQL + pgvector.
+import psycopg
+from pgvector import Vector
+from pgvector.psycopg import register_vector
+
+def connect(dsn: str) -&gt; psycopg.Connection:
+    conn = psycopg.connect(dsn)               # dsn desde el entorno, NUNCA en el repo
+    register_vector(conn)                     # ensena a psycopg el tipo vector
+    return conn
+
+def upsert_chunk(conn, *, chunk_id, content, embedding, **meta) -&gt; None:
+    conn.execute(
+        """
+        INSERT INTO chunks (chunk_id, lesson_id, module_id, section,
+                            source_path, model, content, embedding)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (chunk_id) DO UPDATE SET
+            content = EXCLUDED.content,
+            embedding = EXCLUDED.embedding
+        """,
+        (chunk_id, meta["lesson_id"], meta["module_id"], meta["section"],
+         meta["source_path"], meta["model"], content, Vector(embedding)),
+    )
+    conn.commit()
+
+def search(conn, query_embedding, k: int = 5, module_id: str | None = None):
+    # El patron importante: FILTRAR por metadato + ordenar por distancia.
+    # &lt;=&gt; es distancia coseno; ASC porque en distancia MENOR es mejor.
+    sql = """
+        SELECT chunk_id, lesson_id, section, content,
+               1 - (embedding &lt;=&gt; %s) AS similarity
+        FROM chunks
+        WHERE (%s::text IS NULL OR module_id = %s)
+        ORDER BY embedding &lt;=&gt; %s
+        LIMIT %s
+    """
+    rows = conn.execute(sql, (Vector(query_embedding), module_id, module_id,
+                              Vector(query_embedding), k)).fetchall()
+    return rows
+</code></pre>
+        <p>Detalles que importan:</p>
+        <ul>
+          <li><strong>Distancia, no similitud</strong>: <code>ORDER BY embedding &lt;=&gt; q ASC</code>. La columna <code>similarity</code> se calcula como <code>1 - distancia</code> solo para mostrarla.</li>
+          <li><strong><code>ON CONFLICT ... DO UPDATE</code></strong>: reindexar una lección cambiada es un <em>upsert</em> por <code>chunk_id</code>, no un borrado masivo. La persistencia y la clave estable (lección 3) se combinan.</li>
+          <li><strong>Filtro + índice</strong>: <code>WHERE module_id = ...</code> reduce candidatos antes del ranking. Con el índice HNSW, PostgreSQL combina el filtro con la búsqueda vectorial.</li>
+          <li><strong>La dimensión <code>vector(384)</code> es fija</strong>: debe casar con el modelo. Cambiar de modelo implica migración y reindexado.</li>
+        </ul>
+
+        <h3>sqlite-vec: el más pequeño posible</h3>
+        <p><code>sqlite-vec</code> lleva la búsqueda vectorial a SQLite: un solo archivo, cero servidores, perfecto para el Copiloto local o para tests. Usa «tablas virtuales» <code>vec0</code> que declaras con la dimensión y columnas de metadato, y responde con <code>MATCH</code> + <code>k</code>.</p>
+        <div class="code-file">copiloto/sql/sqlite.sql</div>
+        <pre><code class="language-sql">-- Tabla virtual vec0: vector + metadatos declarados como columnas.
+CREATE VIRTUAL TABLE chunks USING vec0(
+    chunk_id    text PRIMARY KEY,
+    embedding   float[384],
+    module_id   text,
+    lesson_id   text,
+    section     text
+);
+
+-- Busqueda KNN: MATCH (vector) + k = N, ordenada por distance (menor = mejor).
+-- Los filtros de metadato van en el mismo WHERE y se aplican durante la busqueda.
+SELECT chunk_id, section, distance
+FROM chunks
+WHERE embedding MATCH :query_vector
+  AND k = 5
+  AND module_id = '03'
+ORDER BY distance;
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Dos alcances distintos en <code>sqlite-vec</code>:</strong> el <code>MATCH ... k = N</code> hace la búsqueda KNN, y las condiciones de metadato <strong>filtran</strong> los resultados. Pero para un filtrado <em>verdaderamente selectivo</em> (poca proporción del corpus) conviene usar una <strong>partition key</strong> o filtrar antes en una tabla normal. Con un <code>WHERE module_id = '03'</code> que deja fuera el 90% del corpus, un índice plano puede visitar miles de vectores «inútiles». Lo verás al medir.</p>
+        </div>
+        <div class="code-file">copiloto/src/copiloto/store_sqlite.py (fragmento)</div>
+        <pre><code class="language-python"># store_sqlite.py — cargar la extension y buscar con sqlite-vec.
+import sqlite3, struct
+import sqlite_vec
+
+def connect(path: str = "copiloto.db") -&gt; sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)                     # registra las funciones vec_* y el tipo vec0
+    db.enable_load_extension(False)
+    return db
+
+def to_blob(vector) -&gt; bytes:
+    # Compacto: N floats empaquetados, mejor que JSON para vectores grandes.
+    return struct.pack(f"{len(vector)}f", *vector)
+
+def search(db, query_vector, k: int = 5):
+    rows = db.execute(
+        """
+        SELECT chunk_id, section, distance
+        FROM chunks
+        WHERE embedding MATCH ? AND k = ?
+        ORDER BY distance
+        """,
+        (to_blob(query_vector), k),
+    ).fetchall()
+    return rows
+</code></pre>
+        <p>Fíjate en los paralelismos y en las diferencias:</p>
+        <ul>
+          <li><strong><code>distance</code>, no similitud</strong>: igual que en pgvector, <strong>menor es mejor</strong>. La similitud coseno de una búsqueda es <code>1 - distance</code> (si indexaste con coseno).</li>
+          <li><strong><code>to_blob</code></strong>: pasar vectores como <code>bytes</code> empaquetados (<code>struct.pack</code>) es mucho más rápido y compacto que JSON. Acepta ambas formas, pero prefiere el blob.</li>
+          <li><strong>Sin servidor</strong>: la base es un archivo. Copias, versionas o borras el índice sin infraestructura. Ideal para el desarrollo y los tests del Copiloto.</li>
+        </ul>
+
+        <h3>Filtrado por metadato: dónde se aplica es la pregunta</h3>
+        <p>«Busca en el módulo 4» puede implementarse de dos maneras, y la diferencia es enorme:</p>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Cómo</th><th>Cuándo conviene</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Pre-filtrado</strong> (<em>filter-then-search</em>)</td>
+              <td>Reduce el conjunto y busca solo dentro</td>
+              <td>Filtro selectivo (deja poco corpus). Más preciso.</td>
+            </tr>
+            <tr>
+              <td><strong>Post-filtrado</strong> (<em>search-then-filter</em>)</td>
+              <td>Busca top-k global y descarta los que no cumplen</td>
+              <td>Filtro poco selectivo. Sencillo, pero puede devolver menos de <em>k</em>.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>El problema clásico es el <strong>post-filtrado</strong>: pides top-10, filtras a «módulo 4», y solo sobreviven 2. Si filtras antes, garantizas <em>k</em> resultados relevantes. Por eso las bases vectoriales serias ofrecen operadores de filtro <em>durante</em> la búsqueda (como el <code>WHERE</code> de <code>vec0</code> o el índice parcial de pgvector).</p>
+
+        <h3>Búsqueda híbrida: vectorial + BM25</h3>
+        <p>Recordemos el límite de la lección 1: los embeddings capturan <strong>tema</strong>, no <strong>exactitud</strong>. «<code>uv sync --frozen</code>» o «<code>data-module="03"</code>» se recuperan mejor con búsqueda <strong>léxica</strong> por palabra clave. La familia clásica es <strong>BM25</strong> (una versión ponderada de «cuenta cuántas palabras de la consulta aparecen, penalizando las frecuentes»); en SQLite se implementa con <strong>FTS5</strong>.</p>
+        <pre class="diagram">
+   consulta
+      |
+      +-- vectorial (embeddings) ---&gt; ranking por significado
+      |
+      +-- lexica   (BM25/FTS5)  ---&gt; ranking por palabras exactas
+      |
+      v
+   FUSION (RRF: 1/(60+rank) sumado)  ---&gt; ranking final
+        </pre>
+        <div class="code-file">copiloto/sql/hybrid.sql</div>
+        <pre><code class="language-sql">-- Tabla FTS5 (indice invertido) con el texto de los chunks.
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    content,
+    tokenize = 'unicode61'
+);
+
+-- Fusion RRF: combina el ranking vectorial y el lexico sin calibrar escalas.
+-- Cada rama aporta 1/(RRF_K + posicion); sumamos y ordenamos de mayor a menor.
+WITH vector AS (
+    SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY distance) AS rank
+    FROM chunks
+    WHERE embedding MATCH :query_vector AND k = 20
+),
+lexical AS (
+    SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY bm25(chunks_fts)) AS rank
+    FROM chunks_fts
+    WHERE chunks_fts MATCH :query_text
+    LIMIT 20
+)
+SELECT chunk_id, SUM(1.0 / (60 + rank)) AS rrf_score
+FROM (SELECT chunk_id, rank FROM vector
+      UNION ALL
+      SELECT chunk_id, rank FROM lexical)
+GROUP BY chunk_id
+ORDER BY rrf_score DESC
+LIMIT 5;
+</code></pre>
+        <p>Dos ideas que hacen que esto funcione:</p>
+        <ul>
+          <li><strong>RRF (<em>Reciprocal Rank Fusion</em>)</strong>: en vez de sumar puntuaciones de escalas incompatibles (similitud coseno 0–1 vs. BM25 sin cota), se combinan <strong>posiciones</strong>. Cada lista aporta <code>1/(60 + rank)</code>. Simple, robusto y sin parámetros que calibrar. <code>60</code> es la constante habitual.</li>
+          <li><strong>Consultas distintas por rama</strong>: la vectorial usa el embedding de la <em>pregunta</em>; la léxica usa el texto de la pregunta (o palabras clave extraídas). Ambas contribuyen al mismo ranking final.</li>
+        </ul>
+
+        <h3>¿Cuál elijo? Criterio, no moda</h3>
+        <table>
+          <thead><tr><th>Escenario</th><th>Elección recomendada</th></tr></thead>
+          <tbody>
+            <tr><td>Prototipo, demo, tests, app de escritorio, un solo usuario</td><td><strong>sqlite-vec</strong> (+ FTS5 para híbrida)</td></tr>
+            <tr><td>Ya tienes PostgreSQL en producción; quieres metadatos, joins y transacciones</td><td><strong>pgvector</strong></td></tr>
+            <tr><td>Pocos miles de chunks, quieres cero infraestructura</td><td><strong>numpy en memoria</strong> (lección 2) o <strong>sqlite-vec</strong> plano</td></tr>
+            <tr><td>Miles de millones de vectores, servidores dedicados, multi-tenant</td><td>Base vectorial <strong>dedicada</strong> (Qdrant, Milvus…)</td></tr>
+            <tr><td>Necesitas lo exacto (comandos, versiones) además de lo semántico</td><td><strong>Híbrida</strong> vectorial + BM25 sobre cualquiera de las anteriores</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Regla del curso:</strong> empieza con <strong>SQLite + sqlite-vec</strong> (local, sin servidor) y deja <code>pgvector</code> listo como camino de producción. Ambas hablan el mismo «modelo mental» (vector + metadatos + filtro + distancia), así que migrar entre ellas es cambiar el driver, no la arquitectura. Y en las dos, <strong>añade la rama léxica</strong> si tu dominio tiene identificadores y comandos — el nuestro los tiene.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Todo el ciclo con <code>sqlite-vec</code>: crear la tabla, insertar tres vectores y buscar el más cercano. Sin servidor ni dependencias de red.</p>
+        <div class="code-file">vector-lab/src/vec_min.py</div>
+        <pre><code class="language-python"># vec_min.py — sqlite-vec mas pequeno posible.
+import sqlite3, struct
+import sqlite_vec
+
+def to_blob(vec: list[float]) -&gt; bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+db = sqlite3.connect(":memory:")              # en memoria: no deja archivo
+db.enable_load_extension(True)
+sqlite_vec.load(db)                           # carga la extension vec0
+db.enable_load_extension(False)
+
+# 1. Tabla virtual con una columna vectorial de 3 dimensiones (juguete).
+db.execute("CREATE VIRTUAL TABLE items USING vec0(item_id text PRIMARY KEY, v float[3])")
+
+# 2. Insertamos tres vectores normalizados.
+rows = [("a", [1.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0]), ("c", [0.707, 0.707, 0.0])]
+for item_id, vec in rows:
+    db.execute("INSERT INTO items(item_id, v) VALUES (?, ?)", (item_id, to_blob(vec)))
+
+# 3. KNN: el vector de consulta mira hacia a y c.
+query = struct.pack("3f", 0.9, 0.2, 0.0)
+for item_id, distance in db.execute(
+    "SELECT item_id, distance FROM items WHERE v MATCH ? ORDER BY distance LIMIT 2",
+    (query,),
+):
+    print(item_id, round(distance, 4))
+        </code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">a 0.0243
+c 0.2187
+</code></pre>
+        <p>Lo que demuestra, paso a paso:</p>
+        <ol class="steps">
+          <li><strong><code>sqlite_vec.load(db)</code></strong>: activa el tipo <code>vec0</code> y las funciones de distancia. Es lo único «especial» respecto a SQLite normal.</li>
+          <li><strong><code>CREATE VIRTUAL TABLE ... vec0</code></strong>: declara la dimensión (<code>float[3]</code>) al crear la tabla. La dimensión queda fijada como en pgvector.</li>
+          <li><strong><code>to_blob</code></strong>: los vectores viajan como bytes empaquetados, la forma más rápida para el motor.</li>
+          <li><strong><code>MATCH ... ORDER BY distance</code></strong>: la búsqueda KNN. El resultado trae la <code>distance</code>: <strong>menor es más cercano</strong>. <code>a</code> gana porque su dirección es la más parecida a la consulta.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén del Copiloto: <code>sqlite-vec</code> para los vectores y <strong>FTS5</strong> para la rama léxica, fusionadas con RRF. Este es el «motor de búsqueda» que el pipeline de RAG (Módulo 4) consultará.</p>
+        <div class="code-file">copiloto/src/copiloto/store.py (fragmento)</div>
+        <pre><code class="language-python"># store.py — indexado y busqueda hibrida (vectorial + BM25) sobre SQLite.
+from __future__ import annotations
+import sqlite3, struct
+import numpy as np
+import sqlite_vec
+
+SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING vec0(
+    chunk_id text PRIMARY KEY,
+    embedding float[384],
+    module_id text,
+    lesson_id text
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id UNINDEXED, content
+);
+"""
+
+def connect(path: str = "copiloto.db") -&gt; sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)
+    db.enable_load_extension(False)
+    db.executescript(SCHEMA)
+    db.execute("PRAGMA journal_mode=WAL")     # mejor concurrencia lectura/escritura
+    return db
+
+def _blob(vec) -&gt; bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+def index_chunks(db, chunks, embeddings) -&gt; None:
+    """Indexa en transaccion: vectores en vec0 y texto en FTS5."""
+    with db:                                   # commit/rollback automatico
+        for chunk, vec in zip(chunks, embeddings, strict=True):
+            db.execute("DELETE FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,))
+            db.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk.chunk_id,))
+            db.execute(
+                "INSERT INTO chunks(chunk_id, embedding, module_id, lesson_id) VALUES (?, ?, ?, ?)",
+                (chunk.chunk_id, _blob(vec), chunk.module_id, chunk.lesson_id),
+            )
+            db.execute(
+                "INSERT INTO chunks_fts(chunk_id, content) VALUES (?, ?)",
+                (chunk.chunk_id, chunk.text),
+            )
+
+def _vector_candidates(db, query_vector, k: int) -&gt; list[str]:
+    rows = db.execute(
+        "SELECT chunk_id FROM chunks WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+        (_blob(query_vector), k),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+def _lexical_candidates(db, query_text: str, k: int) -&gt; list[str]:
+    # bm25(): menor es mejor. Escapamos comillas para evitar inyeccion en FTS.
+    safe = query_text.replace('"', '""')
+    rows = db.execute(
+        "SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
+        (f'"{safe}"', k),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+def hybrid_search(db, query_vector, query_text, k: int = 5, rrf_k: int = 60):
+    """Reciprocal Rank Fusion de los rankings vectorial y lexico."""
+    vec_rank = {cid: i for i, cid in enumerate(_vector_candidates(db, query_vector, k=20))}
+    lex_rank = {cid: i for i, cid in enumerate(_lexical_candidates(db, query_text, k=20))}
+    scores: dict[str, float] = {}
+    for cid in set(vec_rank) | set(lex_rank):
+        score = 0.0
+        if cid in vec_rank:
+            score += 1.0 / (rrf_k + vec_rank[cid])
+        if cid in lex_rank:
+            score += 1.0 / (rrf_k + lex_rank[cid])
+        scores[cid] = score
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return ranked
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Dos índices, un almacén</strong>: <code>chunks</code> (<code>vec0</code>) para la búsqueda semántica y <code>chunks_fts</code> (FTS5) para la léxica. Comparten <code>chunk_id</code>, así que fusionar es trivial.</li>
+          <li><strong>Indexado por transacción</strong>: <code>with db:</code> garantiza que vectores y texto entren juntos o no entren. Nada de índices a medias.</li>
+          <li><strong>Borrado por <code>chunk_id</code> antes de insertar</strong>: indexado incremental idempotente (el reto de la lección 3 encaja aquí).</li>
+          <li><strong>RRF</strong>: no comparamos la <code>distance</code> de sqlite-vec con <code>bm25()</code> (escalas distintas); combinamos <strong>posiciones</strong>. Robusto y sin calibración.</li>
+          <li><strong>Candidatos amplios (20) y resultado corto (5)</strong>: cada rama aporta su «pool» y la fusión devuelve lo mejor de ambos. Súbelo si mides que falta recall.</li>
+          <li><strong><code>WAL</code></strong>: permite leer mientras se escribe; útil si la CLI indexa en segundo plano.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Seguridad en FTS5:</strong> el texto de la consulta entra en <code>MATCH</code>, que tiene su propia sintaxis. Escapar comillas y no interpolar a lo bruto evita que una pregunta del usuario rompa la consulta (o peor). Es el mismo principio que la seguridad de prompt (Módulo 1): desconfía de la entrada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Elige el motor por restricciones reales (escala, infra, equipo)</td>
+              <td>Adoptar una base vectorial dedicada para 5.000 chunks</td>
+              <td>Infra que no aporta precisión es coste y superficie de fallo. SQLite/pgvector cubren el caso típico.</td>
+            </tr>
+            <tr>
+              <td>Empieza con búsqueda <strong>flat</strong>; añade HNSW cuando midas latencia</td>
+              <td>Meter HNSW desde el día uno «por si acaso»</td>
+              <td>Un índice ANN añade memoria, parámetros y pérdida de recall. No lo necesitas hasta que lo necesitas.</td>
+            </tr>
+            <tr>
+              <td>Filtra <strong>antes</strong> cuando el filtro es selectivo</td>
+              <td>Post-filtrar un top-k global y quedarte sin resultados</td>
+              <td>El post-filtrado puede devolver menos de <em>k</em> o candidatos irrelevantes. Pre-filtrar garantiza <em>k</em> útiles.</td>
+            </tr>
+            <tr>
+              <td>Combina <strong>vectorial + BM25</strong> (RRF) cuando haya términos exactos</td>
+              <td>Confiar solo en embeddings para comandos y versiones</td>
+              <td>Lo léxico cubre lo que el vector no distingue: identificadores, flags y nombres de API.</td>
+            </tr>
+            <tr>
+              <td>Normaliza y fija la dimensión alineada con el modelo</td>
+              <td>Mezclar modelos o dimensiones en la misma columna</td>
+              <td>La columna guarda una dimensión fija; comparar vectores de espacios distintos no significa nada.</td>
+            </tr>
+            <tr>
+              <td>Indexa en transacción y por <code>chunk_id</code> estable</td>
+              <td>Recrear la tabla entera en cada arranque</td>
+              <td>Upserts incrementales son seguros y rápidos; recrear arriesga estados a medias y pierde datos.</td>
+            </tr>
+            <tr>
+              <td>Mide recall y latencia con tu corpus</td>
+              <td>Suponer que «el índice mágico lo ordena bien»</td>
+              <td>La calidad del retrieval se mide (Módulo 4); los parámetros del índice (<code>ef</code>, listas) afectan al recall.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Tratar la distancia como similitud (otra vez, ahora con SQL)</h3>
+        <div class="code-label code-label--wrong">❌ Incorrecto</div>
+        <pre><code class="language-sql">-- &lt;=&gt; devuelve DISTANCIA coseno: el mejor es el MENOR.
+SELECT chunk_id FROM chunks ORDER BY embedding &lt;=&gt; :query DESC LIMIT 5;   -- peores!
+</code></pre>
+        <div class="code-label code-label--right">✅ Correcto</div>
+        <pre><code class="language-sql">SELECT chunk_id, 1 - (embedding &lt;=&gt; :query) AS similarity
+FROM chunks
+ORDER BY embedding &lt;=&gt; :query ASC                                       -- menor distancia
+LIMIT 5;
+</code></pre>
+        <p>Si ordenas con <code>DESC</code>, devuelves los <strong>más lejanos</strong>. El error es idéntico al de la lección 2, pero un motor de base no te avisa: devuelve resultados.</p>
+
+        <h3>Indice ANN sin medir el recall</h3>
+        <div class="code-label code-label--wrong">❌ Incorrecto</div>
+        <pre><code class="language-sql">-- HNSW con parametros por defecto... en un corpus donde flat seria instantaneo.
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+</code></pre>
+        <div class="code-label code-label--right">✅ Correcto</div>
+        <pre><code class="language-sql">-- Con pocos miles de chunks: busca plana y mide. Si hace falta ANN, ajusta y MIDE el recall.
+-- SELECT ... ORDER BY embedding &lt;=&gt; :q LIMIT 10;   (sin indice ANN)
+-- CREATE INDEX ... USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+</code></pre>
+        <p>Un índice aproximado puede <strong>no devolver</strong> el vecino exacto. Está bien, siempre que lo sepas y lo midas. Añadirlo cuando no lo necesitas solo introduce una fuente de error.</p>
+
+        <h3>Post-filtrar y quedarte con dos resultados</h3>
+        <div class="code-label code-label--wrong">❌ Incorrecto</div>
+        <pre><code class="language-python">hits = search(db, q, k=10)                 # top-10 global
+module4 = [h for h in hits if h.module_id == "04"]
+# module4 puede tener 0, 1 o 2 elementos: el filtro se aplico DESPUES.
+</code></pre>
+        <div class="code-label code-label--right">✅ Correcto</div>
+        <pre><code class="language-python"># Filtra DENTRO de la busqueda para garantizar k resultados del modulo 4.
+hits = search(db, q, k=10, module_id="04")
+</code></pre>
+
+        <h3>Mezclar embeddings de modelos distintos en una tabla</h3>
+        <div class="code-label code-label--wrong">❌ Incorrecto</div>
+        <pre><code class="language-python"># Un dia reindexas con otro modelo SIN vaciar: conviven espacios vectoriales.
+db.execute("INSERT INTO chunks(embedding) VALUES (?)", (_blob(new_model_vec),))
+</code></pre>
+        <div class="code-label code-label--right">✅ Correcto</div>
+        <pre><code class="language-python"># Cambiar de modelo = migracion completa: nueva tabla/columna y reindexado total.
+# Guarda 'model' como columna y valida que todos los vectores son del mismo modelo.
+</code></pre>
+
+        <h3>Buscar solo con vectores en un dominio lleno de identificadores</h3>
+        <div class="code-label code-label--wrong">❌ Incorrecto</div>
+        <pre><code class="language-text">query: "flag --frozen de uv sync"
+# Solo vectorial: puede devolver "que es uv" y perderse el comentario exacto.
+</code></pre>
+        <div class="code-label code-label--right">✅ Correcto</div>
+        <pre><code class="language-text"># Hibrida: la rama BM25 rescata el match exacto de "--frozen" y "uv sync"
+# y la rama vectorial aporta el contexto semantico. Fusion con RRF.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> indexar chunks reales en <code>sqlite-vec</code>, comparar búsqueda <strong>vectorial</strong>, <strong>léxica</strong> e <strong>híbrida</strong> sobre la misma pregunta, y comprobar que la híbrida gana en el caso con término exacto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> prepara el proyecto con las dependencias.
+            <pre><code class="language-bash">uv init hybrid-lab
+cd hybrid-lab
+uv add fastembed numpy sqlite-vec
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> escribe <code>src/lab.py</code> con un corpus pequeño, dos caminos de búsqueda y una fusión RRF.
+            <pre><code class="language-python">import sqlite3, struct
+import numpy as np, sqlite_vec
+from fastembed import TextEmbedding
+from fastembed.common.model_description import ModelSource, PoolingType
+
+MODEL = "intfloat/multilingual-e5-small"
+TextEmbedding.add_custom_model(
+    model=MODEL, pooling=PoolingType.MEAN, normalization=True,
+    sources=ModelSource(hf=MODEL), dim=384, model_file="onnx/model.onnx",
+)
+model = TextEmbedding(MODEL)
+
+CORPUS = [
+    ("d1", "Para instalar dependencias de forma reproducible usa uv sync --frozen."),
+    ("d2", "La similitud coseno mide el angulo entre dos vectores."),
+    ("d3", "uv es un gestor de proyectos y entornos de Python."),
+    ("d4", "BM25 es una funcion de ranking lexico clasica."),
+]
+
+def blob(v): return struct.pack(f"{len(v)}f", *v)
+
+db = sqlite3.connect(":memory:")
+db.enable_load_extension(True); sqlite_vec.load(db); db.enable_load_extension(False)
+db.execute("CREATE VIRTUAL TABLE c USING vec0(id text PRIMARY KEY, e float[384])")
+db.execute("CREATE VIRTUAL TABLE cfts USING fts5(id UNINDEXED, content)")
+
+vecs = np.array(list(model.embed([t for _, t in CORPUS])))
+for (cid, text), vec in zip(CORPUS, vecs, strict=True):
+    db.execute("INSERT INTO c(id, e) VALUES (?, ?)", (cid, blob(vec)))
+    db.execute("INSERT INTO cfts(id, content) VALUES (?, ?)", (cid, text))
+
+def vector_search(q, k=3):
+    v = np.array(next(iter(model.query_embed([q]))))
+    return [r[0] for r in db.execute(
+        "SELECT id FROM c WHERE e MATCH ? AND k = ? ORDER BY distance", (blob(v), k))]
+
+def lexical_search(q, k=3):
+    safe = q.replace('"', '""')
+    return [r[0] for r in db.execute(
+        "SELECT id FROM cfts WHERE cfts MATCH ? ORDER BY bm25(cfts) LIMIT ?", (f'"{safe}"', k))]
+
+def rrf(q, k=3, rrf_k=60):
+    ranks = {}
+    for i, cid in enumerate(vector_search(q, 20)):  ranks.setdefault(cid, []).append(i)
+    for i, cid in enumerate(lexical_search(q, 20)): ranks.setdefault(cid, []).append(i)
+    scored = {cid: sum(1/(rrf_k + r) for r in rs) for cid, rs in ranks.items()}
+    return sorted(scored, key=scored.get, reverse=True)[:k]
+
+q = "uv sync --frozen"
+print("vectorial:", vector_search(q))
+print("lexica   :", lexical_search(q))
+print("hibrida  :", rrf(q))
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> ejecútalo.
+            <pre><code class="language-bash">uv run python src/lab.py
+            </code></pre>
+            <p>Resultado esperado: la rama <strong>léxica</strong> devuelve <code>d1</code> primero (por <code>--frozen</code> y <code>uv</code>); la <strong>vectorial</strong> quizá ponga <code>d3</code> (el concepto «uv») por delante; la <strong>híbrida</strong> queda con <code>d1</code> arriba.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> cambia la pregunta por una puramente semántica («como fijo las versiones de un proyecto») y observa cómo la rama <strong>vectorial</strong> recupera <code>d1</code> aunque no comparta casi palabras, y la léxica se queda corta.
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> imprime por separado los candidatos de cada rama y sus posiciones. Comprueba que RRF <strong>no</strong> compara <code>distance</code> con <code>bm25()</code>, sino posiciones: sube un resultado una vez con cada método y su score RRF debe ser la suma de dos <code>1/(60+rank)</code>. Esa es toda la magia de la fusión.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Recuperación híbrida con filtro y evaluación</h3>
+          <p>Lleva la búsqueda híbrida al corpus real del Copiloto y evalúala de forma objetiva. El objetivo no es «que funcione», sino <strong>medir cuánto mejora</strong> la fusión frente a cada rama por separado.</p>
+          <ol class="steps">
+            <li>Indexa los chunks reales de las lecciones (Módulo 3) en <code>sqlite-vec</code> + FTS5.</li>
+            <li>Escribe <strong>10 preguntas</strong> cuyo chunk correcto conozcas a mano (el «golden set»). Incluye deliberadamente preguntas con términos exactos (<code>uv sync --frozen</code>, <code>data-module="03"</code>, <code>vector_cosine_ops</code>).</li>
+            <li>Para cada pregunta, mide el <strong>Recall@5</strong> en tres modos: solo vectorial, solo léxica e híbrida (RRF).</li>
+            <li>Añade un <strong>filtro por módulo</strong> (<code>module_id = '03'</code>) y verifica que sigue devolviendo <em>k</em> resultados útiles (pre-filtrado).</li>
+            <li>Prueba dos valores de <code>rrf_k</code> y dos de <code>k</code> por rama; tabula los resultados.</li>
+          </ol>
+          <p>Pista: casi siempre verás que la <strong>léxica gana en las preguntas con identificadores</strong>, la <strong>vectorial gana en las paráfrasis</strong> y la <strong>híbrida queda igual o mejor que ambas</strong> — ese es el resultado que quieres demostrar con números, no con intuición. Si alguna pregunta falla en los tres modos, el problema no es la fusión: revisa el <em>chunking</em> (lección 3). Y recuerda: este mismo golden set es el embrión del dataset de evaluación del Módulo 7.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>base vectorial</strong> guarda vectores + metadatos y responde a «los <em>k</em> más cercanos», con filtros.</li>
+          <li>Índices: <strong>flat</strong> (exacto), <strong>HNSW</strong> e <strong>IVF</strong> (aproximados). Flat hasta que la escala obligue a ANN, y entonces <strong>mide el recall</strong>.</li>
+          <li><strong>pgvector</strong>: vectores dentro de PostgreSQL (<code>vector(n)</code>, <code>&lt;=&gt;</code> coseno, HNSW). Ideal si ya tienes Postgres.</li>
+          <li><strong>sqlite-vec</strong>: un archivo, sin servidor; tablas <code>vec0</code>, <code>MATCH ... k</code>, filtros por metadato. Ideal para el Copiloto local.</li>
+          <li>Siempre <strong>distancia</strong> (menor es mejor) en SQL; similitud = <code>1 - distancia</code>.</li>
+          <li>Filtrado por metadato: <strong>pre-filtrar</strong> cuando es selectivo; el post-filtrado puede dejar menos de <em>k</em>.</li>
+          <li><strong>Híbrida (vectorial + BM25 con RRF)</strong>: cubre lo semántico y lo exacto; el patrón que mejor funciona con comandos y versiones.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Necesidad</th><th>Herramienta del curso</th></tr></thead>
+          <tbody>
+            <tr><td>Vectores + metadatos + SQL en Postgres</td><td><code>pgvector</code> (<code>vector(384)</code>, HNSW coseno)</td></tr>
+            <tr><td>Base vectorial local sin servidor</td><td><code>sqlite-vec</code> (<code>vec0</code>)</td></tr>
+            <tr><td>Búsqueda léxica clásica</td><td>FTS5 + <code>bm25()</code></td></tr>
+            <tr><td>Combinar ambas señales</td><td>RRF (<code>1/(60+rank)</code>)</td></tr>
+            <tr><td>Filtrar por módulo/lección</td><td><code>WHERE module_id = ...</code> dentro de la búsqueda</td></tr>
+            <tr><td>Escala muy grande</td><td>Base vectorial dedicada (fuera del núcleo)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito una base vectorial dedicada (Qdrant, Milvus…)?</summary>
+            <div>
+              <p>Para el Copiloto, no. Con miles de chunks, <code>sqlite-vec</code> o <code>pgvector</code> bastan y te dan metadatos y filtros sin infraestructura extra. Una base dedicada brilla con millones/miles de millones de vectores, multi-tenant o requisitos de latencia muy estrictos; entonces su complejidad se paga sola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿HNSW siempre es mejor que la búsqueda plana?</summary>
+            <div>
+              <p>No. HNSW es más rápido a gran escala pero <strong>aproximado</strong> (puede no devolver el vecino exacto) y consume más memoria. Con corpus pequeños, flat es instantáneo y exacto. Añade HNSW cuando midas que la latencia lo pide, y entonces verifica el recall.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿pgvector o sqlite-vec para el proyecto del curso?</summary>
+            <div>
+              <p>Ambos: empieza con <code>sqlite-vec</code> (local, sin servidor, perfecto para desarrollo y tests) y deja <code>pgvector</code> como camino de producción. Comparten el mismo modelo mental, así que cambiar de uno a otro es cambiar el driver y el SQL, no rediseñar. El curso usa las dos: una principal y otra comparativa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es exactamente la búsqueda híbrida?</summary>
+            <div>
+              <p>Combinar una búsqueda <strong>semántica</strong> (embeddings) con una <strong>léxica</strong> (BM25/FTS) y fusionar los rankings. Captura tanto paráfrasis como términos exactos, que es justo lo que necesita un corpus técnico. La fusión habitual, sencilla y robusta, es <strong>RRF</strong>, porque combina posiciones y evita calibrar escalas incompatibles.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si el filtro por metadato está bien aplicado?</summary>
+            <div>
+              <p>Pruébalo con un filtro selectivo. Si pides <code>k=5</code> filtrando por un módulo y recibes menos de 5 resultados, estás <strong>post-filtrando</strong> (mal): el filtro debería aplicarse dentro de la búsqueda para garantizar <em>k</em> candidatos que cumplan. En <code>vec0</code> y en pgvector el filtro va en el mismo <code>WHERE</code>; verifícalo midiendo resultados devueltos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

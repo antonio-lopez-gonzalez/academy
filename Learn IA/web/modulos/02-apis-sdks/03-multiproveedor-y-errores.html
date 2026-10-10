@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-multiproveedor-y-errores">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Local vs nube, una interfaz común para varios proveedores, errores típicos de los LLM, reintentos con backoff exponencial y jitter, y manejo de rate limits.">
+  <title>Multiproveedor y errores — Módulo 2 · Curso IA</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Multiproveedor y errores</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · APIs y SDKs</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tu app funcionará con Ollama en local, con OpenAI o con Anthropic según el día. Cada SDK tiene sus nombres, sus errores y sus rarezas. Si escribes tu lógica pegada al SDK de turno, cambiar de proveedor será reescribir medio proyecto. La solución es una <strong>interfaz común</strong> (un contrato) y adaptadores por proveedor.</p>
+        <p>Y como la red falla, las APIs imponen <strong>rate limits</strong> y los modelos se atascan, necesitas una política seria de <strong>errores y reintentos</strong>. No basta con <code>try/except</code>: hay que distinguir lo <em>transitorio</em> de lo <em>permanente</em> y reintentar solo lo primero, con <strong>backoff exponencial y jitter</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el 90% de los «fallos de IA» en producción no son del modelo: son timeouts, 429, respuestas truncadas o claves mal puestas. Tratar los errores con criterio es lo que separa una demo de un servicio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Local vs nube: no es una religión, son compromisos</h3>
+        <table>
+          <thead><tr><th>Aspecto</th><th>Local (Ollama)</th><th>Nube (OpenAI/Anthropic)</th></tr></thead>
+          <tbody>
+            <tr><td>Coste por token</td><td>Cero (pagas tu hardware/electricidad)</td><td>Por millón de tokens de entrada/salida</td></tr>
+            <tr><td>Privacidad</td><td>Los datos no salen de tu máquina</td><td>Envías los datos al proveedor (lee su política)</td></tr>
+            <tr><td>Calidad</td><td>Buena en modelos abiertos; depende del tamaño</td><td>Estado del arte, modelos grandes</td></tr>
+            <tr><td>Latencia</td><td>Depende de tu GPU/RAM</td><td>Depende de la red y de la carga del proveedor</td></tr>
+            <tr><td>Disponibilidad</td><td>La tuya</td><td>La del proveedor (con rate limits)</td></tr>
+            <tr><td>Reproducibilidad</td><td>Alta (fijas versión del modelo)</td><td>Cambian modelos bajo el mismo nombre</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el proveedor es como la compañía eléctrica. Tu casa (tu código) no debería depender del <em>nombre</em> de la compañía: enchufas y ya. La <strong>interfaz común</strong> es el enchufe; los adaptadores son los distintos enchufes de cada país.</p>
+        </div>
+
+        <h3>Una interfaz común: el patrón adaptador</h3>
+        <p>Define un <strong>contrato</strong> pequeño (generar una respuesta, quizá con streaming y tools) y una implementación por proveedor. El resto del Copiloto habla con el contrato, no con el SDK:</p>
+        <pre class="diagram">
+  Copiloto (tu lógica)  ──depende de──►  LLMClient (Protocol)
+                                                ▲
+                            ┌───────────────────┼────────────────────┐
+                            │                   │                    │
+                      OllamaClient        OpenAIClient        AnthropicClient
+                    (local, por defecto)   (rama nube)          (rama nube)
+        </pre>
+        <div class="callout callout--why">
+          <p>La ventaja no es «soportar 3 proveedores», sino poder <strong>cambiar y comparar</strong> sin tocar la app, y poder <strong>testear</strong> con un fake. La neutralidad de proveedor es una decisión de arquitectura, no de moda.</p>
+        </div>
+
+        <h3>Taxonomía de errores: no todos se reintentan</h3>
+        <table>
+          <thead><tr><th>Error</th><th>¿Transitorio?</th><th>Qué hacer</th></tr></thead>
+          <tbody>
+            <tr><td>Conexión (sin red, host caído)</td><td>Sí</td><td>Reintentar con backoff</td></tr>
+            <tr><td>Timeout</td><td>Sí</td><td>Reintentar, quizá con prompt más corto</td></tr>
+            <tr><td>429 / rate limit</td><td>Sí</td><td>Respetar <code>Retry-After</code> y reintentar con backoff</td></tr>
+            <tr><td>500 / 502 / 503 / 504</td><td>Sí</td><td>Reintentar con backoff y jitter</td></tr>
+            <tr><td>400 / 422 (petición inválida)</td><td>No</td><td>Arreglar el código o los argumentos; reintentar no ayuda</td></tr>
+            <tr><td>401 / 403 (auth / permiso)</td><td>No</td><td>Revisar clave y permisos</td></tr>
+            <tr><td>404 (modelo no existe)</td><td>No</td><td>Corregir el nombre del modelo</td></tr>
+            <tr><td>Contexto excedido</td><td>No</td><td>Reducir el prompt (resumir, recortar); reintentar no arregla nada</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Reintentar un 401 mil veces no lo convierte en un 200.</strong> Reintentar lo permanente solo multiplica la carga y retrasa el diagnóstico. Clasifica primero, reintenta después.</p>
+        </div>
+
+        <h3>Backoff exponencial con jitter</h3>
+        <p>Reintentar «a piñón» satura al proveedor y empeora todo. La técnica estándar es esperar cada vez más, y añadir <strong>jitter</strong> (un pequeño aleatorio) para que muchos clientes no reintenten a la vez. La fórmula típica:</p>
+        <pre class="diagram">
+  espera(n) = min( base * 2^n , tope )  +  aleatorio(0, jitter)
+
+  intento 0 ─► espera 0.5s ─► intento 1 ─► espera 1s ─► intento 2 ─► espera 2s ─► …
+  con jitter: 0.5±0.25s, 1±0.25s, 2±0.25s…  (clientes desincronizados)
+        </pre>
+        <div class="callout callout--tip">
+          <p>Muchos SDKs ya reintentan solos (el de Anthropic y el de OpenAI lo hacen por defecto 2 veces con backoff y respetan <code>Retry-After</code>). Tu capa añade las decisiones de <strong>negocio</strong>: cuántos reintentos, qué hacer si se agotan y si conviene <em>cambiar de proveedor</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un decorador de reintentos con backoff exponencial y jitter, independiente del proveedor. Es el ladrillo que envolverás alrededor de cualquier llamada.</p>
+        <div class="code-file">ejemplos/retry_minimo.py</div>
+        <pre><code class="language-python"># retry_minimo.py — reintentos con backoff exponencial + jitter.
+from __future__ import annotations
+
+import random
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+class TransientError(Exception):
+    """Error temporal: merece la pena reintentar (timeout, 429, 5xx)."""
+
+
+class PermanentError(Exception):
+    """Error definitivo: reintentar no ayuda (400, 401, contexto excedido)."""
+
+
+@contextmanager
+def retry(
+    *,
+    max_attempts: int = 4,
+    base: float = 0.5,
+    cap: float = 8.0,
+    jitter: float = 0.25,
+) -&gt; Iterator[Callable[[Exception], None]]:
+    """Reintenta un bloque solo si lanza TransientError."""
+    def attempt() -&gt; Iterator[None]:
+        for n in range(max_attempts):
+            try:
+                yield
+                return
+            except TransientError:
+                if n == max_attempts - 1:
+                    raise                     # se agotaron los intentos
+                wait = min(base * (2 ** n), cap) + random.uniform(0, jitter)
+                print(f"  reintento {n + 1}/{max_attempts - 1}: espero {wait:.2f}s")
+                time.sleep(wait)
+    yield attempt().__next__
+
+
+# Uso: simulamos una llamada que falla las dos primeras veces.
+calls = {"n": 0}
+
+
+def flaky_call() -&gt; str:
+    calls["n"] += 1
+    if calls["n"] &lt; 3:
+        raise TransientError("429 rate limit simulado")
+    return "respuesta del modelo"
+
+
+with retry() as retrying:
+    retrying(None)  # arranca el generador interno
+    result = flaky_call()
+    print(result)
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">  reintento 1/3: espero 0.61s
+  reintento 2/3: espero 1.12s
+respuesta del modelo
+</code></pre>
+        <div class="callout callout--note">
+          <p>El ejemplo del <code>contextmanager</code> es didáctico pero enrevesado. En producción, un simple <code>for</code> con <code>try/except</code> se lee mejor (lo verás en el ejemplo real). La idea clave —<strong>solo se reintenta lo transitorio</strong> y <strong>la espera crece con jitter</strong>— es la misma.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el <strong>Copiloto</strong> definimos un contrato <code>LLMClient</code> y un adaptador de Ollama. El resto del código no sabe que existe Ollama. Añadimos reintentos clasificando errores y parseando el <code>Retry-After</code> cuando lo haya.</p>
+        <div class="code-file">src/copiloto/llm.py — contrato y adaptador local</div>
+        <pre><code class="language-python"># src/copiloto/llm.py
+from __future__ import annotations
+
+import random
+import time
+from typing import Protocol
+
+from ollama import Client, ResponseError
+
+
+class LLMClient(Protocol):
+    """Contrato mínimo: cualquier proveedor debe poder generar una respuesta."""
+
+    def complete(self, messages: list[dict[str, str]], *, model: str) -&gt; str: ...
+
+
+class TransientError(Exception):
+    def __init__(self, message: str, retry_after: float | None = None) -&gt; None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class PermanentError(Exception):
+    pass
+
+
+class OllamaClient:
+    """Adaptador local. Traduce errores de Ollama a nuestra taxonomía."""
+
+    def __init__(self, host: str = "http://localhost:11434", timeout: float = 30.0) -&gt; None:
+        self._client = Client(host=host, timeout=timeout)
+
+    def complete(self, messages: list[dict[str, str]], *, model: str) -&gt; str:
+        try:
+            response = self._client.chat(model=model, messages=messages)
+            return response.message.content or ""
+        except (ConnectionError, TimeoutError) as exc:
+            raise TransientError(f"conexión/timeout: {exc}") from exc
+        except ResponseError as exc:
+            status = getattr(exc, "status_code", None)
+            if status is not None and (status == 429 or 500 &lt;= status &lt; 600):
+                # No hay Retry-After en local, pero el mismo patrón aplica en la nube.
+                raise TransientError(f"servidor ocupado ({status})") from exc
+            raise PermanentError(f"petición inválida: {exc}") from exc
+
+
+def complete_with_retry(
+    client: LLMClient,
+    messages: list[dict[str, str]],
+    *,
+    model: str,
+    max_attempts: int = 4,
+) -&gt; str:
+    """Reintenta SOLO errores transitorios, con backoff exponencial + jitter."""
+    last: Exception | None = None
+    for n in range(max_attempts):
+        try:
+            return client.complete(messages, model=model)
+        except PermanentError:
+            raise                                    # nunca reintentamos lo definitivo
+        except TransientError as exc:
+            last = exc
+            if n == max_attempts - 1:
+                break
+            # Si el proveedor dijo 'espera X', lo respetamos; si no, backoff + jitter.
+            wait = exc.retry_after if exc.retry_after else min(0.5 * (2 ** n), 8.0)
+            wait += random.uniform(0, 0.25)
+            print(f"  transitorio: {exc}. Reintento {n + 1}/{max_attempts - 1} en {wait:.2f}s")
+            time.sleep(wait)
+    raise TransientError(f"se agotaron los reintentos: {last}")
+</code></pre>
+        <div class="code-file">src/copiloto/app.py — la app no conoce el proveedor</div>
+        <pre><code class="language-python"># src/copiloto/app.py
+from copiloto.llm import OllamaClient, complete_with_retry
+
+client = OllamaClient()   # cambiar a OpenAIClient no tocaría esta línea más allá del import
+
+answer = complete_with_retry(
+    client,
+    [{"role": "user", "content": "Resume en una frase qué es tool calling."}],
+    model="llama3.2",
+)
+print(answer)
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>Protocol</code>, no herencia</strong>: cualquier clase con <code>complete(...)</code> cumple el contrato. Es <em>structural typing</em>: flexible y sin acoplar.</li>
+          <li><strong>Traducir errores en el adaptador</strong>: el resto del sistema solo conoce <code>TransientError</code> y <code>PermanentError</code>. Añadir un proveedor no cambia la política de reintentos.</li>
+          <li><strong><code>retry_after</code></strong>: si el proveedor indica cuándo reintentar, manda él; si no, aplicamos nuestro backoff.</li>
+          <li><strong>Jitter siempre</strong>: evita que muchos procesos reintenten en el mismo instante (efecto <em>thundering herd</em>).</li>
+          <li><strong>Reintentos acotados</strong>: al agotarlos, lanzamos <code>TransientError</code> hacia arriba. Quien decide el <em>fallback</em> es la capa de negocio (reto de hoy).</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Nube como alternativa:</strong> en <code>OpenAIClient</code>/<code>AnthropicClient</code> mapearías <code>RateLimitError</code>→<code>TransientError</code>, <code>APIConnectionError</code>/<code>APITimeoutError</code>→<code>TransientError</code> y <code>AuthenticationError</code>/<code>BadRequestError</code>→<code>PermanentError</code>. El resto del Copiloto no cambia nada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Una interfaz común + adaptadores por proveedor</td>
+              <td>Invocar el SDK directamente por toda la app</td>
+              <td>Cambiar de proveedor no debe tocar la lógica</td>
+            </tr>
+            <tr>
+              <td>Reintentar solo lo transitorio (429, 5xx, timeouts)</td>
+              <td>Reintentar cualquier excepción</td>
+              <td>Reintentar un 401/400 es inútil y encarece el diagnóstico</td>
+            </tr>
+            <tr>
+              <td>Backoff exponencial <strong>con jitter</strong></td>
+              <td>Espera fija o backoff puro</td>
+              <td>Desincroniza clientes y no satura al proveedor</td>
+            </tr>
+            <tr>
+              <td>Respetar <code>Retry-After</code> cuando lo dé el servidor</td>
+              <td>Ignorar las cabeceras de rate limit</td>
+              <td>Reintentar antes de tiempo te gana otro 429</td>
+            </tr>
+            <tr>
+              <td>Lee tu configuración de proveedor de variables de entorno</td>
+              <td>Claves hardcodeadas en el repo</td>
+              <td>Seguridad: las claves nunca viven en Git</td>
+            </tr>
+            <tr>
+              <td>Un timeout razonable por llamada</td>
+              <td>Timeouts infinitos «por si acaso»</td>
+              <td>Un cuelgue sin límite bloquea hilos y usuarios</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Reintentar todo por igual</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Trata igual un 401 (clave mal) que un 503 (servidor caído).
+try:
+    response = client.chat(model=model, messages=messages)
+except Exception:
+    time.sleep(1)
+    response = client.chat(model=model, messages=messages)
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Solo se reintenta lo transitorio; lo permanente se eleva tal cual.
+try:
+    response = client.chat(model=model, messages=messages)
+except PermanentError:
+    raise                       # 400/401: arregla el código o la clave
+except TransientError as exc:
+    return retry_with_backoff(exc)
+</code></pre>
+
+        <h3>Backoff sin jitter</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Todos los clientes esperan exactamente lo mismo y reintentan a la vez.
+time.sleep(2 ** n)   # 1s, 2s, 4s… sincronizados
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Añade ruido aleatorio: los reintentos se reparten en el tiempo.
+base = min(0.5 * (2 ** n), 8.0)
+time.sleep(base + random.uniform(0, 0.25))
+</code></pre>
+
+        <h3>Clave de API en el repositorio</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ La clave viaja en Git y en cada captura de pantalla. Nunca.
+client = OpenAI(api_key="sk-proj-abcd1234...")
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Variables de entorno (.env fuera de Git; p. ej. con python-dotenv).
+import os
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+</code></pre>
+
+        <h3>Reintentos infinitos que ocultan el problema</h3>
+        <span class="code-label code-label--wrong">Mal</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ 'while True' convierte un fallo en un cuelgue y una factura.
+while True:
+    try:
+        return client.complete(messages, model=model)
+    except TransientError:
+        pass
+</code></pre>
+        <span class="code-label code-label--right">Bien</span>
+        <pre class="code-right"><code class="language-python"># ✅ Nº máximo de intentos y, agotados, error explícito hacia arriba.
+for n in range(MAX_ATTEMPTS):
+    try:
+        return client.complete(messages, model=model)
+    except TransientError:
+        if n == MAX_ATTEMPTS - 1:
+            raise
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> clasificar errores y reintentar únicamente los transitorios, con backoff y jitter, sobre una función <em>fake</em> que simula el proveedor.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Simula el proveedor.</strong> Guarda <code>retry_lab.py</code>:
+            <pre><code class="language-python">import random
+import time
+
+class TransientError(Exception):
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+class PermanentError(Exception):
+    pass
+
+FAILS = {"left": 3}
+
+def fake_provider(messages, *, model):
+    """Falla las 2 primeras veces con 429, luego responde bien."""
+    if FAILS["left"] &gt; 0:
+        FAILS["left"] -= 1
+        raise TransientError("429 rate limit", retry_after=0.2)
+    return "OK: respuesta del modelo"
+
+def complete(client, messages, *, model, max_attempts=4):
+    for n in range(max_attempts):
+        try:
+            return client(messages, model=model)
+        except PermanentError:
+            raise
+        except TransientError as exc:
+            if n == max_attempts - 1:
+                raise
+            wait = exc.retry_after if exc.retry_after else min(0.5 * (2 ** n), 8.0)
+            wait += random.uniform(0, 0.25)
+            print(f"reintento {n + 1} en {wait:.2f}s")
+            time.sleep(wait)
+
+print(complete(fake_provider, [{"role": "user", "content": "hola"}], model="fake"))
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Ejecuta.</strong>
+            <pre><code class="language-bash">uv run retry_lab.py
+</code></pre>
+            <p>Resultado esperado: dos líneas de <code>reintento</code> con esperas cercanas a <code>0.2</code> s (se respeta el <code>retry_after</code>) y, al final, <code>OK: respuesta del modelo</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Prueba lo permanente.</strong> Haz que <code>fake_provider</code> lance <code>PermanentError("401 unauth")</code> siempre. Comprueba que <strong>no hay reintentos</strong>: el error sube al instante.
+          </li>
+          <li>
+            <strong>Paso 4 — Agota los intentos.</strong> Pon <code>FAILS["left"] = 10</code> y <code>max_attempts=4</code>. Verifica que, tras el último intento, se lanza el error en vez de quedarse en bucle.
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> imprime en cada reintento cuántos intentos quedan y qué tipo de error fue. Debes poder leer la secuencia completa y saber <em>por qué</em> se reintentó (o no) cada vez.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cadena de proveedores con fallback</h3>
+          <p>Implementa en el Copiloto una <strong>cadena de proveedores</strong>: primero intenta Ollama local; si agota los reintentos transitorios, pasa a OpenAI; si también falla, a Anthropic; y si todos fallan, lanza un error claro. La app debe seguir llamando al <em>mismo</em> contrato <code>LLMClient</code>, sin enterarse de la cadena.</p>
+          <p><em>Pista: crea un <code>FallbackClient</code> que guarde una lista de clientes y <code>complete</code> los pruebe en orden, capturando <code>TransientError</code> y pasando al siguiente. No captures <code>PermanentError</code> (un 401 en el primero no se arregla con el segundo salvo que sean claves distintas). Registra en un log qué proveedor sirvió cada respuesta: sin esa traza, no sabrás si el fallback funciona.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Local (Ollama) y nube (OpenAI/Anthropic) son <strong>compromisos</strong> de coste, privacidad, calidad y latencia, no bandos.</li>
+          <li>Una <strong>interfaz común</strong> (<code>LLMClient</code>) con adaptadores por proveedor evita acoplar tu app a un SDK.</li>
+          <li>Clasifica siempre: <strong>transitorio</strong> (429, 5xx, timeout, conexión) → reintenta; <strong>permanente</strong> (400, 401, 404, contexto excedido) → no reintentes.</li>
+          <li>Reintenta con <strong>backoff exponencial + jitter</strong> y respeta el <code>Retry-After</code> cuando exista.</li>
+          <li>Reintentos <strong>acotados</strong>: al agotarlos, error explícito o <em>fallback</em> de proveedor.</li>
+          <li>Las claves van en <strong>variables de entorno</strong>, nunca en el repositorio.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta / patrón</th></tr></thead>
+          <tbody>
+            <tr><td>Contrato de proveedor</td><td><code>typing.Protocol</code> (<code>LLMClient</code>)</td></tr>
+            <tr><td>Adaptadores</td><td><code>OllamaClient</code>, <code>OpenAIClient</code>, <code>AnthropicClient</code></td></tr>
+            <tr><td>Clasificación de errores</td><td><code>TransientError</code> / <code>PermanentError</code></td></tr>
+            <tr><td>Backoff</td><td><code>min(base * 2**n, cap) + random.uniform(0, jitter)</code></td></tr>
+            <tr><td>Rate limit</td><td>Respetar <code>Retry-After</code> / cabeceras 429</td></tr>
+            <tr><td>Secrets</td><td><code>os.environ["..."]</code> + <code>.env</code> fuera de Git</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si los SDKs ya reintentan solos, ¿para qué mi capa?</summary>
+            <div>
+              <p>Los SDKs gestionan reintentos de red a bajo nivel, pero tu capa decide política de negocio: cuántos intentos como máximo, qué hacer al agotarlos, si cambiar de proveedor, si degradar a una respuesta de caché o mostrar un mensaje al usuario. Además, la capa de negocio unifica proveedores con errores distintos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Local o nube?</summary>
+            <div>
+              <p>Empieza en local: sin clave, sin coste, reproducible, y el núcleo del curso funciona así. Sube a la nube cuando necesites más calidad o cuando tu hardware no dé. Lo importante es no <em>acoplarte</em>: con una interfaz común, cambiar es configurar, no reescribir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos reintentos pongo?</summary>
+            <div>
+              <p>Pocos: 3-4 intentos cubren casi todos los fallos transitorios de la red y de un proveedor con hipo. Más allá, el proveedor está caído de verdad y el fallback o el error explícito son mejores que seguir insistiendo. Ajusta con datos, no por intuición.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el jitter importa tanto?</summary>
+            <div>
+              <p>Sin jitter, si tienes 100 instancias y todas reciben un 429 al mismo tiempo, todas reintentan en el mismo instante y generan otro pico que vuelve a ser 429. El aleatorio desincroniza los reintentos y el sistema converge en vez de oscilar. Es un detalle barato con un efecto enorme.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago con un error de contexto excedido?</summary>
+            <div>
+              <p>No reintentes: el prompt es demasiado largo. Reduce el contexto (recorta mensajes antiguos, resume, quita ejemplos) o usa un modelo con más ventana. Es un error determinista con una causa determinista: <strong>tu prompt</strong>. En el módulo 4 verás cómo gestionar el contexto de forma sistemática.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

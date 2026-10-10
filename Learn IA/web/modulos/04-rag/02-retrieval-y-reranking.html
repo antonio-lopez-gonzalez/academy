@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-retrieval-y-reranking">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Retrieval y reranking — Módulo 4 · Curso IA</title>
+  <meta name="description" content="Top-k, umbrales de similitud y reranking (cross-encoder o heurístico) en RAG, y cómo diagnosticar cuándo falla la recuperación.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Retrieval y reranking</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · RAG</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior vimos las seis fases del pipeline. Pues bien: <strong>la fase que más determina la calidad de un RAG es la recuperación</strong>. Da igual lo bueno que sea el modelo: si le das el fragmento equivocado, responderá mal o alucinará. Y como el modelo casi nunca dice «el contexto que me diste no venía a cuento», un mal retrieval se disfraza de mal modelo.</p>
+        <p>En esta lección afinamos esa fase con tres herramientas que se usan juntas:</p>
+        <ul>
+          <li><strong>top-k</strong> — cuántos fragmentos recuperar, y por qué <em>k</em> no es un número que se elige a ojo.</li>
+          <li><strong>umbrales de similitud</strong> — cuándo descartar fragmentos aunque sean los «menos malos», y por qué un umbral absoluto es una trampa.</li>
+          <li><strong>reranking</strong> — una segunda pasada de ordenación, más cara y más precisa, que se queda solo con los mejores candidatos.</li>
+        </ul>
+        <p>Y, sobre todo, aprenderemos a <strong>diagnosticar</strong>: ante una mala respuesta, decidir si falló el <em>retrieval</em> (no se recuperó el fragmento correcto) o la <em>generación</em> (se recuperó y el modelo lo ignoró). Esa distinción es la que convierte el trabajo en ingeniería.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todo el mundo empieza con <code>k = 5</code> y ya. Cuando el Copiloto responde mal sobre una lección, necesitamos saber si el fragmento correcto estaba en la lista, si estaba fuera del top-k, o si estaba ahí y puntuó bajo. Cada caso tiene una solución distinta, y sin medir no se distingue.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué la recuperación es «aproximada»</h3>
+        <p>La búsqueda semántica normal la hace un <strong>bi-encoder</strong> (o modelo de dos torres): un modelo que convierte la consulta y el documento <em>por separado</em> en dos vectores y luego compara con similitud coseno. Es rapidísimo porque los vectores de los documentos están precalculados; solo hay que embeber la consulta y hacer un producto. Pero esa velocidad tiene un coste: el modelo <strong>nunca ve la consulta y el documento juntos</strong>, así que no puede capturar matices finos de la relación entre ambos.</p>
+        <div class="callout callout--analogy">
+          <p>Un bi-encoder es como un <strong>apuntador de biblioteca</strong> que ha memorizado de qué va cada libro por un resumen. Acierta lo grande («este libro es de cocina italiana») pero se le escapan los detalles («cocina italiana <em>sin gluten</em>»). Un <strong>cross-encoder</strong> es el bibliotecario que abre los libros uno a uno y lee la pregunta a la vez: mucho más preciso, pero no puede hacerlo con toda la biblioteca, solo con unos pocos.</p>
+        </div>
+
+        <h3>Top-k: cuántos fragmentos recuperar</h3>
+        <p>El <strong>top-k</strong> es el número de fragmentos que pasan a la fase de contexto. Se elige con un <em>trade-off</em> claro:</p>
+        <table>
+          <thead><tr><th>k pequeño (1–2)</th><th>k grande (10–20)</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Contexto limpio y barato</td>
+              <td>Alta probabilidad de que el fragmento correcto esté dentro</td>
+            </tr>
+            <tr>
+              <td>Riesgo: si el top-1 falla, falla todo</td>
+              <td>Ruido, más tokens, más latencia</td>
+            </tr>
+            <tr>
+              <td>Sin reranking: razonable</td>
+              <td>Con reranking: es lo que quieres antes de reordenar</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>La regla de oro: <strong>el top-k del <em>retrieval</em> y el top-k del <em>contexto</em> son distintos</strong>. En un sistema de dos etapas recuperas un <em>pool</em> ancho (por ejemplo, 20–50 candidatos) y luego el reranker deja pasar 3–5 al contexto. Confundir estos dos números es la fuente de la mitad de los problemas.</p>
+
+        <h3>Umbrales de similitud: cuándo descartar</h3>
+        <p>No todos los fragmentos recuperados son buenos. Si la pregunta trata de algo que <strong>no está en el corpus</strong>, el top-k igualmente devolverá «los menos malos», y esos fragmentos irrelevantes son gasolina para una alucinación. La solución es un <strong>umbral</strong>: descartar lo que no supere una puntuación mínima. Pero hay un detalle que casi todos ignoran:</p>
+        <div class="callout callout--warning">
+          <p><strong>Los valores absolutos de similitud coseno no son comparables entre modelos.</strong> Un coseno de 0.7 con un modelo puede significar «muy relevante» y con otro «a duras penas». Un umbral absoluto copiado de otro proyecto es una bomba de relojería. Mide y calibra el tuyo con consultas conocidas.</p>
+        </div>
+        <p>Dos alternativas mejores que un umbral absoluto fijo:</p>
+        <ul>
+          <li><strong>Umbral relativo (margen)</strong>: quédate con los fragmentos que están a cierta distancia del mejor. Si el mejor puntúa 0.81 y el siguiente 0.52, ese salto enorme sugiere que solo el primero es relevante.</li>
+          <li><strong>Umbral calibrado por modelo</strong>: para tu modelo de embeddings concreto, mide en un conjunto de preguntas cuál es la puntuación mínima de un fragmento realmente relevante, y usa ese valor.</li>
+        </ul>
+
+        <h3>Reranking: la segunda pasada</h3>
+        <p>El <strong>reranking</strong> toma los candidatos del bi-encoder y los <strong>reordena con un modelo más preciso pero más caro</strong>. Hay dos familias:</p>
+
+        <h4>Reranking con cross-encoder</h4>
+        <p>Un <strong>cross-encoder</strong> recibe el par <em>(consulta, documento)</em> <strong>juntos</strong> y devuelve una puntuación de relevancia. Al ver ambos a la vez, captura matices que el bi-encoder pierde. El precio: hay que ejecutarlo <strong>una vez por candidato</strong>, así que solo es viable sobre un pool pequeño (20–100). Es un modelo de IA, otra llamada de inferencia.</p>
+
+        <h4>Reranking heurístico</h4>
+        <p>Sin modelo, con reglas de tu código. Barato y determinista. Ejemplos:</p>
+        <ul>
+          <li><strong>Refuerzo por metadatos</strong>: si el usuario pregunta por el módulo 4, sube los candidatos de ese módulo.</li>
+          <li><strong>Solape léxico</strong>: cuenta cuántas palabras clave de la consulta aparecen en el fragmento (un <em>mini</em> BM25).</li>
+          <li><strong>Diversidad (MMR)</strong>: evita devolver cinco fragmentos que dicen lo mismo; penaliza la redundancia.</li>
+          <li><strong>Recencia o prioridad</strong>: en documentación viva, prioriza la versión más reciente.</li>
+        </ul>
+
+        <h4>Búsqueda híbrida</h4>
+        <p>La búsqueda <em>densa</em> (vectores) capta significado; la búsqueda <em>léxica</em> (BM25) capta coincidencias exactas —nombres de función, siglas, números de versión— que los embeddings a veces «redondean». La <strong>híbrida</strong> combina ambas y fusiona los resultados (por ejemplo, con <em>Reciprocal Rank Fusion</em>). Es especialmente potente cuando la pregunta contiene términos técnicos exactos.</p>
+        <pre class="diagram">
+  CONSULTA
+     │
+     ├──▶ bi-encoder (denso)  ──┐
+     │                          ├──▶ fusión (RRF) ──▶ POOL (20–50) ──▶ reranker ──▶ top 3–5 ──▶ contexto
+     └──▶ BM25 (léxico)       ──┘                        (cross-encoder o heurístico)
+        </pre>
+
+        <h3>Cuándo falla el retrieval y cómo diagnosticarlo</h3>
+        <p>Un retrieval puede fallar de cuatro maneras. Identificar cuál es tu caso es medio camino andado:</p>
+        <table>
+          <thead><tr><th>Síntoma</th><th>Causa probable</th><th>Qué tocar</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>El fragmento correcto <strong>ni aparece</strong> en el pool</td>
+              <td>Chunking, modelo de embeddings o falta de búsqueda léxica</td>
+              <td>Revisa tamaño/solape de chunk, modelo multilingüe, añade BM25</td>
+            </tr>
+            <tr>
+              <td>Aparece, pero <strong>fuera del top-k</strong> del contexto</td>
+              <td>k demasiado pequeño para el pool final</td>
+              <td>Sube el pool y añade reranking</td>
+            </tr>
+            <tr>
+              <td>Aparece y puntúa bien, pero la respuesta es mala</td>
+              <td>Fallo de <strong>generación</strong> (prompt sin grounding)</td>
+              <td>No es retrieval: endurece el prompt (lección 03)</td>
+            </tr>
+            <tr>
+              <td>Varios fragmentos casi idénticos copan el top</td>
+              <td>Redundancia de chunks</td>
+              <td>MMR / deduplicación en el reranking</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>El diagnóstico se hace con una <strong>traza</strong>: para cada pregunta, registra los fragmentos recuperados con su puntuación y marca si el correcto (el <em>gold</em>) está dentro del top-N. Esa es la métrica de <strong>recall@N</strong> que formalizaremos en la lección 04; aquí basta con saber que sin esta traza vas a ciegas.</p>
+        <div class="callout callout--tip">
+          <p>Antes de tocar nada, imprime los diez candidatos con sus puntuaciones para unas cuantas preguntas representativas. En cinco minutos verás si el problema es de <em>orden</em> (reranking) o de <em>presencia</em> (chunking/híbrida).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un <strong>reranker heurístico</strong> en veinte líneas: recuperamos un pool ancho y lo reordenamos combinando la similitud densa con el solape léxico y un refuerzo por metadatos. Todo determinista, sin ningún modelo extra.</p>
+        <div class="code-file">rerank_minimo.py</div>
+        <pre><code class="language-python"># rerank_minimo.py — reranking heurístico: denso + léxico + metadatos.
+import re
+
+import numpy as np
+from fastembed import TextEmbedding
+
+# Cada candidato: texto, metadatos y (más abajo) su vector.
+CANDIDATES = [
+    {"text": "El chunking divide un documento con solape.",
+     "module": "04", "lesson": "01-pipeline-rag"},
+    {"text": "El reranking reordena candidatos con un cross-encoder.",
+     "module": "04", "lesson": "02-retrieval-y-reranking"},
+    {"text": "La temperatura controla el azar del muestreo.",
+     "module": "00", "lesson": "02-tokens-contexto-sampling"},
+    {"text": "Un umbral de similitud descarta fragmentos poco relevantes.",
+     "module": "04", "lesson": "02-retrieval-y-reranking"},
+]
+
+model = TextEmbedding("intfloat/multilingual-e5-small")
+vecs = np.array(list(model.embed([c["text"] for c in CANDIDATES])))
+vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+
+
+def tokens(text: str) -> set[str]:
+    return set(re.findall(r"\w+", text.lower()))
+
+
+def rerank(query: str, boost_module: str, pool: int = 4, keep: int = 2):
+    """Devuelve los `keep` mejores tras combinar señal densa y heurística."""
+    q = np.array(next(iter(model.embed([query])))); q /= np.linalg.norm(q)
+    dense = vecs @ q                                   # similitud coseno
+    q_tokens = tokens(query)
+    scored = []
+    for c, dense_score in zip(CANDIDATES, dense):
+        lexical = len(q_tokens &amp; tokens(c["text"])) / max(len(q_tokens), 1)
+        bonus = 0.15 if c["module"] == boost_module else 0.0
+        # Mezcla ponderada: la señal densa manda, la heurística desempata.
+        final = 0.7 * float(dense_score) + 0.3 * lexical + bonus
+        scored.append((final, c["text"]))
+    scored.sort(reverse=True)
+    return scored[:keep]
+
+
+for score, text in rerank("¿cómo reordeno los fragmentos recuperados?", boost_module="04"):
+    print(f"{score:.3f}  {text}")
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">0.812  El reranking reordena candidatos con un cross-encoder.
+0.701  Un umbral de similitud descarta fragmentos poco relevantes.
+</code></pre>
+        <p>Observa que el fragmento sobre «temperatura» (módulo 0) queda descartado pese a tener un vector razonable: el <strong>refuerzo por módulo</strong> y el solape léxico empujan arriba lo que de verdad responde a la pregunta. Eso es reranking heurístico: barato, explicable y sorprendentemente eficaz como primera capa.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto</strong> en dos etapas: <em>recuperar un pool ancho</em> con búsqueda híbrida y <em>reranquear</em> con un cross-encoder, dejando pasar solo lo que supera un umbral relativo. Este patrón —pool ancho, reranker preciso, corte por margen— es el que usan los sistemas RAG serios.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/retrieval.py</div>
+        <pre><code class="language-python">"""Recuperación en dos etapas para el Copiloto: híbrida + reranking."""
+from dataclasses import dataclass
+
+from copiloto.index import Embeddings, lexical_search     # denso + BM25
+
+
+@dataclass
+class Candidate:
+    text: str
+    module: str
+    lesson: str
+    section: str
+    dense: float          # similitud coseno del bi-encoder
+
+
+def reciprocal_rank_fusion(dense: list[str], lexical: list[str], k: int = 60) -> list[str]:
+    """Fusiona dos listas ordenadas por rango (RRF): robusto y sin calibrar pesos."""
+    scores: dict[str, float] = {}
+    for ranking in (dense, lexical):
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+
+def retrieve_pool(query: str, pool_size: int = 30) -> list[Candidate]:
+    """Etapa 1: pool ancho combinando búsqueda densa y léxica."""
+    emb = Embeddings.load()
+    dense_ids = emb.store.dense_ids(query, limit=pool_size)        # vectores
+    lexical_ids = lexical_search(query, limit=pool_size)           # BM25
+    fused = reciprocal_rank_fusion(dense_ids, lexical_ids)[:pool_size]
+    return [emb.store.get(doc_id) for doc_id in fused]
+
+
+def rerank(query: str, pool: list[Candidate], keep: int = 4,
+           margin: float = 0.35) -> list[Candidate]:
+    """Etapa 2: cross-encoder + corte por margen relativo."""
+    from sentence_transformers import CrossEncoder
+
+    encoder = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+    pairs = [(query, c.text) for c in pool]
+    scores = encoder.predict(pairs)                                # una pasada por par
+    for c, s in zip(pool, scores):
+        c.dense = float(s)                                         # reutilizamos el campo
+    pool.sort(key=lambda c: c.dense, reverse=True)
+
+    if not pool:
+        return []
+    top = pool[0].dense
+    # Solo lo que esté cerca del mejor: si hay un salto grande, cortamos ahí.
+    return [c for c in pool[:keep] if c.dense &gt; top - margin]
+
+
+def retrieve(query: str) -> list[Candidate]:
+    """Recuperación final que consume la fase de contexto."""
+    return rerank(query, retrieve_pool(query, pool_size=30), keep=4)
+</code></pre>
+        <p>Uso y traza desde el Copiloto:</p>
+        <pre><code class="language-bash">uv run copiloto ask "¿Cómo evito que RAG alucine?" --trace
+</code></pre>
+        <pre><code class="language-text">pool[30]  rerank: 0.981 04-rag/03-citas-y-fidelidad#teoria
+          rerank: 0.947 04-rag/01-pipeline-rag#teoria
+          rerank: 0.612 01-prompting/04-seguridad-de-prompt#teoria
+          corte por margen (&gt; 0.981 - 0.35 = 0.631): 3 fragmentos pasan
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Pool ancho (30) y contexto estrecho (4)</strong>: el pool da recall; el corte da precisión. Nunca son el mismo número.</li>
+          <li><strong>RRF para fusionar denso y léxico</strong>: combina rankings sin tener que calibrar pesos entre dos puntuaciones que no son comparables. Es la opción robusta por defecto.</li>
+          <li><strong>Cross-encoder multilingüe</strong>: el corpus del Copiloto está en español; un reranker solo en inglés ordenaría peor.</li>
+          <li><strong>Corte por margen, no por umbral absoluto</strong>: «cerca del mejor» es estable entre modelos; «mayor que 0.42» no.</li>
+          <li><strong>El reranker es lo caro</strong>: 30 pares por consulta. Si el pool crece, la latencia sube linealmente; por eso el pool se mantiene en decenas, no en miles.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>El cross-encoder añade latencia (decenas de milisegundos por par en CPU). Para el Copiloto es aceptable; en un servicio de alto tráfico, se cachea o se ejecuta en lote. Mide siempre antes de optimizar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Separar el pool del retrieval del top-k del contexto</td>
+              <td>Usar el mismo <code>k</code> para todo</td>
+              <td>El pool da recall; el contexto estrecho, precisión</td>
+            </tr>
+            <tr>
+              <td>Calibrar el umbral con consultas conocidas</td>
+              <td>Copiar un umbral absoluto de otro proyecto</td>
+              <td>Los cosenos no son comparables entre modelos</td>
+            </tr>
+            <tr>
+              <td>Reranking solo sobre un pool pequeño (20–100)</td>
+              <td>Pasar el corpus entero al cross-encoder</td>
+              <td>El coste es lineal en el número de pares</td>
+            </tr>
+            <tr>
+              <td>Combinar denso + léxico (híbrida)</td>
+              <td>Depender solo de vectores</td>
+              <td>Los términos exactos (siglas, versiones) se pierden en denso</td>
+            </tr>
+            <tr>
+              <td>Usar MMR o deduplicar para evitar redundancia</td>
+              <td>Dejar que cinco chunks casi iguales copen el top</td>
+              <td>Contexto repetido = tokens gastados sin información nueva</td>
+            </tr>
+            <tr>
+              <td>Registrar recall@N por pregunta</td>
+              <td>Mirar solo la respuesta final</td>
+              <td>El recall te dice <em>dónde</em> está el fallo</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Usar un umbral absoluto copiado</h3>
+        <p>El umbral de otro modelo o de otro corpus no significa nada en el tuyo.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "0.7 siempre es relevante" — falso según el modelo y el corpus.
+fragments = [c for c in pool if c.dense &gt;= 0.7]
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Corte por margen relativo al mejor candidato.
+top = pool[0].dense
+fragments = [c for c in pool if c.dense &gt; top - 0.35]   # margen medido en tu corpus
+</code></pre>
+
+        <h3>6.2. Recuperar pocos candidatos y no reranquear</h3>
+        <p>Si recuperas solo <code>k = 3</code> y el bi-encoder ordena mal, el fragmento correcto nunca llega.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Tres candidatos directos al contexto, sin segunda pasada.
+pool = store.search(q, limit=3)
+context = build_context(pool)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Pool ancho y reranking: el correcto entra aunque el denso lo ordene bajo.
+pool = store.search(q, limit=30)
+context = build_context(rerank(q, pool, keep=4))
+</code></pre>
+
+        <h3>6.3. Culpar al modelo de un fallo de recuperación</h3>
+        <p>Cambiar de LLM cuando el problema estaba en el retrieval es tirar tiempo y dinero.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ El Copiloto responde mal → "cambiemos a un modelo más grande".
+answer = bigger_model(same_bad_context)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Mira la traza primero: ¿está el fragmento correcto en el pool?
+assert gold_id in [c.id for c in retrieve_pool(question)]   # recall@pool
+answer = chat(build_messages(question, retrieve(question)))
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir el <strong>recall</strong> del retrieval del Copiloto sobre 5 preguntas con respuesta conocida, y comprobar cuánto mejora al añadir un <strong>reranker cross-encoder</strong>. Sin LLM: solo medimos recuperación.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — el conjunto de prueba (gold).</strong> Crea <code>eval_retrieval.py</code> con preguntas y el <code>lesson</code> que sabes que contiene la respuesta:
+            <pre><code class="language-python"># eval_retrieval.py — 5 preguntas con su lección de referencia (gold).
+CASES = [
+    {"q": "¿Qué es un chunk?",                 "gold": "03-chunking"},
+    {"q": "¿Cómo reduce RAG la alucinación?",  "gold": "01-pipeline-rag"},
+    {"q": "¿Qué es el reranking?",             "gold": "02-retrieval-y-reranking"},
+    {"q": "¿Qué hago si no hay contexto?",     "gold": "03-citas-y-fidelidad"},
+    {"q": "¿Cómo mido el recall de RAG?",      "gold": "04-evaluacion-de-rag"},
+]
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — recall@N del bi-encoder.</strong> Añade la función que cuenta si el gold está en el pool:
+            <pre><code class="language-python">from copiloto.retrieval import retrieve_pool
+
+
+def recall_at(pool_size: int) -> float:
+    hits = 0
+    for case in CASES:
+        pool = retrieve_pool(case["q"], pool_size=pool_size)
+        if any(c.lesson.endswith(case["gold"]) for c in pool):
+            hits += 1
+    return hits / len(CASES)
+
+
+print(f"recall@5  = {recall_at(5):.0%}")     # sin reranking, pool estrecho
+print(f"recall@30 = {recall_at(30):.0%}")    # pool ancho: sube
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — interpreta.</strong> Ejecuta <code>uv run eval_retrieval.py</code>. Esperado aproximado:
+            <pre><code class="language-text">recall@5  = 60%
+recall@30 = 100%
+</code></pre>
+            <p>Lección clave: con un pool estrecho (<code>k = 5</code>) el fragmento correcto <strong>ni siquiera está</strong> en el 40 % de los casos. No es un problema del modelo: es del tamaño del pool.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — añade el reranker.</strong> Recupera 30, reordena con el cross-encoder y mide el <strong>recall@4 tras reranking</strong>:
+            <pre><code class="language-python">from copiloto.retrieval import retrieve, rerank
+
+
+def recall_after_rerank(keep: int = 4) -> float:
+    hits = 0
+    for case in CASES:
+        final = rerank(case["q"], retrieve_pool(case["q"], pool_size=30), keep=keep)
+        if any(c.lesson.endswith(case["gold"]) for c in final):
+            hits += 1
+    return hits / len(CASES)
+
+
+print(f"recall@4 tras rerank = {recall_after_rerank():.0%}")
+</code></pre>
+            <p>Esperado: <code>100%</code> (el 100 % del pool ancho se mantiene porque el reranker ordena bien). Si baja, sube <code>keep</code> o revisa el margen.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — diagnostica un fallo concreto.</strong> Si algún caso no llega, imprime su pool completo:
+            <pre><code class="language-python">case = CASES[0]
+for c in retrieve_pool(case["q"], pool_size=10):
+    mark = "&lt;-- gold" if c.lesson.endswith(case["gold"]) else ""
+    print(f"{c.dense:.3f}  {c.lesson}#{c.section} {mark}")
+</code></pre>
+            <p><strong>Resultado esperado:</strong> verás si el gold aparece (problema de <em>orden</em> → reranking) o no aparece (problema de <em>chunking</em> o falta de búsqueda léxica). Acabas de hacer diagnóstico de retrieval con datos, no con intuición.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Sube el recall@5 del Copiloto sin cambiar el modelo de embeddings</h3>
+          <p>Partiendo del ejercicio, mejora el <code>recall@5</code> (pool estrecho, que es lo que finalmente ve el modelo tras reranquear) usando <strong>solo</strong> cambios en tu código, no en el modelo de embeddings. Candidatos:</p>
+          <ul>
+            <li>Añadir <strong>búsqueda híbrida</strong> con BM25 y fusión por RRF.</li>
+            <li>Aplicar <strong>MMR</strong> para evitar cinco chunks redundantes de la misma sección.</li>
+            <li><strong>Reescribir la consulta</strong> antes de embeberla (expandir siglas, quitar muletillas).</li>
+            <li>Añadir un <strong>refuerzo por metadatos</strong> cuando la pregunta menciona un módulo.</li>
+          </ul>
+          <p>Mide el <code>recall@5</code> antes y después de cada cambio, uno por uno, y quédate solo con los que aporten. Reporta la tabla <em>cambio → recall@5</em>.</p>
+          <p><em>Pista: el cross-encoder no cuenta como «cambio de modelo de embeddings», pero el reranking ya lo tienes; el objetivo es mejorar la <strong>etapa 1</strong>. Empieza por la híbrida: los términos técnicos exactos (nombres como <code>sqlite-vec</code> o IDs como <code>03-chunking</code>) son donde el denso más falla y el léxico más ayuda. No resuelvas el reto cambiando <code>pool_size</code>: eso no es mejorar el retrieval, es esconder el problema.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La recuperación es <strong>aproximada</strong>: el bi-encoder embebe consulta y documento por separado, rápido pero sin verlos juntos.</li>
+          <li><strong>Pool ≠ contexto</strong>: recupera ancho (20–50), reranquea y deja pasar estrecho (3–5).</li>
+          <li>Los <strong>umbrales absolutos de coseno no son comparables</strong> entre modelos; usa corte por <strong>margen relativo</strong> o calibra en tu corpus.</li>
+          <li><strong>Reranking</strong>: cross-encoder (preciso, una pasada por par) o heurístico (metadatos, léxico, MMR; barato y determinista).</li>
+          <li><strong>Híbrida</strong> (denso + BM25, fusionados con RRF): lo mejor cuando la pregunta lleva términos exactos.</li>
+          <li>Diagnostica con <strong>recall@N</strong>: si el gold está en el pool, el fallo es de orden o de generación; si no está, es de chunking o de embeddings.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td>Búsqueda densa</td><td><code>fastembed</code> + <code>sqlite-vec</code> / <code>pgvector</code></td></tr>
+            <tr><td>Búsqueda léxica</td><td>BM25 (<code>rank_bm25</code> o full-text de Postgres)</td></tr>
+            <tr><td>Fusión de rankings</td><td><em>Reciprocal Rank Fusion</em> (RRF)</td></tr>
+            <tr><td>Reranking preciso</td><td><code>CrossEncoder</code> de <code>sentence-transformers</code></td></tr>
+            <tr><td>Reranking barato</td><td>Metadatos + solape léxico + MMR (<code>numpy</code>)</td></tr>
+            <tr><td>Diagnóstico</td><td>recall@N sobre un conjunto de preguntas gold</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito siempre un cross-encoder para reranking?</summary>
+            <div>
+              <p>No. Un reranker heurístico (metadatos, solape léxico, MMR) ya mejora mucho y es gratis y determinista. Añade el cross-encoder cuando midas que el heurístico no basta y puedas asumir su latencia. En muchos casos, la ganancia mayor viene de la búsqueda híbrida, no del cross-encoder.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi umbral de 0.7 que funcionaba antes ya no descarta nada?</summary>
+            <div>
+              <p>Casi seguro cambiaste de <strong>modelo de embeddings</strong> (o de versión). Cada modelo tiene su escala de coseno: unos concentran los valores altos, otros no. No mezcles umbrales entre modelos. Recalibra con consultas conocidas o pasa a un corte por margen relativo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos candidatos debo pasar al reranker?</summary>
+            <div>
+              <p>El coste es lineal en el número de pares y el reranker solo necesita ver «lo plausible», no todo el corpus. Entre 20 y 100 candidatos suele ser el punto dulce. Empieza en 30, mide latencia y recall, y ajusta. Si subes de 100, plantéate mejorar la etapa 1 (híbrida) antes que engordar el pool.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La búsqueda híbrida cuándo no merece la pena?</summary>
+            <div>
+              <p>Cuando el corpus y las preguntas son puramente conceptuales y sin términos exactos relevantes (nombres de API, versiones, siglas). En ese caso, el denso solo basta y la híbrida añade complejidad sin recall. Mide: si el léxico no aporta casos que el denso falla, quítalo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿MMR o deduplicación por umbral de texto?</summary>
+            <div>
+              <p>MMR es más elegante: balancea relevancia y diversidad de forma continua, sin umbrales frágiles. La deduplicación por similitud de texto es más simple y directa cuando sospechas chunks literalmente duplicados (por solape de chunking). Empieza por deduplicar; si el problema es «fragmentos parecidos pero distintos», pasa a MMR.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

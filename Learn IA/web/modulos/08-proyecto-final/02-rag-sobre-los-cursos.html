@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="08" data-lesson="02-rag-sobre-los-cursos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG sobre los cursos — Módulo 8 · Curso IA</title>
+  <meta name="description" content="Indexar el HTML real de Academy/Learn */web/modulos/** con chunking y metadatos, y consultar las lecciones con citas al módulo y a la lección de origen.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>RAG sobre los cursos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 8 · Proyecto final: Copiloto</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora el Copiloto era una promesa de arquitectura. En esta lección le damos su primera capacidad real: <strong>saber cosas</strong>. Y las cosas que sabe son las lecciones de la propia Academy, tal y como están en disco: los archivos HTML de <code>Academy/Learn */web/modulos/**</code>. No hay un corpus de juguete ni un <em>dataset</em> preparado a mano: el Copiloto indexa el contenido que ya existe y responde citando de dónde lo sacó.</p>
+        <p>Esto es RAG, pero con dos exigencias que un ejemplo de laboratorio no tiene. La primera: el corpus es <strong>HTML real</strong>, con etiquetas, navegación y ruido; hay que extraer el texto útil y quedarse con las <strong>secciones</strong> (<code>introduccion</code>, <code>teoria</code>…). La segunda: cada respuesta debe poder <strong>citar el módulo y la lección</strong> de origen, así que los metadatos no son un extra, son parte del producto.</p>
+        <p>Construiremos la capa <code>index.py</code> completa: recorrer los cursos, parsear cada lección, trocear por sección con solape, embeber con un modelo multilingüe y guardar los vectores en <code>sqlite-vec</code> con sus metadatos. Después cerraremos la consulta recuperando fragmentos y mostrando su referencia.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «indexar los cursos» suena trivial y no lo es: el 80 % de los fallos de un RAG real están en la <em>ingesta</em> y el <em>chunking</em>, no en el modelo. Si los chunks pierden la sección, no puedes citar; si el troceado corta ideas por la mitad, el retrieval trae fragmentos rotos. Aquí resolvemos eso sobre datos reales.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La analogía: catalogar una biblioteca viva</h3>
+        <div class="callout callout--analogy">
+          <p>Imagina una biblioteca donde los libros <strong>se reescriben cada semana</strong>. No puedes memorizar el contenido; lo que haces es <strong>catalogar</strong>: por cada página útil escribes una ficha con el texto, el libro, el capítulo y el número de página. Cuando llega una pregunta, buscas las fichas relevantes y las pones sobre la mesa, citando libro y capítulo. El Copiloto hace exactamente eso: las <em>fichas</em> son los chunks y la ficha incluye <strong>curso, módulo, lección y sección</strong> porque son las coordenadas que hacen la cita verificable.</p>
+        </div>
+
+        <h3>El corpus: qué hay exactamente en disco</h3>
+        <p>El corpus del Copiloto es todo el HTML de lecciones de la Academy. La forma es uniforme porque <em>todos</em> los cursos siguen el mismo contrato:</p>
+        <pre class="diagram">
+  Academy/
+  ├── Learn IA/       web/modulos/08-proyecto-final/01-arquitectura.html
+  ├── Learn Python/   web/modulos/*/*.html
+  ├── Learn Docker/   web/modulos/*/*.html
+  └── … (un curso por carpeta "Learn *")
+
+  Cada lección es un HTML con esta anatomía (la misma de todo el curso):
+    &lt;html data-module="08" data-lesson="02-rag-sobre-los-cursos"&gt;
+      &lt;h1&gt;Título de la lección&lt;/h1&gt;
+      &lt;section id="introduccion"&gt; … &lt;/section&gt;
+      &lt;section id="teoria"&gt; … &lt;/section&gt;
+      … 10 secciones numeradas …
+        </pre>
+        <div class="callout callout--tip">
+          <p>Esa uniformidad es una ventaja enorme: como todas las lecciones tienen las mismas 10 secciones con <code>id</code>, el parser funciona igual para <em>cualquier</em> curso del repo. Añadir un curso nuevo no toca ni una línea del índice.</p>
+        </div>
+
+        <h3>Paso 1: ingesta — del HTML al texto con metadatos</h3>
+        <p>Se parsea con <code>BeautifulSoup</code>. Tres decisiones clave:</p>
+        <ul>
+          <li><strong>Extraer solo el contenido de las secciones</strong>: seleccionamos <code>section[id]</code> y descartamos el <em>chrome</em> (cabecera, scripts, navegación). El ruido de navegación aparece en <em>todas</em> las lecciones y contamina los embeddings (todo se parece a todo).</li>
+          <li><strong>Preservar metadatos de estructura</strong>: <code>course</code> (carpeta <code>Learn *</code>), <code>module</code> (el <code>data-module</code> / badge), <code>lesson</code> (<code>data-lesson</code>) y <code>section</code> (el <code>id</code> de la sección). Son las coordenadas de la cita.</li>
+          <li><strong>Normalizar el texto</strong> (colapsar espacios) para que el mismo contenido produzca siempre el mismo chunk. La ingesta debe ser <strong>idempotente</strong>.</li>
+        </ul>
+
+        <h3>Paso 2: chunking — trocear por estructura, no por caracteres</h3>
+        <p>Un <code>teoria</code> puede tener 800 líneas. No cabe en un chunk ni conviene: un vector de 800 líneas apunta a «una mezcla» de muchos temas y no recupera bien ninguna pregunta concreta. Estrategia del Copiloto, en dos niveles:</p>
+        <ol class="steps">
+          <li><strong>Por sección</strong>: cada sección es una unidad temática natural (una sección habla de una cosa). Mantener la sección como metadato permite citar «teoría». </li>
+          <li><strong>Ventana con solape dentro de la sección</strong>: si la sección supera ~220 palabras, se parte en ventanas de 220 con 40 de solape. El solape evita cortar una idea justo en la frontera y perder continuidad.</li>
+        </ol>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Valor típico</th><th>Efecto si lo subes</th><th>Efecto si lo bajas</th></tr></thead>
+          <tbody>
+            <tr><td>Tamaño de chunk</td><td>~220 palabras</td><td>Más contexto pero el vector se «diluye»; más tokens</td><td>Más precisión pero pierdes contexto y citas fragmentadas</td></tr>
+            <tr><td>Solape</td><td>~40 palabras</td><td>Mejor continuidad, índice más grande</td><td>Riesgo de cortar ideas en la frontera</td></tr>
+            <tr><td>Unidad base</td><td>la <code>section</code></td><td>—</td><td>Trocear por caracteres rompe el sentido</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p>Trabajamos en <strong>palabras</strong> por simplicidad, pero el modelo cuenta <strong>tokens</strong>. Regla mental: ~1 token ≈ 0,75 palabras en español. Si tu modelo tiene ventana limitada, calcula el tamaño real con su tokenizador. En la práctica, 220 palabras ≈ 290 tokens.</p>
+        </div>
+
+        <h3>Paso 3: embeddings — el mismo modelo a los dos lados</h3>
+        <p>Usamos <code>fastembed</code> con <code>intfloat/multilingual-e5-small</code> (384 dimensiones), cómodo en local y multilingüe. La regla de oro: <strong>el mismo modelo y la misma normalización al indexar y al consultar</strong>. Normalizamos cada vector (L2) para que la comparación sea similitud coseno y no dependa de la longitud.</p>
+        <div class="callout callout--warning">
+          <p>Si cambias de modelo de embeddings, <strong>reindexa todo</strong>. Los vectores de dos modelos distintos viven en espacios incompatibles; mezclarlos produce resultados silenciosamente malos, no un error. El índice guarda el nombre del modelo para que puedas detectarlo.</p>
+        </div>
+
+        <h3>Paso 4: vector store — <code>sqlite-vec</code> como base por defecto</h3>
+        <p>El Copiloto guarda los vectores en <strong><code>sqlite-vec</code></strong>: un archivo, cero servidores, ideal para local-first. Crea una tabla virtual que acepta el vector y columnas auxiliares con los metadatos:</p>
+        <pre><code class="language-sql">CREATE VIRTUAL TABLE chunks USING vec0(
+  embedding float[384] distance_metric=cosine,
+  +text TEXT, +course TEXT, +module TEXT, +lesson TEXT,
+  +section TEXT, +chunk_id TEXT
+);
+</code></pre>
+        <p>La búsqueda es por vecinos más cercanos: <code>WHERE embedding MATCH :q AND k = :k ORDER BY distance</code>. Con <code>distance_metric=cosine</code>, la similitud es <code>1 - distance</code>. La alternativa de producción es <strong>pgvector</strong> (PostgreSQL) cuando necesitas concurrencia, filtros SQL ricos o varios procesos compartiendo el índice; el contrato de la capa <code>index</code> es el mismo, solo cambia el <em>backend</em>.</p>
+
+        <h3>Idempotencia: el mismo archivo, el mismo índice</h3>
+        <p>Cada chunk lleva un <code>chunk_id</code> <strong>determinista</strong>: un hash de <em>(curso, módulo, lección, sección, posición)</em>. Así, reindexar dos veces el mismo archivo produce los mismos identificadores y no genera duplicados. Es la base para un reindexado <em>incremental</em> (lección 02 de este módulo, en el reto) y para saber qué cambió.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La pieza más pequeña que ya aporta valor: <strong>parsear una lección real</strong> y convertirla en chunks con sus coordenadas. Sin embeddings y sin base de datos: solo la ingesta, que es donde vive la mitad del trabajo de RAG.</p>
+        <div class="code-file">ingest_minimo.py</div>
+        <pre><code class="language-python"># ingest_minimo.py — de un HTML de lección a una lista de chunks con metadatos.
+# Instalación:  uv add beautifulsoup4
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+
+# Ruta real de una lección de esta Academy (ajusta si tu carpeta difiere).
+LESSON = Path("../../Learn IA/web/modulos/04-rag/03-citas-y-fidelidad.html")
+
+
+def clean(text: str) -> str:
+    """Colapsa todos los espacios para que el resultado sea estable."""
+    return " ".join(text.split())
+
+
+def parse(path: Path, course: str) -&gt; list[dict]:
+    html = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
+    lesson = html.html.get("data-lesson", path.stem)     # p. ej. "03-citas-y-fidelidad"
+    chunks = []
+    for section in html.select("section[id]"):           # solo el contenido útil
+        text = clean(section.get_text(" ", strip=True))
+        if len(text) &lt; 40:                               # descarta secciones vacías
+            continue
+        chunks.append({
+            "text": text,
+            "course": course,
+            "lesson": lesson,
+            "section": section["id"],                    # introduccion, teoria, …
+        })
+    return chunks
+
+
+if __name__ == "__main__":
+    chunks = parse(LESSON, course="Learn IA")
+    print(f"{len(chunks)} chunks")
+    for c in chunks[:3]:
+        print(f"  [{c['section']}] {c['text'][:64]}…")
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">10 chunks
+  [introduccion] Ya sabemos recuperar buenos fragmentos. Pero un RAG no está…
+  [teoria] Grounding: la respuesta debe «tocarse» con el contexto Decimos que…
+  [ejemplo-minimo] Dos piezas pequeñas y deterministas: formatear el contexto…
+</code></pre>
+        <p>Cada chunk sabe de qué curso, lección y sección viene. Con eso ya puedes <strong>citar</strong>. La siguiente pieza —embeber y buscar— la añadimos en el ejemplo real.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> La capa <code>index.py</code> completa: recorre <em>todos</em> los cursos, trocea con solape, embebe y guarda en <code>sqlite-vec</code> con metadatos. Al final, una función <code>search()</code> devuelve fragmentos ya citables.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/index.py</div>
+        <pre><code class="language-python">"""Capa index: convierte el HTML real de los cursos en un índice vectorial citable."""
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import sqlite_vec
+from bs4 import BeautifulSoup
+from fastembed import TextEmbedding
+
+from copiloto.config import settings
+
+# Ajustes de chunking (en palabras; ~1 token ≈ 0,75 palabras en español).
+CHUNK_WORDS = 220
+OVERLAP_WORDS = 40
+DIM = 384                                            # intfloat/multilingual-e5-small
+
+
+@dataclass
+class Chunk:
+    """Un fragmento indexado, con sus coordenadas de cita."""
+    chunk_id: str
+    text: str
+    course: str
+    module: str
+    lesson: str
+    section: str
+
+
+def _connect(db_path: Path) -&gt; sqlite3.Connection:
+    """Abre sqlite-vec (extensión cargada) y garantiza la tabla."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(db_path)
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)
+    db.enable_load_extension(False)
+    db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING vec0("
+        "embedding float[384] distance_metric=cosine, "
+        "+text TEXT, +course TEXT, +module TEXT, +lesson TEXT, "
+        "+section TEXT, +chunk_id TEXT)"
+    )
+    return db
+
+
+def iter_lessons(academy_root: Path) -&gt; list[Path]:
+    """Todas las lecciones de todos los cursos: Learn */web/modulos/*/*.html."""
+    return sorted(academy_root.glob("Learn */web/modulos/*/*.html"))
+
+
+def _clean(text: str) -&gt; str:
+    return " ".join(text.split())
+
+
+def _split_words(text: str, size: int, overlap: int) -&gt; list[str]:
+    """Parte el texto en ventanas de `size` palabras con `overlap` de solape."""
+    words = text.split()
+    if not words:
+        return []
+    step = max(size - overlap, 1)
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), step)]
+
+
+def parse_lesson(path: Path, academy_root: Path) -&gt; list[Chunk]:
+    """Ingesta de una lección: HTML -> chunks con curso, módulo, lección y sección."""
+    rel = path.relative_to(academy_root)
+    course = rel.parts[0]                                   # p. ej. "Learn IA"
+    html = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
+    lesson = html.html.get("data-lesson", path.stem)
+    badge = html.select_one(".badge")
+    module = _clean(badge.get_text()) if badge else rel.parts[2]
+    title = _clean(html.find("h1").get_text()) if html.find("h1") else lesson
+
+    chunks: list[Chunk] = []
+    for section in html.select("section[id]"):
+        text = _clean(section.get_text(" ", strip=True))
+        for i, part in enumerate(_split_words(text, CHUNK_WORDS, OVERLAP_WORDS)):
+            seed = f"{course}|{module}|{lesson}|{section['id']}|{i}"
+            chunks.append(Chunk(
+                chunk_id=hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16],
+                # El título ayuda al retrieval: el embedding ve de qué lección es.
+                text=f"{title} — {section['id']}: {part}",
+                course=course, module=module, lesson=lesson, section=section["id"],
+            ))
+    return chunks
+
+
+def _embed(texts: list[str]) -&gt; np.ndarray:
+    """Embeddings normalizados (L2) para que el coseno sea el producto punto."""
+    model = TextEmbedding(settings.embed_model)
+    vecs = np.array(list(model.embed(texts)), dtype=np.float32)
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
+
+def build_index() -&gt; int:
+    """Reindexa todo el corpus. Devuelve cuántos chunks quedaron indexados."""
+    db = _connect(settings.db_path)
+    db.execute("DELETE FROM chunks")                        # reindexado completo
+    total = 0
+    for path in iter_lessons(settings.academy_root):
+        chunks = parse_lesson(path, settings.academy_root)
+        if not chunks:
+            continue
+        vecs = _embed([c.text for c in chunks])
+        db.executemany(
+            "INSERT INTO chunks(embedding, text, course, module, lesson, section, chunk_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(v.tobytes(), c.text, c.course, c.module, c.lesson, c.section, c.chunk_id)
+             for v, c in zip(vecs, chunks, strict=True)],
+        )
+        total += len(chunks)
+    db.commit()
+    db.close()
+    return total
+
+
+def search(question: str, k: int = 4) -&gt; list[tuple[float, Chunk]]:
+    """Embed de la consulta + top-k por coseno. Listo para citar."""
+    q = _embed([question])[0]
+    db = _connect(settings.db_path)
+    rows = db.execute(
+        "SELECT distance, text, course, module, lesson, section, chunk_id "
+        "FROM chunks WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+        (q.tobytes(), k),
+    ).fetchall()
+    db.close()
+    return [
+        (1.0 - distance, Chunk(chunk_id, text, course, module, lesson, section))
+        for distance, text, course, module, lesson, section, chunk_id in rows
+    ]
+</code></pre>
+
+        <p>Construir el índice y probar la búsqueda desde la CLI:</p>
+        <pre><code class="language-bash">uv run copiloto index
+# → Indexados 1247 chunks de 9 cursos.
+
+uv run copiloto ask "¿Cómo se trocea un documento para el RAG?" --no-llm
+# → (traza) top-k:
+#   0.86  Learn IA · Módulo 8 · 02-rag-sobre-los-cursos · teoria
+#   0.81  Learn IA · Módulo 3 · 03-chunking · teoria
+#   0.74  Learn IA · Módulo 4 · 01-pipeline-rag · teoria
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Glob uniforme</strong> <code>Learn */web/modulos/*/*.html</code>: un solo patrón cubre todos los cursos presentes y futuros; no hay lista que mantener.</li>
+          <li><strong>Chunking por sección + ventana</strong>: la sección da sentido temático y la cita; la ventana evita chunks gigantes. El solape protege las ideas a caballo entre ventanas.</li>
+          <li><strong>Título en el texto del chunk</strong> (<code>{title} — {section}: …</code>): mejora el retrieval porque el embedding capta de qué lección habla, no solo el párrafo suelto.</li>
+          <li><strong><code>chunk_id</code> con hash determinista</strong>: reindexar no duplica; abre la puerta al reindexado incremental.</li>
+          <li><strong><code>distance_metric=cosine</code></strong>: coherente con normalizar los vectores; comparamos dirección, no magnitud.</li>
+          <li><strong><code>top_k</code> desde <code>settings</code></strong>: el número de fragmentos es configuración, no una constante escondida.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>La parte de <em>generación</em> con citas vive en <code>rag.py</code> (módulo 4) y la recuperación con reranking en el módulo 4, lección 02. Aquí dejamos <code>search()</code> devolviendo fragmentos ya referenciados; unirla al LLM es la lección 03 de este módulo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Extraer solo las <code>section[id]</code> del HTML</td>
+              <td>Indexar el <code>body</code> entero con chrome</td>
+              <td>La navegación contamina los embeddings y hace que todo se parezca</td>
+            </tr>
+            <tr>
+              <td>Guardar curso, módulo, lección y sección por chunk</td>
+              <td>Guardar solo el texto plano</td>
+              <td>Sin coordenadas no puedes citar ni filtrar por curso</td>
+            </tr>
+            <tr>
+              <td>Trocear por estructura (sección) con solape</td>
+              <td>Cortar por número fijo de caracteres</td>
+              <td>Cortar por caracteres parte frases y pierde el sentido</td>
+            </tr>
+            <tr>
+              <td>Mismo modelo y normalización en index y query</td>
+              <td>Cambiar de modelo a mitad</td>
+              <td>Vectores de espacios distintos dan resultados silenciosamente malos</td>
+            </tr>
+            <tr>
+              <td>Reindexado completo explícito (<code>copiloto index</code>)</td>
+              <td>Reindexar en cada arranque o consulta</td>
+              <td>Embeber todo el corpus tarda; el índice es persistente</td>
+            </tr>
+            <tr>
+              <td><code>chunk_id</code> determinista</td>
+              <td>IDs aleatorios por ejecución</td>
+              <td>Permite idempotencia y reindexado incremental</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Perder la sección al trocear</h3>
+        <p>Si unes todas las secciones en un solo texto y luego cortas por caracteres, cada chunk pierde de dónde viene y ya no puedes citar.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Concatenar todo y cortar por longitud: el chunk no sabe su sección.
+all_text = soup.get_text(" ")
+chunks = [all_text[i:i + 800] for i in range(0, len(all_text), 800)]
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Trocear por sección: cada chunk conserva su referencia.
+for section in html.select("section[id]"):
+    for part in _split_words(_clean(section.get_text(" ")), 220, 40):
+        chunk = Chunk(text=part, section=section["id"], lesson=lesson, …)
+</code></pre>
+
+        <h3>6.2. Indexar con un modelo y consultar con otro</h3>
+        <p>El error más caro porque no da error: la búsqueda «funciona» y devuelve basura.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Indexamos con e5-small y consultamos con otro modelo.
+index_model = TextEmbedding("intfloat/multilingual-e5-small")
+query_model = TextEmbedding("BAAI/bge-small-en")     # ¡otro espacio vectorial!
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Un único modelo, leído de la configuración, para index y query.
+from copiloto.config import settings
+model = TextEmbedding(settings.embed_model)
+</code></pre>
+
+        <h3>6.3. Mezclar saltos de línea y espacios (índice no idempotente)</h3>
+        <p>Si no normalizas, el mismo contenido puede producir chunks distintos según cómo esté formateado el HTML, y reindexar duplica.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ El texto conserva \n y espacios múltiples: cambia entre formatos.
+text = section.get_text()                            # "Hola\n\n  mundo"
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Normaliza siempre: mismo contenido -> mismos chunks -> mismo id.
+def _clean(text: str) -&gt; str:
+    return " ".join(text.split())
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir el índice real de la Academy, comprobar que cubre <em>todos</em> los cursos y consultar una pregunta obteniendo fragmentos con su referencia. Al terminar tendrás <code>copiloto index</code> y <code>copiloto ask --no-llm</code> funcionando sobre datos reales.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — implementa <code>index.py</code>.</strong> Copia el módulo del ejemplo real dentro de <code>src/copiloto/</code>. Asegúrate de que <code>settings.academy_root</code> apunta a la carpeta <code>Academy/</code> (desde <code>proyectos/copiloto</code> es <code>../..</code>):
+            <pre><code class="language-python"># Comprueba de dónde saldrán las lecciones.
+from copiloto.config import settings
+from copiloto.index import iter_lessons
+
+lessons = iter_lessons(settings.academy_root)
+print(len(lessons), "lecciones")
+print(lessons[0])
+</code></pre>
+            <p>Ejecuta <code>uv run python -c "..."</code> o guárdalo como script. Esperado: el número total de lecciones presentes y la ruta de la primera.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — añade el comando <code>index</code>.</strong> En <code>cli.py</code>:
+            <pre><code class="language-python">from copiloto.index import build_index
+
+@app.command()
+def index() -&gt; None:
+    """Reindexa los cursos y construye la base vectorial."""
+    total = build_index()
+    typer.echo(f"Indexados {total} chunks.")
+</code></pre>
+            <p>Ejecuta <code>uv run copiloto index</code>. La primera vez <code>fastembed</code> descarga el modelo (~100 MB); después queda en caché. Esperado: un recuento de chunks coherente con el número de lecciones.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — consulta sin LLM (mirar la traza).</strong> Añade <code>ask --no-llm</code> que solo haga <code>search()</code> y muestre la traza:
+            <pre><code class="language-python">from copiloto.index import search
+
+@app.command()
+def ask(question: str, k: int = 4, no_llm: bool = typer.Option(False, "--no-llm")) -&gt; None:
+    for score, c in search(question, k=k):
+        ref = f"{c.course} · {c.module} · {c.lesson} · {c.section}"
+        typer.echo(f"{score:.2f}  {ref}")
+</code></pre>
+            <p>Prueba <code>uv run copiloto ask "¿Qué es la fidelidad en un RAG?" --no-llm</code>. Esperado: arriba, fragmentos de <code>Learn IA · Módulo 4 · 03-citas-y-fidelidad</code> con puntuación alta.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — verifica las coordenadas de cita.</strong> Elige un fragmento del top-k e imprime su <code>text</code> junto con su referencia:
+            <pre><code class="language-python">score, top = search("¿Cómo se trocea un documento?", k=1)[0]
+print(f"score={score:.2f}")
+print(f"ref  ={top.course} &gt; {top.module} &gt; {top.lesson} &gt; {top.section}")
+print(top.text[:160], "…")
+</code></pre>
+            <p>Esperado: una referencia tipo <code>Learn IA &gt; Módulo 8 · Proyecto final: Copiloto &gt; 02-rag-sobre-los-cursos &gt; teoria</code> y un texto de chunk legible.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — comprueba la idempotencia.</strong> Ejecuta <code>copiloto index</code> dos veces y cuenta los chunks. Deben ser los mismos: el <code>DELETE</code> + los <code>chunk_id</code> deterministas garantizan que reindexar no infla el índice. Si el recuento cambia entre ejecuciones, tu normalización o tu troceado no es determinista.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Antes de tocar el prompt, mira siempre la traza. Si el fragmento correcto no está en el top-k, ningún ajuste de generación te salvará: es un problema de <em>ingesta</em> o <em>chunking</em>. Este comando <code>ask --no-llm</code> es tu microscopio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Reindexado incremental por huella de contenido</h3>
+          <p>Reindexar 1.200 chunks cada vez que cambias una sola lección es un desperdicio. Haz que <code>copiloto index</code> sea <strong>incremental</strong>. Requisitos:</p>
+          <ul>
+            <li>Añade una tabla <code>files(path TEXT PRIMARY KEY, sha1 TEXT, indexed_at TEXT)</code> que guarde la huella (<em>hash</em> del archivo) de cada lección ya indexada.</li>
+            <li>En <code>build_index()</code>, para cada lección calcula su <code>sha1</code>: si coincide con el guardado, <strong>sáltala</strong>; si cambió, borra sus chunks antiguos (<code>WHERE lesson = ?</code>) e insértalos de nuevo.</li>
+            <li>Detecta también lecciones <strong>borradas</strong> del disco y elimina sus chunks del índice.</li>
+            <li>Reporta al final: <em>N nuevas, M actualizadas, K borradas, cambios omitidos</em>.</li>
+          </ul>
+          <p><em>Pista: <code>hashlib.sha1(path.read_bytes()).hexdigest()</code> da la huella del archivo; para borrar los chunks de una lección, guarda también el <code>path</code> como metadato en la tabla <code>chunks</code>. Mide cuánto tarda un reindexado completo frente a uno incremental tras cambiar <strong>una</strong> lección, y deja los números en el README. No optimices «por si acaso»: mide primero, y hazlo solo si el reindexado completo es un cuello de botella real.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El corpus del Copiloto es el <strong>HTML real</strong> de <code>Academy/Learn */web/modulos/**</code>; la uniformidad de las lecciones permite un parser único para todos los cursos.</li>
+          <li><strong>Ingesta</strong>: extraer las <code>section[id]</code> y preservar curso, módulo, lección y sección como metadatos; normalizar el texto.</li>
+          <li><strong>Chunking</strong>: por sección y, si es larga, con ventana (~220 palabras) y solape (~40). La sección da la cita; la ventana evita diluir el vector.</li>
+          <li><strong>Embeddings</strong>: mismo modelo y misma normalización al indexar y al consultar; <code>intfloat/multilingual-e5-small</code> (384 dims) en local.</li>
+          <li><strong>Store</strong>: <code>sqlite-vec</code> por defecto (un archivo, local-first); pgvector como alternativa de producción con el mismo contrato.</li>
+          <li><strong>Idempotencia</strong>: <code>chunk_id</code> determinista por hash → reindexar no duplica y habilita el reindexado incremental.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Ingesta del HTML</td><td><code>BeautifulSoup</code> sobre <code>section[id]</code></td></tr>
+            <tr><td>Chunking</td><td><code>_split_words()</code> por sección (220/40)</td></tr>
+            <tr><td>Embeddings</td><td><code>fastembed.TextEmbedding</code> (<code>multilingual-e5-small</code>)</td></tr>
+            <tr><td>Base vectorial</td><td><code>sqlite-vec</code> (<code>vec0</code>, <code>distance_metric=cosine</code>)</td></tr>
+            <tr><td>Identidad de chunk</td><td><code>hashlib.sha1</code> determinista</td></tr>
+            <tr><td>Consulta</td><td><code>search()</code> → top-k con referencia citable</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué trocear por sección y no por párrafo?</summary>
+            <div>
+              <p>Porque la sección es la <strong>unidad de cita</strong> y de sentido del curso. Un párrafo suelto a veces no se entiende sin los anteriores y, sobre todo, pierde la referencia «teoría de tal lección». Trocear por sección mantiene el metadato natural y, cuando la sección es larga, se subdivide con solape sin perder la referencia. Si trocearas por párrafo desde el principio, tendrías muchos más chunks y peor contexto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántas palabras por chunk es lo ideal?</summary>
+            <div>
+              <p>No hay un número universal: depende del corpus y del modelo. Para documentación técnica en español, <strong>200–300 palabras</strong> con un 15–20 % de solape es un buen punto de partida. Pero lo correcto es medirlo con las evals (lección 04): si el recall de las preguntas del dataset es bajo, prueba a subir el solape o a trocear distinto. El tamaño de chunk es un <em>hiperparámetro</em> a calibrar, no una verdad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito pgvector o me vale sqlite-vec?</summary>
+            <div>
+              <p>Para el Copiloto (un usuario, local-first, un proceso), <code>sqlite-vec</code> es ideal: cero infraestructura, un archivo, fácil de versionar y de borrar. Migra a <strong>pgvector</strong> cuando necesites concurrencia real (varios procesos o usuarios), filtros SQL complejos en la misma consulta, o índices ANN aproximados sobre millones de vectores. La capa <code>index</code> aísla el <em>backend</em>, así que cambiar no toca el resto del sistema.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si cambio una lección? ¿Tengo que reindexar todo?</summary>
+            <div>
+              <p>Con el <code>build_index()</code> de esta lección, sí: reindexa todo (borra y reinserta). Es simple y correcto, y con volúmenes de miles de chunks tarda poco. Cuando el corpus crezca o el reindexado completo duela, aplica el reto: guarda la huella de cada archivo y reindexa <strong>solo lo que cambió</strong>. Empieza por lo simple y optimiza cuando midas que hace falta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Guardo el índice en el repositorio?</summary>
+            <div>
+              <p>No por defecto. La base (<code>.data/copiloto.db</code>) es un <strong>artefacto</strong> que se regenera con <code>copiloto index</code>; va en <code>.gitignore</code>. Versionar el índice acopla el repo al modelo de embeddings y a la versión de <code>sqlite-vec</code>, y crea conflictos binarios innecesarios. Si necesitas reproducibilidad exacta, versiona el <em>código</em> de ingesta y reindexa en el despliegue.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

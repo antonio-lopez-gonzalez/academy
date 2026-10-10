@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-tools-y-handlers">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tools y handlers — Módulo 5 · Curso IA</title>
+  <meta name="description" content="Diseñar tools para un agente: nombre, esquema y descripción; validar argumentos con pydantic, manejar errores del handler y devolver resultados útiles al modelo.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Tools y handlers</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Agentes y tools</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un agente sin tools es un modelo que solo puede hablar. Las <strong>tools</strong> son las manos del agente: lo que le permite buscar, calcular, leer archivos o consultar una base de datos. Pero una tool no es «una función que llamas»: es un <strong>contrato</strong> con dos caras que deben encajar perfectamente. Por un lado, el <strong>esquema</strong> que ve el modelo (nombre, descripción, parámetros) para decidir <em>cuándo</em> y <em>con qué argumentos</em> usarla. Por otro, el <strong>handler</strong>, el código Python que realmente la ejecuta y produce el resultado.</p>
+        <p>Casi todos los agentes que «van mal» fallan aquí, no en el modelo. El modelo elige mal la tool porque su descripción era ambigua; o el handler explota con una excepción porque los argumentos venían sin validar; o la tool devuelve 4 KB de texto que el modelo no puede aprovechar y contamina el resto del bucle. Ninguno de esos fallos es de «inteligencia»: son fallos de <strong>diseño del contrato</strong>. Y son, precisamente, los que tú controlas.</p>
+        <p>En esta lección aprendemos a diseñar ese contrato bien: un <strong>nombre</strong> que el modelo entienda, un <strong>esquema</strong> que acote lo que puede pedir, una <strong>descripción</strong> que le diga cuándo usar la tool, una <strong>validación</strong> que proteja al handler y una <strong>respuesta útil</strong> que el modelo pueda leer y seguir con el bucle. Todo sobre las tools reales del <strong>Copiloto</strong>: buscar lecciones, abrir un módulo y contar progreso.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el eslabón que más se descuida de un agente es el más barato de mejorar. Reescribir una descripción o validar un argumento no cuesta GPU ni tokens, pero arregla más fallos que cambiar de modelo. Antes de escalar el modelo, diseña bien la tool.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La analogía: el formulario del mostrador</h3>
+        <div class="callout callout--analogy">
+          <p>Una tool es como un <strong>formulario de mostrador con ventanilla</strong>. Tú (el desarrollador) diseñas el formulario: qué casillas hay, cuáles son obligatorias y cómo se llama cada una. El modelo (el cliente) lo rellena. Si la casilla «fecha» no dice qué formato espera, el cliente escribirá «mañana» y el empleado de detrás (el handler) no sabrá qué hacer. Si el formulario tiene un campo llamado «dato» sin explicación, nadie sabrá qué poner. Y si el empleado, al recibir un formulario incompleto, <em>se va a casa</em> (excepción), se corta toda la cola. Diseñar tools es diseñar buenos formularios y un mostrador que no se cierra ante un error.</p>
+        </div>
+
+        <h3>El esquema de una tool: las tres piezas que ve el modelo</h3>
+        <p>Cada tool se declara con un esquema JSON. De todo él, el modelo usa tres piezas para decidir:</p>
+        <ul>
+          <li><strong><code>name</code></strong>: el identificador. Debe ser un verbo o frase corta en <code>snake_case</code> que diga <em>qué hace</em> (<code>buscar_lecciones</code>, <code>contar_progreso</code>). Nada de <code>tool1</code> o <code>hacer_cosa</code>.</li>
+          <li><strong><code>description</code></strong>: la frase que le dice al modelo <em>cuándo</em> usarla y <em>qué devuelve</em>. Es la pieza más importante y la que más se descuida. Es documentación que se ejecuta.</li>
+          <li><strong><code>parameters</code></strong>: el esquema JSON de los argumentos (tipos, cuáles son obligatorios, valores permitidos). Es un <strong>contrato</strong>: limita lo que el modelo puede pedir y te da algo que validar.</li>
+        </ul>
+        <pre><code class="language-json">{
+  "type": "function",
+  "function": {
+    "name": "buscar_lecciones",
+    "description": "Busca un tema en las lecciones de la Academy y devuelve las lecciones donde aparece, con su curso, modulo y archivo. Usala cuando el usuario pregunte DONDE se explica algo. NO la uses para contar lecciones (para eso usa contar_progreso).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "consulta": {
+          "type": "string",
+          "description": "Tema o frase a buscar, en lenguaje natural. Ejemplo: 'bucle agentic', 'chunking'."
+        },
+        "limite": {
+          "type": "integer",
+          "description": "Numero maximo de resultados. Por defecto 5.",
+          "default": 5
+        }
+      },
+      "required": ["consulta"]
+    }
+  }
+}</code></pre>
+
+        <h3>La descripción: el prompt que no escribiste</h3>
+        <p>El modelo no ve tu código del handler. Solo ve el nombre, la descripción y el esquema. Por eso la descripción <strong>es un prompt</strong>: le dice al modelo cuándo usar la tool y cuándo no. Una buena descripción responde a tres preguntas:</p>
+        <table>
+          <thead><tr><th>Pregunta</th><th>Qué incluir</th><th>Ejemplo de fragmento</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>¿Qué hace?</td>
+              <td>Acción concreta y resultado</td>
+              <td>«Devuelve las lecciones donde aparece un tema»</td>
+            </tr>
+            <tr>
+              <td>¿Cuándo usarla?</td>
+              <td>La intención del usuario que la dispara</td>
+              <td>«Úsala cuando pregunte <em>dónde</em> se explica algo»</td>
+            </tr>
+            <tr>
+              <td>¿Cuándo NO usarla?</td>
+              <td>La tool parecida con la que se confunde</td>
+              <td>«No la uses para contar lecciones; para eso, <code>contar_progreso</code>»</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p>La tercera fila es la que casi nadie escribe y la que más arregla. Cuando tienes dos tools parecidas, la desambiguación explícita («para X usa A; para Y usa B») reduce drásticamente las elecciones equivocadas. El modelo no «debería saberlo»: díselo.</p>
+        </div>
+
+        <h3>El handler: validar antes de ejecutar</h3>
+        <p>El <strong>handler</strong> es la función Python que se ejecuta cuando el modelo pide la tool. Aunque el esquema acote los tipos, <strong>nunca confíes en los argumentos sin validar</strong>. Los motivos son dos: el modelo <em>puede</em> equivocarse (el esquema guía, no obliga), y el esquema JSON es más pobre que tus tipos reales (no conoce tus <code>Enum</code>, tus rangos, tus rutas). La herramienta de validación natural en el curso es <strong>pydantic</strong>: describes el modelo de argumentos una vez y pydantic valida, convierte y da errores legibles.</p>
+        <pre><code class="language-python"># Validar es la frontera entre "el modelo pidio algo" y "ejecuto algo".
+from pydantic import BaseModel, Field
+
+
+class BuscarArgs(BaseModel):
+    consulta: str = Field(min_length=2)
+    limite: int = Field(default=5, ge=1, le=20)      # entre 1 y 20
+
+
+def buscar_lecciones(consulta: str, limite: int = 5) -&gt; str:
+    args = BuscarArgs(consulta=consulta, limite=limite)   # lanza si algo no cuadra
+    ...  # aqui ya trabajamos con tipos garantizados
+</code></pre>
+        <div class="callout callout--note">
+          <p>Validar no es solo por seguridad: convierte valores «casi correctos» en correctos. Si el modelo pide <code>limite="5"</code> (texto), pydantic lo coerciona a <code>5</code> (entero). Si pedía <code>limite=999</code>, la validación lo rechaza y tú decides qué hacer: recortar, avisar o devolver un error útil (lo vemos abajo).</p>
+        </div>
+
+        <h3>Errores de tool: el bucle no debe morir</h3>
+        <p>Un handler puede fallar: una ruta que no existe, una base caída, un argumento fuera de rango. ¿Qué debe pasar? Que el <strong>bucle siga vivo</strong> y que el <em>modelo</em> se entere del fallo. La regla es simple: <strong>una excepción del handler no debe propagarse hasta tumbar el agente; se convierte en una observación de error</strong> que vuelve al transcript. Así el modelo puede reaccionar —corregir un argumento, probar otra tool, o decirle al usuario que no pudo— en lugar de que el programa muera sin explicación.</p>
+        <pre class="diagram">
+   modelo pide tool
+        │
+        ▼
+   handler lanza excepcion ──▶ ¿capturamos? ── sí ──▶ observacion "ERROR: ..." ──▶ vuelve al modelo
+                                            └─ no ──▶ 💥 el agente entero se cae
+        </pre>
+        <p>Hay un matiz importante: un error <em>recuperable</em> (argumento inválido, no encontrado) es información útil para el modelo. Un error <em>fatal</em> (falta la API key, la base no existe) no lo es: reintentar no ayudará. Distinguirlos evita que el agente dé vueltas corrigiendo algo que no tiene arreglo. La distinción se implementa con un mensaje claro en la observación («no encontrado» vs «error de configuración, no reintentes»).</p>
+
+        <h3>Resultados útiles: lo que devuelves es lo que el modelo verá</h3>
+        <p>El resultado de una tool entra en el transcript <em>tal cual</em>. Un volcado de 4 KB llena el contexto, cuesta tokens y diluye la señal. Un resultado útil es <strong>corto, estructurado y concluyente</strong>: exactamente lo que el modelo necesita para decidir si ya puede responder. Tres principios:</p>
+        <ul>
+          <li><strong>Corto</strong>: devuelve solo los campos relevantes, no el objeto entero. Si hay una lista larga, recorta y di cuántos elementos quedaron fuera.</li>
+          <li><strong>Estructurado</strong>: usa JSON o un formato estable por líneas. Es más fácil de «leer» por el modelo y de depurar por ti.</li>
+          <li><strong>Concluyente</strong>: incluye el resultado <em>y su interpretación</em>. «0 resultados» es más útil que una lista vacía; «no encontrado» es más útil que una cadena vacía.</li>
+        </ul>
+        <pre class="diagram">
+  ❌   {"rows": [ ... 40 objetos con todos sus campos ... ]}     (ruido, tokens)
+
+  ✅   "3 lecciones encontradas:
+        1. Learn IA > Modulo 5 > 01-bucle-agentic (relevancia 0.91)
+        2. Learn IA > Modulo 4 > 01-pipeline-rag (relevancia 0.88)
+        ... (+2 omitidas)"                                   (senal util)
+        </pre>
+        <div class="callout callout--warning">
+          <p><strong>Nunca</strong> metas en el resultado de una tool credenciales, rutas internas, SQL crudo con datos sensibles ni contenido de ficheros sin filtrar. Todo lo que devuelve una tool termina en el transcript y, potencialmente, en la respuesta final. La tool es una frontera de confianza (lo veremos a fondo en la lección 03 de seguridad y en el módulo 7).</p>
+        </div>
+
+        <h3>El ciclo completo de una tool</h3>
+        <pre class="diagram">
+  ESQUEMA (lo ve el modelo)          HANDLER (lo ejecuta tu codigo)
+  ┌─────────────────────────┐        ┌──────────────────────────────┐
+  │ name: buscar_lecciones  │        │ 1. valida args (pydantic)    │
+  │ description: cuando...  │──────▶ │ 2. ejecuta la accion         │
+  │ parameters: {...}       │        │ 3. captura errores -> obs     │
+  └─────────────────────────┘        │ 4. formatea resultado corto  │
+                                     └───────────────┬──────────────┘
+                                                     ▼
+                                     observacion -> transcript -> modelo decide
+        </pre>
+        <p>Este ciclo es el contrato entero. Diséñalo bien y el modelo parecerá «más listo»; diséñalo mal y ningún modelo lo arreglará.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una única tool, <code>buscar_lecciones</code>, con las tres piezas del contrato: esquema claro, validación con pydantic y resultado corto. Ejecútala <em>directamente</em> (sin LLM): así ves que el handler es código normal y que la validación hace su trabajo antes de tocar nada.</p>
+        <div class="code-file">tool_minima.py</div>
+        <pre><code class="language-python"># tool_minima.py — el contrato de UNA tool: esquema + validacion + resultado corto.
+# Instalacion:  uv add pydantic
+from pydantic import BaseModel, Field, ValidationError
+
+# --- El universo de datos (en el Copiloto serian las lecciones indexadas) ---
+LECCIONES = {
+    "bucle agentic": "Learn IA &gt; Modulo 5 &gt; 01-bucle-agentic",
+    "chunking": "Learn IA &gt; Modulo 3 &gt; 03-chunking",
+    "pipeline de rag": "Learn IA &gt; Modulo 4 &gt; 01-pipeline-rag",
+    "embeddings": "Learn IA &gt; Modulo 3 &gt; 01-que-son-los-embeddings",
+}
+
+
+# --- 1. El modelo de argumentos: el contrato que validamos ---
+class BuscarArgs(BaseModel):
+    consulta: str = Field(min_length=2, description="Tema a buscar")
+    limite: int = Field(default=3, ge=1, le=10)
+
+
+# --- 2. El handler: valida, ejecuta y formatea ---
+def buscar_lecciones(consulta: str, limite: int = 3) -&gt; str:
+    """Devuelve un resultado CORTO y util: solo las coincidencias y el recuento."""
+    try:
+        args = BuscarArgs(consulta=consulta, limite=limite)     # valida
+    except ValidationError as exc:
+        # El error se devuelve como texto: es la observacion que vera el modelo.
+        return f"ERROR: argumentos invalidos -&gt; {exc.errors()[0]['msg']}"
+
+    hits = [(k, v) for k, v in LECCIONES.items() if args.consulta.lower() in k]
+    if not hits:
+        return f"0 lecciones encontradas para '{args.consulta}'."   # concluyente
+
+    lineas = [f"{i}. {ruta}" for i, (_, ruta) in enumerate(hits[: args.limite], 1)]
+    extra = len(hits) - args.limite
+    resumen = f"{len(hits)} leccion(es) encontrada(s):\n" + "\n".join(lineas)
+    return resumen + (f"\n(+{extra} omitidas)" if extra &gt; 0 else "")
+
+
+if __name__ == "__main__":
+    print(buscar_lecciones("rag"))              # -> 1 leccion encontrada
+    print(buscar_lecciones("x"))                # -> ERROR: cadena demasiado corta
+    print(buscar_lecciones("leccion", limite=99))  # -> ERROR: fuera de rango
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">1 leccion(es) encontrada(s):
+1. Learn IA &gt; Modulo 4 &gt; 01-pipeline-rag
+ERROR: argumentos invalidos -&gt; String should have at least 2 characters
+ERROR: argumentos invalidos -&gt; Input should be less than or equal to 10
+</code></pre>
+        <p>Fíjate en lo esencial: incluso llamada «a mano», la tool <strong>no revienta</strong> con argumentos malos: devuelve un mensaje de error claro. Cuando esta misma función la invoque el agente, ese <code>ERROR:</code> entrará en el transcript y el modelo decidirá qué hacer. Eso es lo que mantiene vivo el bucle.</p>
+        <div class="callout callout--tip">
+          <p>Fíjate también en el formato: líneas numeradas y un recuento. El modelo puede «leer» esto y citarlo. Si la tool devolviera <code>{...}</code> con 40 campos, ni el modelo ni tú sacaríais nada en claro.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Sus tools viven en <code>proyectos/copiloto/src/copiloto/tools.py</code>, y son tres: <code>buscar_lecciones</code>, <code>abrir_modulo</code> y <code>contar_progreso</code>. Lo importante del archivo no es la lógica (es sencilla) sino <strong>cómo está organizado el contrato</strong>: cada tool tiene su esquema, su modelo pydantic de argumentos, su handler con errores capturados y un despachador único <code>dispatch()</code> que el bucle del agente llama en cada vuelta.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/tools.py</div>
+        <pre><code class="language-python">"""Las tools del Copiloto: esquema + validacion + handler + despachador."""
+import json
+from pathlib import Path
+
+from pydantic import BaseModel, Field, ValidationError
+
+LECCIONES = {                                  # indice minimo (el real lo da rag.py)
+    "bucle agentic": ("Learn IA", "Modulo 5", "01-bucle-agentic"),
+    "pipeline de rag": ("Learn IA", "Modulo 4", "01-pipeline-rag"),
+}
+MODULOS = {"05": ("Agentes y tools", 4), "04": ("RAG", 4)}
+
+
+# --- Modelos de argumentos (una clase por tool) ---------------------------
+class BuscarArgs(BaseModel):
+    consulta: str = Field(min_length=2)
+    limite: int = Field(default=5, ge=1, le=20)
+
+
+class ModuloArgs(BaseModel):
+    modulo: str = Field(pattern=r"^0[0-8]$")     # solo ids validos: "00".."08"
+
+
+class ProgresoArgs(BaseModel):
+    modulo: str = Field(default="05", pattern=r"^0[0-8]$")
+
+
+# --- Handlers --------------------------------------------------------------
+def _buscar(args: BuscarArgs) -&gt; str:
+    hits = [(l, m, a) for tema, (l, m, a) in LECCIONES.items()
+            if args.consulta.lower() in tema]
+    if not hits:
+        return f"0 lecciones encontradas para '{args.consulta}'."
+    out = [f"{l} &gt; {m} &gt; {a}" for l, m, a in hits[: args.limite]]
+    return f"{len(hits)} resultado(s):\n" + "\n".join(out)
+
+
+def _abrir_modulo(args: ModuloArgs) -&gt; str:
+    if args.modulo not in MODULOS:
+        return f"No existe el modulo '{args.modulo}'."
+    titulo, n = MODULOS[args.modulo]
+    return f"Modulo {args.modulo}: {titulo} ({n} lecciones)."
+
+
+def _contar_progreso(args: ProgresoArgs) -&gt; str:
+    # En el Copiloto real lee la clave 'ia-progress' del navegador del usuario;
+    # aqui simulamos para mostrar el contrato.
+    total = MODULOS.get(args.modulo, ("?", 0))[1]
+    hechas = min(total, 2)
+    return f"Modulo {args.modulo}: {hechas}/{total} lecciones completadas."
+
+
+# --- Registro: esquema (lo ve el modelo) + handler (lo ejecutas tu) --------
+REGISTRY = {
+    "buscar_lecciones": (BuscarArgs, _buscar),
+    "abrir_modulo": (ModuloArgs, _abrir_modulo),
+    "contar_progreso": (ProgresoArgs, _contar_progreso),
+}
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "buscar_lecciones",
+        "description": ("Busca un tema en las lecciones de la Academy y devuelve "
+                        "curso &gt; modulo &gt; archivo. Usala cuando pregunte DONDE se "
+                        "explica algo, no para contar lecciones."),
+        "parameters": {"type": "object",
+                       "properties": {"consulta": {"type": "string"},
+                                      "limite": {"type": "integer", "default": 5}},
+                       "required": ["consulta"]}}},
+    {"type": "function", "function": {
+        "name": "abrir_modulo",
+        "description": ("Devuelve el titulo y el numero de lecciones de un modulo. "
+                        "Usala cuando pregunten por un modulo concreto."),
+        "parameters": {"type": "object",
+                       "properties": {"modulo": {"type": "string"}},
+                       "required": ["modulo"]}}},
+    {"type": "function", "function": {
+        "name": "contar_progreso",
+        "description": ("Cuenta las lecciones completadas del usuario en un modulo. "
+                        "Usala solo si preguntan por SU progreso, no por el temario."),
+        "parameters": {"type": "object",
+                       "properties": {"modulo": {"type": "string", "default": "05"}},
+                       "required": []}}},
+]
+
+
+def dispatch(name: str, raw_arguments: dict | str) -&gt; str:
+    """Punto unico de entrada del bucle: valida, ejecuta y NUNCA propaga excepciones."""
+    if name not in REGISTRY:                              # tool desconocida
+        return f"ERROR: no existe la tool '{name}'."
+    model, handler = REGISTRY[name]
+    try:
+        args = model(**raw_arguments)                     # 1. valida
+    except ValidationError as exc:                        # 2. error -> observacion
+        return f"ERROR: argumentos invalidos -&gt; {exc.errors()[0]['msg']}"
+    try:
+        return handler(args)                              # 3. ejecuta
+    except Exception as exc:                              # 4. cualquier fallo -> observacion
+        return f"ERROR: la tool '{name}' fallo: {exc}"
+</code></pre>
+        <p>Y así lo consume el bucle del agente (lección 01):</p>
+        <pre><code class="language-python">from copiloto.tools import TOOLS, dispatch
+
+for call in msg.message.tool_calls:
+    args = call.function.arguments
+    if isinstance(args, str):                 # algunos SDKs entregan JSON en texto
+        args = json.loads(args)
+    result = dispatch(call.function.name, args)   # siempre devuelve texto, nunca lanza
+    messages.append({"role": "tool", "content": result, "tool_name": call.function.name})
+</code></pre>
+        <p>Uso desde la CLI del Copiloto:</p>
+        <pre><code class="language-bash">uv run copiloto ask "¿Dónde se explica el bucle agentic y cuántas lecciones tiene el Módulo 5?"
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Un modelo pydantic por tool</strong>: la validación vive junto al contrato, no desperdigada por el handler. Cambiar una restricción es cambiar una línea del modelo.</li>
+          <li><strong><code>pattern=r"^0[0-8]$"</code></strong>: el argumento <code>modulo</code> solo admite ids válidos. Es mucho más fuerte que <code>"type": "string"</code>: descarta de raíz <code>"9"</code>, <code>"modulo 5"</code> o <code>"abc"</code>.</li>
+          <li><strong>Un único <code>dispatch()</code></strong>: el bucle no conoce handlers concretos, solo el nombre. Añadir una tool es registrarla; el bucle no cambia. Esta indirección es la que hace que el módulo 6 (MCP) pueda enchufar tools externas casi sin tocar el agente.</li>
+          <li><strong>Nunca propaga excepciones</strong>: <code>dispatch()</code> captura <em>todo</em> y lo convierte en texto. El bucle del agente no necesita <code>try</code>: por contrato, <code>dispatch</code> siempre devuelve una cadena.</li>
+          <li><strong>Descripciones con desambiguación</strong>: «no para contar lecciones», «solo si preguntan por SU progreso». Le dicen al modelo cuándo <em>no</em> usar cada tool, que es lo que evita elegir la equivocada.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Este archivo es la frontera de confianza del agente. Todo lo que entra (argumentos del modelo) y lo que sale (resultado) pasa por aquí. Por eso el <code>dispatch</code> es también el lugar natural para registrar qué tool se llamó y con qué, y para recortar o filtrar el resultado antes de que llegue al transcript.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Nombre en verbo <code>snake_case</code> (<code>buscar_lecciones</code>)</td>
+              <td><code>tool1</code>, <code>fn_do_thing</code>, nombres ambiguos</td>
+              <td>El modelo elige por el nombre; que sea autoexplicativo</td>
+            </tr>
+            <tr>
+              <td>Descripción con qué hace, cuándo y cuándo <em>no</em></td>
+              <td>Una línea vaga como «busca cosas»</td>
+              <td>La descripción es el prompt que decide la elección de tool</td>
+            </tr>
+            <tr>
+              <td>Esquema con tipos, obligatorios y valores permitidos</td>
+              <td><code>parameters</code> vacío o un único <code>"object"</code></td>
+              <td>Un contrato pobre deja al modelo adivinar los argumentos</td>
+            </tr>
+            <tr>
+              <td>Validar con pydantic en el handler</td>
+              <td>Confiar en que «el modelo siempre acierta»</td>
+              <td>El esquema guía, no obliga; valida antes de ejecutar</td>
+            </tr>
+            <tr>
+              <td>Capturar errores y devolverlos como observación</td>
+              <td>Dejar que la excepción tumbe el agente</td>
+              <td>El modelo debe poder reaccionar al fallo, no el programa morir</td>
+            </tr>
+            <tr>
+              <td>Resultados cortos, estructurados y concluyentes</td>
+              <td>Volcar el objeto entero o listas de cientos de filas</td>
+              <td>El resultado va al transcript: cada carácter cuesta tokens y atención</td>
+            </tr>
+            <tr>
+              <td>Un despachador único (<code>dispatch</code>)</td>
+              <td>Un <code>if name == ...</code> por todo el bucle</td>
+              <td>Centraliza validación, errores y registro; facilita enchufar tools</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Descripciones vagas</h3>
+        <p>El modelo no puede adivinar el matiz que no escribiste.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ "Gestiona lecciones": no dice cuando usarla frente a las otras.
+{"name": "lecciones", "description": "Gestiona lecciones",
+ "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Dice que hace, cuando usarla y cuando NO.
+{"name": "buscar_lecciones",
+ "description": ("Devuelve curso > modulo > archivo donde aparece un tema. "
+                 "Usala para preguntas de DONDE se explica algo. "
+                 "No la uses para contar lecciones (usa contar_progreso)."),
+ "parameters": {"type": "object",
+                "properties": {"consulta": {"type": "string"}},
+                "required": ["consulta"]}}
+</code></pre>
+
+        <h3>6.2. Confiar en argumentos sin validar</h3>
+        <p>El modelo <em>puede</em> pedir <code>limite=1000</code> o enviar <code>"5"</code> como texto. Si el handler no valida, el fallo aparece tarde y lejos del origen.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Sin validacion: un argumento raro explota dentro de la logica.
+def buscar(consulta: str, limite: int = 5) -&gt; str:
+    return "&gt;".join(LECCIONES[consulta][:limite])   # IndexError si no existe
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Valida en la frontera; el resto del handler trabaja con tipos garantizados.
+class BuscarArgs(BaseModel):
+    consulta: str = Field(min_length=2)
+    limite: int = Field(default=5, ge=1, le=20)
+
+def buscar(consulta: str, limite: int = 5) -&gt; str:
+    args = BuscarArgs(consulta=consulta, limite=limite)
+    hit = LECCIONES.get(args.consulta)
+    return hit if hit else f"0 resultados para '{args.consulta}'."
+</code></pre>
+
+        <h3>6.3. Dejar que la excepción tumbe el bucle</h3>
+        <p>Una tool que lanza encima del bucle mata al agente entero, justo cuando el modelo podía haberse recuperado.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ La excepcion sube por todo el bucle y revienta el agente.
+result = HANDLERS[name](**args)
+messages.append({"role": "tool", "content": result})
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ El fallo se convierte en observacion: el modelo decide como seguir.
+try:
+    result = HANDLERS[name](**args)
+except Exception as exc:
+    result = f"ERROR: la tool '{name}' fallo: {exc}"
+messages.append({"role": "tool", "content": result})
+</code></pre>
+
+        <h3>6.4. Devolver volcados gigantes</h3>
+        <p>Una tool que devuelve todo el dataset llena el contexto, sube el coste y diluye la señal que el modelo necesitaba.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ 200 filas con todos sus campos: ruido puro en el transcript.
+return json.dumps(all_rows)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Recorta, resume y di cuantos quedaron fuera.
+top = all_rows[:5]
+return f"{len(all_rows)} resultados, top {len(top)}:\n" + "\n".join(
+    f"{r['leccion']} ({r['score']:.2f})" for r in top)
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir una <strong>tercera tool</strong> al Copiloto de forma completa (esquema + validación + handler + registro) y probar sus errores sin que el programa se caiga. Al terminar tendrás el patrón exacto que se repite por cada tool nueva.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — crea el archivo de trabajo.</strong>
+            <pre><code class="language-bash">uv init copiloto-tools &amp;&amp; cd copiloto-tools
+uv add pydantic
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — parte del <code>dispatch</code> mínimo.</strong> Copia la estructura del ejemplo real: registro de <code>(modelo, handler)</code> y un único punto de entrada que nunca lanza:
+            <pre><code class="language-python"># tools.py — base con una tool ya registrada.
+from pydantic import BaseModel, Field, ValidationError
+
+class BuscarArgs(BaseModel):
+    consulta: str = Field(min_length=2)
+    limite: int = Field(default=5, ge=1, le=20)
+
+def _buscar(args: BuscarArgs) -&gt; str:
+    return f"buscando '{args.consulta}' (top {args.limite})..."
+
+REGISTRY = {"buscar_lecciones": (BuscarArgs, _buscar)}
+
+def dispatch(name: str, raw: dict | str) -&gt; str:
+    if name not in REGISTRY:
+        return f"ERROR: no existe la tool '{name}'."
+    model, handler = REGISTRY[name]
+    try:
+        args = model(**raw)
+    except ValidationError as exc:
+        return f"ERROR: argumentos invalidos -&gt; {exc.errors()[0]['msg']}"
+    try:
+        return handler(args)
+    except Exception as exc:
+        return f"ERROR: la tool '{name}' fallo: {exc}"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — añade la tool <code>abrir_leccion</code>.</strong> Debe recibir un <code>archivo</code> y devolver el título real, validando el formato del nombre:
+            <pre><code class="language-python"># Añade al final de tools.py (antes del REGISTRY) y registra la tool.
+TITULOS = {"01-bucle-agentic": "El bucle agentic",
+           "02-tools-y-handlers": "Tools y handlers"}
+
+class LeccionArgs(BaseModel):
+    archivo: str = Field(pattern=r"^\d{2}-[a-z-]+$")   # p. ej. 01-bucle-agentic
+
+def _abrir_leccion(args: LeccionArgs) -&gt; str:
+    titulo = TITULOS.get(args.archivo)
+    return f"{args.archivo}: {titulo}" if titulo else f"No encontrada: {args.archivo}."
+
+REGISTRY["abrir_leccion"] = (LeccionArgs, _abrir_leccion)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — prueba los tres casos.</strong> Ninguno debe lanzar; todos deben devolver texto:
+            <pre><code class="language-python">print(dispatch("abrir_leccion", {"archivo": "01-bucle-agentic"}))   # titulo
+print(dispatch("abrir_leccion", {"archivo": "EXISTE?"}))            # ERROR de patron
+print(dispatch("abrir_leccion", {"archivo": "99-nada"}))           # No encontrada
+print(dispatch("tool_fantasma", {}))                               # ERROR: no existe
+</code></pre>
+            <p><strong>Resultado esperado:</strong> cuatro líneas, todas cadenas de texto. La segunda empieza por <code>ERROR: argumentos invalidos</code> (el patrón rechazó <code>EXISTE?</code>); la tercera por <code>No encontrada</code>; la cuarta por <code>ERROR: no existe la tool</code>. Acabas de blindar la frontera de confianza del agente.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — describe la tool para el modelo.</strong> Añade su esquema a una lista <code>TOOLS</code> con una descripción que incluya <em>cuándo no</em> usarla:
+            <pre><code class="language-python">TOOLS = [{"type": "function", "function": {
+    "name": "abrir_leccion",
+    "description": ("Devuelve el titulo de una leccion por su archivo "
+                    "(p. ej. '01-bucle-agentic'). Usala cuando ya sepas el archivo. "
+                    "Si solo tienes un tema, usa antes buscar_lecciones."),
+    "parameters": {"type": "object",
+                   "properties": {"archivo": {"type": "string"}},
+                   "required": ["archivo"]}}}]
+</code></pre>
+            <p><strong>Resultado esperado:</strong> un esquema completo con las tres piezas (nombre, descripción con desambiguación, parámetros). Compáralo con el del paso 3: uno es el contrato que ve el modelo; el otro, la validación que lo protege. Los dos deben estar en sintonía.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Reutiliza este patrón por cada tool nueva: <strong>modelo pydantic → handler → registro → entrada en <code>TOOLS</code></strong>. Cuando tengas 20 tools, seguirá siendo el mismo ritual de cuatro pasos.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un catálogo de tools que se defiende solo</h3>
+          <p>Convierte el registro de tools en un catálogo <strong>autodescriptivo y a prueba de errores</strong>. Requisitos:</p>
+          <ul>
+            <li>Cada tool se declara <strong>una sola vez</strong> (nombre, descripción y modelo pydantic) y de ahí se generan tanto el esquema JSON de <code>TOOLS</code> como el registro de handlers. No debe haber dos sitios donde escribir el nombre.</li>
+            <li><code>dispatch()</code> debe rellenar un <strong>informe</strong> por llamada: tool, argumentos normalizados, duración en milisegundos y si fue éxito o error.</li>
+            <li>El resultado debe pasar por un <strong>recorte</strong>: si supera N caracteres, truncar y añadir <code>… (+X caracteres omitidos)</code>.</li>
+            <li>Distingue en la observación los errores <strong>recuperables</strong> (<code>ERROR_RECUPERABLE: ...</code>, el modelo puede reintentar) de los <strong>fatales</strong> (<code>ERROR_FATAL: ... no reintentes</code>).</li>
+            <li>Prueba con una tool que reciba un argumento fuera de rango y otra que intente leer por encima del límite de <code>limite</code>; ninguna debe lanzar.</li>
+          </ul>
+          <p><em>Pista: en Python puedes guardar el modelo pydantic junto al handler en un <code>dataclass Tool</code> y generar el JSON Schema con <code>Model.model_json_schema()</code>. Para el informe, mide con <code>time.perf_counter()</code> alrededor de la ejecución. No busques «la tool perfecta»: busca que añadir la siguiente tool no obligue a tocar el bucle ni a repetir nombres.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una tool es un <strong>contrato de dos caras</strong>: el esquema (que ve el modelo) y el handler (que ejecutas tú). Deben encajar.</li>
+          <li>El esquema tiene tres piezas decisivas: <strong>nombre, descripción y parámetros</strong>. La descripción es un prompt: di qué hace, cuándo usarla y cuándo <em>no</em>.</li>
+          <li><strong>Valida los argumentos</strong> (pydantic) en la frontera, antes de ejecutar. El esquema guía; la validación protege.</li>
+          <li>Una excepción del handler <strong>no debe tumbar el agente</strong>: se convierte en observación de error y el modelo reacciona.</li>
+          <li>Devuelve resultados <strong>cortos, estructurados y concluyentes</strong>: lo que sale de la tool entra tal cual en el transcript.</li>
+          <li>Centraliza en un <strong><code>dispatch()</code></strong> único: validación, errores, registro y recorte en un solo sitio.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Esquema de la tool</td><td>Lista <code>TOOLS</code> en <code>src/copiloto/tools.py</code></td></tr>
+            <tr><td>Validación de argumentos</td><td><code>pydantic.BaseModel</code> por tool</td></tr>
+            <tr><td>Frontera de confianza</td><td><code>dispatch(name, args)</code></td></tr>
+            <tr><td>Errores de tool</td><td>Capturados y devueltos como texto <code>ERROR: ...</code></td></tr>
+            <tr><td>Siguiente paso</td><td>Memoria y planificación (lección 03)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántas tools debería darle a un agente?</summary>
+            <div>
+              <p>Las mínimas que cubran las tareas, y no muchas más. Cuantas más tools, más fácil que el modelo elija la equivocada o se invente una; además, cada esquema ocupa tokens en cada llamada. Empieza con 3–5 y crece solo cuando falte cobertura real. Si dos tools se pisan, fusíonalas o desambigua sus descripciones.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El esquema de la tool ya valida? ¿Por qué validar otra vez con pydantic?</summary>
+            <div>
+              <p>El esquema <em>guía</em>, no <em>obliga</em>. El modelo puede producir argumentos que no encajen con el JSON Schema (tipos raros, valores fuera de rango), y el esquema no conoce tus tipos reales (un <code>Enum</code>, un rango, un patrón). La validación con pydantic es tu última línea: garantiza que el handler recibe tipos y valores seguros, y te da errores legibles para devolver al modelo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si una tool falla? ¿Dejo que el agente pare?</summary>
+            <div>
+              <p>No. Convierte el fallo en una <strong>observación</strong> y devuélvela al transcript. En la mayoría de errores recuperables (argumento inválido, no encontrado), el modelo corrige y reintenta solo. Para errores fatales (falta configuración), dile explícitamente que no reintente, para que no desperdicie pasos. Lo que nunca debes hacer es dejar que la excepción suba y mate el bucle.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto puede devolver una tool?</summary>
+            <div>
+              <p>Lo mínimo que permita al modelo decidir. Unas pocas líneas o un JSON corto. El resultado entra en el transcript y se reenvía en <em>cada</em> vuelta posterior, así que un volcado grande se paga muchas veces y además diluye la señal. Recorta, resume e indica cuántos elementos quedaron fuera (<code>+N omitidas</code>).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Ejecuta el modelo mi código? ¿Es peligroso?</summary>
+            <div>
+              <p>No: el modelo solo <em>pide</em> ejecutar una tool; quien la ejecuta eres tú. Por eso el peligro está en qué tools expones y qué permites. Una tool que ejecuta código arbitrario o borra archivos es peligrosa por diseño, no por el modelo. La regla: expón solo lo que necesites y trata cada argumento como entrada no confiable (validación + sandboxing, tema de la lección 04).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
