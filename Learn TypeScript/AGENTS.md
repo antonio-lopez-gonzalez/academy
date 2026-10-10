@@ -230,6 +230,33 @@ Aplicacion completa paso a paso que incluye:
 
 ---
 
+# Modulo 10 — Tipos avanzados (ampliacion)
+
+- Recursion de tipos con template literals (35 min)
+- infer en funciones: ReturnType y Parameters a mano (30 min)
+- Branded types con validacion en runtime (35 min)
+- Strict mode y exhaustividad en profundidad (35 min)
+
+---
+
+# Modulo 11 — Genericos en profundidad (ampliacion)
+
+- Restricciones, defaults e inferencia contextual (30 min)
+- Variadic tuple types (30 min)
+- Mapped types y remapeo de claves (35 min)
+- Builder tipado: fluent APIs con genericos (35 min)
+
+---
+
+# Modulo 12 — Monorepos y produccion (ampliacion)
+
+- Monorepos con project references (40 min)
+- Contratos end-to-end tipados (40 min)
+- Publicar librerias tipadas (40 min)
+- TypeScript en produccion y CI (35 min)
+
+---
+
 # Buenas practicas
 
 Explicar siempre:

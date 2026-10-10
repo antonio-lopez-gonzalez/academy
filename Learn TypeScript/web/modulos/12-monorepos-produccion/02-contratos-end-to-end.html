@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="12" data-lesson="02-contratos-end-to-end">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Contratos end-to-end tipados — Modulo 12 · Curso TypeScript</title>
+  <meta name="description" content="Compartir un paquete de contratos entre front y back con validacion en runtime e inferencia de tipos.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ts-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Contratos end-to-end tipados</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Modulo 12 · Monorepos y produccion</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ================================================================
+           1 · INTRODUCCION
+           ================================================================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introduccion</h2>
+        <p>
+          El mito mas caro del desarrollo web es <strong>"el backend me manda un JSON y ya se como es"</strong>.
+          No: quien lo dice define a mano un interface en front y otro en back, y cuando uno cambia, el otro se
+          entera por un crash en produccion. Esta leccion construye un <strong>contrato end-to-end</strong>: un solo
+          paquete <code>contracts</code> que comparten front y back, con <strong>validacion en runtime</strong> en
+          el borde (con zod) y <strong>tipos derivados del schema</strong> con <code>z.infer</code>.
+        </p>
+        <p>
+          El problema que resuelve: los tipos no cruzan la red. En el motor de tu app, TypeScript te protege; en la
+          frontera de la API, el dato llega como <code>string</code> o <code>unknown</code> y ninguna promesa del
+          compilador le aplica. Un schema es la <em>unica fuente de verdad</em>: valida ahi, deriva los tipos para
+          todos, y elimina los <code>interface Pedido</code> duplicados.
+        </p>
+        <div class="callout callout--note">
+          <div class="callout__title">Cuando se utiliza</div>
+          <ul>
+            <li>APIs propias donde controlas front y back (monorepo o no).</li>
+            <li>Contratos de red, payloads de eventos, respuestas de endpoints.</li>
+            <li>Cuando el JSON del exterior no se puede confiar para "tiparlo con as".</li>
+            <li>Equipos que quieren un unico punto de verdad y romper en CI, no en runtime.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           2 · TEORIA
+           ================================================================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoria</h2>
+
+        <h3>La analogia: el contrato de obra y el formulario de aduanas</h3>
+        <p>
+          Front y back son dos paises que hablan idiomas distintos (navegador y servidor). El <strong>contrato</strong>
+          es el documento que ambos firman: como se llama cada campo, que valores admite. Pero un contrato firmado
+          no basta: en la <strong>aduana</strong> hay que <em>revisar</em> cada paquete que cruza la frontera antes
+          de dejarlo entrar, porque cualquiera puede decir "esto es un Pedido" sin serlo. El schema es el contrato;
+          <code>parse</code>/<code>safeParse</code> son la aduana.
+        </p>
+
+        <h3>El problema: tipos duplicados y deriva (drift)</h3>
+        <div class="diagram">Sin contrato compartido:
+   
+   apps/server/src/pedido.ts          apps/client/src/api.ts
+   ┌─────────────────────────┐        ┌──────────────────────────┐
+   │ interface Pedido {      │        │ interface Pedido {       │
+   │   id: string;           │        │   id: string;            │
+   │   total: number;        │        │   total: number;         │
+   │ }                       │  ✖     │ }                        │
+   │ // back anade "envio"   │ ─────▶ │ // front no se entera    │
+   └─────────────────────────┘        └──────────────────────────┘
+                                            ✖ dos copias de la verdad
+</div>
+        <p>
+          Dos interfaces con el mismo nombre, mantenidas a mano, en repositorios (o carpetas) distintos. Cuando el
+          back anade <code>envio</code>, el front no se entera hasta que un <code>undefined</code> explota en
+          pantalla. Eso es <strong>drift</strong>: la deriva entre lo que el servidor produce y lo que el cliente
+          cree que produce.
+        </p>
+
+        <h3>El borde de confianza: el JSON llega como unknown</h3>
+        <pre><code class="language-ts">const res = await fetch("/api/pedidos/1");
+const pedido = await res.json(); // tipo: any 😱 nada te protege
+
+// Lo "tipamos" a mano, pero es una mentira:
+const pedido = (await res.json()) as Pedido; // ✖ asercion sin comprobar
+// si el back cambio el contrato, esto no falla en compilacion:
+// pedido.envio.metodo -> undefined.envio en runtime
+</code></pre>
+        <p>
+          La asercion <code>as</code> sobre un JSON no validado es una <strong>mentira que el compilador te cree</strong>.
+          El JSON cruza la red sin tipos; "prometer" con <code>as</code> no convierte el dato, solo silencia al
+          compilador. El problema se ve tarde: donde usas el campo, no donde llego.
+        </p>
+
+        <h3>zod: el schema como fuente de verdad</h3>
+        <p>
+          Un schema de zod es una <strong>descripcion ejecutable</strong> del dato: define la forma, la valida en
+          runtime y, de paso, <strong>deriva el tipo estatico</strong> con <code>z.infer</code>. Un solo objeto
+          gobierna dos mundos: el mundo real (verificacion) y el mundo de tipos (compilador).
+        </p>
+        <pre><code class="language-ts">import { z } from "zod";
+
+// El schema: fuente de verdad unica.
+export const PedidoSchema = z.object({
+  id: z.string(),
+  total: z.number().nonnegative(),
+  estado: z.enum(["creado", "pagado", "enviado"]),
+});
+
+// El tipo DERIVADO: no se escribe a mano, sale del schema.
+export type Pedido = z.infer&lt;typeof PedidoSchema&gt;;
+// => { id: string; total: number; estado: "creado" | "pagado" | "enviado" }
+</code></pre>
+        <div class="callout callout--why">
+          <div class="callout__title">Por que derivar el tipo y no escribirlo</div>
+          <p>
+            Si escribes el tipo a mano ademas del schema, tienes DOS fuentes de verdad otra vez: schema y tipo
+            pueden divergir. Al derivar con <code>z.infer</code>, cualquier cambio en el schema actualiza el tipo
+            en todo el proyecto de forma automatica. El schema es el hecho; el tipo, una consecuencia.
+          </p>
+        </div>
+
+        <h3>El patron: validar en el borde, tipar dentro</h3>
+        <pre><code class="language-ts">// 1) En el borde de entrada (server): parse antes de tocar la logica.
+const body = PedidoSchema.safeParse(req.body);
+
+if (!body.success) {
+  // ✖ dato invalido: ni entra al dominio de negocio.
+  return res.status(400).json({ error: body.error.flatten() });
+}
+
+// 2) Dentro del dominio, body.data YA es Pedido (validado).
+registrar(body.data); // body.data: Pedido — no hay "as", hay prueba
+</code></pre>
+        <p>
+          La clave es <strong>donde</strong> se valida: en el borde, la primera linea del handler. A partir de ahi,
+          el dato validado se mueve por el sistema con su tipo derivado. El resto del codigo nunca vuelve a dudar.
+        </p>
+
+        <h3>Comparativa de estrategias</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Estrategia</th>
+              <th>Seguridad en runtime</th>
+              <th>Tipos en compilacion</th>
+              <th>Fuente de verdad</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>as Pedido</code> sobre el JSON</td>
+              <td>Ninguna</td>
+              <td>Si, pero mentirosa</td>
+              <td>Dos copias manuales</td>
+            </tr>
+            <tr>
+              <td>Solo interface compartido</td>
+              <td>Ninguna</td>
+              <td>Si</td>
+              <td>Una, pero no comprueba</td>
+            </tr>
+            <tr>
+              <td>Schema zod + <code>z.infer</code></td>
+              <td>Si (parse en el borde)</td>
+              <td>Si, derivado</td>
+              <td>Una, ejecutable</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ================================================================
+           3 · EJEMPLO MINIMO
+           ================================================================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo minimo</h2>
+        <div class="code-file">schema-minimo.ts</div>
+        <pre><code class="language-ts">import { z } from "zod";
+
+// Schema: la unica fuente de verdad.
+const UsuarioSchema = z.object({
+  nombre: z.string().min(1),
+  edad: z.number().int().positive(),
+});
+
+// Tipo derivado (no escrito a mano):
+type Usuario = z.infer&lt;typeof UsuarioSchema&gt;;
+
+// Validacion en el borde:
+const resultado = UsuarioSchema.safeParse({ nombre: "Ana", edad: 30 });
+
+if (resultado.success) {
+  const u: Usuario = resultado.data; // ✅ data es Usuario de verdad
+  console.log(u.nombre.toUpperCase());
+} else {
+  console.log("Dato invalido:", resultado.error.issues);
+}
+</code></pre>
+        <p><strong>Linea a linea:</strong></p>
+        <ul>
+          <li><code>z.object</code> describe la forma; los campos admiten restricciones (<code>min</code>,
+            <code>int</code>, <code>positive</code>).</li>
+          <li><code>z.infer</code> convierte el schema en el tipo <code>Usuario</code> estatico.</li>
+          <li><code>safeParse</code> valida en runtime y devuelve un union: exito (con <code>data</code>) o fallo
+            (con <code>error.issues</code>).</li>
+          <li>Tras <code>safeParse</code>, <code>data</code> esta validado: eliminaste la necesidad del
+            <code>as</code>.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           4 · EJEMPLO REAL
+           ================================================================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Contrato de pedidos compartido entre un server (Node) y un client, dentro del monorepo del Modulo 12.</p>
+        <div class="code-file">packages/contracts/package.json</div>
+        <pre><code class="language-json">{
+  "name": "@acme/contracts",
+  "dependencies": {
+    "zod": "^4.0.0"
+  }
+}
+</code></pre>
+        <div class="code-file">packages/contracts/src/pedido.ts</div>
+        <pre><code class="language-ts">import { z } from "zod";
+
+// El contrato entero: entradas, salidas y errores.
+export const EstadoSchema = z.enum(["creado", "pagado", "enviado"]);
+
+export const PedidoSchema = z.object({
+  id: z.string(),
+  total: z.number().nonnegative(),
+  estado: EstadoSchema,
+  envio: z.object({
+    metodo: z.enum(["correos", "agencia"]),
+    seguimiento: z.string().optional(),
+  }),
+});
+
+export const CrearPedidoSchema = z.object({
+  total: z.number().positive(),
+  metodo: z.enum(["correos", "agencia"]),
+});
+
+export const ErrorApiSchema = z.object({
+  error: z.string(),
+});
+
+// Tipos derivados: los consumidores nunca los re-escriben.
+export type Pedido = z.infer&lt;typeof PedidoSchema&gt;;
+export type CrearPedido = z.infer&lt;typeof CrearPedidoSchema&gt;;
+export type ErrorApi = z.infer&lt;typeof ErrorApiSchema&gt;;
+</code></pre>
+        <div class="code-file">apps/server/src/rutas.ts</div>
+        <pre><code class="language-ts">import {
+  CrearPedidoSchema,
+  PedidoSchema,
+} from "@acme/contracts";
+
+// El borde: TODO lo externo pasa por safeParse antes de tocar negocio.
+export async function crearPedido(req: Request): Promise&lt;Response&gt; {
+  const cuerpo = await req.json(); // unknown, no confiable
+  const entrada = CrearPedidoSchema.safeParse(cuerpo);
+
+  if (!entrada.success) {
+    // Dato invalido: se rechaza aqui, con detalle util.
+    return new Response(JSON.stringify({
+      error: entrada.error.issues.map(i =&gt; i.message),
+    }), { status: 400 });
+  }
+
+  // entrada.data ya es CrearPedido validado.
+  const pedido = { id: crypto.randomUUID(), estado: "creado", ...entrada.data };
+  return new Response(JSON.stringify(pedido), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
+export function validarPedidoEntrante(data: unknown): Pedido | null {
+  const r = PedidoSchema.safeParse(data);
+  return r.success ? r.data : null; // cargo completo, parseado
+}
+</code></pre>
+        <div class="code-file">apps/client/src/api.ts</div>
+        <pre><code class="language-ts">import type { CrearPedido, Pedido } from "@acme/contracts";
+
+// El client importa solo TIPOS: sin codigo de validacion.
+export async function crearPedido(input: CrearPedido): Promise&lt;Pedido&gt; {
+  const res = await fetch("/api/pedidos", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+
+  const json = await res.json();
+  // El client confia en el contrato: el server ya valido (o rechazo 4xx).
+  return json as Pedido;
+}
+</code></pre>
+        <p><strong>Decisiones:</strong></p>
+        <ul>
+          <li>El schema vive en <code>contracts</code>, el unico punto de verdad; front y back lo importan.</li>
+          <li>El server valida en runtime (aduana): nada externo entra sin <code>safeParse</code>.</li>
+          <li>Los tipos (<code>Pedido</code>, <code>CrearPedido</code>) se derivan con <code>z.infer</code>: nadie
+            los escribe a mano, impossible el drift.</li>
+          <li>El client importa <code>import type</code> (cero peso en el bundle) y usa los mismos tipos.</li>
+          <li>Cambiar el contrato rompe en compilacion a ambos lados: descubres la rotura en CI, no en pantalla.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           5 · BUENAS PRACTICAS
+           ================================================================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas practicas</h2>
+        <ul>
+          <li>Valida en el borde: primera linea del handler; que el dato invalido no cruce hacia el dominio.</li>
+          <li>Deriva SIEMPRE los tipos con <code>z.infer</code>; prohibido escribir a mano el interface paralelo.</li>
+          <li>En el client usa <code>import type</code> de los contratos (tipos borrados, cero bundle).</li>
+          <li>Rechaza con 400 y detalles utiles (<code>error.issues</code>) en lugar de romper con 500.</li>
+          <li>Combina con el monorepo de la leccion 1: <code>contracts</code> como paquete composite y referenciado.</li>
+          <li>Para schemas grandes, compone schemas pequenos (<code>EstadoSchema</code> dentro de
+            <code>PedidoSchema</code>) y reutilizalos.</li>
+        </ul>
+        <h3>Que evitar</h3>
+        <ul>
+          <li><code>(await res.json()) as Pedido</code> sin validar: una promesa sin prueba.</li>
+          <li>Validar en el interior y no en el borde: el dato malo ya toco logica de negocio.</li>
+          <li>Duplicar el schema en front y back: vuelves al drift con dos aduanas distintas.</li>
+          <li>Confiar en <code>json() as T</code> solo porque "el API es nuestro": los bugs de versiones y el
+            cache rompen esa confianza.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           6 · ERRORES HABITUALES
+           ================================================================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <span class="code-label code-label--wrong">Mal — asercion sin validar sobre JSON externo</span>
+        <pre><code class="language-ts">const res = await fetch("/api/pedidos/1");
+const p = (await res.json()) as Pedido; // ✖ no se ha comprobado nada
+console.log(p.envio.seguimiento.toUpperCase()); // puede explotar
+</code></pre>
+        <span class="code-label code-label--right">Bien — safeParse en el borde</span>
+        <pre><code class="language-ts">const r = PedidoSchema.safeParse(await res.json());
+if (!r.success) return; // o lanza un error manejable
+console.log(r.data.envio.seguimiento?.toUpperCase()); // ✅ data es Pedido
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — escribir el tipo a mano ademas del schema</span>
+        <pre><code class="language-ts">const PedidoSchema = z.object({ id: z.string(), total: z.number() });
+
+// ✖ dos fuentes de verdad: schema y tipo pueden divergir
+interface Pedido {
+  id: string;
+  total: number;
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — tipo derivado del schema</span>
+        <pre><code class="language-ts">const PedidoSchema = z.object({ id: z.string(), total: z.number() });
+
+// ✅ una sola fuente; si el schema cambia, el tipo cambia solo
+type Pedido = z.infer&lt;typeof PedidoSchema&gt;;
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — validar dentro de la logica, tarde</span>
+        <pre><code class="language-ts">function procesar(pedido: Pedido): void {
+  // ✖ el dato ya "toco" el sistema sin ser comprobado
+  if (typeof pedido.total !== "number") { /* casi nunca llega aqui */ }
+  cobrar(pedido.total);
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — validar en el borde</span>
+        <pre><code class="language-ts">export async function handler(req: Request): Promise&lt;Response&gt; {
+  const r = PedidoSchema.safeParse(await req.json());
+  if (!r.success) return new Response("400", { status: 400 });
+  return procesar(r.data); // ✅ procesar recibe Pedido validado
+}
+</code></pre>
+      </section>
+
+      <!-- ================================================================
+           7 · EJERCICIO GUIADO
+           ================================================================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p>Construye un contrato de <code>Producto</code> y su handler de creacion.</p>
+        <ol class="steps">
+          <li>Instala zod en <code>packages/contracts</code>: <code>pnpm --filter @acme/contracts add zod</code>.</li>
+          <li>Define <code>ProductoSchema</code> con <code>nombre: z.string().min(1)</code> y
+            <code>precio: z.number().nonnegative()</code>.</li>
+          <li>Exporta <code>type Producto = z.infer&lt;typeof ProductoSchema&gt;</code>.</li>
+          <li>En el server, crea un handler que haga <code>safeParse</code> del body y devuelva 400 si falla.</li>
+          <li>En el client, importa <code>import type { Producto }</code> y escribe una funcion que reciba y
+            devuelva <code>Producto</code>.</li>
+        </ol>
+        <p><strong>Solucion paso a paso:</strong></p>
+        <div class="code-file">packages/contracts/src/producto.ts</div>
+        <pre><code class="language-ts">import { z } from "zod";
+
+export const ProductoSchema = z.object({
+  nombre: z.string().min(1),
+  precio: z.number().nonnegative(),
+});
+
+export type Producto = z.infer&lt;typeof ProductoSchema&gt;;
+</code></pre>
+        <div class="code-file">apps/server/src/productos.ts</div>
+        <pre><code class="language-ts">import { ProductoSchema } from "@acme/contracts";
+
+export async function crearProducto(req: Request): Promise&lt;Response&gt; {
+  const entrada = ProductoSchema.safeParse(await req.json());
+
+  if (!entrada.success) {
+    // Rechazo util en el borde: nombre o precio invalidos.
+    return new Response(
+      JSON.stringify({ error: entrada.error.issues.map(i =&gt; i.message) }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  const guardado = { id: crypto.randomUUID(), ...entrada.data };
+  return new Response(JSON.stringify(guardado), {
+    headers: { "content-type": "application/json" },
+  });
+}
+</code></pre>
+        <div class="code-file">apps/client/src/api.ts</div>
+        <pre><code class="language-ts">import type { Producto } from "@acme/contracts";
+
+export async function crearProducto(p: Producto): Promise&lt;Producto&gt; {
+  const res = await fetch("/api/productos", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(p),
+  });
+  return (await res.json()) as Producto; // el server ya valido
+}
+</code></pre>
+      </section>
+
+      <!-- ================================================================
+           8 · RETO
+           ================================================================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>Reto</h3>
+          <p>
+            Extiende el contrato con una <strong>union discriminada</strong>: <code>PedidoSchema</code> con un campo
+            <code>tipo</code> igual a <code>"digital"</code> o <code>"fisico"</code>, donde el fisico requiere
+            <code>envio</code> y el digital requiere <code>enlaceDescarga</code>. Usa <code>z.discriminatedUnion</code>
+            para que la union sea exhaustiva, y comprueba que en el server puedes distinguir ambos casos sin
+            <code>as</code>. Pista: el discriminador debe aparecer como literal en cada rama del schema.
+          </p>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           9 · RESUMEN
+           ================================================================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los tipos no cruzan la red: el JSON llega como <code>unknown</code> y hay que validarlo, no
+            "prometerlo" con <code>as</code>.</li>
+          <li>Un schema (zod) es la fuente de verdad: valida en runtime y deriva tipos con <code>z.infer</code>.</li>
+          <li>Validar en el <strong>borde</strong>: primera linea del handler, antes de la logica de negocio.</li>
+          <li>Compartir el paquete <code>contracts</code> entre front y back elimina el drift de interfaces
+            duplicadas.</li>
+          <li>Un cambio de contrato rompe en compilacion en los dos lados: el error aparece en CI, no en
+            produccion.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           10 · PREGUNTAS FRECUENTES
+           ================================================================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No basta con compartir solo los tipos con import type?</summary>
+            <div><p>Compartir tipos quita el drift, pero los tipos desaparecen en runtime: alguien puede mandarte
+              un JSON que no cumple el contrato y tu codigo lo tratara como valido. El schema anade la verificacion
+              real en el borde. Lo ideal es schema + tipos derivados.</p></div>
+          </details>
+          <details>
+            <summary>¿Cuando uso parse y cuando safeParse?</summary>
+            <div><p><code>parse</code> lanza una excepcion <code>ZodError</code> si falla; util en pruebas o cuando
+              el fallo debe abortar el flujo. <code>safeParse</code> devuelve un union
+              (<code>{ success: true, data } | { success: false, error }</code>) sin lanzar; la opcion recomendada
+              en handlers y bordes.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si el client tambien quiere validar la respuesta del server?</summary>
+            <div><p>Puedes: pasas la respuesta por <code>PedidoSchema.safeParse</code> en el client. Es una capa
+              extra de seguridad ante proxies, caches o versiones desplegadas. El coste es pequeno comparado con
+              diagnosticar un dato corrupto.</p></div>
+          </details>
+          <details>
+            <summary>¿zod anade mucho peso al bundle del client?</summary>
+            <div><p>Si importas el schema en el client, si: zod tiene coste. Solucion: en el client importa solo
+              los tipos (<code>import type</code>) y deja la validacion en el server. Si necesitas validar en
+              ambos lados, busca alternativas sin peso (o subdivide schemas por paquete).</p></div>
+          </details>
+          <details>
+            <summary>¿Que pasa con fetch y el runtime fuera del browser (Node)?</summary>
+            <div><p>Node 18+ trae <code>fetch</code>, <code>Request</code> y <code>Response</code> nativos, asi que
+              el patron de esta leccion funciona igual en el server. El borde es el mismo: parsear antes de usar.</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo generar los contratos desde el schema en un solo paso?</summary>
+            <div><p>Existen herramientas que derivan clientes tipados desde schemas (p. ej. tRPC, o generadores de
+              clientes desde OpenAPI). Aqui aprendes el patron manual con zod: suficiente para la mayoria de APIs
+              propias y la base sobre la que construyen esas herramientas.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

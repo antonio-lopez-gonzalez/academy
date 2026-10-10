@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="12" data-lesson="04-tsc-en-ci">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TypeScript en produccion y CI — Modulo 12 · Curso TypeScript</title>
+  <meta name="description" content="Chequeo de tipos en CI, cache incremental, roles de tsc vs ESLint y telemetria de rendimiento.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ts-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TypeScript en produccion y CI</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Modulo 12 · Monorepos y produccion</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ================================================================
+           1 · INTRODUCCION
+           ================================================================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introduccion</h2>
+        <p>
+          El editor te avisa de los tipos en vivo, pero <strong>no es una garantia</strong>: nadie puede cazar cada
+          combinacion de ramas y archivos en local. La garantia real vive en CI: un paso que comprueba los tipos de
+          TODO el proyecto y <strong>falla el pipeline</strong> si algo esta roto. Esta leccion monta ese paso: que
+          comando usar (<code>tsc --noEmit</code> vs <code>tsc -b</code>), como cachear el trabajo incremental,
+          donde dibujar la linea entre <code>tsc</code> y ESLint, y como medir el rendimiento del chequeo.
+        </p>
+        <p>
+          El problema que resuelve: en produccion, un error de tipos se paga carisimo (el build explode o, peor, sale
+          a runtime). En CI, el coste es un commit rechazado. La diferencia entre los dos mundos es un pipeline que
+          <em>sepa</em> que los tipos son parte del contrato, no un adorno.
+        </p>
+        <div class="callout callout--note">
+          <div class="callout__title">Cuando se utiliza</div>
+          <ul>
+            <li>En cada PR y en cada push a la rama principal.</li>
+            <li>En monorepos (leccion 1): <code>tsc -b</code> desde la raiz chequea el grafo entero.</li>
+            <li>Antes de publicar (leccion 3): los .d.ts se validan, no solo se emiten.</li>
+            <li>Cuando el equipo quiere metrics de cuanto tarda el chequeo y por que.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           2 · TEORIA
+           ================================================================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoria</h2>
+
+        <h3>La analogia: el portero del concierto</h3>
+        <p>
+          El editor es el <strong>guia</strong> que te aconseja en el camino; CI es el <strong>portero</strong> de la
+          puerta del concierto: sin entrada no pasas. A nadie le importa que el guia haya sido amable: si el portero
+          (un <code>tsc</code> estricto, de punta a punta) encuentra que tu "entrada" (el codigo) no es valida, el
+          espectaculo (el despliegue) no ocurre. El portero nunca se cansa ni "se le escapa".
+        </p>
+
+        <h3>Chequeo en CI: tsc --noEmit o tsc -b</h3>
+        <p>Dos contextos, dos comandos naturales:</p>
+        <pre><code class="language-bash"># Proyecto unico: comprueba tipos sin emitir nada.
+tsc --noEmit --pretty false
+
+# Monorepo (leccion 1): el grafo entero, en orden, con cache.
+tsc -b . --pretty false
+</code></pre>
+        <ul>
+          <li><code>--noEmit</code> solo quiere la respuesta "¿hay errores?". No hay artefactos que limpiar.</li>
+          <li><code>-b</code> (build mode) respeta references, ordena y reutiliza <code>tsbuildinfo</code>: en un
+            monorepo es la unica forma de chequear el conjunto sin compilar el mundo dos veces.</li>
+          <li><code>--pretty false</code> produce salida parseable en CI (lineas de error normales).</li>
+        </ul>
+        <div class="callout callout--warning">
+          <div class="callout__title">El build del bundler NO es un chequeo de tipos</div>
+          <p>
+            Vite (esbuild) transpila archivo a archivo: <strong>borra los tipos sin comprobarlos</strong>. Un
+            <code>vite build</code> en verde con un <code>as any</code> sospechoso te da falsa seguridad. El paso de
+            <code>tsc</code> es el unico que verifica el sistema de tipos completo. Por eso el pipeline lleva AMBOS:
+            <code>typecheck</code> + <code>build</code>.
+          </p>
+        </div>
+
+        <h3>incremental y tsBuildInfoFile: cache del chequeo</h3>
+        <pre><code class="language-json">// apps/client/tsconfig.json
+{
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    "incremental": true,        // en composite viene implicito
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.client.tsbuildinfo"
+  }
+}
+</code></pre>
+        <p>
+          <code>incremental</code> guarda la huella de cada archivo en <code>tsbuildinfo</code>; en la siguiente
+          ejecucion, TypeScript reutiliza el resultado de lo que no cambio. En CI, restaurar ese fichero (cache del
+          runner) hace el chequeo de tipos notablemente mas rapido en PRs que repiten trabajo. Tips:
+        </p>
+        <ul>
+          <li>Reubica el fichero (<code>tsBuildInfoFile</code>) fuera del paquete para cachearlo de un solo sitio.</li>
+          <li>No lo comitees; restauralo desde el cache de tu CI (por ejemplo, <code>actions/cache</code>).</li>
+          <li>En monorepo, el cache cubre el grafo: si <code>contracts</code> no cambio, sus consumidores no se
+            recomprueban.</li>
+        </ul>
+
+        <h3>tsc y ESLint: dos roles, no un sustituto</h3>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Herramienta</th>
+              <th>Comprueba</th>
+              <th>Ejemplos</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tsc</code></td>
+              <td>El sistema de tipos: asignaciones, genericos, narrowing, referencias.</td>
+              <td><code>type error</code>, <code>as any</code> no detectado, referencia rota entre paquetes.</td>
+            </tr>
+            <tr>
+              <td>ESLint</td>
+              <td>Estilo y patrones: nombrado, ramas, importacion, accesibilidad, seguridad.</td>
+              <td><code>no-unused-vars</code>, reglas de <code>@typescript-eslint</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          Ambos son <strong>complementarios</strong>: ESLint no puede validar que tu <code>Generico&lt;T&gt;</code>
+          sea correcto, y tsc no te obliga a nombrar bien las funciones. Un pipeline sano ejecuta los dos, y una
+          regla de ESLint "type-aware" (<code>@typescript-eslint/no-unsafe-assignment</code>) refuerza a tsc sin
+          reemplazarlo.
+        </p>
+
+        <h3>skipLibCheck: que se salta y cuando mirarlo</h3>
+        <pre><code class="language-json">// tsconfig.base.json (raiz)
+{
+  "compilerOptions": {
+    "skipLibCheck": true
+    // ^ no chequear los .d.ts de node_modules (rendimiento)
+  }
+}
+</code></pre>
+        <p>
+          <code>skipLibCheck: true</code> salta la validacion de los <code>.d.ts</code> de <code>node_modules</code>
+          (bibliotecas ajenas): enorme ahorro de tiempo y la opcion sana por defecto en apps. Cuando
+          <strong>publicas</strong> una libreria (leccion 3), conviene validarlo a false en la build para cazar
+          declaraciones tuyas mal generadas (o usar un validador de API como api-extractor).
+        </p>
+
+        <h3>Aislamiento: isolatedModules y verbatimModuleSyntax</h3>
+        <p>
+          Vite, esbuild y el compilador nativo transpilan <strong>archivo a archivo</strong>, sin ver el proyecto
+          entero. Un archivo debe poder transpilarse solo: por eso <code>isolatedModules</code> te obliga a marcar
+          los <code>import type</code> explicitos, y <code>verbatimModuleSyntax</code> mantiene esa distincion en el
+          codigo emitido. Ya lo viste en detalle en el Modulo 7; aqui es <strong>politica de CI</strong>:
+        </p>
+        <ul>
+          <li>Activalos en la config base: lo que vale en local vale en el build de produccion.</li>
+          <li>Atrapan errores que tsc a veces perdona y el transpilador rompe (por ejemplo,
+            <code>const enum</code> inlineado).</li>
+          <li>Preparan el terreno para el <strong>type-stripping</strong> del futuro (tsgo/TS natal): codigo que se
+            puede ejecutar sin una pasada de compilacion completa.</li>
+        </ul>
+
+        <h3>Telemetria de rendimiento: tsgo y tsserver</h3>
+        <pre><code class="language-bash"># Cuanto tarda y quien consume:
+tsc -b . --extendedDiagnostics     # tiempos por fase (program, bind, check, emit)
+tsc -b . --listFiles               # que archivos entran al programa
+tsc --explainFiles                 # por que entra cada archivo
+tsc --generateTrace ./trace        # grafo puro para @typescript/trace-analyzer
+
+# Compilador nativo (TS 7): mismo tsconfig, ~10x mas rapido.
+tsgo -b . --pretty false
+</code></pre>
+        <p>
+          Medir es decidir: si el chequeo tarda 4 minutos, primero mira <code>--extendedDiagnostics</code> (¿check o
+          emit?) y <code>--listFiles</code> (¿se colo un directorio gigante?). El <strong>tsgo</strong> (port nativo
+          en Go, linea TypeScript 6/7) acelera el mismo pipeline sin cambiar tsconfig. El tsserver (lenguaje del
+          editor) comparte config; si el editor va lento, el mismo perfil sirve para diagnosticarlo.
+        </p>
+      </section>
+
+      <!-- ================================================================
+           3 · EJEMPLO MINIMO
+           ================================================================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo minimo</h2>
+        <div class="code-file">package.json (script de tipo)</div>
+        <pre><code class="language-json">{
+  "scripts": {
+    "typecheck": "tsc -b . --pretty false"
+  }
+}
+</code></pre>
+        <div class="code-file">.github/workflows/ci.yml (minimo)</div>
+        <pre><code class="language-yaml">name: CI
+on: [push, pull_request]
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck   # falla el PR si hay errores de tipos
+</code></pre>
+        <p><strong>Linea a linea:</strong></p>
+        <ul>
+          <li><code>tsc -b . --pretty false</code>: grafo completo, salida parseable; nada de emit intermedio en el
+            job de tipos.</li>
+          <li><code>actions/setup-node</code> con <code>cache: pnpm</code> reutiliza el store de paquetes.</li>
+          <li><code>--frozen-lockfile</code>: la instalacion debe reproducir exactamente el lockfile commiteado.</li>
+          <li>Si el job falla, el PR se bloquea: los tipos pasan a ser parte del contrato del equipo.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           4 · EJEMPLO REAL
+           ================================================================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Pipeline de monorepo (leccion 1) con typecheck, lint, build y cache del chequeo incremental:</p>
+        <div class="code-file">.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml">name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Cache de los tsbuildinfo: el chequeo incremental no repite trabajo.
+      - uses: actions/cache@v4
+        with:
+          path: node_modules/.tmp
+          key: tsbuildinfo-${{ runner.os }}-${{ hashFiles('**/tsconfig*.json') }}
+
+      - run: pnpm typecheck   # tsc -b . --pretty false
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: typecheck          # si hay errores de tipos, no llegamos aqui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint        # ESLint: estilo y reglas, roles separados
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build       # compila/empaqueta lo que se ira a produccion
+</code></pre>
+        <p><strong>Decisiones:</strong></p>
+        <ul>
+          <li>Jobs separados = fallos claros y paralelismo: typecheck, lint y build tienen responsabilidad unica.</li>
+          <li><code>needs</code> encadena: un tipo roto detiene el pipeline antes de gastar tiempo en lint/build.</li>
+          <li>El cache de <code>node_modules/.tmp</code> guarda los <code>tsbuildinfo</code> (clave por estado de
+            tsconfigs); la cache del paquete (<code>pnpm</code>) ya la gestiona setup-node.</li>
+          <li>Typecheck y build son pasos distintos a proposito: verificar tipos (tsc) y empaquetar (Vite) no son lo
+            mismo, y ambos fallan por razones distintas.</li>
+          <li>Con <code>tsgo</code> este job se declara igual: mismo tsconfig, mismo resultado, menos tiempo.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           5 · BUENAS PRACTICAS
+           ================================================================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas practicas</h2>
+        <ul>
+          <li>Comprueba tipos en CI con <code>tsc</code> (nunca confies en el build del bundler para validar tipos).</li>
+          <li>En monorepo, un solo <code>tsc -b . --pretty false</code> desde la raiz cubre todo el grafo.</li>
+          <li>Activa <code>incremental</code> y cachea los <code>tsbuildinfo</code>; rebonde la clave si cambian los
+            tsconfigs.</li>
+          <li>Separa tsc y ESLint en jobs (o en pasos) con responsabilidad explicita.</li>
+          <li><code>skipLibCheck: true</code> en apps; revisa las declaraciones propias con la build de libreria
+            (leccion 3).</li>
+          <li>Activa <code>isolatedModules</code> y <code>verbatimModuleSyntax</code> en la base: protegen frente a
+            transpiladores archivo a archivo.</li>
+          <li>Registra la duracion del typecheck (<code>--extendedDiagnostics</code>) y considera tsgo si el tiempo
+            empieza a doler.</li>
+        </ul>
+        <h3>Que evitar</h3>
+        <ul>
+          <li>Confundir "build verde" con "tipos sanos": esbuild no comprueba el sistema de tipos.</li>
+          <li>Correr <code>tsc</code> sin <code>--noEmit</code> (o -b) en CI y ensuciar el workspace con emisiones.</li>
+          <li>Cachear mal: tsbuildinfo restaurado con codigo nuevo (clave poco especifica) invalida el proposito.</li>
+          <li>Relajar <code>skipLibCheck</code> a false en una app solo por "rigor": pagas minutos por archivos que no
+            controlas.</li>
+          <li>Comiteos de <code>*.tsbuildinfo</code>: son cache, se regeneran.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           6 · ERRORES HABITUALES
+           ================================================================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <span class="code-label code-label--wrong">Mal — validar tipos con el build del bundler</span>
+        <pre><code class="language-bash"># "build": "vite build" (o "tsup", "esbuild")
+# ✖ el transpilador borra los tipos sin COMPROBARLOS:
+#    un "as any" o un generico roto pasan en verde.
+</code></pre>
+        <span class="code-label code-label--right">Bien — chequeo aparte con tsc</span>
+        <pre><code class="language-bash"># "typecheck": "tsc -b . --pretty false"
+# ✅ comprueba el sistema de tipos completo; luego construye el bundler.
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — emitir en CI donde no hace falta</span>
+        <pre><code class="language-bash">tsc -p apps/client        # ✖ escribe JS junto a los tipos, sin -b ni noEmit
+</code></pre>
+        <span class="code-label code-label--right">Bien — solo respuesta, sin artefactos</span>
+        <pre><code class="language-bash">tsc -b . --pretty false    # ✅ grafo en orden; apps con noEmit no escriben nada
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — cache del tsbuildinfo con clave ambigua</span>
+        <pre><code class="language-yaml"># ✖ misma clave siempre: restaura tsbuildinfo de otro codigo
+key: tsbuildinfo
+</code></pre>
+        <span class="code-label code-label--right">Bien — clave ligada a la config</span>
+        <pre><code class="language-yaml"># ✅ invalida cuando cambian los tsconfigs
+key: tsbuildinfo-${{ hashFiles('**/tsconfig*.json') }}
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — codigo que transpila pero no tipa (const enum)</span>
+        <pre><code class="language-ts">const enum Moneda { EUR, USD }   // ✖ con isolatedModules no puede transpilarse
+// tsc lo alinea en un proyecto; esbuild (archivo a archivo) no puede resolverlo
+</code></pre>
+        <span class="code-label code-label--right">Bien — enums reales o unions de literales</span>
+        <pre><code class="language-ts">type Moneda = "EUR" | "USD";      // ✅ transpila y tipa en cualquier tool
+</code></pre>
+      </section>
+
+      <!-- ================================================================
+           7 · EJERCICIO GUIADO
+           ================================================================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p>Pon un chequeo de tipos en CI para tu monorepo (leccion 1).</p>
+        <ol class="steps">
+          <li>Anade el script <code>typecheck</code> al package.json raiz:
+            <code>tsc -b . --pretty false</code>.</li>
+          <li>Verifica en local que falla cuando introduces un error de tipos (cambia un nombre de funcion).</li>
+          <li>Configura el job <code>typecheck</code> de GitHub Actions con checkout, pnpm, node y
+            <code>pnpm install --frozen-lockfile</code>.</li>
+          <li>Anade cache de <code>node_modules/.tmp</code> con clave ligada a los tsconfigs.</li>
+          <li>Ejecuta el typecheck y comprueba que el job en verde pasa y que un error de tipos bloquea.</li>
+        </ol>
+        <p><strong>Solucion paso a paso:</strong></p>
+        <div class="code-file">package.json</div>
+        <pre><code class="language-json">{
+  "scripts": {
+    "typecheck": "tsc -b . --pretty false"
+  }
+}
+</code></pre>
+        <div class="code-file">.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml">name: CI
+on: [push, pull_request]
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/cache@v4
+        with:
+          path: node_modules/.tmp
+          key: tsbuildinfo-${{ runner.os }}-${{ hashFiles('**/tsconfig*.json') }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+</code></pre>
+        <p>
+          Puebalo a fondo: rompe un tipo a proposito (<code>doble("texto")</code>), sube la rama, y verifica que el
+          job falla con la linea exacta del error. Esa es la garantia que el editor no puede darte sola.
+        </p>
+      </section>
+
+      <!-- ================================================================
+           8 · RETO
+           ================================================================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>Reto</h3>
+          <p>
+            Mide el typecheck actual con <code>tsc -b . --extendedDiagnostics</code> y anota los tiempos de
+            <code>Program</code>, <code>Bind</code> y <code>Check</code>. Luego ejecuta el mismo chequeo con
+            <code>tsgo -b . --pretty false</code> (el compilador nativo) y compara. Si tienes un paquete publicable
+            (leccion 3), valida sus declaraciones con <code>skipLibCheck: false</code>: ¿aparece algun error en tus
+            propios <code>.d.ts</code>? Anade el resultado como job de PR. Pista: la telemetria te dice donde
+            duelen los segundos; el fix casi nunca es "afinar el tsconfig".
+          </p>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           9 · RESUMEN
+           ================================================================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El editor aconseja; CI garantiza: un job <code>tsc</code> que falla el pipeline es la linea roja de
+            tipos.</li>
+          <li><code>tsc --noEmit</code> para proyectos unicos; <code>tsc -b .</code> para monorepos (grafo, orden,
+            cache).</li>
+          <li><code>incremental</code>/<code>tsBuildInfoFile</code> + cache del runner abaratan el chequeo repetido.</li>
+          <li>tsc y ESLint tienen roles distintos; el build del bundler NO chequea tipos.</li>
+          <li><code>skipLibCheck</code>, <code>isolatedModules</code> y <code>verbatimModuleSyntax</code> son
+            politica de CI tanto como de tsconfig.</li>
+          <li>Mide con <code>--extendedDiagnostics</code>/<code>--listFiles</code> y acelera con tsgo si hace falta.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           10 · PREGUNTAS FRECUENTES
+           ================================================================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por que no sirve "vite build" como chequeo de tipos?</summary>
+            <div><p>Vite usa esbuild, que transpila archivo a archivo: elimina los tipos sin comprobarlos. Un
+              generico roto o un <code>as</code> que esconde un bug pasan el build. Solo tsc valida el sistema de
+              tipos completo; por eso el pipeline lleva typecheck + build.</p></div>
+          </details>
+          <details>
+            <summary>¿--noEmit y -b son intercambiables?</summary>
+            <div><p>No exactamente: <code>--noEmit</code> chequea un proyecto sin emitir; <code>-b</code> (build
+              mode) respeta references, ordena el grafo y usa tsbuildinfo. En un proyecto solo, <code>tsc --noEmit</code>
+              basta; en un monorepo, <code>tsc -b</code> es la herramienta (y respeta los noEmit de sus projects).</p></div>
+          </details>
+          <details>
+            <summary>¿Que es tsgo y por que deberia importarme?</summary>
+            <div><p>Es el compilador nativo de TypeScript (linea 6/7, portado a Go): da el mismo resultado que tsc
+              (mismo tsconfig) con tiempos del orden de 10x menores. En CI significa menos minutos por pipeline;
+              en local, menos espera al salvar. Codigo compatible con 5.9+ corre igual en ambos.</p></div>
+          </details>
+          <details>
+            <summary>¿Vale la pena cachear los tsbuildinfo en CI?</summary>
+            <div><p>Para proyectos medianos/grandes, si: es el ahorro mas grande del chequeo incremental. Si tu
+              chequeo dura segundos, el cache puede no compensar el overhead de restaurar. Mide antes de complicar.</p></div>
+          </details>
+          <details>
+            <summary>¿Cuando desactivo skipLibCheck?</summary>
+            <div><p>Cuando publicas librerias: quieres validar tus propios .d.ts y los de tus dependencias de tipos
+              (p. ej. paquetes de tipos flojos). En apps, manten true: revisar cada .d.ts de node_modules cuesta y
+              casi nunca aporta.</p></div>
+          </details>
+          <details>
+            <summary>¿ESLint con reglas de tipos reemplaza a tsc?</summary>
+            <div><p>No. Las reglas type-aware de <code>@typescript-eslint</code> se apoyan en el type checker para
+              opiniones (no-misused-promises, no-unsafe-assignment), pero no sustituyen la comprobacion completa de
+              tipos. tsc valida; ESLint opina. Ejecuta ambos.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

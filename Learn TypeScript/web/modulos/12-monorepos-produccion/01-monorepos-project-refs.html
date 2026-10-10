@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="12" data-lesson="01-monorepos-project-refs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monorepos con project references — Modulo 12 · Curso TypeScript</title>
+  <meta name="description" content="Estructura de paquetes tipados, herencia de tsconfig con extends y orden de build con tsc -b.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ts-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Monorepos con project references</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Modulo 12 · Monorepos y produccion</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ================================================================
+           1 · INTRODUCCION
+           ================================================================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introduccion</h2>
+        <p>
+          Un monorepo profesional organiza aplicaciones y librerias en <strong>paquetes independientes</strong>,
+          cada uno con su propio <code>tsconfig.json</code>. En el Modulo 7 viste la base: pnpm workspaces y
+          project references. Ahora lo llevamos al terreno de produccion: una estructura tipada
+          <code>contracts / client / server</code>, configuraciones compartidas con <code>extends</code> y el
+          <strong>orden de build</strong> garantizado con <code>tsc -b</code>.
+        </p>
+        <p>
+          El problema que resuelve: si cada paquete compila ajeno a los demas, terminas copiando tipos a mano,
+          duplicando configuraciones (<code>strict</code>, <code>module</code>, <code>target</code>) y con builds
+          que "recompilan el mundo" aunque solo haya cambiado un interface. Con references + extends, un cambio en
+          <code>contracts</code> recompila solo a quien lo usa, y una sola config base gobierna a todos.
+        </p>
+        <div class="callout callout--note">
+          <div class="callout__title">Cuando se utiliza</div>
+          <ul>
+            <li>Equipos con varias apps (client, server) y librerias compartidas (contracts, ui, utils).</li>
+            <li>Paquetes tipados reutilizables que quieres verificar de forma incremental en CI.</li>
+            <li>Cuando duplicar <code>strict</code> y compania en 10 tsconfigs empieza a doler.</li>
+            <li>Cuando necesitas compilar en orden: primero las dependencias, luego los consumidores.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           2 · TEORIA
+           ================================================================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoria</h2>
+
+        <h3>La analogia: la fabrica de muebles</h3>
+        <p>
+          Una fabrica de muebles no corta la madera y monta la silla en el mismo banco. Tiene talleres: el de
+          <em>diseno</em> (contracts, los planos), el de <em>montaje</em> (client/server, que usan los planos). El
+          <strong>capataz</strong> (el modo build) decide el orden: primero diseno, luego montaje, y solo reabre un
+          taller si su trabajo de entrada cambio. Los planos que se pasan entre talleres son los <code>.d.ts</code>.
+        </p>
+        <div class="diagram">Raiz
+   ├── tsconfig.json          (files: [], solo references -> orquesta)
+   ├── tsconfig.base.json     (extends: config comun, sin codigo propio)
+   ├── packages/contracts     (composite: true -> emite planos .d.ts)
+   ├── apps/server            (composite: true, emits JS para Node)
+   └── apps/client            (composite: true, noEmit -> Vite empaqueta)
+        ▲          │
+        │          └── tsc -b ordena el grafo: contracts antes que apps
+        └── pnpm workspace enlaza @acme/contracts en node_modules
+</div>
+
+        <h3>Project references: un proyecto por paquete</h3>
+        <p>
+          Un paquete que otros van a consumir debe declararse como <strong>proyecto compuesto</strong> con
+          <code>"composite": true</code>. Esta opcion hace dos cosas automaticamente:
+        </p>
+        <ul>
+          <li><strong>Activa <code>declaration</code></strong>: emite <code>.d.ts</code>, el "contrato" que otros
+            proyectos leen.</li>
+          <li><strong>Activa <code>incremental</code></strong>: escribe un fichero de build (<code>tsconfig.tsbuildinfo</code>)
+            con la huella de cada archivo, clave para recompilar solo lo que cambio.</li>
+        </ul>
+        <pre><code class="language-json">// packages/contracts/tsconfig.json
+{
+  "compilerOptions": {
+    "composite": true,        // implica declaration + incremental (no se pueden apagar)
+    "declarationMap": true,   // mapas de los .d.ts hacia el codigo fuente
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": true
+  },
+  "include": ["src"]
+}
+</code></pre>
+        <div class="callout callout--why">
+          <div class="callout__title">Por que composite fuerza declaration e incremental</div>
+          <p>
+            Para que un proyecto sea <em>referenciado</em> necesita poder entregar tipos (declaraciones) y saber si
+            su salida sigue vigente (seguimiento incremental). Sin esos dos, el compilador no puede decidir cuando
+            debe recompilar a los consumidores. Por eso, si intentas poner <code>"declaration": false</code> o
+            <code>"incremental": false</code> en un proyecto composite, TypeScript da error.
+          </p>
+        </div>
+        <p>El consumidor declara la dependencia en su propio tsconfig:</p>
+        <pre><code class="language-json">// apps/server/tsconfig.json
+{
+  "references": [
+    { "path": "../../packages/contracts" }
+  ]
+}
+</code></pre>
+        <p>
+          <code>references</code> establece el grafo: "mi codigo usa tipos que vienen de
+          <code>packages/contracts</code>". Este grafo es lo que el modo build explota para ordenar y cachear.
+        </p>
+
+        <h3>El orden de build: el grafo dirigido</h3>
+        <p>
+          <code>tsc -b</code> (build mode) lee las references de todos los proyectos, construye el grafo y lo recorre en
+          <strong>orden topologico</strong>: las dependencias antes que los dependientes. Ademas reutiliza los
+          <code>tsbuildinfo</code>: si <code>contracts</code> no cambio (misma huella), sus consumidores no se
+          recompilan.
+        </p>
+        <pre><code class="language-bash">tsc -b .            # compila la raiz y TODO el grafo en orden
+tsc -b . --dry      # muestra el orden sin compilar (ensayo)
+tsc -b . --verbose  # explica proyecto a proyecto que hace
+tsc -b . --force    # ignora la cache, recompila todo
+tsc -b . --clean    # borra la salida de todos los proyectos
+tsc -b . --watch    # modo vigilante: recompila al guardar
+</code></pre>
+
+        <h3>Herencia de tsconfig con extends</h3>
+        <p>
+          Mantener <code>strict</code>, <code>module</code> y <code>target</code> copiados en 10 tsconfigs es
+          fabricar errores. <code>extends</code> resuelve la duplicacion: un fichero base y los hijos heredan.
+        </p>
+        <pre><code class="language-json">// tsconfig.base.json (raiz del monorepo)
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}
+</code></pre>
+        <pre><code class="language-json">// apps/client/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+</code></pre>
+        <p>
+          Reglas de herencia que debes conocer:
+        </p>
+        <ul>
+          <li>Todo lo que el hijo defina <strong>gana</strong> sobre la base (override).</li>
+          <li><code>files</code>, <code>include</code> y <code>exclude</code> del hijo <strong>sustituyen</strong>
+            a los de la base (no se mezclan).</li>
+          <li>Desde TypeScript 5.0, <code>extends</code> acepta un <strong>array</strong> de bases; la ultima gana
+            en conflictos. Util para combinar <code>@tsconfig/strictest</code> con tu base propia.</li>
+          <li>Los <strong>paths relativos</strong> (include, outDir, rootDir) se resuelven respecto al fichero
+            donde estan escritos. No pongas <code>outDir</code> en la base si los paquetes viven a distintas
+            profundidades.</li>
+        </ul>
+
+        <h3>Composicion: la raiz que solo orquesta</h3>
+        <p>
+          El tsconfig raiz no compila codigo: solo <strong>compone</strong> el grafo. Es el patron de Vite y de la
+          mayoria de monorepos tipados.
+        </p>
+        <pre><code class="language-json">// tsconfig.json (raiz)
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/contracts" },
+    { "path": "./apps/server" },
+    { "path": "./apps/client" }
+  ]
+}
+</code></pre>
+        <p>
+          Ejecutar <code>tsc -b .</code> en la raiz dispara los tres proyectos en orden. Nota que las apps del
+          ejemplo usan <code>noEmit</code>: su JavaScript lo genera Vite (client) o un runtime (server); el
+          TypeScript solo <strong>verifica</strong>. El modo build soporta proyectos <code>noEmit</code> sin
+          problema: los comprueba y emite solo cuando el proyecto produce dist.
+        </p>
+
+        <h3>pnpm workspaces conecta los paquetes</h3>
+        <pre><code class="language-yaml"># pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+</code></pre>
+        <pre><code class="language-json">// apps/server/package.json
+{
+  "name": "@acme/server",
+  "dependencies": {
+    "@acme/contracts": "workspace:*"
+  }
+}
+</code></pre>
+        <pre><code class="language-bash">pnpm install                         # instala y enlaza los workspaces
+pnpm --filter @acme/server build     # ejecuta el script "build" solo en server
+pnpm -r exec tsc -b --pretty false   # ejecuta tsc -b en todos los paquetes
+</code></pre>
+        <p>
+          <code>workspace:*</code> le dice a pnpm "enlaza el paquete local con ese nombre en lugar de buscar en el
+          registry". En runtime y en el tipado, <code>@acme/contracts</code> se resuelve a la carpeta local del
+          workspace.
+        </p>
+      </section>
+
+      <!-- ================================================================
+           3 · EJEMPLO MINIMO
+           ================================================================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo minimo</h2>
+        <div class="code-file">monorepo-minimo</div>
+        <pre><code class="language-ts">// Estructura:
+//   tsconfig.base.json  ~  extends global
+//   packages/lib/       ~  composite, emite .d.ts
+//   apps/app/           ~  references + noEmit
+
+// tsconfig.base.json
+// { "compilerOptions": { "strict": true, "module": "nodenext" } }
+
+// packages/lib/tsconfig.json
+// { "extends": "../../tsconfig.base.json",
+//   "compilerOptions": { "composite": true, "rootDir": "src", "outDir": "dist" } }
+
+// packages/lib/src/doble.ts
+export function doble(n: number): number {
+  return n * 2;
+}
+
+// apps/app/tsconfig.json
+// { "extends": "../../tsconfig.base.json",
+//   "compilerOptions": { "composite": true, "noEmit": true },
+//   "references": [{ "path": "../../packages/lib" }] }
+
+// apps/app/src/main.ts
+import { doble } from "@acme/lib";
+const x: number = doble(21); // ✅ el tipo fluye desde lib
+console.log(x);
+</code></pre>
+        <p><strong>Linea a linea:</strong></p>
+        <ul>
+          <li>La base define lo comun (<code>strict</code>, <code>module</code>); los hijos solo anaden lo suyo.</li>
+          <li><code>lib</code> es composite: produce los <code>.d.ts</code> que app consumira.</li>
+          <li><code>app</code> referencia a lib y usa <code>noEmit</code>: solo chequea tipos.</li>
+          <li><code>tsc -b .</code> desde la raiz construye lib antes que app.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           4 · EJEMPLO REAL
+           ================================================================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Monorepo tipado con tres paquetes: contratos compartidos, servidor y cliente.</p>
+        <div class="code-file">tsconfig.base.json</div>
+        <pre><code class="language-json">{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+</code></pre>
+        <div class="code-file">packages/contracts/tsconfig.json</div>
+        <pre><code class="language-json">{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+</code></pre>
+        <div class="code-file">packages/contracts/src/index.ts</div>
+        <pre><code class="language-ts">// Los "planos" compartidos: aqui solo hay tipos.
+export interface Pedido {
+  id: string;
+  total: number;
+  estado: EstadoPedido;
+}
+
+export type EstadoPedido = "creado" | "pagado" | "enviado";
+</code></pre>
+        <div class="code-file">apps/server/tsconfig.json</div>
+        <pre><code class="language-json">{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "../../node_modules/.tmp/tsconfig.server.tsbuildinfo"
+  },
+  "references": [{ "path": "../../packages/contracts" }],
+  "include": ["src"]
+}
+</code></pre>
+        <div class="code-file">apps/server/src/main.ts</div>
+        <pre><code class="language-ts">import type { Pedido } from "@acme/contracts";
+
+// El servidor SI emite JavaScript (lo ejecuta Node).
+function cobrar(pedido: Pedido): Pedido {
+  // pedido.estado esta tipado por contracts, no duplicado aqui.
+  console.log(`Cobrando ${pedido.total} (${pedido.estado})`);
+  return { ...pedido, estado: "pagado" };
+}
+</code></pre>
+        <div class="code-file">apps/client/tsconfig.json</div>
+        <pre><code class="language-json">{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    "tsBuildInfoFile": "../../node_modules/.tmp/tsconfig.client.tsbuildinfo"
+  },
+  "references": [{ "path": "../../packages/contracts" }],
+  "include": ["src"]
+}
+</code></pre>
+        <div class="code-file">apps/client/src/main.ts</div>
+        <pre><code class="language-ts">import type { Pedido } from "@acme/contracts";
+
+// El cliente NO emite: Vite empaqueta su JavaScript.
+const p: Pedido = { id: "1", total: 99, estado: "creado" };
+if (p.estado === "creado") {
+  console.log("Pedido listo para pagar");
+}
+</code></pre>
+        <div class="code-file">tsconfig.json (raiz, orquesta)</div>
+        <pre><code class="language-json">{
+  "files": [],
+  "references": [
+    { "path": "./packages/contracts" },
+    { "path": "./apps/server" },
+    { "path": "./apps/client" }
+  ]
+}
+</code></pre>
+        <div class="code-file">Comandos</div>
+        <pre><code class="language-bash">pnpm install
+tsc -b . --verbose   # 💡 muestra el orden: contracts -> server -> client
+</code></pre>
+        <p><strong>Decisiones:</strong></p>
+        <ul>
+          <li>La raiz solo orquesta con <code>files: []</code>; el grafo vive en las references.</li>
+          <li><code>contracts</code> es la unica fuente de tipos: nadie redeclara <code>Pedido</code>.</li>
+          <li>El server emite (<code>outDir: dist</code>) porque Node ejecuta su JavaScript; el client usa
+            <code>noEmit</code> porque Vite hace el bundle.</li>
+          <li><code>tsBuildInfoFile</code> saca los ficheros de build a <code>node_modules/.tmp</code> (ya
+            ignorado por git) y evita ensuciar cada paquete.</li>
+          <li>Un cambio en <code>Pedido</code> recompila contracts y, con huella distinta, a server y client.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           5 · BUENAS PRACTICAS
+           ================================================================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas practicas</h2>
+        <ul>
+          <li>Marca <code>composite: true</code> en TODO proyecto que vaya a ser referenciado; TypeScript dara error
+            si lo olvidas, asi que hazlo sistematico en la base de los paquetes.</li>
+          <li>Centraliza <code>strict</code>, <code>module</code> y <code>target</code> en un
+            <code>tsconfig.base.json</code> con <code>extends</code>; no copies opciones.</li>
+          <li>Comila siempre con <code>tsc -b</code> cuando haya references: orden + cache. <code>tsc -p</code>
+            a secas ignora el grafo.</li>
+          <li>Usa <code>noEmit</code> en apps cuyo JavaScript produce otra herramienta (Vite); deja emitir a los
+            paquetes que publican dist.</li>
+          <li>Saca los <code>tsbuildinfo</code> del arbol (<code>tsBuildInfoFile</code> hacia
+            <code>node_modules/.tmp</code>) y add al ignore los que queden.</li>
+          <li>Declara los enlaces locales con <code>workspace:*</code> en pnpm; el tipado se resuelve contra la
+            carpeta del workspace.</li>
+          <li>Manten el grafo en arbol: sin dependencias circulares entre paquetes.</li>
+        </ul>
+        <h3>Que evitar</h3>
+        <ul>
+          <li>Poner <code>outDir</code> o <code>rootDir</code> en la config base: los paths se resuelven respecto al
+            fichero donde nacen y cada paquete esta a una profundidad distinta.</li>
+          <li>Copiar interfaces entre paquetes en lugar de referenciar el paquete comun.</li>
+          <li>Mezclar la config del editor con la de build sin necesidad: el editor puede ser mas laxo, el build
+            mas estricto (o viceversa), pero la raiz de verdad es el build.</li>
+          <li><code>noEmit</code> en un paquete que debe publicar <code>.d.ts</code>: las librerias necesitan emitir.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           6 · ERRORES HABITUALES
+           ================================================================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <span class="code-label code-label--wrong">Mal — referenciar un proyecto que no es composite</span>
+        <pre><code class="language-json">{
+  "compilerOptions": { "strict": true }
+}
+// apps/app -> references a packages/lib, pero lib no tiene composite
+// ✖ TS6306: Referenced project must have setting "composite": true
+</code></pre>
+        <span class="code-label code-label--right">Bien — el referenciado es composite</span>
+        <pre><code class="language-json">{
+  "compilerOptions": {
+    "composite": true,   // implica declaration + incremental
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — compilar con tsc -p ignorando el grafo</span>
+        <pre><code class="language-bash">tsc -p apps/server   # ✖ no construye contracts primero
+tsc -p packages/contracts   # ✖ no avisa a los consumidores
+</code></pre>
+        <span class="code-label code-label--right">Bien — build mode respeta el orden</span>
+        <pre><code class="language-bash">tsc -b apps/server   # ✅ compila contracts (si hace falta) y despues server
+tsc -b .              # ✅ todo el monorepo desde la raiz
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — outDir en la base compartida</span>
+        <pre><code class="language-json">// tsconfig.base.json
+{
+  "compilerOptions": {
+    "strict": true,
+    "outDir": "dist"   // ✖ se resuelve relativo a la RAIZ, no a cada paquete
+  }
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — el hijo decide su salida</span>
+        <pre><code class="language-json">// packages/contracts/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist"   // ✅ relativo a packages/contracts
+  }
+}
+</code></pre>
+
+        <span class="code-label code-label--wrong">Mal — dependencia circular entre paquetes</span>
+        <pre><code class="language-ts">// apps/client importa de packages/ui
+// packages/ui importa de apps/client  (✖ cierra el ciclo)
+// TypeScript no puede ordenar el grafo: error de referencia
+</code></pre>
+        <span class="code-label code-label--right">Bien — grafo en arbol</span>
+        <pre><code class="language-ts">// packages/ui no conoce a apps; las apps dependen de packages
+</code></pre>
+      </section>
+
+      <!-- ================================================================
+           7 · EJERCICIO GUIADO
+           ================================================================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p>Monta un mini-monorepo de dos paquetes con config compartida por <code>extends</code>.</p>
+        <ol class="steps">
+          <li>Crea <code>tsconfig.base.json</code> en la raiz con <code>strict: true</code> y
+            <code>module: "nodenext"</code>.</li>
+          <li>Crea <code>packages/lib</code> que extienda la base, con <code>composite: true</code> y una funcion
+            <code>saludar(nombre: string): string</code>.</li>
+          <li>Crea <code>apps/app</code> que extienda la base, con <code>noEmit: true</code> y una reference a lib.</li>
+          <li>Declara en el raiz un tsconfig con <code>files: []</code> y references a los dos proyectos.</li>
+          <li>Ejecuta <code>tsc -b . --verbose</code> y verifica el orden.</li>
+        </ol>
+        <p><strong>Solucion paso a paso:</strong></p>
+        <div class="code-file">packages/lib/src/index.ts</div>
+        <pre><code class="language-ts">export function saludar(nombre: string): string {
+  return `Hola, ${nombre}`;
+}
+</code></pre>
+        <div class="code-file">apps/app/src/main.ts</div>
+        <pre><code class="language-ts">import { saludar } from "@acme/lib";
+
+const msg: string = saludar("Equipo"); // ✅ tipos desde lib
+console.log(msg);
+</code></pre>
+        <div class="code-file">apps/app/tsconfig.json</div>
+        <pre><code class="language-json">{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true
+  },
+  "references": [{ "path": "../../packages/lib" }],
+  "include": ["src"]
+}
+</code></pre>
+        <div class="code-file">tsconfig.json (raiz)</div>
+        <pre><code class="language-json">{
+  "files": [],
+  "references": [
+    { "path": "./packages/lib" },
+    { "path": "./apps/app" }
+  ]
+}
+</code></pre>
+        <div class="code-file">Comandos</div>
+        <pre><code class="language-bash">pnpm install
+tsc -b . --verbose   # deberias ver lib compilando antes que app
+</code></pre>
+      </section>
+
+      <!-- ================================================================
+           8 · RETO
+           ================================================================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>Reto</h3>
+          <p>
+            Anade un tercer proyecto <code>packages/utils</code> que dependa SOLO de
+            <code>packages/lib</code> (funcion <code>doble</code>), y haz que <code>apps/app</code> use ambos.
+            Integra <code>packages/utils</code> en la raiz y verifica con <code>tsc -b . --dry</code> que el orden
+            es <code>lib</code> → <code>utils</code> → <code>app</code>. Pista: <code>references</code> de cada
+            proyecto debe reflejar exactamente sus dependencias; el grafo lo ordena TypeScript, no tu.
+          </p>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           9 · RESUMEN
+           ================================================================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Project references convierten cada paquete en un proyecto con dependencias declaradas.</li>
+          <li><code>composite: true</code> es obligatorio en lo referenciado e implica
+            <code>declaration</code> + <code>incremental</code>.</li>
+          <li><code>tsc -b</code> construye el grafo en orden topologico con cache (
+            <code>--dry</code>, <code>--force</code>, <code>--clean</code>).</li>
+          <li><code>extends</code> hereda config (TS 5.0 permite arrays); los paths relativos se resuelven en su
+            fichero de origen.</li>
+          <li>La raiz con <code>files: []</code> solo orquesta; apps con <code>noEmit</code> chequean sin emitir.</li>
+          <li>pnpm <code>workspace:*</code> enlaza los paquetes locales.</li>
+        </ul>
+      </section>
+
+      <!-- ================================================================
+           10 · PREGUNTAS FRECUENTES
+           ================================================================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por que composite obliga a declaration e incremental?</summary>
+            <div><p>Porque un proyecto referenciado debe poder <em>entregar tipos</em> (.d.ts) y
+              <em>saber si su salida sigue vigente</em> (huella incremental). Sin eso, el modo build no puede
+              decidir cuando recompilar a los consumidores. Son una restriccion del diseno, no un capricho.</p></div>
+          </details>
+          <details>
+            <summary>¿Puedo comprobar tipos sin emitir en un proyecto composite?</summary>
+            <div><p>Si: <code>composite: true</code> con <code>noEmit: true</code> esta soportado en modo build.
+              El proyecto se comprueba y no escribe JavaScript; util en apps cuyo bundle genera Vite (o un bundler
+              ajeno a tsc).</p></div>
+          </details>
+          <details>
+            <summary>¿Que pasa con los ficheros tsbuildinfo?</summary>
+            <div><p>Son caches de build: no se comitean. Puedes reubicarlos con
+              <code>tsBuildInfoFile</code> (por ejemplo a <code>node_modules/.tmp</code>) y anadirlos al ignore. En
+              CI determinista, suelen regenerarse en cada ejecucion o restaurarse desde cache.</p></div>
+          </details>
+          <details>
+            <summary>¿extends acepta varias configuraciones base?</summary>
+            <div><p>Desde TypeScript 5.0 si: <code>"extends": ["a", "b"]</code>. Funciona como una cadena
+              (b extiende a a) y en conflictos gana la ultima. Muy util para combinar una base generica de la
+              comunidad (<code>@tsconfig/strictest</code>) con la tuya propia.</p></div>
+          </details>
+          <details>
+            <summary>¿Tengo que usar composite en la raiz que solo orquesta?</summary>
+            <div><p>No: la raiz con <code>files: []</code> es un "pasaporte" que no emite nada; solo apunta a los
+              proyectos reales con <code>references</code>. El modo build la trata como punto de entrada del grafo.</p></div>
+          </details>
+          <details>
+            <summary>¿Y si CI solo quiere tipos y no artefactos?</summary>
+            <div><p>Un script <code>typecheck</code> con <code>tsc -b . --pretty false</code> desde la raiz da el
+              chequeo completo del grafo sin tocar artefactos de build (las apps con noEmit no escriben nada; las
+              librerias si, y eso esta bien para detectar roturas en sus .d.ts). En el modulo 12, leccion 4,
+              veras esto desplegado en CI.</p></div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

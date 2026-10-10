@@ -45,7 +45,7 @@ curso y en su `AGENTS.md`.
 | `Learn Redis` | Redis para .NET (hub + caché) | `AGENTS.md` | `redis-theme/progress` | 9 | 34 | `proyectos/redis-ws-hub` |
 | `Learn SDD` | Spec-Driven Development | `spec.md` | `sdd-theme/progress` | 8 | 32 | `proyectos/lumen` |
 | `Learn Tailwind` | Tailwind CSS v4 | `AGENTS.md` | `tw-theme/progress` | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
-| `Learn TypeScript` | TypeScript profesional | `AGENTS.md` | `ts-theme/progress` | 10 | 39 | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| `Learn TypeScript` | TypeScript profesional | `AGENTS.md` | `ts-theme/progress` | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.

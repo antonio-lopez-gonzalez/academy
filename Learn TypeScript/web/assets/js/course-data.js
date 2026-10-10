@@ -150,5 +150,44 @@ window.COURSE = {
         { file: "04-build-despliegue.html", title: "Build de produccion y despliegue", minutes: 40, project: true },
       ],
     },
+    /* ============================================================ MODULO 10 */
+    {
+      id: "10",
+      dir: "modulos/10-tipos-avanzados",
+      title: "Tipos avanzados",
+      description: "Recursion de tipos con template literals, infer en funciones, branded types con validacion en runtime y modo strict exhaustivo.",
+      lessons: [
+        { file: "01-template-recursion.html", title: "Recursion de tipos con template literals", minutes: 35 },
+        { file: "02-infer-functions.html", title: "infer en funciones: ReturnType y Parameters a mano", minutes: 30 },
+        { file: "03-branded-runtime.html", title: "Branded types con validacion en runtime", minutes: 35 },
+        { file: "04-strict-exhaustive.html", title: "Strict mode y exhaustividad en profundidad", minutes: 35 },
+      ],
+    },
+    /* ============================================================ MODULO 11 */
+    {
+      id: "11",
+      dir: "modulos/11-genericos-profundidad",
+      title: "Genericos en profundidad",
+      description: "Restricciones y defaults, variadic tuple types, mapped types con remapeo de claves y builders fluidos tipados.",
+      lessons: [
+        { file: "01-restricciones-defaults.html", title: "Restricciones, defaults e inferencia contextual", minutes: 30 },
+        { file: "02-variadic-tuples.html", title: "Variadic tuple types", minutes: 30 },
+        { file: "03-mapped-key-remap.html", title: "Mapped types y remapeo de claves", minutes: 35 },
+        { file: "04-fluent-builders.html", title: "Builder tipado: fluent APIs con genericos", minutes: 35 },
+      ],
+    },
+    /* ============================================================ MODULO 12 */
+    {
+      id: "12",
+      dir: "modulos/12-monorepos-produccion",
+      title: "Monorepos y produccion",
+      description: "Monorepos con project references, contratos end-to-end tipados, publicacion de librerias y TypeScript en CI.",
+      lessons: [
+        { file: "01-monorepos-project-refs.html", title: "Monorepos con project references", minutes: 40 },
+        { file: "02-contratos-end-to-end.html", title: "Contratos end-to-end tipados", minutes: 40 },
+        { file: "03-publicar-librerias.html", title: "Publicar librerias tipadas", minutes: 40 },
+        { file: "04-tsc-en-ci.html", title: "TypeScript en produccion y CI", minutes: 35 },
+      ],
+    },
   ],
 };

@@ -41,7 +41,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Learn Redis` | Redis para .NET (hub + caché) | 9 | 34 | `proyectos/redis-ws-hub` |
 | `Learn SDD` | Spec-Driven Development | 8 | 32 | `proyectos/lumen` |
 | `Learn Tailwind` | Tailwind CSS v4 | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
-| `Learn TypeScript` | TypeScript profesional | 10 | 39 | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| `Learn TypeScript` | TypeScript profesional | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
