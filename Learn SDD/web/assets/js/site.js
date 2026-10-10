@@ -94,6 +94,7 @@
         </svg>
         <span>${COURSE.title}</span>
       </a>
+      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <div class="topbar__search">
         <input type="search" placeholder="buscar lección…" data-search aria-label="Buscar lección">
       </div>
