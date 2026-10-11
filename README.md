@@ -44,6 +44,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Learn TypeScript` | TypeScript profesional | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
 | `Learn IA` | IA aplicada (LLM, RAG, agentes, MCP) | 9 | 36 | `proyectos/copiloto` |
 | `Learn FastAPI` | FastAPI (APIs modernas en Python) | 8 | 32 | `proyectos/copiloto-api` |
+| `Learn DevOps` | CI/CD y DevOps (Actions, IaC) | 8 | 32 | `proyectos/pipeline` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
