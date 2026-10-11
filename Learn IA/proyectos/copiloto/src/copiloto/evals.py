@@ -1,10 +1,13 @@
-"""Evaluación del Copiloto: dataset + métricas deterministas (+ juez opcional)."""
+"""Evaluación del Copiloto: dataset + comprobaciones deterministas."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .rag import Answer
 
 
 @dataclass
@@ -25,10 +28,10 @@ class Result:
     detail: str = ""
 
 
-def load_dataset(path: Path) -> list[Case]:
+def load_dataset(path: str | Path) -> list[Case]:
     """Carga el dataset JSONL de evaluación."""
     cases: list[Case] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -43,6 +46,30 @@ def load_dataset(path: Path) -> list[Case]:
     return cases
 
 
-def check_abstention(answer_text: str) -> bool:
-    """Comprueba que una respuesta sin contexto se abstiene."""
-    return any(phrase in answer_text.lower() for phrase in ("no lo sé", "no lo se", "no tengo"))
+def check_abstention(text: str) -> bool:
+    """¿La respuesta se abstiene en lugar de inventar?"""
+    low = text.lower()
+    return any(p in low for p in ("no lo sé", "no lo se", "no encuentro", "no tengo"))
+
+
+def check_citation(text: str) -> bool:
+    """¿La respuesta cita alguna fuente (`[n]`)?"""
+    return "[" in text and "]" in text
+
+
+def run_evals(cases: list[Case], answer_fn: Callable[[str], Answer]) -> list[Result]:
+    """Ejecuta el dataset contra el Copiloto y evalúa cada caso."""
+    results: list[Result] = []
+    for case in cases:
+        text = answer_fn(case.question).text
+        if case.must_abstain:
+            passed = check_abstention(text)
+            detail = "debe abstenerse"
+        elif case.expect_citation:
+            passed = check_citation(text) and not check_abstention(text)
+            detail = "debe citar"
+        else:
+            passed = True
+            detail = ""
+        results.append(Result(case, passed, detail))
+    return results
