@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 from .embeddings import Embedder
 from .llm import LLMClient
-from .store import Chunk, Store
+from .rank import keyword_scores
+from .store import Chunk, Store, dot
 
 SYSTEM = (
     "Eres el Copiloto de la Academy. Responde SOLO con la información del "
@@ -30,9 +31,19 @@ def retrieve(
     k: int = 5,
     course: str | None = None,
 ) -> list[tuple[float, Chunk]]:
-    """Recupera los `k` fragmentos más similares a la pregunta."""
-    vec = embedder.embed([question])[0]
-    return store.search(vec, k=k, course=course)
+    """Recupera los `k` fragmentos más relevantes (híbrido: keywords + embeddings)."""
+    rows = list(store.iter_rows(course))
+    if not rows:
+        return []
+    query_vec = embedder.embed([question])[0]
+    keyword = keyword_scores(question, [c.text for c in rows])
+    cosine = [dot(query_vec, c.embedding or []) for c in rows]
+    # 0.8 keywords + 0.2 embeddings: señal absoluta → permite abstenerse.
+    # (Con el fallback offline el coseno es poco discriminante; con embeddings
+    # reales de Ollama se puede subir el peso del vector.)
+    combined = [0.8 * kw + 0.2 * cs for kw, cs in zip(keyword, cosine, strict=True)]
+    scored = sorted(zip(combined, rows, strict=True), key=lambda p: p[0], reverse=True)
+    return scored[:k]
 
 
 def build_prompt(question: str, context: list[Chunk]) -> str:

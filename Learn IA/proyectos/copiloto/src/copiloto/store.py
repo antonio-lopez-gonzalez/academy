@@ -40,7 +40,8 @@ def _unpack(blob: bytes) -> list[float]:
     return list(struct.unpack(f"<{n}f", blob))
 
 
-def _dot(a: list[float], b: list[float]) -> float:
+def dot(a: list[float], b: list[float]) -> float:
+    """Producto punto (equivale al coseno con vectores normalizados)."""
     return sum(x * y for x, y in zip(a, b, strict=False))
 
 
@@ -86,19 +87,23 @@ class Store:
         """Número de chunks indexados."""
         return int(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
 
-    def search(
-        self, query_vec: list[float], k: int = 5, course: str | None = None
-    ) -> list[tuple[float, Chunk]]:
-        """Devuelve los `k` chunks más similares (coseno), opcionalmente de un curso."""
+    def iter_rows(self, course: str | None = None):
+        """Itera los chunks (con su embedding) del índice, opcionalmente de un curso."""
         sql = "SELECT chunk_id, course, module, lesson, section, text, embedding FROM chunks"
         params: tuple = ()
         if course:
             sql += " WHERE course = ?"
             params = (course,)
-        scored: list[tuple[float, Chunk]] = []
         for cid, co, mod, les, sec, text, blob in self.conn.execute(sql, params):
-            chunk = Chunk(cid, co, mod, les, sec, text)
-            scored.append((_dot(query_vec, _unpack(blob)), chunk))
+            yield Chunk(cid, co, mod, les, sec, text, _unpack(blob))
+
+    def search(
+        self, query_vec: list[float], k: int = 5, course: str | None = None
+    ) -> list[tuple[float, Chunk]]:
+        """Devuelve los `k` chunks más similares (coseno), opcionalmente de un curso."""
+        scored: list[tuple[float, Chunk]] = [
+            (dot(query_vec, chunk.embedding or []), chunk) for chunk in self.iter_rows(course)
+        ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored[:k]
 

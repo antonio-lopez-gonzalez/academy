@@ -16,7 +16,7 @@ class Settings:
     ollama_host: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     data_dir: str = os.environ.get("COPILOTO_DATA", "data")
     top_k: int = int(os.environ.get("COPILOTO_TOP_K", "5"))
-    min_score: float = float(os.environ.get("COPILOTO_MIN_SCORE", "0.15"))
+    min_score: float = float(os.environ.get("COPILOTO_MIN_SCORE", "0.25"))
 
     @property
     def db_path(self) -> Path:
