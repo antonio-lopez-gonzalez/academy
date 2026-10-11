@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-oauth2-jwt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OAuth2 y JWT: login y token — Módulo 5 · Curso FastAPI</title>
+  <meta name="description" content="OAuth2 password flow en FastAPI: OAuth2PasswordBearer, hash de contraseñas con bcrypt, emisión y verificación de JWT con sub y exp.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>OAuth2 y JWT: login y token</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Seguridad</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora cualquiera que descubra la URL de tu API puede llamarla. Copiloto API expone <code>POST /ask</code>, que cuesta dinero (llama al modelo), y <code>GET /logs</code>, que guarda el histórico de preguntas. Si esos endpoints son públicos, cualquiera consume tu presupuesto y lee datos que no le corresponden. Es el momento de responder a una pregunta: <strong>¿quién eres?</strong> Eso es <em>autenticación</em>.</p>
+        <p>Este módulo resuelve dos problemas distintos que conviene no mezclar: <strong>autenticación</strong> (identificar al usuario) y <strong>autorización</strong> (decidir qué puede hacer). Esta primera lección ataca la autenticación con el mecanismo que FastAPI trae de serie: el <strong>flujo password de OAuth2</strong> para hacer login y un <strong>JWT</strong> (JSON Web Token) firmado como credencial de las peticiones siguientes. La autorización —roles y permisos— llega en la lección 2.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque una API real no autentica en cada petición con usuario y contraseña. El cliente <em>canjea</em> sus credenciales una vez por un token que viaja en cada petición y caduca. Es el patrón que usan Google, GitHub y cualquier API moderna, y el que el propio <code>/docs</code> de FastAPI entiende sin configurar nada.</p>
+        </div>
+        <p>Errores típicos que veremos y evitaremos: guardar contraseñas en claro o con un hash inventado, poner la clave secreta en el repositorio, emitir tokens sin caducidad, decodificar el JWT sin fijar el algoritmo (cediendo ante el ataque <code>alg: none</code>), meter datos sensibles en el payload (el JWT <em>no</em> está cifrado) y confundir un 401 (no autenticado) con un 403 (autenticado pero sin permiso).</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Autenticación vs. autorización</h3>
+        <p>Son dos preguntas distintas y con dos códigos de estado distintos:</p>
+        <table>
+          <thead><tr><th>Pregunta</th><th>Concepto</th><th>Si falla</th></tr></thead>
+          <tbody>
+            <tr><td>¿Quién eres?</td><td>Autenticación</td><td><code>401 Unauthorized</code> (+ <code>WWW-Authenticate</code>)</td></tr>
+            <tr><td>¿Puedes hacer esto?</td><td>Autorización</td><td><code>403 Forbidden</code></td></tr>
+          </tbody>
+        </table>
+        <p>En esta lección el 401 es el protagonista: no hay token, el token está caducado o la firma no cuadra. En la lección 2 aparecerá el 403.</p>
+
+        <h3>El flujo password de OAuth2</h3>
+        <p>OAuth2 define varios flujos; nosotros usamos el <strong>password flow</strong>, el adecuado para un cliente de confianza (tu propio frontend) que recoge usuario y contraseña. Tiene dos movimientos:</p>
+        <ol class="steps">
+          <li><strong>Login.</strong> El cliente envía las credenciales a un endpoint de token (<code>POST /auth/token</code>) como <em>formulario</em> y recibe un <code>access_token</code>.</li>
+          <li><strong>Uso.</strong> En cada petición posterior el cliente añade la cabecera <code>Authorization: Bearer &lt;token&gt;</code>. El servidor valida el token y no vuelve a mirar la contraseña.</li>
+        </ol>
+        <p>¿Por qué el login va en un formulario (<code>application/x-www-form-urlencoded</code>) y no en JSON? Porque el estándar OAuth2 lo especifica así, y FastAPI lo respeta para que el botón <em>Authorize</em> de <code>/docs</code> funcione. De ahí el formulario <code>OAuth2PasswordRequestForm</code> que veremos en el ejemplo.</p>
+        <pre class="diagram">
+  Cliente                        FastAPI                         BD
+    │                              │                             │
+    │  POST /auth/token            │                             │
+    │  form: username + password   │                             │
+    ├─────────────────────────────►│  buscar usuario por username│
+    │                              ├────────────────────────────►│
+    │                              │◄────────────────────────────┤
+    │                              │  verify(password, hash)     │
+    │                              │  create_access_token(sub)   │
+    │  200 {access_token, bearer}  │                             │
+    │◄─────────────────────────────┤                             │
+    │                              │                             │
+    │  GET /ask                    │                             │
+    │  Authorization: Bearer eyJ...│                             │
+    ├─────────────────────────────►│  decode JWT → sub, exp      │
+    │  200 {answer}                │  (no consulta la tabla)     │
+    │◄─────────────────────────────┤                             │
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> las credenciales son tu DNI y el mostrador de recepción verifica que eres tú. El token es la <strong>pulsera del evento</strong>: la enseñas para entrar a cada sala y no vuelves a pasar por recepción. Si te la quitan o caduca a medianoche, te quedas fuera. Y como la pulsera lleva tu nombre escrito pero no va firmada por ti, quien la vea puede leer a quién pertenece: por eso el JWT no es un sitio para secretos.</p>
+        </div>
+
+        <h3>Contraseñas: nunca en claro, siempre con hash lento</h3>
+        <p>La base de datos guarda un <strong>hash</strong>, no la contraseña. Un hash criptográfico es una función de un solo sentido: de <code>"s3creto"</code> obtienes una cadena, pero de la cadena no vuelves. Para verificar, aplicas el hash a lo que teclea el usuario y comparas.</p>
+        <p>Pero un hash <em>rápido</em> (SHA-256) es un problema: un atacante con la base de datos robada prueba millones de contraseñas por segundo. Por eso se usan funciones <strong>deliberadamente lentas</strong> y con <em>salt</em>:</p>
+        <ul>
+          <li><strong>bcrypt</strong>: lento por diseño, con factor de coste y salt incluido en el propio resultado. Es el estándar clásico y el que usa este curso.</li>
+          <li><strong>argon2</strong>: el ganador de la Password Hashing Competition; resistente también a ataques con GPU. Es la opción moderna (la librería <code>pwdlib</code> que usa la documentación actual de FastAPI lo recomienda).</li>
+        </ul>
+        <div class="code-file">app/security.py — hash de contraseñas</div>
+        <pre><code class="language-python">from passlib.context import CryptContext
+
+# bcrypt es lento a proposito: el coste hace inviable el ataque por fuerza bruta
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(plain_password: str) -&gt; str:
+    """Convierte una contrasena en un hash con salt. Irreversible."""
+    return pwd_context.hash(plain_password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -&gt; bool:
+    """Compara una contrasena con su hash en tiempo constante."""
+    return pwd_context.verify(plain_password, hashed_password)
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Nunca escribas tu propio hash.</strong> Un <code>hashlib.sha256(password + "mi_salt")</code> casero parece seguro pero es rapidísimo y sin salt por usuario. Usa una librería probada: <code>passlib</code> con <code>bcrypt</code> (lo que usa la spec de este curso) o <code>pwdlib</code> con argon2 si prefieres lo más moderno. Ambas exponen <code>hash()</code> y <code>verify()</code>.</p>
+        </div>
+
+        <h3>El JWT: tres trozos y una firma</h3>
+        <p>Un <strong>JWT</strong> (JSON Web Token) es una cadena de tres bloques separados por puntos, cada uno en base64url:</p>
+        <pre class="diagram">
+  eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiI0MiIsImV4cCI6MTcyOD...} . SflKxwRJSMeKKF2QT4fwpMeJ
+  └──── header ──────┘   └────────── payload ──────────┘   └────── signature ───────┘
+      algoritmo (HS256)            claims (datos)            HMAC sobre las 2 partes
+        </pre>
+        <ul>
+          <li><strong>header</strong>: el algoritmo con el que se firmó (<code>HS256</code> = HMAC-SHA256).</li>
+          <li><strong>payload</strong>: los <em>claims</em>, pares clave-valor. Aquí van <code>sub</code> (el sujeto: quién es) y <code>exp</code> (cuándo expira). <strong>Es legible por cualquiera</strong>: solo está codificado, no cifrado.</li>
+          <li><strong>signature</strong>: la firma, calculada con la clave secreta. Es lo que impide que alguien cambie el payload: si toca un solo carácter, la firma deja de cuadrar.</li>
+        </ul>
+        <p>Claims habituales:</p>
+        <table>
+          <thead><tr><th>Claim</th><th>Significado</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><code>sub</code></td><td>Subject: a quién representa el token (el <code>username</code> o el <code>id</code> <em>como string</em>)</td><td><code>"42"</code></td></tr>
+            <tr><td><code>exp</code></td><td>Expiration: instante de caducidad (timestamp UTC). PyJWT lo rechaza solo si pasó</td><td><code>1728000000</code></td></tr>
+            <tr><td><code>iat</code></td><td>Issued At: cuándo se emitió</td><td><code>1727998200</code></td></tr>
+            <tr><td><code>iss</code></td><td>Issuer: quién lo emitó (útil si consumes tokens de terceros)</td><td><code>"copiloto-api"</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>El JWT no está cifrado.</strong> Cualquiera que intercepte el token puede leer el payload (basta un base64). Sirve para transportar datos <em>verificables</em>, no secretos. Y sin HTTPS, la firma no impide que alguien lo robe y lo reutilice: el token <em>es</em> la credencial.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El flujo completo con un usuario en memoria, sin base de datos. Primero las dependencias; fíjate en <code>python-multipart</code>, obligatorio para leer formularios:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">uv add pyjwt "passlib[bcrypt]" python-multipart
+</code></pre>
+        <p>Ahora el <code>main.py</code> mínimo. Cada pieza está comentada:</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">import os
+from datetime import UTC, datetime, timedelta
+
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jwt.exceptions import InvalidTokenError
+from passlib.context import CryptContext
+
+SECRET_KEY = os.environ["FAPI_SECRET_KEY"]          # nunca en el codigo
+ALGORITHM = "HS256"
+TOKEN_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# 1) El esquema declara DONDE se pide el token (tokenUrl) para /docs.
+#    En cada peticion extrae la cabecera Authorization: Bearer <token>.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+# Un unico usuario de prueba con la contrasena ya hasheada.
+USERS = {
+    "ana": {
+        "username": "ana",
+        "hashed_password": pwd_context.hash("copiloto"),
+    }
+}
+
+app = FastAPI()
+
+
+def authenticate(username: str, password: str) -&gt; str | None:
+    user = USERS.get(username)
+    if user is None:
+        return None
+    if not pwd_context.verify(password, user["hashed_password"]):
+        return None
+    return user["username"]
+
+
+def create_access_token(sub: str) -&gt; str:
+    payload = {
+        "sub": sub,                                   # sujeto: quien es
+        "exp": datetime.now(UTC) + timedelta(minutes=TOKEN_MINUTES),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+@app.post("/auth/token")
+def login(form: OAuth2PasswordRequestForm = Depends()) -&gt; dict[str, str]:
+    # OAuth2PasswordRequestForm trae .username y .password del formulario.
+    username = authenticate(form.username, form.password)
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contrasena incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"access_token": create_access_token(username), "token_type": "bearer"}
+
+
+def get_current_username(token: str = Depends(oauth2_scheme)) -&gt; str:
+    # 2) Aqui se VALIDA el token en cada peticion protegida.
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales invalidas",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    sub = payload.get("sub")
+    if sub is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token sin sub")
+    return sub
+
+
+@app.get("/me")
+def read_me(username: str = Depends(get_current_username)) -&gt; dict[str, str]:
+    return {"username": username}
+</code></pre>
+        <p>Arranca y prueba el ciclo completo:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">export FAPI_SECRET_KEY=$(openssl rand -hex 32)   # en PowerShell: $env:FAPI_SECRET_KEY = -join ((1..32) | % { '{0:x}' -f (Get-Random -Max 16) })
+uv run uvicorn main:app --reload
+
+# 1) Login: canjea credenciales por token
+curl -s -X POST http://127.0.0.1:8000/auth/token \
+  -d "username=ana&amp;password=copiloto"
+# {"access_token":"eyJhbGciOiJIUzI1NiJ9...","token_type":"bearer"}
+
+# 2) Uso: la pulsera viaja en la cabecera
+curl -s http://127.0.0.1:8000/me -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9..."
+
+# Sin token: 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/me
+</code></pre>
+        <p>Resultado esperado: el login devuelve <code>access_token</code>, <code>/me</code> con token devuelve <code>{"username":"ana"}</code> y sin token devuelve <code>401</code>. En <code>/docs</code> aparece el botón <strong>Authorize</strong> que pide usuario y contraseña: eso es <code>OAuth2PasswordBearer</code> leyendo el <code>tokenUrl</code>.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En Copiloto API las piezas viven separadas por capas, como en los módulos anteriores: la configuración en <code>config.py</code>, la criptografía en <code>security.py</code>, la dependencia de identidad en <code>deps.py</code> y el login en su router.</p>
+        <div class="code-file">app/config.py</div>
+        <pre><code class="language-python">from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Sin valores por defecto para los secretos: si faltan, la app no arranca.
+    secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+
+    model_config = SettingsConfigDict(env_prefix="fapi_", env_file=".env")
+
+
+settings = Settings()
+</code></pre>
+        <div class="code-file">.env (fuera del repositorio)</div>
+        <pre><code class="language-bash"># Genera el valor con: openssl rand -hex 32
+FAPI_SECRET_KEY=una_cadena_larga_y_aleatoria_de_64_hex
+</code></pre>
+        <div class="code-file">app/security.py</div>
+        <pre><code class="language-python">from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import jwt
+from passlib.context import CryptContext
+
+from app.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(plain_password: str) -&gt; str:
+    return pwd_context.hash(plain_password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -&gt; bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(subject: str, extra: dict[str, Any] | None = None) -&gt; str:
+    """Emite un JWT firmado. 'extra' permite anadir claims (p. ej. roles)."""
+    now = datetime.now(UTC)
+    payload: dict[str, Any] = {
+        "sub": subject,
+        "iat": now,
+        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
+    }
+    if extra:
+        payload.update(extra)
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+
+def decode_access_token(token: str) -&gt; dict[str, Any]:
+    """Valida firma y caducidad. Lanza InvalidTokenError si algo falla."""
+    return jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+</code></pre>
+        <div class="code-file">app/deps.py</div>
+        <pre><code class="language-python">from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jwt.exceptions import InvalidTokenError
+from sqlmodel import Session
+
+from app.db import get_session
+from app.models import User
+from app.security import decode_access_token
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    session: Session = Depends(get_session),
+) -&gt; User:
+    """Dependencia reutilizable: traduce un token valido en un User de la BD."""
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Credenciales invalidas",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_access_token(token)
+    except InvalidTokenError:
+        raise credentials_error
+
+    sub = payload.get("sub")
+    if sub is None:
+        raise credentials_error
+
+    user = session.get(User, int(sub))
+    if user is None or user.disabled:
+        raise credentials_error
+    return user
+</code></pre>
+        <div class="code-file">app/routers/auth.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlmodel import Session, select
+
+from app.db import get_session
+from app.models import User
+from app.schemas import Token
+from app.security import create_access_token, verify_password
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# hash de descarte: si el usuario no existe, igual pagamos el coste de bcrypt
+# para no revelar por el tiempo de respuesta que usuario existe y cual no.
+DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.4Gj9XqR9sC0aB3lF7Hn5K2mQ8wP1uSe"
+
+
+@router.post("/token", response_model=Token)
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    session: Session = Depends(get_session),
+) -&gt; Token:
+    user = session.exec(select(User).where(User.username == form.username)).first()
+    if user is None:
+        verify_password(form.password, DUMMY_HASH)   # mismo tiempo, sin revelar nada
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contrasena incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not verify_password(form.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contrasena incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(subject=str(user.id))   # sub como string
+    return Token(access_token=token, token_type="bearer")
+</code></pre>
+        <div class="code-file">app/routers/ask.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends
+
+from app.deps import get_current_user
+from app.models import User
+from app.schemas import AskRequest, AskResponse
+
+router = APIRouter(tags=["ask"])
+
+
+@router.post("/ask", response_model=AskResponse)
+def ask(
+    payload: AskRequest,
+    current_user: User = Depends(get_current_user),   # &lt;- endpoint protegido
+) -&gt; AskResponse:
+    # Solo llegamos aqui con un token valido. El usuario esta identificado.
+    return AskResponse(answer=f"Hola {current_user.username}: {payload.question}")
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>La clave secreta viene de <code>Settings</code></strong> (Módulo 3), no de una constante en el código. Sin ella la app no arranca, y el <code>.env</code> nunca se sube al repositorio.</li>
+          <li><strong><code>sub</code> es el <code>id</code> como string.</strong> El estándar JWT define <code>sub</code> como una cadena; usar el <code>id</code> entero puede romper validadores. El token lleva el identificador mínimo, y <code>get_current_user</code> recupera el usuario real de la base de datos: si mañana lo deshabilitas, el token deja de valer aunque no haya caducado.</li>
+          <li><strong>Un único sitio donde se valida el token</strong> (<code>get_current_user</code>). Cualquier endpoint protegido depende de él. No se repite el <code>jwt.decode</code> por ahí.</li>
+          <li><strong>El <code>DUMMY_HASH</code></strong> en el login: si el usuario no existe, verificamos contra un hash de descarte para tardar lo mismo. Sin eso, la diferencia de milisegundos revela qué nombres de usuario existen (<em>user enumeration</em>).</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>El contrato cambia, y eso es bueno.</strong> Si abres <code>/docs</code> verás que <code>POST /ask</code> ahora muestra el candado y, arriba, el botón <strong>Authorize</strong>. OpenAPI declara la seguridad porque <code>OAuth2PasswordBearer</code> es un <code>SecurityScheme</code>: el contrato es la fuente de verdad y ahora refleja que estos endpoints requieren token.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Sacar <code>SECRET_KEY</code> de una variable de entorno</td>
+              <td>Dejarla escrita en el código</td>
+              <td>Un secreto en el repo es un secreto comprometido: queda en el historial de Git</td>
+            </tr>
+            <tr>
+              <td>Caducidad corta (<code>exp</code> de 15-60 min)</td>
+              <td>Tokens eternos</td>
+              <td>Un token robado es válido para siempre si no caduca; no hay forma de «anularlo» sin estado</td>
+            </tr>
+            <tr>
+              <td>Hash lento con bcrypt/argon2 y salt por usuario</td>
+              <td>SHA-256, MD5 o un salt fijo «casero»</td>
+              <td>Los hashes rápidos se revierten por fuerza bruta en segundos</td>
+            </tr>
+            <tr>
+              <td><code>sub</code> como cadena estable (<code>str(user.id)</code>)</td>
+              <td>Meter el email u objetos enteros</td>
+              <td>El subject debe ser un identificador; el email cambia y contamina el token</td>
+            </tr>
+            <tr>
+              <td>Decodificar con <code>algorithms=[ALGORITHM]</code></td>
+              <td><code>jwt.decode(token, key, options={"verify_signature": False})</code></td>
+              <td>Sin fijar el algoritmo aceptas <code>alg: none</code> y la firma deja de proteger nada</td>
+            </tr>
+            <tr>
+              <td><code>401</code> con cabecera <code>WWW-Authenticate: Bearer</code></td>
+              <td>Devolver <code>400</code> o <code>500</code> cuando falta el token</td>
+              <td>Los clientes y el propio <code>/docs</code> saben qué hacer ante un 401 correcto</td>
+            </tr>
+            <tr>
+              <td>Mensaje de error idéntico para usuario y contraseña erróneos</td>
+              <td>Decir «ese usuario no existe»</td>
+              <td>Revelar qué usuarios existen facilita ataques dirigidos</td>
+            </tr>
+            <tr>
+              <td>HTTPS obligatorio en producción</td>
+              <td>Tokens por HTTP en claro</td>
+              <td>El bearer token es la credencial: quien lo ve, lo puede usar</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>El secreto en el código</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">SECRET_KEY = "super-secreto-123"    # va al repositorio y a la imagen Docker
+
+def create_access_token(sub: str) -&gt; str:
+    return jwt.encode({"sub": sub}, SECRET_KEY, algorithm="HS256")
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from app.config import settings   # secret_key viene de FAPI_SECRET_KEY
+
+def create_access_token(sub: str) -&gt; str:
+    return jwt.encode({"sub": sub}, settings.secret_key, algorithm=settings.jwt_algorithm)
+</code></pre>
+        <p>Si el secreto está en el repositorio, cualquiera puede <strong>firmar tokens válidos</strong>: la autenticación entera deja de valer. Rótalo con <code>openssl rand -hex 32</code> y guárdalo en el gestor de secretos del entorno.</p>
+
+        <h3>Token sin caducidad (o con demasiada)</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># Sin 'exp': el token vale para siempre
+token = jwt.encode({"sub": str(user.id)}, settings.secret_key, algorithm="HS256")
+
+# O con un año de vida "para no molestar al usuario"
+{"exp": datetime.now(UTC) + timedelta(days=365)}
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">now = datetime.now(UTC)
+payload = {"sub": str(user.id), "iat": now, "exp": now + timedelta(minutes=30)}
+token = jwt.encode(payload, settings.secret_key, algorithm="HS256")
+</code></pre>
+        <p>PyJWT <strong>verifica <code>exp</code> automáticamente</strong> al decodificar y lanza <code>ExpiredSignatureError</code> (subclase de <code>InvalidTokenError</code>) si pasó. Para sesiones largas, el patrón es un <em>refresh token</em> aparte, no alargar el de acceso (ver el reto).</p>
+
+        <h3>Decodificar sin fijar el algoritmo</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># Peligro: si no se fija el algoritmo, un atacante puede presentar
+# un token con "alg": "none" y saltarse la firma por completo.
+payload = jwt.decode(token, options={"verify_signature": False})
+username = payload["sub"]
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">try:
+    payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+except InvalidTokenError:
+    raise HTTPException(status_code=401, detail="Credenciales invalidas")
+</code></pre>
+        <p>La librería no puede adivinar con qué algoritmo esperas los tokens; si no se lo dices, acepta cualquiera. Fijar <code>algorithms=[...]</code> es obligatorio, no opcional.</p>
+
+        <h3>Datos sensibles en el payload</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">payload = {
+    "sub": str(user.id),
+    "password": form.password,       # legible por cualquiera que vea el token
+    "credit_card": user.card_pan,    # jamas
+}
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">payload = {"sub": str(user.id), "iat": now, "exp": ...}
+# El JWT transporta una AFIRMACION verificable (quien es), no datos privados.
+</code></pre>
+        <p>El payload es base64, no cifrado. Cualquiera que intercepte el token —o mire en el navegador— lee todo lo que metas. El JWT lleva identidad y claims de control, nunca secretos.</p>
+
+        <h3>Contraseña en claro o hash rápido</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">import hashlib
+
+user.password = hashlib.sha256(form.password.encode()).hexdigest()   # rapidisimo, sin salt
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">user.hashed_password = pwd_context.hash(form.password)   # bcrypt: lento + salt
+</code></pre>
+        <p>SHA-256 calcula miles de millones de hashes por segundo; bcrypt, con su factor de coste, decenas. Esa diferencia es la que separa una base de datos filtrada de una catástrofe, o de un contratiempo.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir autenticación con JWT a Copiloto API y proteger <code>POST /ask</code>, verificando el ciclo login → token → petición protegida.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Dependencias.</strong> Añade las librerías (el curso ya usa <code>uv</code>):
+            <pre><code class="language-bash">uv add pyjwt "passlib[bcrypt]" python-multipart
+uv run python -c "import jwt, passlib; print('ok')"
+</code></pre>
+            <p>Resultado esperado: imprime <code>ok</code>. Si <code>OAuth2PasswordRequestForm</code> da error en runtime, es que falta <code>python-multipart</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Configuración.</strong> Añade a <code>app/config.py</code> <code>secret_key: str</code> y <code>access_token_expire_minutes: int = 30</code>, y crea un <code>.env</code> con <code>FAPI_SECRET_KEY=</code> y el resultado de <code>openssl rand -hex 32</code>. Comprueba que <code>.env</code> está en <code>.gitignore</code>.
+          </li>
+          <li>
+            <strong>Paso 3 — Módulo de seguridad.</strong> Crea <code>app/security.py</code> con <code>hash_password</code>, <code>verify_password</code>, <code>create_access_token</code> y <code>decode_access_token</code> (como en el ejemplo real). Incluye <code>iat</code> y <code>exp</code>.
+          </li>
+          <li>
+            <strong>Paso 4 — Semilla de usuario.</strong> Crea un script <code>scripts/seed_user.py</code> que inserte un usuario <code>ana</code> con <code>hash_password("copiloto")</code> en la base de datos (Módulo 4). Nunca guardes la contraseña en claro en la tabla.
+          </li>
+          <li>
+            <strong>Paso 5 — Router de login.</strong> Crea <code>app/routers/auth.py</code> con <code>POST /auth/token</code> usando <code>OAuth2PasswordRequestForm</code>, el <code>DUMMY_HASH</code> para usuarios inexistentes y <code>response_model=Token</code>. Registra el router en <code>app/main.py</code>.
+          </li>
+          <li>
+            <strong>Paso 6 — Dependencia de identidad.</strong> En <code>app/deps.py</code> añade <code>get_current_user(token=Depends(oauth2_scheme), session=Depends(get_session))</code> que decodifique, lea <code>sub</code>, busque el usuario y rechace si <code>disabled</code>.
+          </li>
+          <li>
+            <strong>Paso 7 — Protege y prueba.</strong> Añade <code>current_user: User = Depends(get_current_user)</code> a <code>POST /ask</code>. Arranca y ejecuta:
+            <pre><code class="language-bash">TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/token \
+  -d "username=ana&amp;password=copiloto" | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+curl -s -o /dev/null -w "sin token: %{http_code}\n" -X POST http://127.0.0.1:8000/ask \
+  -H "Content-Type: application/json" -d '{"question":"hola"}'
+
+curl -s -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question":"hola"}'
+</code></pre>
+            <p>Resultado esperado: <code>401</code> sin token y un <code>AskResponse</code> con el saludo y tu usuario cuando el token es válido. Comprueba en <code>/docs</code> que <code>/ask</code> muestra el candado y que el botón <strong>Authorize</strong> funciona con <code>ana</code>/<code>copiloto</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 8 — Verifica la caducidad.</strong> Ponte <code>access_token_expire_minutes=0</code> temporalmente y repite la última llamada. Resultado esperado: <code>401</code>, porque <code>exp</code> ya pasó. Vuelve a dejarlo en <code>30</code>.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Refresh tokens con rotación</h3>
+          <p>Un token de acceso de 30 minutos obliga al usuario a volver a loguearse cada media hora. Implanta el patrón <strong>refresh token</strong>: un segundo token de vida larga (por ejemplo 7 días) que el cliente canjea por un access token nuevo sin volver a teclear la contraseña, con <strong>rotación</strong> (cada uso del refresh emite uno nuevo e invalida el anterior).</p>
+          <p><em>Pistas: añade un claim <code>type</code> («access» o «refresh») y rechaza los refresh en <code>get_current_user</code> (¡un refresh token no debe servir para llamar a <code>/ask</code>!). Como los JWT son sin estado, «invalidar el anterior» exige guardar el identificador del refresh (<code>jti</code>) en la base de datos (Módulo 4) y marcarlo como usado; si un refresh ya usado vuelve a aparecer, es señal de robo: revoca toda la cadena. Piensa también: ¿qué gana quien roba el refresh frente a quien roba el access? ¿Por qué el access token debe seguir siendo corto aunque existan refresh tokens? Pista final: el flujo estándar para clientes públicos es <code>OAuth2PasswordRequestForm</code> con <code>grant_type=refresh_token</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Autenticar</strong> es saber quién eres (401 si falla); <strong>autorizar</strong>, qué puedes hacer (403 si falla).</li>
+          <li>El <strong>password flow de OAuth2</strong> tiene dos movimientos: <code>POST /auth/token</code> (formulario → token) y <code>Authorization: Bearer &lt;token&gt;</code> en cada petición.</li>
+          <li><code>OAuth2PasswordBearer(tokenUrl=...)</code> extrae el token y hace que <code>/docs</code> muestre el botón <strong>Authorize</strong>.</li>
+          <li>Las contraseñas se guardan como <strong>hash lento con salt</strong> (bcrypt/argon2), nunca en claro ni con hashes rápidos.</li>
+          <li>El <strong>JWT</strong> es header.payload.signature: el payload es público; la <strong>firma</strong> es lo que impide alterarlo.</li>
+          <li>Los claims clave son <code>sub</code> (quién, como string) y <code>exp</code> (cuándo caduca); PyJWT valida <code>exp</code> solo.</li>
+          <li>Al decodificar hay que <strong>fijar el algoritmo</strong> (<code>algorithms=[...]</code>) para cerrar el ataque <code>alg: none</code>.</li>
+          <li>El secreto vive en el entorno (<code>Settings</code>), nunca en el repositorio.</li>
+          <li>Una sola dependencia (<code>get_current_user</code>) concentra la validación; los endpoints solo declaran que la necesitan.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Esquema bearer</td><td><code>oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")</code></td></tr>
+            <tr><td>Login (formulario)</td><td><code>form: OAuth2PasswordRequestForm = Depends()</code></td></tr>
+            <tr><td>Hash de contraseña</td><td><code>pwd_context.hash(pw)</code> / <code>pwd_context.verify(pw, hash)</code></td></tr>
+            <tr><td>Emitir token</td><td><code>jwt.encode({"sub": sub, "exp": exp}, secret, algorithm="HS256")</code></td></tr>
+            <tr><td>Verificar token</td><td><code>jwt.decode(token, secret, algorithms=["HS256"])</code></td></tr>
+            <tr><td>Extraer identidad</td><td><code>payload.get("sub")</code> → buscar el usuario en la BD</td></tr>
+            <tr><td>Proteger un endpoint</td><td><code>current_user: User = Depends(get_current_user)</code></td></tr>
+            <tr><td>Error de credenciales</td><td><code>HTTPException(401, headers={"WWW-Authenticate": "Bearer"})</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué el login usa un formulario y no un cuerpo JSON?</summary>
+            <div>
+              <p>Porque el flujo password de OAuth2 lo especifica como <code>application/x-www-form-urlencoded</code>, y FastAPI lo respeta para que el botón <strong>Authorize</strong> de <code>/docs</code> funcione sin configuración. <code>OAuth2PasswordRequestForm</code> es un <code>Depends</code> que lee ese formulario. Nada te impide exponer además un <code>POST /auth/login</code> en JSON para tu frontend, pero el endpoint que <code>tokenUrl</code> apunta debe ser el de formulario.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo «cerrar sesión» invalidando el token?</summary>
+            <div>
+              <p>No directamente: un JWT sin estado es válido hasta que <code>exp</code> lo mata, y el servidor no lleva registro. Opciones reales: (1) caducidades cortas + refresh tokens con estado (ver el reto); (2) una <em>denylist</em> de tokens revocados en Redis, consultada en <code>get_current_user</code>; (3) subir un <code>token_version</code> en el usuario y compararlo con un claim, de modo que cambiar la contraseña invalide todos sus tokens. La (3) es la más limpia para «cerrar sesión en todas partes».</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿HS256 o RS256?</summary>
+            <div>
+              <p><strong>HS256</strong> (HMAC) usa un único secreto compartido para firmar y verificar: simple y perfecto cuando el mismo backend es quien emite y valida. <strong>RS256</strong> (RSA) firma con una clave privada y verifica con la pública: imprescindible cuando <em>otros</em> servicios deben validar tus tokens sin poder emitirlos. Para Copiloto API, HS256 basta; si mañana un microservicio valida tokens sin compartir el secreto, cambia a RS256 y reparte solo la clave pública.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde guardo el token en el navegador?</summary>
+            <div>
+              <p>Es un compromiso clásico. En <strong>localStorage</strong> es cómodo pero accesible a cualquier XSS; en una cookie <code>HttpOnly</code> no lo lee JavaScript, pero abre la puerta a CSRF (mitigable con <code>SameSite</code> y tokens anti-CSRF). Para una API consumida por un frontend propio, la opción razonable es access token en memoria, refresh token en cookie <code>HttpOnly</code> + <code>Secure</code> + <code>SameSite=Strict</code>. Lo que nunca se hace: guardarlo en la URL o loguearlo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>sub</code> debe ser una cadena si mi <code>id</code> es un entero?</summary>
+            <div>
+              <p>El estándar JWT (RFC 7519) define <code>sub</code> como una cadena (un «StringOrURI»). PyJWT lo acepta tal cual, pero otros validadores —y otras librerías de otros lenguajes— pueden rechazar un número. Guarda <code>str(user.id)</code> y vuelve a convertirlo con <code>int(sub)</code> al consultar la base de datos. Es un detalle pequeño que evita incompatibilidades al integrarte con terceros.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

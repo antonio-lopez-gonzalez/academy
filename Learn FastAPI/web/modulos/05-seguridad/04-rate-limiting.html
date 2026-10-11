@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-rate-limiting">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rate limiting y protecciones anti-abuso — Módulo 5 · Curso FastAPI</title>
+  <meta name="description" content="Rate limiting en FastAPI: límites por IP y por usuario, algoritmos de ventana, middleware frente a dependencia, respuestas 429 y anti-abuso con Redis.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Rate limiting y protecciones anti-abuso</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Seguridad</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Copiloto API ya está autenticada: solo usuarios con token llaman a <code>POST /ask</code>. Pero un usuario legítimo, o una integración con un <em>bug</em> que reintenta en bucle, puede lanzar mil peticiones por segundo y dejar la API sin aire para los demás. Y aunque la autenticación protege <code>/ask</code>, ¿qué pasa con <code>POST /auth/token</code>? Ese endpoint está <em>abierto</em> —es donde se obtiene el token— y es el objetivo natural de un ataque de fuerza bruta de contraseñas. Autenticar no es suficiente: hace falta <strong>limitar la velocidad</strong> a la que se puede usar la API.</p>
+        <p>El <strong>rate limiting</strong> (limitación de tasa) fija cuántas peticiones puede hacer un cliente en una ventana de tiempo. Además de frenar ataques, protege la economía del sistema: en Copiloto API cada <code>/ask</code> cuesta dinero (llamada al modelo) y cada consulta consume una base de datos compartida.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque cierra el módulo de seguridad con la defensa que no depende de <em>quién</em> eres, sino de <em>cuánto</em> puedes pedir. Es la lección más «de sistemas» del módulo: obliga a pensar en procesos múltiples (<code>--workers</code>), en la IP real detrás de un proxy y en el estado compartido. Y muestra cómo una idea de seguridad se implementa reutilizando lo aprendido: dependencias (Módulo 3) y repositorios con estado externo (Módulo 4).</p>
+        </div>
+        <p>Errores típicos que veremos: contar por IP a secas (todos los usuarios detrás de un proxy parecen uno), guardar los contadores en un diccionario que crece sin fin (fuga de memoria), contar igual un <code>GET</code> barato que un <code>POST</code> caro, agotar el límite entre el <code>401</code> y el <code>429</code> en el login, y devolver <code>500</code> en vez de <code>429</code> con <code>Retry-After</code>.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué limitar y con qué clave</h3>
+        <p>El rate limiting siempre se define por una <strong>clave</strong> (a quién cuentas) y un <strong>límite</strong> (cuánto). Elegir la clave es la decisión importante:</p>
+        <table>
+          <thead><tr><th>Clave</th><th>Qué protege</th><th>Problema</th></tr></thead>
+          <tbody>
+            <tr><td><strong>IP del cliente</strong></td><td>Endpoints abiertos (login) y tráfico anónimo</td><td>Tras NAT/proxy, muchos usuarios comparten IP: castigas a inocentes. Y la IP se falsifica en cabeceras</td></tr>
+            <tr><td><strong>Usuario / token</strong></td><td>Cuotas justas por identidad; el caso ideal cuando hay auth</td><td>Solo aplica a endpoints autenticados</td></tr>
+            <tr><td><strong>API key</strong></td><td>Clientes de terceros y planes (free/pro)</td><td>Requiere gestionar claves</td></tr>
+            <tr><td><strong>Ruta + método</strong></td><td>Coste distinto por operación (<code>/ask</code> no es <code>/health</code>)</td><td>Es un modificador de la clave, no un sustituto</td></tr>
+          </tbody>
+        </table>
+        <p>La estrategia habitual es <strong>combinar</strong>: «por usuario autenticado; si no hay usuario, por IP», y con un límite distinto por ruta. El login, por ser el punto de fuerza bruta, lleva su propio límite estricto por IP.</p>
+
+        <h3>Algoritmos: ventana fija, ventana deslizante y cubo de fichas</h3>
+        <p>Cómo se cuenta el tiempo cambia el comportamiento bajo ráfagas:</p>
+        <table>
+          <thead><tr><th>Algoritmo</th><th>Cómo funciona</th><th>Ventaja</th><th>Defecto</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Ventana fija</strong></td>
+              <td>Cuenta por bloques (<code>12:00:00–12:00:59</code>): «máximo N por minuto»</td>
+              <td>Trivial de implementar y de explicar</td>
+              <td>Ráfaga doble en el borde: N al final de una ventana + N al inicio de la siguiente = 2N seguidos</td>
+            </tr>
+            <tr>
+              <td><strong>Ventana deslizante</strong></td>
+              <td>Cuenta las peticiones de los últimos 60 s reales</td>
+              <td>Sin ráfaga de borde; suave</td>
+              <td>Más estado (guardar marcas de tiempo) y más cálculo</td>
+            </tr>
+            <tr>
+              <td><strong>Cubo de fichas</strong> (<em>token bucket</em>)</td>
+              <td>Un cubo de N fichas se rellena a ritmo fijo; cada petición gasta una</td>
+              <td>Permite ráfagas controladas; es el estándar de facto</td>
+              <td>Requiere guardar el nivel y el instante del último rellenado</td>
+            </tr>
+            <tr>
+              <td><strong>Cubo con fuga</strong> (<em>leaky bucket</em>)</td>
+              <td>Las peticiones entran en una cola que sale a ritmo fijo</td>
+              <td>Salida perfectamente uniforme</td>
+              <td>Introduce latencia esperada</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Empieza por ventana fija.</strong> Para el 90 % de las APIs, «N por minuto» con ventana fija es suficiente, se explica en una frase y se implementa en veinte líneas. Migra a ventana deslizante o cubo de fichas cuando midas que el doble gasto de borde te perjudica de verdad. La corrección prematura aquí también aplica.</p>
+        </div>
+
+        <h3>Dónde poner el límite: proxy, middleware o dependencia</h3>
+        <pre class="diagram">
+  Cliente
+     │
+     ▼
+  ┌─────────────────────────────────────────────┐
+  │ Proxy / CDN (nginx, Cloudflare)             │  ← el mejor sitio en produccion
+  │ limite por IP, incluso sin llegar a la app  │     (barato, global, corta antes)
+  └───────────────────┬─────────────────────────┘
+                      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Middleware (toda la app)                    │  ← proteccion general
+  └───────────────────┬─────────────────────────┘
+                      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Dependencia por endpoint (require_limiter)  │  ← conoce al USUARIO y la ruta
+  └───────────────────┬─────────────────────────┘
+                      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Endpoint                                    │
+  └─────────────────────────────────────────────┘
+        </pre>
+        <ul>
+          <li><strong>El proxy/CDN</strong> es el mejor sitio en producción: corta el tráfico antes de que consuma CPU de tu aplicación y suele ser global (no por proceso). Útil contra ataques volumétricos.</li>
+          <li><strong>El middleware</strong> es fácil de añadir a toda la app, pero no conoce al usuario (solo la petición) ni sabe cuánto cuesta cada ruta.</li>
+          <li><strong>La dependencia por endpoint</strong> es la más expresiva: ya tienes <code>get_current_user</code> (lecciones 1 y 2), así que puedes limitar <em>por usuario</em>, y declarar un límite distinto para <code>/ask</code> (caro) que para <code>/health</code> (barato). Además, si el límite se supera, la petición ni siquiera entra al endpoint.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>La respuesta correcta.</strong> En producción se usan <em>las tres</em> capas: el CDN contra lo volumétrico, un middleware general contra el abuso básico, y dependencias finas para las cuotas por usuario y las rutas caras. Esta lección implementa el middleware y la dependencia, que son las que controlas desde FastAPI.</p>
+        </div>
+
+        <h3>El estado: por qué <em>no</em> un diccionario y por qué Redis</h3>
+        <p>Necesitas recordar, por cliente, cuántas peticiones lleva en la ventana. Un <code>dict</code> en memoria funciona en desarrollo, pero tiene dos problemas serios:</p>
+        <ol class="steps">
+          <li><strong>El proceso no es único.</strong> Arrancas <code>uvicorn --workers 4</code> y hay <em>cuatro</em> procesos, cada uno con su diccionario. El límite real se multiplica por cuatro. Con varios contenedores, por más aún.</li>
+          <li><strong>No se reinicia de forma sana.</strong> Si el diccionario crece sin poda, es una <strong>fuga de memoria</strong>: un atacante que llame desde miles de IPs crea miles de entradas que nunca se borran.</li>
+        </ol>
+        <p>La solución profesional es un almacén <strong>compartido</strong>, típicamente <strong>Redis</strong>, con operaciones atómicas (por ejemplo <code>INCR</code> + <code>EXPIRE</code> en un script o pipelining). Así el contador es único para todos los workers y expira solo. Redis resuelve de un golpe las dos cosas: compartición y expiración.</p>
+        <pre class="diagram">
+   worker 1 ─┐
+   worker 2 ─┼──►  Redis (contadores compartidos, con TTL)
+   worker 3 ─┘           ▲
+                         │  INCR key  /  EXPIRE key 60
+        </pre>
+
+        <h3>La respuesta correcta: <code>429</code> y <code>Retry-After</code></h3>
+        <p>Cuando se supera el límite, el código de estado es <strong><code>429 Too Many Requests</code></strong>, no un <code>500</code> ni un <code>403</code>. Y se acompaña de la cabecera <code>Retry-After</code> con los segundos que el cliente debe esperar: eso permite que un cliente honesto se autorregule en vez de martillear. Un buen limitador también expone cuántas peticiones quedan (<code>X-RateLimit-Remaining</code>), aunque eso es convención, no estándar.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el rate limiting es el <em>torniquete</em> de una estación de metro. No pregunta si tienes billete (eso es la autenticación): solo deja pasar a un ritmo. Si intentas colar a cien personas de golpe, el torniquete se bloquea y te dice «espera 20 segundos» (<code>Retry-After</code>). Y como hay varias puertas de entrada (varios workers), hacen falta torniquetes coordinados: si cada puerta llevara su propia cuenta, entrarían cien por cada una.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El limitador más pequeño posible: ventana fija en memoria, una entrada por IP, con poda para que no crezca sin fin. Sirve para entender el mecanismo —<strong>y para saber por qué en producción no basta</strong>.</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">import time
+from collections import defaultdict
+
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+LIMIT = 5           # peticiones
+WINDOW = 60.0       # por ventana, en segundos
+
+app = FastAPI()
+
+
+class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, limit: int, window: float) -&gt; None:
+        super().__init__(app)
+        self.limit = limit
+        self.window = window
+        self.hits: dict[str, list[float]] = defaultdict(list)   # ip -&gt; marcas de tiempo
+
+    async def dispatch(self, request: Request, call_next):
+        now = time.monotonic()
+        ip = request.client.host if request.client else "unknown"
+        # 1) Poda: descarta las marcas fuera de la ventana (evita fuga de memoria)
+        self.hits[ip] = [t for t in self.hits[ip] if now - t &lt; self.window]
+        # 2) Cuenta
+        if len(self.hits[ip]) &gt;= self.limit:
+            retry = int(self.window - (now - self.hits[ip][0])) + 1
+            return Response(
+                content='{"detail":"Demasiadas peticiones"}',
+                status_code=429,
+                media_type="application/json",
+                headers={"Retry-After": str(retry)},
+            )
+        self.hits[ip].append(now)
+        return await call_next(request)
+
+
+app.add_middleware(InMemoryRateLimitMiddleware, limit=LIMIT, window=WINDOW)
+
+
+@app.get("/ping")
+def ping() -&gt; dict[str, str]:
+    return {"pong": "ok"}
+</code></pre>
+        <p>Este ejemplo ya es una <strong>ventana deslizante</strong> (guarda marcas de tiempo y va descartando las viejas). Pruébalo:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">for i in $(seq 1 7); do
+  curl -s -o /dev/null -w "%{http_code} " http://127.0.0.1:8000/ping
+done; echo
+# 200 200 200 200 200 429 429
+
+curl -s -D - -o /dev/null http://127.0.0.1:8000/ping | findstr /I retry-after
+# retry-after: 58
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Esto se rompe en producción.</strong> Con <code>uvicorn --workers 4</code> hay cuatro copias de <code>self.hits</code>: cada worker permite 5, así que en realidad pasan 20. Y con varios contenedores, más. El diccionario también vive en la memoria del proceso: si reinicias, los contadores se pierden (aceptable) y si llegan IPs infinitas, la poda ayuda pero no comparte nada. Es un juguete útil y peligroso de creer terminado.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En Copiloto API el limitador vive donde conoce al usuario: una <strong>dependencia</strong> que se aplica por ruta con un límite distinto, sobre un <strong>almacén compartido en Redis</strong>. Primero, el puerto del almacén (reutilizando la idea de repositorio del Módulo 4):</p>
+        <div class="code-file">app/rate_limit.py — el almacén (puerto + adaptador)</div>
+        <pre><code class="language-python">from typing import Protocol
+
+from redis.asyncio import Redis
+
+
+class RateLimitStore(Protocol):
+    """Puerto: cuantas veces se ha contado 'key' en la ventana actual."""
+
+    async def hit(self, key: str, window_seconds: int) -&gt; int: ...
+
+
+class RedisRateLimitStore:
+    """Adaptador con Redis: atomico y compartido entre todos los workers.
+
+    Usa INCR + EXPIRE dentro de un pipeline para no dejar contadores
+    sin caducidad si la peticion se interrumpe entre los dos comandos.
+    """
+
+    def __init__(self, redis: Redis) -&gt; None:
+        self._redis = redis
+
+    async def hit(self, key: str, window_seconds: int) -&gt; int:
+        pipe = self._redis.pipeline()
+        pipe.incr(key)                          # +1 atomico
+        pipe.expire(key, window_seconds, nx=True)  # TTL solo la primera vez
+        count, _ = await pipe.execute()
+        return int(count)
+</code></pre>
+        <p>El <em>doble</em> en memoria implementa el mismo puerto y sirve para desarrollo y tests:</p>
+        <div class="code-file">app/rate_limit.py — adaptador en memoria (dev/test)</div>
+        <pre><code class="language-python">import time
+
+
+class InMemoryRateLimitStore:
+    """Solo para desarrollo o tests: un proceso, sin compartir."""
+
+    def __init__(self) -&gt; None:
+        self._buckets: dict[str, tuple[int, float]] = {}   # key -&gt; (count, expira_en)
+
+    async def hit(self, key: str, window_seconds: int) -&gt; int:
+        now = time.monotonic()
+        count, expires = self._buckets.get(key, (0, now + window_seconds))
+        if now &gt;= expires:                                  # ventana caducada: reinicia
+            count, expires = 0, now + window_seconds
+        count += 1
+        self._buckets[key] = (count, expires)
+        return count
+</code></pre>
+        <p>Ahora la dependencia, que es donde está la gracia: conoce al usuario, la ruta y el coste.</p>
+        <div class="code-file">app/deps.py — limitador por usuario/IP con límite por ruta</div>
+        <pre><code class="language-python">from collections.abc import Callable
+
+from fastapi import Depends, HTTPException, Request, status
+
+from app.deps import CurrentUser, get_current_user
+from app.rate_limit import RateLimitStore, get_rate_limit_store
+
+
+def rate_limit(
+    times: int,
+    seconds: int,
+    scope: str,
+) -&gt; Callable[..., None]:
+    """Fabrica un limitador: 'times' peticiones por 'seconds', con clave por usuario.
+
+    Si no hay usuario (p. ej. login), cae a la IP del cliente.
+    """
+
+    async def limiter(
+        request: Request,
+        store: RateLimitStore = Depends(get_rate_limit_store),
+        user: CurrentUser | None = Depends(get_optional_user),
+    ) -&gt; None:
+        if user is not None:
+            identity = f"user:{user.id}"
+        else:
+            client = request.client
+            identity = f"ip:{client.host if client else 'unknown'}"
+        key = f"rl:{scope}:{identity}"
+        count = await store.hit(key, seconds)
+        if count &gt; times:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Demasiadas peticiones. Intentalo mas tarde.",
+                headers={"Retry-After": str(seconds)},
+            )
+
+    return limiter
+</code></pre>
+        <div class="code-file">app/routers/ask.py — límite distinto según el coste</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends, Security
+
+from app.deps import CurrentUser, get_current_user, rate_limit
+from app.schemas import AskRequest, AskResponse
+
+router = APIRouter(tags=["copiloto"])
+
+
+# Barato: 120/min por usuario
+@router.get("/modules", dependencies=[Depends(rate_limit(times=120, seconds=60, scope="modules"))])
+def list_modules(user: CurrentUser = Depends(get_current_user)) -&gt; list[dict[str, str]]:
+    return [{"slug": "fastapi", "title": "FastAPI"}]
+
+
+# Caro (llama al modelo): 10/min por usuario
+@router.post(
+    "/ask",
+    response_model=AskResponse,
+    dependencies=[Depends(rate_limit(times=10, seconds=60, scope="ask"))],
+)
+def ask(
+    payload: AskRequest,
+    user: CurrentUser = Security(get_current_user, scopes=["ask:write"]),
+) -&gt; AskResponse:
+    return AskResponse(answer=f"Respuesta para {user.username}")
+</code></pre>
+        <div class="code-file">app/routers/auth.py — el login es el punto de fuerza bruta</div>
+        <pre><code class="language-python">from app.deps import rate_limit
+
+# 5 intentos por minuto y por IP: frena el ataque de fuerza bruta.
+@router.post(
+    "/token",
+    response_model=Token,
+    dependencies=[Depends(rate_limit(times=5, seconds=60, scope="login"))],
+)
+def login(form: OAuth2PasswordRequestForm = Depends(), session: Session = Depends(get_session)) -&gt; Token:
+    ...
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>La clave es el usuario, no la IP.</strong> Así cada cliente tiene su cuota justa, y no castigas a todos los que salen por el mismo proxy. Solo en endpoints sin usuario (login) se cae a la IP.</li>
+          <li><strong>El límite es por ruta</strong> (<code>scope="ask"</code>, <code>scope="modules"</code>): <code>/ask</code> cuesta dinero y se limita a 10/min; <code>/modules</code> es una lectura barata y permite 120/min. El coste distinto merece un límite distinto.</li>
+          <li><strong>El login tiene su propio límite estricto</strong> (5/min por IP): es el endpoint donde la fuerza bruta más duele, y no requiere token.</li>
+          <li><strong>Se aplica con <code>dependencies=[...]</code></strong>: la dependencia se ejecuta <em>antes</em> del cuerpo del endpoint; si se supera el límite, el endpoint ni se llama. Además, no ensucia la firma del endpoint con un parámetro que no usa.</li>
+          <li><strong>El almacén es un puerto</strong>, con Redis en producción y memoria en tests: en los tests del Módulo 6 sustituyes el adaptador con <code>dependency_overrides</code> y pruebas el 429 sin levantar Redis.</li>
+          <li><strong><code>nX=True</code> en <code>expire</code></strong>: solo se pone TTL la primera vez, para no renovar la ventana con cada petición (si no, la ventana nunca caducaría mientras llegan peticiones).</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>La IP real detrás del proxy.</strong> Si Copiloto API corre detrás de nginx, <code>request.client.host</code> puede ser la IP del proxy, no la del usuario: todos comparten clave y se bloquean entre sí. Arranca uvicorn con <code>--proxy-headers --forwarded-allow-ips="&lt;ip-del-proxy&gt;"</code> para que Starlette resuelva <code>X-Forwarded-For</code>. Y confía en esa cabecera <em>solo</em> si el proxy la reescribe: si un cliente la puede falsificar, falseará su IP y esquivará el límite.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Clave por usuario cuando hay auth; IP solo como respaldo</td>
+              <td>Limitar siempre por IP</td>
+              <td>El NAT y los proxies hacen que muchos usuarios compartan IP</td>
+            </tr>
+            <tr>
+              <td>Almacén compartido (Redis) en producción</td>
+              <td>Un <code>dict</code> en memoria con varios workers</td>
+              <td>Con <code>--workers 4</code> el límite se multiplica por cuatro</td>
+            </tr>
+            <tr>
+              <td>Poda o TTL en cada entrada del contador</td>
+              <td>Un diccionario que crece sin fin</td>
+              <td>Miles de IPs distintas = miles de entradas = fuga de memoria</td>
+            </tr>
+            <tr>
+              <td>Límites distintos por ruta y coste</td>
+              <td>El mismo límite para <code>/health</code> y para <code>/ask</code></td>
+              <td>Operar el modelo de IA es caro; leer un catálogo, no</td>
+            </tr>
+            <tr>
+              <td><code>429</code> + <code>Retry-After</code></td>
+              <td><code>500</code>, <code>403</code> o cerrar la conexión</td>
+              <td>El cliente honesto se autorregula; el 500 parece un fallo del servidor</td>
+            </tr>
+            <tr>
+              <td>Límite estricto en el login (fuerza bruta)</td>
+              <td>Dejar <code>/auth/token</code> sin límite</td>
+              <td>Es el único endpoint abierto y el objetivo natural de los ataques</td>
+            </tr>
+            <tr>
+              <td>Confiar en <code>X-Forwarded-For</code> solo tras un proxy propio</td>
+              <td>Leer la cabecera tal cual del cliente</td>
+              <td>Una cabecera falsificable deja que el atacante invente su IP</td>
+            </tr>
+            <tr>
+              <td>Devolver cabeceras de estado (<code>X-RateLimit-Remaining</code>)</td>
+              <td>Dejar al cliente adivinar cuánto le queda</td>
+              <td>Un cliente bien educado frena antes de chocar contra el muro</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Contar solo por IP detrás de un proxy</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">ip = request.client.host        # detras de nginx, TODOS ven la IP del proxy
+key = f"rl:{ip}"                # y se bloquean entre si
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># 1) Si el endpoint tiene usuario autenticado, la clave es el usuario.
+key = f"rl:{scope}:user:{user.id}" if user else f"rl:{scope}:ip:{ip}"
+# 2) Arranca uvicorn con --proxy-headers --forwarded-allow-ips="<ip-proxy>"
+#    para que request.client.host sea la IP real, no la del proxy.
+</code></pre>
+        <p>Con NAT o un balanceador, mil usuarios comparten IP: limitar por IP bloquea a usuarios legítimos mientras el atacante cambia de IP. La identidad del usuario autenticado es la clave correcta.</p>
+
+        <h3>El contador que nunca se limpia</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">counts: dict[str, int] = {}
+
+def hit(ip: str) -&gt; int:
+    counts[ip] = counts.get(ip, 0) + 1     # la entrada jamas se borra
+    return counts[ip]
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># Redis: cada clave expira sola con el TTL de la ventana.
+pipe = redis.pipeline()
+pipe.incr(key)
+pipe.expire(key, window_seconds, nx=True)   # TTL desde la primera peticion
+count, _ = await pipe.execute()
+</code></pre>
+        <p>Un contador por cliente sin caducidad es una fuga de memoria: un atacante lo convierte en un ataque de agotamiento (DoS por diccionario). El TTL de Redis (o una poda explícita en memoria) mantiene el estado acotado al número de clientes <em>activos</em>.</p>
+
+        <h3>Devolver 500 en vez de 429</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">if count &gt; times:
+    raise HTTPException(status_code=500, detail="Server busy")
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">if count &gt; times:
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Demasiadas peticiones",
+        headers={"Retry-After": str(seconds)},
+    )
+</code></pre>
+        <p>Un <code>500</code> parece un fallo del servidor, dispara alertas y hace que los clientes reintenten con <em>backoff</em> agresivo. El <code>429</code> con <code>Retry-After</code> comunica exactamente «es un límite, espera», y los clientes bien hechos lo respetan.</p>
+
+        <h3>El login sin límite</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">@router.post("/token")
+def login(form: OAuth2PasswordRequestForm = Depends()):
+    ...   # sin limite: admite miles de intentos de contrasena por segundo
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@router.post("/token", dependencies=[Depends(rate_limit(times=5, seconds=60, scope="login"))])
+def login(form: OAuth2PasswordRequestForm = Depends()):
+    ...
+</code></pre>
+        <p>El login es el único endpoint que no exige token y el sitio donde la fuerza bruta rinde. Sin límite, bcrypt solo añade una constante: cinco intentos por minuto por IP hacen el ataque inviable.</p>
+
+        <h3>Contar igual lo barato y lo caro</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># Un unico middleware con el mismo limite para todo
+app.add_middleware(InMemoryRateLimitMiddleware, limit=100, window=60)
+# 100 /health son gratis; 100 /ask cuestan una fortuna.
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># Limite por ruta segun el coste: 120/min para leer, 10/min para preguntar.
+@router.post("/ask", dependencies=[Depends(rate_limit(times=10, seconds=60, scope="ask"))])
+def ask(...): ...
+</code></pre>
+        <p>El coste de una petición no es uniforme. Poner el mismo cupo a todo obliga a elegir entre ser demasiado laxos con lo caro o demasiado estrictos con lo barato.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir rate limiting a Copiloto API con límites por ruta, comprobar el <code>429</code> con <code>Retry-After</code> y verificar que el almacén es compartido (no uno por worker).</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Puerto y dobles.</strong> Crea <code>app/rate_limit.py</code> con el <code>Protocol</code> <code>RateLimitStore</code>, el adaptador <code>InMemoryRateLimitStore</code> y el <code>RedisRateLimitStore</code>. Añade en <code>app/config.py</code> <code>redis_url: str = "redis://localhost:6379/0"</code>.
+          </li>
+          <li>
+            <strong>Paso 2 — Dependencia del almacén.</strong> Crea <code>get_rate_limit_store()</code> que devuelva el adaptador de Redis (en producción) o el de memoria (en desarrollo). Debe ser una dependencia (Módulo 3) para poder sustituirla en los tests.
+          </li>
+          <li>
+            <strong>Paso 3 — Fábrica del limitador.</strong> Implementa <code>rate_limit(times, seconds, scope)</code> como en el ejemplo real: clave por usuario si lo hay, si no por IP. Añade <code>get_optional_user</code> (una versión de <code>get_current_user</code> con <code>auto_error=False</code> que devuelva <code>None</code> en lugar de <code>401</code>).
+            <pre><code class="language-python"># Pista: OAuth2PasswordBearer(auto_error=False) no lanza 401 si falta el token
+oauth2_optional = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Aplica los límites.</strong> <code>GET /modules</code>: 120/min. <code>POST /ask</code>: 10/min. <code>POST /auth/token</code>: 5/min (por IP, sin usuario). Usa <code>dependencies=[Depends(...)]</code>.
+          </li>
+          <li>
+            <strong>Paso 5 — Provoca el 429.</strong> Autentícate, guarda el token y lanza 12 peticiones a <code>/ask</code>:
+            <pre><code class="language-bash">TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/token -d "username=editora&amp;password=copiloto" \
+  | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code} " -X POST http://127.0.0.1:8000/ask \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"question":"hola"}'
+done; echo
+</code></pre>
+            <p>Resultado esperado: diez <code>200</code> seguidos de dos <code>429</code>. Mira la cabecera:</p>
+            <pre><code class="language-bash">curl -s -D - -o /dev/null -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question":"x"}' \
+  | findstr /I retry-after    # retry-after: 60
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Comprueba que el límite es por usuario.</strong> Genera un token para otro usuario (<code>lector</code>) y llama a <code>/ask</code> inmediatamente. Resultado esperado: recibe <code>200</code> (o <code>403</code> si no tiene <code>ask:write</code>), no <code>429</code>. El límite de <code>editora</code> no afecta a <code>lector</code>: la clave es la identidad, no la IP.
+          </li>
+          <li>
+            <strong>Paso 7 — Demuestra el problema del estado local.</strong> Arranca con <code>uv run uvicorn app.main:app --workers 4</code> y repite el paso 5 sin Redis (adaptador de memoria). Resultado esperado: <em>no</em> verás 10 y luego 429; verás más de diez <code>200</code>, porque cada worker lleva su propia cuenta. Con <code>redis_url</code> apuntando a un Redis en marcha, el límite vuelve a ser 10. Esta diferencia es toda la lección.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cubo de fichas con Redis y <code>Retry-After</code> exacto</h3>
+          <p>La ventana fija permite una ráfaga doble en el borde. Implanta un <strong>token bucket</strong> con Redis que permita ráfagas controladas y calcule un <code>Retry-After</code> exacto (los segundos reales hasta que vuelva a haber una ficha), en lugar de devolver siempre la ventana completa.</p>
+          <p>Especificación: capacidad de 20 fichas, que se rellenan a razón de 1 por segundo. Cada petición consume una ficha. Si no hay fichas, responde <code>429</code> con <code>Retry-After</code> igual al tiempo que falta para la siguiente ficha (redondeado hacia arriba). Aplícalo a <code>/ask</code> sustituyendo la dependencia de ventana fija.</p>
+          <p><em>Pistas: guarda en un hash de Redis <code>tokens</code> y <code>last_refill</code> (una clave <code>rl:bucket:user:{id}</code> por usuario). En cada petición: lee ambos, calcula <code>elapsed = now - last_refill</code>, añade <code>elapsed * rate</code> fichas (sin pasar de la capacidad), guarda, y decide. Hazlo <strong>atómico</strong>: con varios workers, dos peticiones simultáneas pueden leer el mismo estado y gastar la misma ficha dos veces; resuélvelo con un script Lua (<code>EVAL</code>/<code>register_script</code>) o con <code>WATCH</code>/<code>MULTI</code>. Ese es el núcleo del reto, no la fórmula. Pregúntate además: ¿qué pasa si el reloj del cliente y el del servidor van distintos? (respuesta: el tiempo lo pone siempre el servidor). ¿Y si un usuario nunca vuelve: cuándo borras su hash? (necesitas un <code>EXPIRE</code> holgado, p. ej. <code>capacidad / rate</code> segundos). Pista final: compara tu implementación con la ventana deslizante del ejemplo mínimo y decide, con datos, cuál te conviene para <code>/ask</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>rate limiting</strong> limita cuánto se puede pedir, no quién eres: es la capa que complementa la autenticación.</li>
+          <li>La <strong>clave</strong> es la decisión clave: usuario autenticado &gt; IP; la IP solo para tráfico anónimo y detrás de un proxy de confianza.</li>
+          <li>Algoritmos: <strong>ventana fija</strong> (simple, ráfaga de borde), <strong>ventana deslizante</strong> (suave) y <strong>cubo de fichas</strong> (ráfagas controladas, el estándar).</li>
+          <li>Tres capas: <strong>proxy/CDN</strong> (volumétrico), <strong>middleware</strong> (general) y <strong>dependencia por endpoint</strong> (por usuario y coste).</li>
+          <li>El estado debe ser <strong>compartido</strong>: con <code>--workers 4</code>, un <code>dict</code> en memoria multiplica el límite por cuatro. Redis lo resuelve con TTL.</li>
+          <li>Siempre se <strong>expira</strong> el contador: un <code>dict</code> sin poda es una fuga de memoria explotable.</li>
+          <li>La respuesta correcta es <strong><code>429 Too Many Requests</code></strong> con <code>Retry-After</code>; nunca un <code>500</code>.</li>
+          <li>El <strong>login</strong> necesita su límite estricto propio: es el endpoint abierto donde duele la fuerza bruta.</li>
+          <li>La <strong>IP real</strong> sale de <code>X-Forwarded-For</code> con <code>--proxy-headers</code>, y solo se confía en esa cabecera si el proxy la reescribe.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / valor</th></tr></thead>
+          <tbody>
+            <tr><td>Estado por superar el límite</td><td><code>429 Too Many Requests</code> + <code>Retry-After</code></td></tr>
+            <tr><td>Clave por usuario</td><td><code>f"rl:{scope}:user:{user.id}"</code></td></tr>
+            <tr><td>Clave por IP (login)</td><td><code>f"rl:{scope}:ip:{request.client.host}"</code></td></tr>
+            <tr><td>Contador atómico</td><td><code>INCR</code> + <code>EXPIRE key seconds NX</code> en pipeline/Redis</td></tr>
+            <tr><td>Aplicar por ruta</td><td><code>dependencies=[Depends(rate_limit(times=10, seconds=60, scope="ask"))]</code></td></tr>
+            <tr><td>Usuario opcional (login)</td><td><code>OAuth2PasswordBearer(auto_error=False)</code></td></tr>
+            <tr><td>IP real tras proxy</td><td><code>uvicorn --proxy-headers --forwarded-allow-ips=&lt;ip-proxy&gt;</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántas peticiones por minuto debo permitir?</summary>
+            <div>
+              <p>No hay número universal: depende del coste y del patrón de uso. Empieza <strong>generoso</strong> (midiendo el uso real en logs) y aprieta si detectas abuso; empezar demasiado estricto rompe integraciones legítimas. Como referencia para Copiloto API: lecturas 120/min por usuario, <code>/ask</code> 10/min (cuesta dinero), login 5/min por IP. Lo importante es que el límite sea <em>medible</em>, <em>explicable</em> en la documentación y <em>distinto</em> según lo que cuesta cada ruta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿No basta con un límite en nginx o en el CDN?</summary>
+            <div>
+              <p>Para el tráfico volumétrico, sí, y es lo primero que deberías poner. Pero el proxy no conoce a tu <em>usuario</em>: solo ve IPs. No puede aplicar «10/min para <code>ana</code>» ni cobrar cuotas por plan. La combinación sensata es CDN/nginx a la entrada y límites por identidad en la aplicación. Empezar por el proxy es barato y protege la app; los límites finos vienen después.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo el rate limiting sin arrancar Redis?</summary>
+            <div>
+              <p>Gracias a que el almacén es un <strong>puerto</strong> con dos adaptadores, en los tests usas <code>InMemoryRateLimitStore</code> y lo inyectas con <code>app.dependency_overrides[get_rate_limit_store] = lambda: InMemoryRateLimitStore()</code>. Así pruebas el <code>429</code> y el <code>Retry-After</code> sin infraestructura (Módulo 6). El adaptador de producción (Redis) se prueba aparte, contra un Redis real. Esta separación es exactamente la del Módulo 4: los dobles implementan el puerto, no la tecnología.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El rate limiting protege de un ataque DDoS?</summary>
+            <div>
+              <p>Parcialmente. Frena abuso moderado y ataques de aplicación (fuerza bruta, <em>scraping</em>, un cliente con <em>bug</em>), pero un DDoS volumétrico real —cientos de miles de peticiones por segundo desde muchas IPs— se combate antes, en el CDN y con proveedores anti-DDoS: tu proceso de FastAPI no puede ni ver ese tráfico. Piensa en capas: DDoS volumétrico → CDN; abuso por IP → nginx; abuso por usuario y cuotas → aplicación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si el cliente legítimo supera el límite a menudo?</summary>
+            <div>
+              <p>Entonces tu límite está mal calibrado, no el cliente. Señales: muchos <code>429</code> en logs de usuarios autenticados normales. Soluciones: subir el cupo, dar cuotas por plan (free/pro) con límites distintos, o exponer cabeceras de estado (<code>X-RateLimit-Remaining</code>) para que el cliente module su ritmo. Un <code>429</code> frecuente contra un usuario de pago es un <em>bug</em> de configuración, y la telemetría —registrar cada <code>429</code> con su clave— es lo que te lo revela.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-errores-problem-details">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Errores y Problem Details — Módulo 2 · Curso FastAPI</title>
+  <meta name="description" content="HTTPException, handlers de excepción y errores con forma consistente siguiendo RFC 9457 Problem Details en Copiloto API.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Errores y Problem Details</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Respuestas y errores</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Cuando una API falla, el cliente necesita saber <em>tres</em> cosas: qué pasó, por qué y qué puede hacer al respecto. Una API que responde <code>{"detail": "error"}</code> no dice nada útil. Y una API donde cada ruta inventa su propio formato de error —unas veces <code>{"error": ...}</code>, otras <code>{"message": ...}</code>, otras texto plano— es imposible de consumir con dignidad.</p>
+        <p>En esta lección vas a aprender a lanzar errores con <code>HTTPException</code>, a interceptarlos con <strong>handlers de excepción</strong>, y sobre todo a darles <strong>una forma única y estándar</strong>: <em>Problem Details</em> (RFC 9457). El Copiloto API devolverá el mismo sobre de error para un 404, un 422 de validación o un fallo inesperado.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué una forma consistente?</strong> Porque un cliente que consume tu API no quiere adivinar. Si todos los errores comparten el mismo esquema, el frontend escribe <em>un</em> manejador de errores y funciona con todo. Es la misma idea que <code>response_model</code> pero aplicada a lo que sale mal: <strong>modelar también el error</strong>.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Nunca devuelvas un stack trace.</strong> Un <code>500</code> con la traza de Python revela rutas, versiones, nombres de tablas y a veces secretos. El cliente recibe un mensaje genérico con un identificador; el detalle completo vive en <em>tus logs</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El error también es parte del contrato</h3>
+        <p>Un endpoint tiene un camino feliz (respuesta <code>2xx</code>) y varios caminos de error (<code>4xx</code> para culpa del cliente, <code>5xx</code> para culpa tuya). Si solo modelas el camino feliz, tu API está a medias. El error debe ser tan predecible como el éxito.</p>
+        <pre class="diagram">
+   peticion
+      |
+      v
+  +-----------+    excepcion    +---------------------+    respuesta
+  |  tu ruta  | --------------> |  exception_handler  | -------------->  cliente
+  +-----------+                 |  (UN solo formato)  |   application/problem+json
+      |                         +---------------------+
+      | respuesta 2xx
+      v
+   JSON normal (response_model)
+
+  Toda salida, feliz o no, tiene una forma declarada.
+        </pre>
+
+        <h3><code>HTTPException</code>: el error controlado</h3>
+        <p>Para errores previstos —no encontrado, sin permisos, conflicto— lanzas <code>HTTPException</code> con un código y un <code>detail</code>:</p>
+        <pre><code class="language-python">from fastapi import HTTPException
+
+raise HTTPException(status_code=404, detail="Modulo no encontrado")
+</code></pre>
+        <p>FastAPI la convierte en una respuesta con ese <code>status_code</code> y un cuerpo <code>{"detail": ...}</code>. Es correcto, pero ese formato por defecto es <em>pobre</em>: no tiene tipo de problema, ni título, ni identificador de la ocurrencia. Por eso lo vamos a reemplazar por Problem Details.</p>
+        <div class="callout callout--note">
+          <p><code>HTTPException</code> es <strong>control de flujo</strong>, no un fallo. Se usa para resultados esperados del negocio («este recurso no existe»). Un fallo real (una excepción de Python que no esperabas) es otra cosa: la capturas aparte y la traduces a <code>500</code> sin filtrar internals.</p>
+        </div>
+
+        <h3>RFC 9457: Problem Details for HTTP APIs</h3>
+        <p>Este estándar define un objeto JSON para describir errores. Sus campos:</p>
+        <table>
+          <thead><tr><th>Campo</th><th>Tipo</th><th>Significado</th></tr></thead>
+          <tbody>
+            <tr><td><code>type</code></td><td>URI</td><td>Identificador del <em>tipo</em> de problema (a menudo una URL de tu documentación).</td></tr>
+            <tr><td><code>title</code></td><td>string</td><td>Resumen humano y estable («Recurso no encontrado»).</td></tr>
+            <tr><td><code>status</code></td><td>int</td><td>El código HTTP, repetido en el cuerpo para comodidad del cliente.</td></tr>
+            <tr><td><code>detail</code></td><td>string</td><td>Explicación específica de <em>esta</em> ocurrencia.</td></tr>
+            <tr><td><code>instance</code></td><td>URI</td><td>Identificador de la ocurrencia concreta (p. ej. el id de traza).</td></tr>
+          </tbody>
+        </table>
+        <p>Se sirve con el <em>media type</em> <code>application/problem+json</code>, y puedes añadir <strong>extensiones</strong>: campos propios como <code>errors</code> (detalles de validación) o <code>trace_id</code>. Ejemplo del Copiloto:</p>
+        <div class="code-file">application/problem+json</div>
+        <pre><code class="language-json">{
+  "type": "https://copiloto.academy/problems/validation-error",
+  "title": "Error de validacion",
+  "status": 422,
+  "detail": "La pregunta no puede estar vacia.",
+  "instance": "/ask",
+  "trace_id": "01J8Z0W3M4N5P6Q7R8S9T0",
+  "errors": [
+    { "field": "body.question", "message": "String should have at least 1 character" }
+  ]
+}
+</code></pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> Problem Details es la hoja de reclamación oficial de tu API. Todas las reclamaciones usan el mismo impreso: tipo de incidencia, resumen, número de expediente. Da igual si la reclamación es «faltaba un campo» o «no tienes permiso»: el funcionario que la recibe sabe leerla siempre igual.</p>
+        </div>
+
+        <h3>Handlers: se registran una vez, cubren toda la API</h3>
+        <p>Un <em>exception handler</em> es una función que FastAPI invoca cuando se lanza una excepción de cierto tipo. Lo registras con <code>@app.exception_handler(Tipo)</code>. Los tres que necesitarás casi siempre:</p>
+        <ol class="steps">
+          <li><strong><code>StarletteHTTPException</code></strong>: cubre los <code>HTTPException</code> que lanzas tú (y los 404/405 que genera el framework). Aquí das forma Problem Details a los <code>4xx</code>.</li>
+          <li><strong><code>RequestValidationError</code></strong>: lo lanza FastAPI cuando el cuerpo o los query params no validan (el 422). Aquí conviertes la lista de errores de Pydantic en tu extensión <code>errors</code>.</li>
+          <li><strong><code>Exception</code></strong> (catch-all): captura cualquier fallo no previsto y responde un <code>500</code> genérico con <code>trace_id</code>, sin exponer la traza.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Puedes importar los handlers por defecto de FastAPI (<code>fastapi.exception_handlers.http_exception_handler</code> y <code>request_validation_exception_handler</code>) para <em>envolverlos</em>: logueas o enriqueces y luego delegas. Útil cuando no quieres reimplementar el comportamiento estándar.</p>
+        </div>
+
+        <h3>Excepciones de dominio propias</h3>
+        <p>En vez de lanzar <code>HTTPException</code> desde la capa de negocio, define excepciones tuyas (<code>ModuleNotFound</code>, <code>QuotaExceeded</code>) y tradúcelas a HTTP <em>solo</em> en el handler. Así tu lógica de negocio no sabe nada de HTTP.</p>
+        <pre><code class="language-python">class DomainError(Exception):
+    """Base de los errores de negocio del Copiloto."""
+
+class ModuleNotFound(DomainError):
+    def __init__(self, slug: str) -&gt; None:
+        self.slug = slug
+</code></pre>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Definimos el modelo Problem Details y un handler para <code>HTTPException</code>. Con eso, <em>todos</em> los errores controlados de la app salen ya con la forma estándar.</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python"># main.py — un unico formato para todos los errores controlados.
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+app = FastAPI()
+
+
+@app.get("/modules/{slug}")
+async def get_module(slug: str):
+    if slug == "no-existe":
+        raise HTTPException(status_code=404, detail=f"Modulo '{slug}' no encontrado")
+    return {"slug": slug, "title": "Rutas"}
+
+
+# --- Problem Details ---------------------------------------------------
+PROBLEM_TYPES = {
+    404: "https://copiloto.academy/problems/not-found",
+    500: "https://copiloto.academy/problems/internal",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    body = {
+        "type": PROBLEM_TYPES.get(exc.status_code, "about:blank"),
+        "title": "Recurso no encontrado" if exc.status_code == 404 else "Error",
+        "status": exc.status_code,
+        "detail": exc.detail,
+        "instance": str(request.url.path),
+    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+        media_type="application/problem+json",
+    )
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">uv run fastapi dev main.py
+curl -s -i http://127.0.0.1:8000/modules/no-existe
+</code></pre>
+        <p>Salida esperada: cabecera <code>Content-Type: application/problem+json</code> y este cuerpo:</p>
+        <div class="code-file">application/problem+json</div>
+        <pre><code class="language-json">{
+  "type": "https://copiloto.academy/problems/not-found",
+  "title": "Recurso no encontrado",
+  "status": 404,
+  "detail": "Modulo 'no-existe' no encontrado",
+  "instance": "/modules/no-existe"
+}
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>HTTPException(404, ...)</code></strong>: la lógica solo dice <em>qué</em> falla; no decide el formato.</li>
+          <li><strong><code>@app.exception_handler(StarletteHTTPException)</code></strong>: intercepta cualquier excepción HTTP de la app, venga de tu código o del framework (incluidos los 404 de rutas inexistentes).</li>
+          <li><strong><code>PROBLEM_TYPES</code></strong>: mapa de código de estado a URI de tipo de problema. Una sola fuente de verdad para los <code>type</code>.</li>
+          <li><strong><code>media_type="application/problem+json"</code></strong>: el media type que manda el RFC. Los clientes que lo soportan lo detectan por la cabecera.</li>
+          <li><strong><code>instance=request.url.path</code></strong>: identifica la ocurrencia. En producción, un <code>trace_id</code> es aún mejor.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En <strong>Copiloto API</strong> centralizamos todo: un modelo <code>ProblemDetail</code>, las excepciones de dominio, y tres handlers registrados en <code>main.py</code>. El resultado es que el <code>/ask</code> devuelve el mismo sobre tanto si la pregunta está vacía como si el índice no responde.</p>
+        <div class="code-file">proyectos/copiloto-api/app/errors.py</div>
+        <pre><code class="language-python"># app/errors.py — el error como contrato, en un solo sitio.
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class ProblemDetail(BaseModel):
+    """RFC 9457 — Problem Details for HTTP APIs."""
+
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: str | None = None
+    instance: str | None = None
+    # Extensiones propias del Copiloto:
+    trace_id: str | None = None
+    errors: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Detalle por campo en errores de validacion",
+    )
+
+
+# --- Excepciones de dominio (no saben nada de HTTP) -------------------
+class DomainError(Exception):
+    """Base de los errores de negocio."""
+
+class ModuleNotFound(DomainError):
+    def __init__(self, slug: str) -> None:
+        self.slug = slug
+
+class IndexUnavailable(DomainError):
+    """El motor de RAG no responde."""
+</code></pre>
+        <div class="code-file">proyectos/copiloto-api/app/error_handlers.py</div>
+        <pre><code class="language-python"># app/error_handlers.py — traduce excepciones a Problem Details.
+import logging
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.errors import IndexUnavailable, ModuleNotFound, ProblemDetail
+
+logger = logging.getLogger("copiloto")
+
+MEDIA_TYPE = "application/problem+json"
+PROBLEM_TYPES = {
+    404: "https://copiloto.academy/problems/not-found",
+    422: "https://copiloto.academy/problems/validation-error",
+    429: "https://copiloto.academy/problems/rate-limited",
+    500: "https://copiloto.academy/problems/internal",
+    503: "https://copiloto.academy/problems/service-unavailable",
+}
+TITLES = {
+    404: "Recurso no encontrado",
+    422: "Error de validacion",
+    429: "Demasiadas peticiones",
+    500: "Error interno",
+    503: "Servicio no disponible",
+}
+
+
+def _problem(
+    request: Request,
+    *,
+    status: int,
+    detail: str | None,
+    trace_id: str,
+    errors: list[dict] | None = None,
+) -> JSONResponse:
+    problem = ProblemDetail(
+        type=PROBLEM_TYPES.get(status, "about:blank"),
+        title=TITLES.get(status, "Error"),
+        status=status,
+        detail=detail,
+        instance=request.url.path,
+        trace_id=trace_id,
+        errors=errors,
+    )
+    return JSONResponse(
+        status_code=status,
+        content=problem.model_dump(exclude_none=True),
+        media_type=MEDIA_TYPE,
+    )
+</code></pre>
+        <div class="code-file">proyectos/copiloto-api/app/error_handlers.py</div>
+        <pre><code class="language-python">def register_exception_handlers(app: FastAPI) -&gt; None:
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        trace_id = uuid.uuid4().hex
+        logger.warning("http_error status=%s path=%s trace=%s", exc.status_code, request.url.path, trace_id)
+        return _problem(request, status=exc.status_code, detail=str(exc.detail), trace_id=trace_id)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        trace_id = uuid.uuid4().hex
+        errors = [
+            {"field": ".".join(str(p) for p in err["loc"]), "message": err["msg"]}
+            for err in exc.errors()
+        ]
+        return _problem(
+            request,
+            status=422,
+            detail="La peticion no cumple el contrato.",
+            trace_id=trace_id,
+            errors=errors,
+        )
+
+    # --- Excepciones de dominio ---
+    @app.exception_handler(ModuleNotFound)
+    async def module_not_found(request: Request, exc: ModuleNotFound):
+        return _problem(
+            request,
+            status=404,
+            detail=f"Modulo '{exc.slug}' no encontrado.",
+            trace_id=uuid.uuid4().hex,
+        )
+
+    @app.exception_handler(IndexUnavailable)
+    async def index_unavailable(request: Request, exc: IndexUnavailable):
+        return _problem(
+            request,
+            status=503,
+            detail="El indice de busqueda no esta disponible; reintenta en unos segundos.",
+            trace_id=uuid.uuid4().hex,
+        )
+
+    # --- Catch-all: sin stack traces hacia el cliente ---
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        trace_id = uuid.uuid4().hex
+        logger.exception("unhandled error path=%s trace=%s", request.url.path, trace_id)
+        return _problem(
+            request,
+            status=500,
+            detail="Error interno. Cita el trace_id al contactar soporte.",
+            trace_id=trace_id,
+        )
+</code></pre>
+        <p>Y en el router, la lógica lanza errores de dominio —no HTTP—:</p>
+        <div class="code-file">proyectos/copiloto-api/app/routers/modules.py</div>
+        <pre><code class="language-python"># app/routers/modules.py
+from fastapi import APIRouter
+
+from app.errors import ModuleNotFound
+from app.schemas.module import ModuleOut
+
+router = APIRouter(prefix="/modules", tags=["modules"])
+
+
+@router.get("/{slug}", response_model=ModuleOut)
+async def get_module(slug: str) -&gt; ModuleOut:
+    module = await modules_repo.get_by_slug(slug)
+    if module is None:
+        raise ModuleNotFound(slug)      # el handler lo convierte en 404 Problem Details
+    return module
+</code></pre>
+        <div class="code-file">proyectos/copiloto-api/app/main.py</div>
+        <pre><code class="language-python"># app/main.py
+from fastapi import FastAPI
+
+from app.error_handlers import register_exception_handlers
+from app.routers import ask, modules
+
+app = FastAPI(title="Copiloto API", version="0.1.0")
+register_exception_handlers(app)          # UNA llamada: toda la API queda cubierta
+app.include_router(modules.router)
+app.include_router(ask.router)
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Un único <code>_problem()</code></strong>: la forma se define una vez. Añadir un campo al error es tocar un solo sitio.</li>
+          <li><strong>Errores de dominio sin HTTP</strong>: <code>ModuleNotFound</code> no importa nada de FastAPI. Si mañana lo usas desde un CLI o un worker, sigue teniendo sentido.</li>
+          <li><strong>Un <code>trace_id</code> en cada error</strong>: el cliente lo cita, tú lo buscas en los logs. Une la experiencia del usuario con tu observabilidad.</li>
+          <li><strong>Dos handlers para errores no previstos</strong>: el catch-all <code>Exception</code> loguea con <code>logger.exception</code> (traza completa en logs) y responde genérico. El cliente nunca ve el rastro.</li>
+          <li><strong>Extensiones <code>errors</code></strong>: en el 422, cada campo inválido con su mensaje. El frontend puede pintarlos junto al input correspondiente.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Cuidado con el orden y con los catch-all.</strong> Registra el handler de <code>Exception</code> al final y ten presente que Starlette solo aplica handlers de <code>Exception</code> si la app no está en modo depuración para ese error. En desarrollo, con <code>--reload</code>, puede que veas la traza; en producción, no. Prueba el catch-all con <code>fastapi run</code> antes de confiarte.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Una forma de error única (Problem Details) para toda la API</td>
+              <td>Un formato distinto por ruta</td>
+              <td>El cliente escribe un solo manejador de errores</td>
+            </tr>
+            <tr>
+              <td>Mensajes <code>detail</code> claros y específicos</td>
+              <td><code>detail="error"</code> o <code>detail="algo falló"</code></td>
+              <td>Un buen mensaje ahorra un ticket de soporte</td>
+            </tr>
+            <tr>
+              <td>Excepciones de dominio + handler que las traduce</td>
+              <td>Lanzar <code>HTTPException</code> desde la capa de negocio</td>
+              <td>La lógica se mantiene independiente de HTTP</td>
+            </tr>
+            <tr>
+              <td><code>trace_id</code> en el cuerpo del error y en los logs</td>
+              <td>Un 500 sin ninguna pista</td>
+              <td>Correlaciona lo que ve el cliente con lo que ves tú</td>
+            </tr>
+            <tr>
+              <td>Loguear el detalle completo en el servidor</td>
+              <td>Devolver el stack trace al cliente</td>
+              <td>La traza revela internals y a veces secretos</td>
+            </tr>
+            <tr>
+              <td>Documentar los errores en <code>responses=</code></td>
+              <td>Errores invisibles en el OpenAPI</td>
+              <td>El contrato incluye lo que puede salir mal</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Filtrar la traza de Python al cliente</h3>
+        <span class="code-label code-label--wrong">Mal — el cliente ve tus internals</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Devolver la excepcion cruda revela rutas, versiones y estructura interna.
+@app.get("/ask")
+async def ask(q: str):
+    try:
+        return await engine.run(q)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"detail": repr(exc)})
+</code></pre>
+        <span class="code-label code-label--right">Bien — genérico al cliente, detalle en logs</span>
+        <pre class="code-right"><code class="language-python"># ✅ El cliente recibe un 500 con trace_id; la traza completa va al log.
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    trace_id = uuid.uuid4().hex
+    logger.exception("unhandled path=%s trace=%s", request.url.path, trace_id)
+    return _problem(request, status=500, detail="Error interno.", trace_id=trace_id)
+</code></pre>
+
+        <h3>Usar <code>200 OK</code> con un cuerpo de error</h3>
+        <span class="code-label code-label--wrong">Mal — todo responde 200</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ El cliente no puede distinguir exito de fallo sin leer el cuerpo.
+@app.get("/modules/{slug}")
+async def get_module(slug: str):
+    module = await repo.get_by_slug(slug)
+    if module is None:
+        return {"ok": False, "error": "no encontrado"}     # ¡status 200!
+    return {"ok": True, "data": module}
+</code></pre>
+        <span class="code-label code-label--right">Bien — código HTTP correcto</span>
+        <pre class="code-right"><code class="language-python"># ✅ 404 dice lo que pasa sin leer el cuerpo; el cuerpo explica el detalle.
+@app.get("/modules/{slug}", response_model=ModuleOut)
+async def get_module(slug: str) -&gt; ModuleOut:
+    module = await repo.get_by_slug(slug)
+    if module is None:
+        raise ModuleNotFound(slug)
+    return module
+</code></pre>
+
+        <h3>Capturar <code>Exception</code> en cada ruta</h3>
+        <span class="code-label code-label--wrong">Mal — <code>try/except</code> repetido y silencioso</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Ruido, y ademas oculta el error real (except: pass).
+@app.get("/ask")
+async def ask(q: str):
+    try:
+        return await engine.run(q)
+    except Exception:
+        return {"detail": "error"}
+</code></pre>
+        <span class="code-label code-label--right">Bien — un handler global hace ese trabajo</span>
+        <pre class="code-right"><code class="language-python"># ✅ Sin try/except: el handler catch-all centraliza el comportamiento.
+@app.get("/ask", response_model=AskOut)
+async def ask(payload: AskIn) -&gt; AskOut:
+    return await engine.run(payload.question)
+</code></pre>
+
+        <h3>Inventar un formato distinto en cada ruta</h3>
+        <span class="code-label code-label--wrong">Mal — tres formatos, tres maneras de fallar</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ El cliente no sabe que esperar.
+raise HTTPException(404, detail={"error": "no encontrado"})   # dict
+raise HTTPException(403, detail="sin permisos")               # string
+raise HTTPException(429, detail=[1, 2, 3])                    # lista
+</code></pre>
+        <span class="code-label code-label--right">Bien — un handler normaliza todo</span>
+        <pre class="code-right"><code class="language-python"># ✅ Da igual lo que lances: el handler produce siempre Problem Details.
+raise HTTPException(status_code=429, detail="Demasiadas peticiones")
+# -> { "type": ".../rate-limited", "title": "Demasiadas peticiones",
+#      "status": 429, "detail": "...", "instance": "...", "trace_id": "..." }
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> dotar al Copiloto de un 503 coherente cuando el motor de RAG no responde, y comprobar que el error sale como Problem Details con <code>trace_id</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> añade la excepción de dominio:
+            <pre><code class="language-python"># app/errors.py
+class IndexUnavailable(DomainError):
+    """El motor de RAG no responde o el indice esta vacio."""
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> simula el motor del RAG con un stub que falla:
+            <pre><code class="language-python"># app/services/engine.py (stub para practicar)
+from app.errors import IndexUnavailable
+
+async def run(question: str) -&gt; dict:
+    if "indice" in question.lower():
+        raise IndexUnavailable()
+    return {"answer": f"Respuesta a: {question}", "sources": [], "created_at": "2026-01-01T00:00:00Z"}
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> usa el stub en la ruta <code>/ask</code> (sin lanzar HTTP tú mismo):
+            <pre><code class="language-python"># app/routers/ask.py
+from fastapi import APIRouter
+from app.schemas.ask import AskIn, AskOut
+from app.services import engine
+
+router = APIRouter(tags=["ask"])
+
+@router.post("/ask", response_model=AskOut)
+async def ask(payload: AskIn) -&gt; AskOut:
+    result = await engine.run(payload.question)
+    return result
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> registra el handler de <code>IndexUnavailable</code> (ya está en <code>register_exception_handlers</code>) y arranca:
+            <pre><code class="language-bash">uv run fastapi dev app/main.py
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> provoca el fallo y un error de validación, y comprueba que ambos tienen la misma forma:
+            <pre><code class="language-bash"># 503 - el motor falla
+curl -s -i -X POST http://127.0.0.1:8000/ask \
+  -H "Content-Type: application/json" -d '{"question":"indice caido"}'
+
+# 422 - la pregunta esta vacia
+curl -s -i -X POST http://127.0.0.1:8000/ask \
+  -H "Content-Type: application/json" -d '{"question":""}'
+</code></pre>
+            <pre><code class="language-json">{
+  "type": "https://copiloto.academy/problems/service-unavailable",
+  "title": "Servicio no disponible",
+  "status": 503,
+  "detail": "El indice de busqueda no esta disponible; reintenta en unos segundos.",
+  "instance": "/ask",
+  "trace_id": "9f2c1d7e4a5b4c8e"
+}
+</code></pre>
+            <p>Resultado esperado: en los dos casos, <code>Content-Type: application/problem+json</code> y el mismo conjunto de claves. El 422 incluye además la extensión <code>errors</code> con el campo <code>body.question</code>. Copia el <code>trace_id</code> y compruébalo en los logs del servidor: la traza completa debe estar ahí, no en la respuesta.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un catálogo de problemas documentado y testeado</h3>
+          <p>Construye un <em>catálogo</em> de tipos de problema para Copiloto API: una única estructura (por ejemplo, un <code>Enum</code> o un diccionario) que asocie cada <code>type</code> con su <code>title</code>, su <code>status</code> sugerido y una descripción. Deriva de ella <code>PROBLEM_TYPES</code> y <code>TITLES</code> para no duplicar datos, expón el catálogo como JSON en <code>GET /problems</code> (público, sin autenticación) y añade un test que falle si algún handler usa un <code>status</code> que no está en el catálogo o un <code>type</code> que no respeta el prefijo <code>https://copiloto.academy/problems/</code>.</p>
+          <p><em>Pista: documenta cada problema con <code>responses={404: {"model": ProblemDetail}}</code> en el decorador para que aparezca en el OpenAPI. Piensa cómo modelar la extensión <code>errors</code> como un modelo Pydantic propio (<code>FieldError</code>) en lugar de una lista de dicts sin tipo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El error es parte del contrato: <strong>modela también lo que sale mal</strong>.</li>
+          <li><code>HTTPException</code> es el error controlado; los handlers le dan una forma única.</li>
+          <li><strong>Problem Details (RFC 9457)</strong> es el estándar: <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code>, y extensiones como <code>trace_id</code> y <code>errors</code>.</li>
+          <li>Se sirve como <code>application/problem+json</code>.</li>
+          <li>Registra tres handlers: <code>StarletteHTTPException</code>, <code>RequestValidationError</code> y <code>Exception</code> (catch-all).</li>
+          <li>Las excepciones de dominio no conocen HTTP; el handler las traduce.</li>
+          <li>Nunca devuelvas la traza: genérico al cliente, completo en los logs.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Lanzar un error controlado</td><td><code>raise HTTPException(status_code=404, detail="…")</code></td></tr>
+            <tr><td>Registrar un handler</td><td><code>@app.exception_handler(StarletteHTTPException)</code></td></tr>
+            <tr><td>Handler de validación</td><td><code>@app.exception_handler(RequestValidationError)</code></td></tr>
+            <tr><td>Media type Problema</td><td><code>media_type="application/problem+json"</code></td></tr>
+            <tr><td>Handler por defecto reutilizable</td><td><code>fastapi.exception_handlers.request_validation_exception_handler</code></td></tr>
+            <tr><td>Documentar un error</td><td><code>@router.get("/x", responses={404: {"model": ProblemDetail}})</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>HTTPException</code> o una excepción de dominio propia?</summary>
+            <div>
+              <p>Depende de dónde estés. En la <em>capa HTTP</em> (una ruta, una dependencia de seguridad), <code>HTTPException</code> es directo y correcto. En la <em>capa de negocio</em> (servicios, repositorios), usa excepciones de dominio sin dependencia de FastAPI y tradúcelas con un handler. Ganancia: tu lógica se testea y se reutiliza sin arrastrar HTTP.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el 422 y no el 400 para errores de validación?</summary>
+            <div>
+              <p>Porque históricamente FastAPI usa <code>422 Unprocessable Content</code> para fallos de validación semántica (el cuerpo es válido como JSON pero no cumple el esquema). <code>400 Bad Request</code> se reserva para peticiones malformadas de forma más general. Puedes cambiar el código en el handler si tu organización prefiere 400, pero sé consistente y documenta la decisión.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El handler de <code>Exception</code> captura <em>todas</em> las excepciones?</summary>
+            <div>
+              <p>Captura las que se propagan por el flujo normal de la app. En modo depuración (por ejemplo <code>--reload</code> con debug), Starlette puede re-lanzar para mostrarte la traza en pantalla, que es justo lo que quieres en desarrollo. Verifica el comportamiento del catch-all con <code>fastapi run</code> (sin recarga) antes de confiar en él en producción.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito <code>type</code> e <code>instance</code> si mi API es pequeña?</summary>
+            <div>
+              <p>Puedes dejar <code>type</code> en <code>"about:blank"</code> (el valor por defecto del RFC) y omitir <code>instance</code>. Aun así, merece la pena mantener el sobre estándar: el día que añadas un frontend que distingue tipos de error, ya tienes dónde ponerlos. Es más fácil no romper tu contrato que crearlo tarde.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y los errores de <code>429</code> del rate limiting del módulo 5?</summary>
+            <div>
+              <p>Encajan aquí: lanza una excepción (o un <code>HTTPException</code> con 429) y deja que el handler de <code>StarletteHTTPException</code> lo convierta en Problem Details. Añade el tipo <code>…/rate-limited</code> a tu catálogo y, si quieres ser fino, una cabecera <code>Retry-After</code> que verás en la lección 3 sobre cabeceras.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

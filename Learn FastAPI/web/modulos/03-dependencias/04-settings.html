@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-settings">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Configuración y settings — Módulo 3 · Curso FastAPI</title>
+  <meta name="description" content="Configuración en FastAPI con pydantic-settings: BaseSettings, fichero .env, entornos dev/prod, validación de tipos e inyección de settings por dependencia.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Configuración con <code>pydantic-settings</code></h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Dependencias y configuración</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Toda aplicación tiene cosas que cambian entre entornos: la URL de la base de datos, la clave secreta del JWT, el nivel de log, si el modo debug está activo. En local quieres SQLite y logs verbosos; en producción, Postgres y logs sobrios. Y sobre todo: <strong>los secretos no pueden estar en el código ni en el repositorio</strong>.</p>
+        <p>El patrón clásico —leer <code>os.getenv</code> y convertirlo a mano— se rompe enseguida: <code>"false"</code> no es <code>False</code>, un número mal escrito pasa desapercibido y nunca sabes qué variables requiere la aplicación hasta que falla en producción. <strong><code>pydantic-settings</code></strong> resuelve esto modelando la configuración con Pydantic: se declara una clase, se cargan los valores desde variables de entorno y <code>.env</code>, se <strong>validan y convierten</strong> los tipos, y se inyectan por dependencia como cualquier otra cosa.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «configuración» es donde se filtran los secretos, donde revientan los despliegues («funcionaba en mi máquina») y donde el tipado salva vidas. <code>Settings</code> es el punto único de verdad de tu configuración, tipado y validado al arrancar. Si falta algo o está mal, la app <strong>no arranca</strong>, y eso es una virtud: falla rápido y en tu portátil, no en producción a las 3 de la mañana.</p>
+        </div>
+        <p>Errores típicos que verás: claves hardcodeadas, construir <code>Settings()</code> en cada petición, parsear booleanos a mano, versionar el <code>.env</code> con secretos reales y leer variables sueltas por todo el código en lugar de una clase central.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema: configuración dispersa y sin tipos</h3>
+        <p>Imagina leer la configuración con <code>os.getenv</code> repartido por diez módulos:</p>
+        <pre><code class="language-python"># ❌ Configuración dispersa y sin validar
+import os
+
+DEBUG = os.getenv("DEBUG", "false") == "true"          # conversión manual
+DB_URL = os.getenv("DATABASE_URL")                      # ¿y si falta? None silencioso
+SECRET = os.getenv("SECRET_KEY", "changeme")            # secreto por defecto peligroso
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))        # revienta con valor no numérico
+</code></pre>
+        <p>Cuatro problemas: <strong>dispersión</strong> (no hay una lista de lo que necesitas), <strong>sin validación</strong> (un typo en una variable pasa como <code>None</code>), <strong>conversiones manuales</strong> (fáciles de equivocar) y <strong>secretos por defecto</strong> que acaban en producción.</p>
+
+        <h3>La solución: una clase <code>Settings</code></h3>
+        <p><code>pydantic-settings</code> extiende Pydantic con <code>BaseSettings</code>. Declaras los campos con su tipo y un valor por defecto opcional; la librería busca cada valor en las fuentes configuradas y lo valida.</p>
+        <pre><code class="language-python">from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",              # carga variables desde este fichero
+        env_file_encoding="utf-8",
+        extra="ignore",               # ignora variables de entorno desconocidas
+    )
+
+    environment: str = "dev"
+    database_url: str = "sqlite:///./copiloto.db"
+    debug: bool = False               # "true"/"1"/"yes" se convierten solos
+    max_tokens: int = 512
+    secret_key: SecretStr             # sin valor por defecto -&gt; obligatorio
+</code></pre>
+        <p>Fíjate en <code>secret_key: SecretStr</code> <strong>sin valor por defecto</strong>: si no hay variable <code>SECRET_KEY</code> en el entorno ni en el <code>.env</code>, construir <code>Settings()</code> lanza <code>ValidationError</code>. La app no arranca con configuración incompleta. Ese <em>fail fast</em> es exactamente lo que quieres.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> <code>Settings</code> es la <em>checklist de pre-vuelo</em> de un avión. Antes de despegar (arrancar la app) el piloto recorre la lista; si algo falta o está fuera de rango, el avión no despega. Leer <code>os.getenv</code> a vuelapluma sería despegar confiando en la memoria: tarde o temprano olvidas el tren de aterrizaje.</p>
+        </div>
+
+        <h3>De dónde salen los valores y en qué orden</h3>
+        <p>Cada fuente tiene una prioridad. Gana la primera que tenga el valor:</p>
+        <pre class="diagram">
+  Prioridad (de mayor a menor)
+
+  1. Argumentos del constructor   Settings(database_url="...")   ← tests, overrides
+  2. Variables de entorno         export DATABASE_URL=...        ← producción, Docker
+  3. Fichero .env                 DATABASE_URL=...               ← desarrollo local
+  4. Valor por defecto del campo  database_url: str = "sqlite..."← último recurso
+        </pre>
+        <table>
+          <thead><tr><th>Concepto</th><th>Ejemplo</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td>Nombre de variable</td><td>campo <code>database_url</code> → <code>DATABASE_URL</code></td><td>Por defecto no distingue mayúsculas de minúsculas</td></tr>
+            <tr><td><code>env_prefix</code></td><td><code>SettingsConfigDict(env_prefix="copiloto_")</code></td><td>Evita colisiones con variables ajenas (<code>COPILOTO_DATABASE_URL</code>)</td></tr>
+            <tr><td><code>env_file</code></td><td><code>env_file=".env"</code> o una tupla <code>(".env", ".env.local")</code></td><td>Ficheros cargados por orden; el último gana</td></tr>
+            <tr><td><code>case_sensitive</code></td><td><code>SettingsConfigDict(case_sensitive=True)</code></td><td>Exige el nombre exacto en mayúsculas</td></tr>
+            <tr><td><code>env_nested_delimiter</code></td><td><code>"__"</code> → <code>DB__HOST</code> llena <code>db.host</code></td><td>Ajustes anidados por secciones</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Un <code>.env</code> no sobrescribe a las variables de entorno reales.</strong> Es una decisión deliberada: si en producción un contenedor inyecta <code>DATABASE_URL</code>, esa gana sobre el <code>.env</code> que empaquetaste. Así un mismo artefacto se comporta distinto según el entorno, sin recompilar ni tocar código.</p>
+        </div>
+
+        <h3>Tipos que hacen el trabajo sucio</h3>
+        <p>La gracia está en que Pydantic convierte y valida. Estos tipos son los que más se usan:</p>
+        <pre><code class="language-python">from enum import Enum
+from pydantic import AnyHttpUrl, PostgresDsn, SecretStr
+from pydantic_settings import BaseSettings
+
+
+class Env(str, Enum):
+    dev = "dev"
+    staging = "staging"
+    prod = "prod"
+
+
+class Settings(BaseSettings):
+    environment: Env = Env.dev
+    debug: bool = False                       # "true", "1", "yes" -&gt; True
+    database_url: PostgresDsn | None = None   # valida el formato de la URL
+    rag_service_url: AnyHttpUrl               # valida que sea http(s)://
+    secret_key: SecretStr                     # no se imprime al hacer print/log
+    allowed_origins: list[str] = []           # desde JSON: '["https://a.com"]'
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong><code>SecretStr</code> evita fugas accidentales.</strong> Si haces <code>print(settings)</code> o lo vuelcas a un log, el secreto aparece como <code>SecretStr('**********')</code>. Para obtener el valor real, pídelo explícitamente: <code>settings.secret_key.get_secret_value()</code>. Solo hazlo justo donde toca (firmar un JWT), nunca al loguear.</p>
+        </div>
+
+        <h3>Entornos: dev, staging y prod</h3>
+        <p>El patrón habitual tiene un fichero por entorno y un selector:</p>
+        <pre><code class="language-text">.env               ← valores por defecto para desarrollo local (NO se versiona)
+.env.example       ← plantilla con las claves y valores de ejemplo (SÍ se versiona)
+.env.production    ← solo las diferencias de producción (normalmente no se versiona)
+</code></pre>
+        <p>Y en el código se elige el fichero según una variable (por ejemplo <code>APP_ENV</code>):</p>
+        <pre><code class="language-python">import os
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=(".env", f".env.{os.getenv('APP_ENV', 'dev')}"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    environment: str = "dev"
+    database_url: str = "sqlite:///./copiloto.db"
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>El <code>.env</code> no se versiona.</strong> Añádelo a <code>.gitignore</code>. Lo que sí se versiona es un <code>.env.example</code> con las claves necesarias y valores de mentira, para que cualquiera sepa qué configurar sin exponer secretos. Un secreto que llegó a un commit <em>está comprometido</em> aunque lo borres después: hay que rotarlo.</p>
+        </div>
+
+        <h3>Inyectar <code>Settings</code> por dependencia</h3>
+        <p>Aquí se junta todo con el módulo. Construir <code>Settings()</code> en cada petición leería el entorno una y otra vez sin necesidad: es un objeto <strong>inmutable durante la vida de la app</strong>, así que se construye una vez y se cachea. Y se expone por dependencia para que los endpoints lo declaren y los tests lo puedan sustituir.</p>
+        <pre><code class="language-python">from functools import lru_cache
+from typing import Annotated
+
+from fastapi import Depends
+
+from app.config import Settings
+
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    """Se construye UNA vez por proceso y se reutiliza en todas las peticiones."""
+    return Settings()
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+</code></pre>
+        <p>Un endpoint queda así de limpio:</p>
+        <pre><code class="language-python">from fastapi import APIRouter
+
+from app.deps import SettingsDep
+
+router = APIRouter()
+
+
+@router.get("/config")
+def show_config(settings: SettingsDep):
+    return {
+        "environment": settings.environment,
+        "debug": settings.debug,
+        "database_url": settings.database_url,
+        # secret_key NUNCA se serializa
+    }
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Por qué <code>@lru_cache</code> y no <code>app.state</code>:</strong> <code>Settings</code> es inmutable y no necesita ciclo de vida, así que <code>@lru_cache</code> sobre <code>get_settings</code> es lo más simple: se construye la primera vez que se pide y se reutiliza. Ese objeto <code>Settings</code> sí conviene además cargarlo en el <code>lifespan</code> (lección 3) para <strong>fallar al arrancar</strong> si la configuración es inválida, antes de aceptar la primera petición.</p>
+        </div>
+        <p>En los tests, como es una dependencia normal, puedes sustituirla o limpiar la caché:</p>
+        <pre><code class="language-python">from app.deps import get_settings
+
+# Opción 1: override de la dependencia (recomendado)
+app.dependency_overrides[get_settings] = lambda: Settings(debug=True)
+
+# Opción 2: limpiar la caché si construyes Settings con variables distintas
+get_settings.cache_clear()
+</code></pre>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una <code>Settings</code> con tres campos, un <code>.env</code> y un endpoint que muestra la configuración (sin secretos). Ejecutable con <code>uv</code>.</p>
+        <div class="code-file">pyproject.toml (dependencias)</div>
+        <pre><code class="language-bash">uv init copiloto-settings
+cd copiloto-settings
+uv add fastapi "uvicorn[standard]" pydantic-settings
+</code></pre>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">from functools import lru_cache
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    environment: str = "dev"
+    debug: bool = False
+    max_tokens: int = 512
+    secret_key: SecretStr = SecretStr("changeme-en-dev")
+
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+app = FastAPI()
+
+
+@app.get("/config")
+def show_config(settings: SettingsDep):
+    return {
+        "environment": settings.environment,
+        "debug": settings.debug,
+        "max_tokens": settings.max_tokens,
+        # secret_key se queda fuera: SecretStr no se serializa
+    }
+</code></pre>
+        <div class="code-file">.env</div>
+        <pre><code class="language-text">ENVIRONMENT=dev
+DEBUG=true
+MAX_TOKENS=1024
+SECRET_KEY=una-clave-solo-para-local
+</code></pre>
+        <p>Arranca el servidor:</p>
+        <pre><code class="language-bash">uv run uvicorn main:app --reload
+</code></pre>
+        <p>Llama a <code>GET /config</code> y verás:</p>
+        <pre><code class="language-json">{
+  "environment": "dev",
+  "debug": true,
+  "max_tokens": 1024
+}
+</code></pre>
+        <p>Qué ha pasado, paso a paso:</p>
+        <ol class="steps">
+          <li><strong>Se construye <code>Settings()</code></strong> la primera vez que una petición pide <code>SettingsDep</code>. Busca cada campo: <code>environment</code>, <code>debug</code>, <code>max_tokens</code>, <code>secret_key</code>.</li>
+          <li><strong>Lee el <code>.env</code></strong> y mapea <code>DEBUG=true</code> al campo <code>debug: bool</code>, convirtiendo la cadena <code>"true"</code> en el booleano <code>True</code>. Y <code>MAX_TOKENS=1024</code> en el entero <code>1024</code>.</li>
+          <li><strong><code>@lru_cache</code> guarda el objeto</strong>: las siguientes peticiones reutilizan la misma instancia. No se vuelve a leer el entorno.</li>
+          <li><strong>El endpoint serializa</strong> los campos; <code>secret_key</code> no se incluye porque es un <code>SecretStr</code> y nunca lo tocamos. El secreto jamás sale en la respuesta.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Prueba a quitar <code>MAX_TOKENS</code></strong> del <code>.env</code> y a escribir <code>MAX_TOKENS=abc</code>. Al pedir <code>Settings()</code>, Pydantic lanza un <code>ValidationError</code> claro («Input should be a valid integer»). Eso es la validación trabajando por ti.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el <strong>Copiloto API</strong> la configuración tiene secciones: base de datos, servicio de RAG y seguridad. Usamos ajustes <strong>anidados</strong> y un <code>env_prefix</code>, inyectamos <code>Settings</code> por dependencia y lo cargamos en el <code>lifespan</code> para fallar al arrancar si algo está mal.</p>
+        <div class="code-file">app/config.py</div>
+        <pre><code class="language-python">from functools import lru_cache
+from typing import Annotated, Literal
+
+from fastapi import Depends
+from pydantic import AnyHttpUrl, PostgresDsn, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class DatabaseSettings(BaseSettings):
+    url: PostgresDsn | str = "sqlite:///./copiloto.db"
+    echo: bool = False
+    pool_size: int = 5
+
+
+class RagSettings(BaseSettings):
+    service_url: AnyHttpUrl = "http://127.0.0.1:9000"
+    timeout_seconds: float = 10.0
+    top_k: int = 4
+
+
+class SecuritySettings(BaseSettings):
+    secret_key: SecretStr = SecretStr("changeme-en-dev")
+    algorithm: Literal["HS256", "RS256"] = "HS256"
+    access_token_minutes: int = 30
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="copiloto_",
+        env_file=(".env", ".env.local"),
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",   # COPILOTO_DB__HOST llena db.host
+        extra="ignore",
+    )
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    debug: bool = False
+    database: DatabaseSettings = DatabaseSettings()
+    rag: RagSettings = RagSettings()
+    security: SecuritySettings = SecuritySettings()
+
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    """Construida una vez por proceso; validada al importar/arrancar."""
+    return Settings()
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+</code></pre>
+        <div class="code-file">.env.example</div>
+        <pre><code class="language-text"># Copia este fichero a .env y rellena los valores. NO subas .env al repo.
+COPILOTO_ENVIRONMENT=dev
+COPILOTO_DEBUG=true
+COPILOTO_DATABASE__URL=sqlite:///./copiloto.db
+COPILOTO_RAG__SERVICE_URL=http://127.0.0.1:9000
+COPILOTO_RAG__TIMEOUT_SECONDS=10
+COPILOTO_SECURITY__SECRET_KEY=pon-aqui-una-clave-larga-y-aleatoria
+</code></pre>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI
+from sqlmodel import create_engine
+
+from app.config import get_settings
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()          # falla aquí si la config es inválida: fail fast
+    app.state.settings = settings
+    app.state.engine = create_engine(str(settings.database.url), echo=settings.database.echo)
+    app.state.http = httpx.AsyncClient(
+        base_url=str(settings.rag.service_url),
+        timeout=settings.rag.timeout_seconds,
+    )
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+        app.state.engine.dispose()
+
+
+app = FastAPI(title="Copiloto API", lifespan=lifespan)
+
+
+from app.routers import ask, health   # noqa: E402
+
+app.include_router(health.router)
+app.include_router(ask.router)
+</code></pre>
+        <div class="code-file">app/routers/health.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter
+
+from app.config import SettingsDep
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health(settings: SettingsDep):
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "top_k": settings.rag.top_k,       # acceso por secciones anidadas
+    }
+</code></pre>
+        <p><strong>Decisiones explicadas:</strong></p>
+        <ul>
+          <li><strong>Secciones anidadas</strong> (<code>database</code>, <code>rag</code>, <code>security</code>): la configuración se lee por bloques y el editor autocompleta. El delimitador <code>__</code> permite mapear <code>COPILOTO_RAG__TOP_K</code> a <code>settings.rag.top_k</code>.</li>
+          <li><strong><code>env_prefix="copiloto_"</code></strong>: todas las variables quedan bajo un espacio propio y no chocan con las de otros servicios del mismo host.</li>
+          <li><strong><code>.env</code> + <code>.env.local</code></strong>: la tupla se carga en orden; <code>.env.local</code> (ignorado por Git) puede sobrescribir para tu máquina sin ensuciar la plantilla.</li>
+          <li><strong><code>get_settings()</code> con <code>@lru_cache</code></strong>: una única instancia validada por proceso; los tests la sustituyen con <code>dependency_overrides</code>.</li>
+          <li><strong>Carga en <code>lifespan</code></strong>: si falta <code>SECRET_KEY</code> o una URL es inválida, la app no arranca. El <em>fail fast</em> convierte un bug de producción en un error de arranque.</li>
+        </ul>
+        <div class="code-file">.gitignore</div>
+        <pre><code class="language-text">.env
+.env.*
+!.env.example
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Regla de oro:</strong> <code>.env</code> fuera del repositorio, <code>.env.example</code> dentro. Cualquiera que clone el proyecto copia la plantilla, rellena sus valores y arranca. Y si un secreto llegó a un commit, se rota: borrarlo del último commit no lo borra del historial.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Centraliza la config en una clase <code>Settings</code></td>
+              <td>Leer <code>os.getenv</code> por todo el código</td>
+              <td>Un único punto de verdad, tipado y con lista de lo que necesitas</td>
+            </tr>
+            <tr>
+              <td>Valida al arrancar (fail fast)</td>
+              <td>Descubrir un campo mal configurado en la primera petición</td>
+              <td>Es mejor que la app no arranque a que falle en producción</td>
+            </tr>
+            <tr>
+              <td>Usa <code>SecretStr</code> para secretos</td>
+              <td>Guardarlos en <code>str</code> y loguearlos sin querer</td>
+              <td>Evita que aparezcan en <code>print</code>, logs o trazas</td>
+            </tr>
+            <tr>
+              <td>Construye <code>Settings()</code> una vez (<code>@lru_cache</code>)</td>
+              <td>Instanciar <code>Settings()</code> en cada petición</td>
+              <td>Releer el entorno por petición es innecesario: es inmutable</td>
+            </tr>
+            <tr>
+              <td><code>.env</code> en <code>.gitignore</code>, <code>.env.example</code> versionado</td>
+              <td>Subir el <code>.env</code> con secretos reales</td>
+              <td>Los secretos del repo quedan comprometidos para siempre</td>
+            </tr>
+            <tr>
+              <td>Inyecta los settings por dependencia</td>
+              <td>Importar un objeto global de config</td>
+              <td>Se ve en la firma y se sustituye en tests con <code>dependency_overrides</code></td>
+            </tr>
+            <tr>
+              <td><code>env_prefix</code> por aplicación</td>
+              <td>Nombres genéricos como <code>URL</code> o <code>DEBUG</code></td>
+              <td>Evita colisiones con variables de otros servicios del mismo entorno</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Secretos hardcodeados</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">SECRET_KEY = "super-secreto-123"     # en el código, en el repo, para siempre
+DATABASE_URL = "postgres://user:pass@prod:5432/db"
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">class SecuritySettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="copiloto_security_")
+    secret_key: SecretStr            # obligatorio: viene del entorno
+</code></pre>
+        <p>Un secreto en el código está en cada clon, en tu historial de Git y en las copias de seguridad. Se inyecta por entorno, nunca se escribe.</p>
+
+        <h3>2. Construir <code>Settings()</code> por petición</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@app.get("/config")
+def show_config():
+    settings = Settings()      # relee y valida el entorno en CADA petición
+    return {"env": settings.environment}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()
+
+@app.get("/config")
+def show_config(settings: SettingsDep):
+    return {"env": settings.environment}
+</code></pre>
+
+        <h3>3. Convertir variables a mano</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">import os
+
+debug = os.getenv("DEBUG") == "true"        # "True"/"1"/"yes" se interpretan como False
+timeout = float(os.getenv("TIMEOUT"))       # si falta -&gt; TypeError al arrancar
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">class Settings(BaseSettings):
+    debug: bool = False        # Pydantic entiende "true", "1", "yes"...
+    timeout: float = 10.0      # y da un error claro si el valor no es numérico
+</code></pre>
+
+        <h3>4. Versionar el <code>.env</code> con secretos</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-bash">git add .env      # con SECRET_KEY real: ya está comprometido
+git commit -m "config"
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-bash"># .gitignore
+.env
+.env.*
+!.env.example
+
+git add .env.example   # solo la plantilla, sin valores reales
+</code></pre>
+
+        <h3>5. Configuración mutable en tiempo de ejecución</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@app.post("/admin/limits")
+def set_limit(settings: SettingsDep):
+    settings.rag.top_k = 10      # "cambio la config en caliente" -&gt; se pierde al reiniciar
+    return {"top_k": settings.rag.top_k}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python"># La configuración es INMUTABLE. Lo que cambia en caliente va a la BD (o a un store):
+@router.post("/admin/limits")
+def set_limit(top_k: int, session: SessionDep):
+    session.add(SettingValue(name="rag_top_k", value=str(top_k)))
+    return {"top_k": top_k}
+</code></pre>
+        <p><code>Settings</code> describe el <em>entorno</em>, no el estado de la aplicación. Lo que un usuario pueda cambiar en caliente vive en la base de datos, no en la configuración.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear una <code>Settings</code> validada, separar entornos dev/prod con <code>.env</code> y <code>.env.production</code>, exponer la config por dependencia y sustituirla en un test.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto e instala la dependencia:</strong>
+            <pre><code class="language-bash">uv init copiloto-config
+cd copiloto-config
+uv add fastapi "uvicorn[standard]" pydantic-settings
+</code></pre>
+          </li>
+          <li>
+            <strong>Escribe <code>config.py</code></strong> con el selector de entorno:
+            <pre><code class="language-python">import os
+from functools import lru_cache
+from typing import Annotated, Literal
+
+from fastapi import Depends
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="app_",
+        env_file=(".env", f".env.{os.getenv('APP_ENV', 'dev')}"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    debug: bool = False
+    max_tokens: int = 512
+    secret_key: SecretStr = SecretStr("changeme")
+
+
+@lru_cache
+def get_settings() -&gt; Settings:
+    return Settings()
+
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+</code></pre>
+          </li>
+          <li>
+            <strong>Crea los ficheros de entorno:</strong>
+            <div class="code-file">.env</div>
+            <pre><code class="language-text">APP_ENVIRONMENT=dev
+APP_DEBUG=true
+APP_MAX_TOKENS=1024
+APP_SECRET_KEY=clave-local
+</code></pre>
+            <div class="code-file">.env.production</div>
+            <pre><code class="language-text">APP_ENVIRONMENT=prod
+APP_DEBUG=false
+APP_MAX_TOKENS=2048
+</code></pre>
+            <p>Ojo: <code>.env.production</code> no define <code>APP_SECRET_KEY</code> a propósito; en producción llegará como variable de entorno real (y verás por qué importa en el paso siguiente).</p>
+          </li>
+          <li>
+            <strong>Escribe <code>main.py</code></strong> y muestra la configuración:
+            <pre><code class="language-python">from fastapi import FastAPI
+
+from config import SettingsDep
+
+app = FastAPI()
+
+
+@app.get("/config")
+def show_config(settings: SettingsDep):
+    return {
+        "environment": settings.environment,
+        "debug": settings.debug,
+        "max_tokens": settings.max_tokens,
+    }
+</code></pre>
+          </li>
+          <li>
+            <strong>Compruébalo en desarrollo:</strong>
+            <pre><code class="language-bash">uv run uvicorn main:app --reload
+
+# En otra terminal:
+curl http://127.0.0.1:8000/config
+</code></pre>
+            <p><strong>Resultado esperado:</strong> <code>{"environment":"dev","debug":true,"max_tokens":1024}</code>.</p>
+          </li>
+          <li>
+            <strong>Simula producción</strong> cargando el otro fichero y pasando el secreto por entorno real:
+            <pre><code class="language-bash"># bash
+APP_ENV=production APP_SECRET_KEY=clave-de-produccion \
+  uv run uvicorn main:app --port 8001
+</code></pre>
+            <pre><code class="language-powershell"># PowerShell (Windows)
+$env:APP_ENV = "production"; $env:APP_SECRET_KEY = "clave-de-produccion"
+uv run uvicorn main:app --port 8001
+</code></pre>
+            <p>Ahora <code>GET /config</code> devuelve <code>{"environment":"prod","debug":false,"max_tokens":2048}</code>. El mismo código, dos entornos.</p>
+          </li>
+          <li>
+            <strong>Sustituye la configuración en un test</strong> (<code>test_config.py</code>):
+            <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from config import Settings, get_settings
+from main import app
+
+
+def test_config_override():
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        environment="staging", debug=False, max_tokens=8
+    )
+    try:
+        client = TestClient(app)
+        r = client.get("/config")
+        assert r.status_code == 200
+        assert r.json() == {"environment": "staging", "debug": False, "max_tokens": 8}
+    finally:
+        app.dependency_overrides.clear()
+</code></pre>
+            <pre><code class="language-bash">uv run pytest -q
+# 1 passed
+</code></pre>
+          </li>
+          <li><strong>Verificación final:</strong> borra <code>APP_SECRET_KEY</code> del <code>.env</code> y <code>secret_key</code> del default (déjalo como campo obligatorio). Pide <code>/config</code>: verás un <code>ValidationError</code> en el arranque pidiendo la variable. Eso es <em>fail fast</em>: el error llega antes que el tráfico.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 La configuración completa del Copiloto API</h3>
+          <p>Diseña el módulo de configuración del Copiloto API con secciones anidadas, validación estricta y separación de entornos. Debes lograr que:</p>
+          <ul>
+            <li>Haya tres secciones: <code>database</code>, <code>rag</code> y <code>security</code>, con <code>env_nested_delimiter="__"</code> y <code>env_prefix="copiloto_"</code>.</li>
+            <li><code>environment</code> sea un <code>Literal["dev","staging","prod"]</code> y las URLs se validen (<code>PostgresDsn</code>/<code>AnyHttpUrl</code>) con un mensaje de error legible.</li>
+            <li>Los secretos (<code>secret_key</code>) sean <code>SecretStr</code> y <strong>nunca</strong> aparezcan en un log: escribe un endpoint <code>/debug/config</code> que serialice toda la config <em>sin</em> filtrar secretos y compruébalo.</li>
+            <li>Se cargue en el <code>lifespan</code> y la app <strong>no arranque</strong> si falta <code>SECRET_KEY</code> o una URL es inválida.</li>
+            <li>Un test sustituya <code>get_settings</code> por una <code>Settings</code> de test con SQLite y compruebe que el endpoint que construye el engine usa la URL falsa.</li>
+            <li>Un <code>.env.example</code> documente todas las claves y un <code>.gitignore</code> excluya <code>.env</code>.</li>
+          </ul>
+          <p><em>Pista: para «serializar sin filtrar secretos», usa <code>model_dump()</code> sobre un modelo donde el secreto esté tipado como <code>SecretStr</code> (se convierte en <code>**********</code>), o simplemente no incluyas ese campo. Comprueba en el test que la respuesta <strong>no contiene</strong> el valor real del secreto. Para el <em>fail fast</em>, llama a <code>get_settings()</code> en la primera línea del <code>lifespan</code>, antes de crear el engine.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>pydantic-settings</code> modela la configuración con <strong><code>BaseSettings</code></strong>: tipos, validación y valores por defecto.</li>
+          <li>Las fuentes tienen prioridad: <strong>init &gt; variables de entorno &gt; <code>.env</code> &gt; defaults</strong>. Por eso el entorno real gana sobre el <code>.env</code>.</li>
+          <li>Usa <strong><code>env_prefix</code></strong> para aislar tus variables, <code>env_nested_delimiter</code> para secciones y <code>SecretStr</code> para secretos.</li>
+          <li>Separa entornos con <code>.env</code> + <code>.env.&lt;entorno&gt;</code>; <strong>nunca</strong> versiones el <code>.env</code> real, sí el <code>.env.example</code>.</li>
+          <li><code>get_settings()</code> con <strong><code>@lru_cache</code></strong> da una instancia única por proceso; se inyecta con <code>SettingsDep</code>.</li>
+          <li>Valida en el <strong><code>lifespan</code></strong> para fallar al arrancar (<em>fail fast</em>) si la config es inválida.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / valor</th></tr></thead>
+          <tbody>
+            <tr><td>Definir settings</td><td><code>class Settings(BaseSettings): ...</code></td></tr>
+            <tr><td>Configurar fuentes</td><td><code>model_config = SettingsConfigDict(env_file=".env", env_prefix="app_")</code></td></tr>
+            <tr><td>Campo obligatorio</td><td>tipo sin valor por defecto, p. ej. <code>secret_key: SecretStr</code></td></tr>
+            <tr><td>Cambiar tipo</td><td><code>debug: bool = False</code> (convierte <code>"true"</code>)</td></tr>
+            <tr><td>Instancia única</td><td><code>@lru_cache def get_settings() -&gt; Settings: return Settings()</code></td></tr>
+            <tr><td>Inyectar</td><td><code>SettingsDep = Annotated[Settings, Depends(get_settings)]</code></td></tr>
+            <tr><td>Sustituir en tests</td><td><code>app.dependency_overrides[get_settings] = lambda: Settings(...)</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>pydantic-settings</code> es lo mismo que Pydantic?</summary>
+            <div>
+              <p>No. En Pydantic v2, <code>BaseSettings</code> vive en un paquete aparte, <code>pydantic-settings</code>, que se instala con <code>uv add pydantic-settings</code>. <code>pydantic</code> te da los modelos y la validación; <code>pydantic-settings</code> añade los cargadores (entorno, <code>.env</code>, secretos) y la clase <code>BaseSettings</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el <code>.env</code> no sobrescribe una variable de entorno?</summary>
+            <div>
+              <p>Por diseño. La prioridad es: argumentos del constructor &gt; variables de entorno &gt; <code>.env</code> &gt; defaults. Así un mismo build se puede desplegar en varios entornos inyectando variables (Docker, Kubernetes) sin tocar el fichero. En desarrollo local, sin variables externas, manda el <code>.env</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo el arranque cuando falta un secreto?</summary>
+            <div>
+              <p>Haz el campo obligatorio (sin valor por defecto) y construye <code>Settings()</code> en el <code>lifespan</code> o en <code>get_settings</code>. Sin la variable, Pydantic lanza <code>ValidationError</code> y la app no arranca. En un test puedes comprobarlo con <code>pytest.raises(ValidationError)</code> pasando <code>_env_file=None</code> y un entorno limpio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo usar <code>@lru_cache</code> o guardar <code>Settings</code> en <code>app.state</code>?</summary>
+            <div>
+              <p>Para una configuración inmutable, <code>@lru_cache</code> sobre <code>get_settings</code> es lo más simple: una instancia por proceso, sin ciclo de vida que gestionar. Cargarlo <em>además</em> en el <code>lifespan</code> es útil para forzar la validación al arrancar. No necesitas meterlo en <code>app.state</code> salvo que quieras tenerlo todo junto con los demás recursos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo manejo listas o valores más complejos en una variable de entorno?</summary>
+            <div>
+              <p>Pydantic-settings parsea tipos complejos desde JSON. Por ejemplo, <code>allowed_origins: list[str]</code> se llena con <code>ALLOWED_ORIGINS='["https://a.com","https://b.com"]'</code>. Para ajustes anidados usa el doble guion bajo (<code>DB__HOST</code> con <code>env_nested_delimiter="__"</code>). Si en algún caso no encaja, un <code>field_validator</code> te deja parsear el valor a tu gusto.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="03-alembic-migraciones">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Migraciones con Alembic — Módulo 4 · Curso FastAPI</title>
+  <meta name="description" content="Alembic: init, revision --autogenerate y upgrade. Versiona el esquema de la base de datos, revisa cada migración y entiende por qué create_all no vale en producción.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Migraciones con Alembic</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Datos y persistencia</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tu esquema no va a quedarse quieto. Hoy <code>query_log</code> tiene cuatro columnas; mañana le añades <code>retried_at</code>, la semana que viene un índice sobre <code>module_slug</code>, el mes que viene un <code>user_id</code>. En tu portátil puedes borrar el fichero SQLite y volver a ejecutar <code>create_all</code>. En producción <strong>no puedes borrar la base de datos</strong>: tiene datos que importan. Necesitas una forma de <em>transformar</em> el esquema existente sin destruirlo, de forma reproducible y auditable.</p>
+        <p>Eso es una <strong>migración</strong>, y la herramienta estándar en el ecosistema SQLAlchemy —y, por tanto, en SQLModel— es <strong>Alembic</strong>. Con ella, cada cambio de esquema es un fichero de Python versionado en tu repositorio, con su <code>upgrade</code> (aplicar) y su <code>downgrade</code> (revertir).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque <code>SQLModel.metadata.create_all()</code> es una trampa muy común: funciona siempre en local y falla justo cuando más duele, en el servidor con datos reales. En esta lección entenderás <em>qué</em> hace <code>create_all</code> que no encaja en producción, y cómo Alembic sustituye ese hueco con historial, orden y reversibilidad.</p>
+        </div>
+        <p>Errores típicos que aquí cazamos: generar una migración vacía porque los modelos no estaban importados, editar a mano una migración que ya se aplicó en producción, mezclar <code>create_all</code> con Alembic, y olvidar el <em>batch mode</em> de SQLite al alterar columnas.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué es una migración: una lista enlazada de cambios</h3>
+        <p>Cada migración es un fichero con un identificador (<em>revision</em>) y un puntero a la anterior (<em>down_revision</em>). Forman una <strong>cadena</strong> desde la base (sin nada) hasta la cabeza (<em>head</em>), que es la última aplicada. La base de datos guarda en una tabla especial (<code>alembic_version</code>) en qué eslabón está.</p>
+        <pre class="diagram">
+   base            rev a1b2          rev c3d4          rev e5f6 (head)
+   (nada)  ───►   "create            "add index        "add retried_at
+                   query_log"         module_slug"       to query_log"
+   down_rev=None   down_rev=a1b2     down_rev=c3d4     down_rev=e5f6
+        </pre>
+        <p>Cuando ejecutas <code>alembic upgrade head</code>, Alembic compara el <code>alembic_version</code> de tu base de datos con la cadena y aplica <strong>solo los eslabones que faltan</strong>, en orden. Si otra persona del equipo tiene el esquema dos revisiones por detrás, Alembic aplica esas dos y nada más.</p>
+
+        <h3>Anatomía del proyecto Alembic</h3>
+        <table>
+          <thead><tr><th>Elemento</th><th>Qué es</th></tr></thead>
+          <tbody>
+            <tr><td><code>alembic.ini</code></td><td>Configuración: ruta de los <em>scripts</em>, formato de log, y la URL de la base de datos</td></tr>
+            <tr><td><code>migrations/env.py</code></td><td>El corazón: conecta Alembic con tus modelos y decide cómo ejecutar las migraciones</td></tr>
+            <tr><td><code>migrations/versions/</code></td><td>Un fichero <code>.py</code> por migración (los versionas en Git)</td></tr>
+            <tr><td><code>migrations/script.py.mako</code></td><td>Plantilla con la que se generan los ficheros nuevos</td></tr>
+            <tr><td>tabla <code>alembic_version</code></td><td>La crea Alembic en tu base de datos para saber qué revisión está aplicada</td></tr>
+          </tbody>
+        </table>
+
+        <h3><code>autogenerate</code>: Alembic compara dos mundos</h3>
+        <p><code>revision --autogenerate</code> compara dos esquemas y escribe la diferencia:</p>
+        <pre class="diagram">
+   SQLModel.metadata            ──┐
+   (tus modelos Python)           ├──►  DIFF  ──►  fichero de migración
+   la base de datos real        ──┘                (upgrade + downgrade)
+        </pre>
+        <p>Para que funcione, <code>env.py</code> debe (1) apuntar al <code>metadata</code> correcto y (2) haber <strong>importado todos los modelos</strong>: el <code>metadata</code> solo conoce las tablas cuyas clases se han cargado en memoria. Si importas <code>SQLModel</code> pero nunca <code>app.models</code>, el diff ve «cero tablas» y genera una migración vacía.</p>
+        <div class="callout callout--warning">
+          <p><strong>Autogenerate no es magia.</strong> Detecta tablas y columnas nuevas o eliminadas, cambios de tipo básicos e índices. <em>No</em> detecta todo (renombres, restricciones complejas, migraciones de datos). Trata el fichero generado como un <strong>borrador que siempre se revisa antes de aplicar</strong>.</p>
+        </div>
+
+        <h3>El ciclo de trabajo</h3>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>uv run alembic init migrations</code></td><td>Crea la carpeta <code>migrations/</code>, <code>alembic.ini</code> y la plantilla</td></tr>
+            <tr><td><code>uv run alembic revision --autogenerate -m "create query_log"</code></td><td>Genera un fichero con el diff entre modelos y base de datos</td></tr>
+            <tr><td><code>uv run alembic upgrade head</code></td><td>Aplica todas las migraciones pendientes hasta la última</td></tr>
+            <tr><td><code>uv run alembic downgrade -1</code></td><td>Revierte la última migración aplicada</td></tr>
+            <tr><td><code>uv run alembic current</code></td><td>Muestra la revisión en la que está tu base de datos</td></tr>
+            <tr><td><code>uv run alembic history</code></td><td>Lista la cadena de revisiones</td></tr>
+            <tr><td><code>uv run alembic stamp head</code></td><td>Marca la base de datos como «al día» <em>sin</em> ejecutar SQL (útil al adoptar Alembic en una base existente)</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Por qué <code>create_all</code> no vale en producción</h3>
+        <table>
+          <thead><tr><th>Necesidad real</th><th><code>create_all</code></th><th>Alembic</th></tr></thead>
+          <tbody>
+            <tr><td>Añadir una columna a una tabla con datos</td><td>❌ No hace <code>ALTER TABLE</code></td><td>✅ <code>op.add_column(...)</code></td></tr>
+            <tr><td>Saber qué cambios están aplicados en cada entorno</td><td>❌ No lleva historial</td><td>✅ tabla <code>alembic_version</code></td></tr>
+            <tr><td>Revisar el SQL antes de tocarlo</td><td>❌ Se ejecuta sin más</td><td>✅ El fichero es revisable en un PR</td></tr>
+            <tr><td>Revertir un cambio problemático</td><td>❌ Imposible sin borrar datos</td><td>✅ <code>downgrade</code></td></tr>
+            <tr><td>Aplicar en el orden correcto entre equipos</td><td>❌ No hay orden</td><td>✅ Cadena de revisiones</td></tr>
+            <tr><td>Migraciones de datos (rellenar, transformar)</td><td>❌ No contempla datos</td><td>✅ El fichero es Python: puedes ejecutar SQL</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Resumen en una frase:</strong> <code>create_all</code> sirve para crear tablas que no existen; Alembic sirve para <em>evolucionar</em> un esquema que ya está en marcha. Dev y tests pueden usar <code>create_all</code>; producción, siempre Alembic.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Primera migración desde cero, con SQLModel.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Instala Alembic.</strong>
+            <pre><code class="language-bash">uv add alembic
+uv run alembic init migrations
+</code></pre>
+            <p>Resultado esperado: aparece <code>alembic.ini</code> y la carpeta <code>migrations/</code> con <code>env.py</code>, <code>script.py.mako</code> y <code>versions/</code> (vacía).</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Conecta <code>env.py</code> con tus modelos.</strong> Edita <code>migrations/env.py</code> para que use tu <code>metadata</code> y tu URL:
+            <div class="code-file">migrations/env.py</div>
+            <pre><code class="language-python">from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+from sqlmodel import SQLModel
+
+from app.config import settings
+import app.models  # noqa: F401  ← IMPORTA los modelos para registrarlos
+
+config = context.config
+
+# La URL sale de settings (nunca hardcodeada en alembic.ini).
+config.set_main_option("sqlalchemy.url", settings.database_url)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# ★ Alembic compara contra este metadata.
+target_metadata = SQLModel.metadata
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Genera la primera migración.</strong> Con la base de datos vacía:
+            <pre><code class="language-bash">uv run alembic revision --autogenerate -m "create modules and query_log"
+</code></pre>
+            <p>Resultado esperado en la consola:</p>
+            <pre><code class="language-text">INFO  [alembic.autogenerate.compare] Detected added table 'modules'
+INFO  [alembic.autogenerate.compare] Detected added table 'query_log'
+INFO  [alembic.runtime.migration] Generating migrations/versions/a1b2....py ... done
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Revisa el fichero.</strong> Abre <code>migrations/versions/a1b2....py</code>. Verás <code>upgrade()</code> con <code>op.create_table(...)</code> y <code>downgrade()</code> con <code>op.drop_table(...)</code>. <strong>Lee siempre lo generado</strong> antes de aplicarlo.
+          </li>
+          <li>
+            <strong>Paso 5 — Aplica.</strong>
+            <pre><code class="language-bash">uv run alembic upgrade head
+uv run alembic current
+</code></pre>
+            <p>Resultado esperado: <code>Running upgrade  -&gt; a1b2, create modules and query_log</code> y luego la revisión actual. En tu base de datos ya existen <code>modules</code>, <code>query_log</code> y <code>alembic_version</code>.</p>
+          </li>
+        </ol>
+        <p>Cada migración generada tiene esta forma (simplificada):</p>
+        <div class="code-file">migrations/versions/a1b2c3d4e5f6_create_modules_and_query_log.py</div>
+        <pre><code class="language-python">from alembic import op
+import sqlalchemy as sa          # noqa: F401
+
+revision = "a1b2c3d4e5f6"
+down_revision = None             # primera migración: no hay anterior
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -&gt; None:
+    op.create_table(
+        "query_log",
+        sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
+        sa.Column("question", sa.String(length=2000), nullable=False),
+        sa.Column("answer", sa.String(), nullable=True),
+        sa.Column("module_slug", sa.String(length=64), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_query_log_created_at", "query_log", ["created_at"])
+    op.create_index("ix_query_log_module_slug", "query_log", ["module_slug"])
+
+
+def downgrade() -&gt; None:
+    op.drop_index("ix_query_log_module_slug", table_name="query_log")
+    op.drop_index("ix_query_log_created_at", table_name="query_log")
+    op.drop_table("query_log")
+</code></pre>
+        <p>Fíjate: <code>upgrade</code> crea, <code>downgrade</code> destruye <em>en orden inverso</em>. Esta simetría es lo que te permite revertir sin sustos.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Copiloto API va a notificar el tiempo de respuesta. Añadimos <code>latency_ms</code> a <code>query_log</code> y un índice. En local, el flujo completo:</p>
+        <ol class="steps">
+          <li>
+            <strong>Añade la columna al modelo.</strong>
+            <div class="code-file">app/models.py</div>
+            <pre><code class="language-python">class QueryLog(SQLModel, table=True):
+    __tablename__ = "query_log"
+
+    id: int | None = Field(default=None, primary_key=True)
+    question: str = Field(max_length=2000)
+    answer: str | None = None
+    module_slug: str | None = Field(default=None, index=True, max_length=64)
+    latency_ms: int | None = None            # ← nueva columna
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+</code></pre>
+          </li>
+          <li>
+            <strong>Genera el diff.</strong>
+            <pre><code class="language-bash">uv run alembic revision --autogenerate -m "add latency_ms to query_log"
+</code></pre>
+            <p>Resultado esperado: <code>Detected added column 'query_log.latency_ms'</code>. Revisa el fichero generado.</p>
+          </li>
+          <li>
+            <strong>Revisa y ajusta.</strong> El autogenerate propone:
+            <div class="code-file">migrations/versions/b2c3....py</div>
+            <pre><code class="language-python">def upgrade() -&gt; None:
+    op.add_column("query_log", sa.Column("latency_ms", sa.Integer(), nullable=True))
+
+
+def downgrade() -&gt; None:
+    op.drop_column("query_log", "latency_ms")
+</code></pre>
+            <p>Si la columna fuese <code>NOT NULL</code>, añadirla a una tabla con filas fallaría: tendrías que dar un <code>server_default</code> temporal, rellenar y luego quitarlo. Aquí es <code>nullable=True</code>, así que no hay problema.</p>
+          </li>
+          <li>
+            <strong>Aplica en cada entorno.</strong>
+            <pre><code class="language-bash">uv run alembic upgrade head
+</code></pre>
+            <p>Resultado esperado: <code>Running upgrade a1b2c3d4e5f6 -&gt; b2c3d4e5f6a1, add latency_ms to query_log</code>. En producción, este mismo comando —apuntando a la base de producción— aplica exactamente el mismo cambio, porque el fichero de migración está versionado.</p>
+          </li>
+          <li>
+            <strong>Prepara el plan de reversión.</strong> Antes de desplegar, comprueba que <code>downgrade -1</code> funciona en local sobre una copia:
+            <pre><code class="language-bash">uv run alembic downgrade -1
+uv run alembic upgrade head
+</code></pre>
+            <p>Resultado esperado: baja y vuelve a subir sin errores. Un <code>downgrade</code> roto es un seguro que has pagado y no cubre nada.</p>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>SQLite y el <em>batch mode</em>.</strong> SQLite no soporta <code>ALTER COLUMN</code> como otros motores. Cuando Alembic necesite recrear una tabla (cambiar tipo o <code>nullable</code>), activa el modo por lotes en <code>env.py</code> para que copie datos a una tabla temporal y las restituya:</p>
+          <div class="code-file">migrations/env.py — parte online</div>
+          <pre><code class="language-python">def run_migrations_online() -&gt; None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,   # ★ necesario en SQLite para ALTER
+            compare_type=True,      # detecta cambios de tipo
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+</code></pre>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Versionar <code>migrations/versions/</code> en Git</td>
+              <td>Ignorar las migraciones en <code>.gitignore</code></td>
+              <td>Son parte del código; sin ellas nadie puede reconstruir el esquema</td>
+            </tr>
+            <tr>
+              <td>Revisar cada fichero autogenerado antes de aplicarlo</td>
+              <td>Ejecutar <code>--autogenerate</code> y hacer <code>upgrade</code> sin mirar</td>
+              <td>El autogenerate no detecta todo y a veces propone cambios peligrosos</td>
+            </tr>
+            <tr>
+              <td>Una migración por cambio lógico, con mensaje claro</td>
+              <td>Una migración gigante «de todo»</td>
+              <td>Facilita el <code>downgrade</code> selectivo y la lectura en un PR</td>
+            </tr>
+            <tr>
+              <td>Escribir <code>downgrade()</code> de verdad</td>
+              <td>Dejar <code>downgrade()</code> vacío (<code>pass</code>)</td>
+              <td>Sin reversión no tienes red de seguridad ante un despliegue fallido</td>
+            </tr>
+            <tr>
+              <td>Sacar la URL de la base de datos de <code>settings</code></td>
+              <td>Escribir credenciales en <code>alembic.ini</code></td>
+              <td>Nada de secretos en el repositorio</td>
+            </tr>
+            <tr>
+              <td>Importar todos los modelos en <code>env.py</code></td>
+              <td>Confiar en que el <code>metadata</code> «ya los conoce»</td>
+              <td>Un modelo no importado = una migración vacía y errores silenciosos</td>
+            </tr>
+            <tr>
+              <td>Probar <code>upgrade</code> y <code>downgrade</code> en local antes de desplegar</td>
+              <td>Estrenar la migración directamente en producción</td>
+              <td>Una migración lenta o bloqueante puede tumbar el servicio</td>
+            </tr>
+            <tr>
+              <td>Nunca editar una migración ya aplicada</td>
+              <td>«Corregir» un fichero que ya corrió en otro entorno</td>
+              <td>Los entornos divergen: Alembic cree que aplicó una cosa que ya no es</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Migración vacía porque los modelos no se importaron</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># migrations/env.py
+from sqlmodel import SQLModel
+# ...pero NUNCA importamos app.models
+
+target_metadata = SQLModel.metadata   # metadata vacío: conoce cero tablas
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># migrations/env.py
+from sqlmodel import SQLModel
+
+import app.models  # noqa: F401  ← registra Module y QueryLog en el metadata
+
+target_metadata = SQLModel.metadata
+</code></pre>
+        <p>El síntoma es un fichero de migración sin <code>op.create_table</code> y la sensación de que «Alembic no ve mis modelos». Alembic solo ve lo que se ha importado.</p>
+
+        <h3>Mezclar <code>create_all</code> con Alembic</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    SQLModel.metadata.create_all(engine)   # crea las tablas...
+    yield
+# ...y además aplicas migraciones de Alembic → dos fuentes de verdad
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.environment == "development":
+        SQLModel.metadata.create_all(engine)   # SOLO dev/tests
+    yield
+# En producción, el esquema lo aplica `alembic upgrade head` en el despliegue
+</code></pre>
+        <p>Si <code>create_all</code> crea una tabla antes de que Alembic la migre, el <code>upgrade</code> puede fallar por «la tabla ya existe» o quedar desincronizado. Elige una fuente de verdad.</p>
+
+        <h3>Editar una migración ya aplicada</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># b2c3d4e5f6a1.py — YA se aplicó en producción; alguien lo edita
+def upgrade() -&gt; None:
+    op.add_column("query_log", sa.Column("latency_ms", sa.Integer(), nullable=False))  # cambiado
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># Se crea una NUEVA migración para el cambio
+# uv run alembic revision -m "make latency_ms not null"
+def upgrade() -&gt; None:
+    op.alter_column("query_log", "latency_ms", nullable=False)
+</code></pre>
+        <p>Los entornos que ya aplicaron la revisión antigua no vuelven a ejecutarla. Si la editas, tu base de datos y el repositorio cuentan historias distintas. Los cambios se hacen <strong>hacia delante</strong>, con una migración nueva.</p>
+
+        <h3>SQLite sin <em>batch mode</em></h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-bash">uv run alembic revision --autogenerate -m "make question unique"
+uv run alembic upgrade head
+# sqlalchemy.exc.OperationalError: (sqlite3.OperationalError)
+# Cannot add a UNIQUE column / Constraint must have a name
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># migrations/env.py — dentro de run_migrations_online()
+context.configure(
+    connection=connection,
+    target_metadata=target_metadata,
+    render_as_batch=True,   # recrea la tabla por ti
+)
+</code></pre>
+        <p>SQLite no puede alterar columnas in situ. El modo por lotes hace que Alembic cree una tabla nueva, copie los datos y renombre; en PostgreSQL no lo necesitas, pero no estorba.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir un campo <code>feedback</code> (valoración del usuario, 1–5) al histórico, con índice, de principio a fin, incluyendo la reversión.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Modifica el modelo.</strong> En <code>app/models.py</code>, añade a <code>QueryLog</code>:
+            <pre><code class="language-python">feedback: int | None = Field(default=None, index=True)
+</code></pre>
+            <p>Resultado esperado: <code>uv run python -c "import app.models"</code> sin errores.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Genera la migración.</strong>
+            <pre><code class="language-bash">uv run alembic revision --autogenerate -m "add feedback to query_log"
+</code></pre>
+            <p>Resultado esperado: <code>Detected added column 'query_log.feedback'</code> y <code>Detected added index 'ix_query_log_feedback'</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Revisa el fichero.</strong> Comprueba que <code>upgrade()</code> tiene <code>op.add_column(...)</code> y <code>op.create_index(...)</code>, y que <code>downgrade()</code> hace lo inverso (<code>drop_index</code> y <code>drop_column</code>). Si el <code>downgrade</code> está vacío, escríbelo tú: es parte de la migración.</li>
+          <li>
+            <strong>Paso 4 — Aplica.</strong>
+            <pre><code class="language-bash">uv run alembic upgrade head
+uv run alembic current
+</code></pre>
+            <p>Resultado esperado: <code>Running upgrade ... -&gt; ..., add feedback to query_log</code> y la revisión actual apuntando a la nueva.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Verifica en la base de datos.</strong>
+            <pre><code class="language-python">from sqlalchemy import text
+
+from app.db import engine
+
+with engine.connect() as conn:
+    cols = conn.execute(text("PRAGMA table_info(query_log)")).all()
+    print([c[1] for c in cols])   # nombres de columna
+</code></pre>
+            <p>Resultado esperado: aparece <code>feedback</code> en la lista, junto a <code>id</code>, <code>question</code>, <code>answer</code>, <code>module_slug</code>, <code>latency_ms</code> y <code>created_at</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Prueba la reversión.</strong>
+            <pre><code class="language-bash">uv run alembic downgrade -1
+uv run alembic current        # debe retroceder a la revisión anterior
+uv run alembic upgrade head   # y volver
+</code></pre>
+            <p>Resultado esperado: el <code>downgrade</code> elimina <code>feedback</code> y <code>upgrade</code> lo devuelve. Acabas de probar la red de seguridad antes de necesitarla en producción.</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Documenta el cambio.</strong> Escribe en el <code>README</code> del proyecto el comando de despliegue (<code>uv run alembic upgrade head</code>) y añade la variable de entorno de la base de datos. Los pasos de esquema se documentan, no se improvisan.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Clave foránea y migración de datos</h3>
+          <p>Añade una tabla <code>users</code> (con <code>id</code> y <code>email</code> único) y una columna <code>user_id</code> en <code>query_log</code> como clave foránea a <code>users.id</code>. Después escribe <strong>una segunda migración</strong> (no edites la primera) que rellene el histórico existente con un usuario «anónimo» creado en la propia migración antes de aplicar la restricción <code>NOT NULL</code>.</p>
+          <p><em>Pistas: para crear una fila desde una migración usa <code>op.execute(...)</code> o <code>op.bulk_insert(...)</code> sobre una tabla definida con <code>sa.table(...)</code>. El orden importa: crea la columna anulable, inserta/rellena datos, y solo entonces aplícala como <code>NOT NULL</code>. Piensa también qué debe hacer el <code>downgrade</code>: ¿es reversible eliminar una columna con datos rellenados? Justifícalo y decide si merece la pena o si marcas esa revisión como no reversible usando <code>op.get_bind()</code> y una comprobación.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>migración</strong> es un cambio de esquema versionado, con <code>upgrade</code> y <code>downgrade</code>, que forma una cadena de revisiones.</li>
+          <li>Alembic guarda en <code>alembic_version</code> qué revisión está aplicada: por eso puede aplicar solo lo que falta, en orden.</li>
+          <li><code>env.py</code> conecta Alembic con <code>SQLModel.metadata</code> y <strong>debe importar los modelos</strong>.</li>
+          <li><code>--autogenerate</code> produce un <strong>borrador</strong>: siempre se revisa y se completa el <code>downgrade</code>.</li>
+          <li><code>create_all</code> es para dev y tests; <strong>producción usa Alembic</strong> porque necesita <code>ALTER</code>, historial y reversión.</li>
+          <li>Nunca edites una migración ya aplicada: los cambios van <strong>hacia delante</strong>, con una revisión nueva.</li>
+          <li>En SQLite activa <code>render_as_batch=True</code> para alterar columnas.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>uv run alembic init migrations</code></td><td>Crear la estructura de migraciones</td></tr>
+            <tr><td><code>uv run alembic revision --autogenerate -m "..."</code></td><td>Generar el diff modelos ↔ base de datos</td></tr>
+            <tr><td><code>uv run alembic upgrade head</code></td><td>Aplicar todas las migraciones pendientes</td></tr>
+            <tr><td><code>uv run alembic downgrade -1</code></td><td>Revertir la última migración</td></tr>
+            <tr><td><code>uv run alembic current</code></td><td>Ver la revisión aplicada en la base de datos</td></tr>
+            <tr><td><code>uv run alembic history</code></td><td>Listar la cadena de revisiones</td></tr>
+            <tr><td><code>uv run alembic stamp head</code></td><td>Marcar como al día sin ejecutar SQL</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo seguir usando <code>create_all</code> en desarrollo?</summary>
+            <div>
+              <p>Sí, y es cómodo: cero fricción para arrancar. Pero en cuanto el esquema empiece a cambiar, es mejor que dev también use Alembic, para que tu entorno local refleje el mismo proceso que producción. Un buen equilibrio: <code>create_all</code> solo si la base de datos local no existe, y <code>alembic upgrade head</code> el resto del tiempo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si la migración autogenerada sale vacía?</summary>
+            <div>
+              <p>Casi siempre es que el <code>metadata</code> no ve los modelos. Comprueba que <code>env.py</code> importa <code>app.models</code> (y cualquier módulo donde definas tablas). Si el import está bien, revisa que <code>target_metadata = SQLModel.metadata</code> apunta al mismo <code>metadata</code> que usan tus clases.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si la migración falla a mitad en producción?</summary>
+            <div>
+              <p>Depende del motor. En PostgreSQL, el DDL es transaccional: la migración fallida se revierte entera. En MySQL y SQLite, no siempre: puede quedar aplicada a medias. Por eso se prueba el <code>upgrade</code> y el <code>downgrade</code> en una copia antes de tocar producción, y se evitan migraciones largas en una sola transacción.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Alembic detecta si cambio el tipo de una columna?</summary>
+            <div>
+              <p>Solo si activas <code>compare_type=True</code> en <code>context.configure()</code>. Aun así, algunos cambios (por ejemplo, cadenas con distinta longitud) pueden no detectarlos todos los motores. Cuando la detección no sea fiable, escribe la migración a mano: es lo más honesto y lo más seguro.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo adopto Alembic en una base de datos que ya existe?</summary>
+            <div>
+              <p>Genera la primera migración con <code>--autogenerate</code> contra la base existente, y luego usa <code>alembic stamp head</code> para marcar la base como «ya al día» sin ejecutar el SQL (porque las tablas ya están). A partir de ahí, los cambios nuevos sí se aplican con <code>upgrade</code>. Alternativamente, empieza desde cero y usa <code>stamp</code> en el primer despliegue.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

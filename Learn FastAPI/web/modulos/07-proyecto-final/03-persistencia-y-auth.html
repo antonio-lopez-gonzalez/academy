@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-persistencia-y-auth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Persistencia y auth — Módulo 7 · Curso FastAPI</title>
+  <meta name="description" content="Histórico de consultas de Copiloto API en SQLModel, migración con Alembic y endpoints protegidos con JWT: OAuth2 password flow, hash bcrypt, roles y ownership.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Persistencia y auth</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: Copiloto API</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Copiloto API responde y registra consultas, pero hoy cualquiera puede llamarlo y el histórico lo ve todo el mundo. Esta lección cierra las dos grietas: <strong>quién pregunta</strong> y <strong>qué se guarda de esa pregunta</strong>. Añadimos un modelo <code>User</code>, enlazamos <code>QueryLog</code> con su dueño mediante una clave foránea, versionamos el cambio con <strong>Alembic</strong> y protegemos los endpoints con <strong>JWT</strong> y <strong>roles</strong>.</p>
+        <p>Son dos temas que en el curso viven en módulos distintos —persistencia (Módulo 4) y seguridad (Módulo 5)— pero que en un proyecto real van de la mano: una columna <code>owner_id</code> sin autenticación no sirve de nada, y un token sin un usuario en la base de datos no puede autorizar nada.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque aquí se vuelve concreto el modelo de amenazas. Un endpoint público de RAG es caro (cada llamada mueve un modelo) y filtra el histórico de otros usuarios. Autenticar no es burocracia: es lo que permite <strong>facturar, limitar el abuso, auditar y aislar datos</strong>. Y hacerlo con migraciones versionadas es lo que permite aplicar el mismo cambio en tu portátil y en producción sin tocar una línea de SQL a mano.</p>
+        </div>
+        <p>Errores típicos que evitamos: guardar la contraseña (o su hash) con una comparación <code>==</code>, desactivar la verificación del token «para que funcione», confiar en el rol que viene dentro del JWT en lugar de en la base de datos, y responder <code>403</code> a un recurso ajeno revelando que existe.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El histórico con dueño</h3>
+        <p>El histórico no es una tabla suelta: es el registro de <em>quién preguntó qué, cuándo y con qué coste</em>. Con la autenticación, cada fila gana un <code>owner_id</code>. Esa clave foránea es la bisagra entre las dos mitades de la lección.</p>
+        <pre class="diagram">
+   users                          query_log
+   ┌────┬───────────────┬───────┐   ┌────┬──────────────┬──────────┐
+   │ id │ email         │ role  │   │ id │ question     │ owner_id │
+   ├────┼───────────────┼───────┤   ├────┼──────────────┼──────────┤
+   │ 1  │ ana@academy…  │ user  │◄──┤ 7  │ ¿Qué es ASGI?│ 1        │
+   │ 2  │ root@academy… │ admin │◄──┤ 8  │ ¿Y SQLModel? │ 2        │
+   └────┴───────────────┴───────┘   └────┴──────────────┴──────────┘
+           1 : N  (un usuario tiene muchas consultas)
+        </pre>
+        <div class="callout callout--note">
+          <p><strong>¿Por qué <code>owner_id</code> y no guardar el email en el log?</strong> Porque el email puede cambiar y porque una clave foránea garantiza la integridad referencial: no puedes tener una consulta de un usuario que no existe. Guardar datos duplicados es cómodo hasta que se desincronizan.</p>
+        </div>
+
+        <h3>De modelo a tabla: el <em>diff</em> de Alembic</h3>
+        <p>Añadir un modelo en Python <strong>no cambia la base de datos</strong>. El esquema real es un contrato persistente que solo cambia con una migración. El flujo de este módulo es siempre el mismo:</p>
+        <pre class="diagram">
+   1. editas app/models.py             (modelo nuevo: User, y owner_id en QueryLog)
+              │
+   2. uv run alembic revision --autogenerate -m "…"
+              │                        → Alembic compara metadata vs BD real
+              ▼
+   3. LEES migrations/versions/xxxx.py  (y corriges lo que haga falta)
+              │
+   4. uv run alembic upgrade head       → aplica en tu base de datos
+              │
+   5. el MISMO fichero aplica el cambio en producción (mismo código, otra URL)
+        </pre>
+        <div class="callout callout--warning">
+          <p><strong>Añadir una columna <code>NOT NULL</code> a una tabla con datos falla.</strong> No hay valor para las filas existentes. El patrón en tres pasos es: añadirla <em>nullable</em>, rellenar (<code>UPDATE … SET owner_id = …</code>) y luego hacerla <code>NOT NULL</code> en una segunda migración. En SQLite, además, los <code>ALTER</code> complejos necesitan <em>batch mode</em> (Módulo 4, lección 3).</p>
+        </div>
+
+        <h3>Contraseñas: <em>hash</em>, nunca cifrado reversible</h3>
+        <p>Un <strong>hash</strong> es una función de un solo sentido: de la contraseña se obtiene una cadena, pero de la cadena <em>no</em> se vuelve a la contraseña. Al registrarte se guarda el hash; al hacer login se vuelve a calcular y se comparan. Nunca se guarda la contraseña, ni «cifrada», ni en ningún formato que se pueda descifrar.</p>
+        <p>Además, el hash debe ser <strong>lento y salado</strong> para resistir ataques por diccionario o tablas precalculadas. <code>bcrypt</code> es el estándar: incluye <em>salt</em> por contraseña y un coste configurable. <code>passlib</code> con el esquema <code>bcrypt</code> lo gestiona todo:</p>
+        <div class="code-file">app/security.py (fragmento)</div>
+        <pre><code class="language-python">from passlib.context import CryptContext
+
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(password: str) -&gt; str:
+    return _pwd.hash(password)          # el salt va dentro del propio hash
+
+
+def verify_password(password: str, hashed: str) -&gt; bool:
+    return _pwd.verify(password, hashed)   # comparación en tiempo constante
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Dependencia concreta, no abstracta:</strong> este proyecto usa <code>passlib[bcrypt]</code>, como indica la spec del curso. Con <code>bcrypt</code> 4.1 o superior, <code>passlib</code> 1.7.4 emite un aviso al leer su versión (<code>AttributeError: module 'bcrypt' has no attribute '__about__'</code>); es inofensivo pero ruidoso. Si te molesta, fija <code>bcrypt&lt;4.1</code> en <code>pyproject.toml</code> o migra a <code>pwdlib</code>, que es la alternativa moderna. Lo acotas y lo documentas: el hash no es donde conviene improvisar.</p>
+        </div>
+
+        <h3>OAuth2 password flow y JWT</h3>
+        <p>El <em>password flow</em> es el flujo estándar de OAuth2 para clientes de confianza (el propio front, una CLI, Swagger UI). Tiene dos pasos:</p>
+        <pre class="diagram">
+   POST /auth/token                        (form-urlencoded: username + password)
+        │
+        ▼
+   ¿usuario existe y verify_password pasa?  ──no──►  401
+        │ sí
+        ▼
+   firmar JWT { sub: email, role, iat, exp }  ──►  { access_token, token_type: "bearer" }
+        │
+        ▼
+   Cliente:  Authorization: Bearer &lt;token&gt;
+        │
+        ▼
+   Cada endpoint protegido:  decode + buscar usuario en BD  ──►  User
+        </pre>
+        <p>El JWT tiene tres partes (<em>header.payload.signature</em>). El <em>payload</em> no está cifrado: <strong>cualquiera puede leerlo</strong>. Su valor es la <em>firma</em>: si alguien modifica un byte del payload, la firma deja de validar. Los claims que usamos:</p>
+        <table>
+          <thead><tr><th>Claim</th><th>Significado</th><th>Por qué importa</th></tr></thead>
+          <tbody>
+            <tr><td><code>sub</code></td><td>Sujeto: el identificador del usuario (aquí, su email)</td><td>Es a quién pertenece el token</td></tr>
+            <tr><td><code>role</code></td><td>Rol en el momento de emitirlo</td><td>Cómodo, pero puede quedar obsoleto: revalida contra la BD</td></tr>
+            <tr><td><code>iat</code></td><td>Emitido en (<em>issued at</em>)</td><td>Permite auditar y calcular antigüedad</td></tr>
+            <tr><td><code>exp</code></td><td>Caduca en (<em>expiration</em>)</td><td>Es la red de seguridad: un token robado no vale para siempre</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>¿Por qué el token caduca?</strong> Porque es un «pase» que el portador puede robar (un log, un historial, un dispositivo compartido) y no se puede revocar uno a uno. Caducarlo pronto reduce la ventana de abuso. Como eso obliga a loguearse a menudo, los sistemas reales combinan un <em>access token</em> corto con un <em>refresh token</em> largo (el reto de esta lección).</p>
+        </div>
+
+        <h3>Autorización: <code>get_current_user</code> y roles</h3>
+        <p>Autenticación («¿quién eres?») y autorización («¿puedes hacer esto?») son dos pasos encadenados de dependencias. El primero valida el token y devuelve el usuario; el segundo comprueba su rol:</p>
+        <pre class="diagram">
+   OAuth2PasswordBearer  ──token──►  get_current_user  ──User──►  require_role("admin")
+        │                            (decode + BD)                    │
+        └── sin cabecera → 401                                        └── rol insuficiente → 403
+        </pre>
+        <div class="callout callout--why">
+          <p><strong>Revalida el usuario contra la base de datos.</strong> El JWT es una prueba de identidad <em>pasada</em>: fue cierto cuando se emitió. Si el usuario fue borrado, o si su rol cambió, el token sigue diciendo lo de antes hasta que caduque. Buscar al usuario en cada petición (una consulta indexada por <code>email</code>, muy barata) hace que la autorización refleje el estado real. Es la diferencia entre «el token dice que es admin» y «es admin».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El ciclo completo de la seguridad en un fichero: hashear, emitir un token y verificarlo. Sin FastAPI todavía, para ver la mecánica desnuda.</p>
+        <div class="code-file">security_min.py</div>
+        <pre><code class="language-python">from datetime import datetime, timedelta, timezone
+
+import jwt
+from passlib.context import CryptContext
+
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# En el proyecto esto viene de Settings, nunca del código.
+SECRET_KEY = "una-clave-secreta-de-al-menos-32-caracteres"
+ALGORITHM = "HS256"
+
+
+def hash_password(password: str) -&gt; str:
+    return _pwd.hash(password)
+
+
+def verify_password(password: str, hashed: str) -&gt; bool:
+    return _pwd.verify(password, hashed)
+
+
+def create_token(email: str, role: str = "user") -&gt; str:
+    now = datetime.now(timezone.utc)
+    payload = {"sub": email, "role": role, "iat": now,
+               "exp": now + timedelta(minutes=30)}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -&gt; dict:
+    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+
+# --- Prueba del ciclo -------------------------------------------------------
+hashed = hash_password("s3cret")
+print(hashed.startswith("$2b$"))                      # True  (bcrypt)
+print(verify_password("s3cret", hashed))              # True
+print(verify_password("otra", hashed))                # False
+
+token = create_token("ana@academy.dev")
+print(decode_token(token)["sub"])                     # ana@academy.dev
+
+# Un token manipulado o caducado lanza una excepción:
+try:
+    decode_token(token + "x")
+except jwt.InvalidTokenError as exc:
+    print("rechazado:", type(exc).__name__)
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">True
+True
+False
+ana@academy.dev
+rechazado: DecodeError
+</code></pre>
+        <p>Lo esencial, línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>_pwd.hash(password)</code></strong>: genera un hash distinto cada vez (lleva <em>salt</em> dentro, empieza por <code>$2b$</code>). Dos usuarios con la misma contraseña tienen hashes distintos.</li>
+          <li><strong><code>_pwd.verify(password, hashed)</code></strong>: verifica comparando en tiempo constante. <em>Nunca</em> compares con <code>==</code>, y desde luego no compruebes la contraseña en claro.</li>
+          <li><strong><code>datetime.now(timezone.utc)</code></strong>: la fecha con zona, como en el histórico. PyJWT exige que <code>exp</code> sea un instante válido.</li>
+          <li><strong><code>jwt.encode(payload, key, algorithm)</code></strong>: firma el payload. La clave viene de <code>Settings</code> y <strong>nunca</strong> del código.</li>
+          <li><strong><code>jwt.decode(token, key, algorithms=[...])</code></strong>: valida la firma <em>y</em> la caducidad, y <strong>restringe</strong> el algoritmo aceptado. Omitir <code>algorithms</code> o pasar <code>None</code> abre la puerta a ataques de confusión de algoritmo.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Los modelos que añadimos al histórico. <code>User</code> es nuevo; <code>QueryLog</code> gana su dueño.</p>
+        <div class="code-file">app/models.py (fragmento)</div>
+        <pre><code class="language-python">class User(SQLModel, table=True):
+    __tablename__ = "users"
+
+    id: int | None = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True, max_length=320)
+    hashed_password: str                        # NUNCA la contraseña en claro
+    role: str = Field(default="user", max_length=32)   # user | admin
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class QueryLog(SQLModel, table=True):
+    __tablename__ = "query_log"
+
+    id: int | None = Field(default=None, primary_key=True)
+    question: str = Field(max_length=2000)
+    answer: str | None = None
+    module_slug: str | None = Field(default=None, index=True, max_length=64)
+    latency_ms: int | None = None
+    owner_id: int | None = Field(default=None, foreign_key="users.id", index=True)
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+</code></pre>
+        <div class="code-file">app/security.py</div>
+        <pre><code class="language-python">from datetime import datetime, timedelta, timezone
+
+import jwt
+from passlib.context import CryptContext
+
+from app.config import Settings
+
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(password: str) -&gt; str:
+    return _pwd.hash(password)
+
+
+def verify_password(password: str, hashed: str) -&gt; bool:
+    return _pwd.verify(password, hashed)
+
+
+def create_access_token(subject: str, settings: Settings, role: str = "user") -&gt; str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": subject,
+        "role": role,
+        "iat": now,
+        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
+def decode_token(token: str, settings: Settings) -&gt; dict[str, object]:
+    """Valida firma y caducidad. Lanza jwt.InvalidTokenError si algo falla."""
+    return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+</code></pre>
+        <div class="code-file">app/deps.py (fragmento de seguridad)</div>
+        <pre><code class="language-python">import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlmodel import select
+
+from app.models import User
+from app.security import decode_token
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+def get_current_user(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session: SessionDep,
+    settings: SettingsDep,
+) -&gt; User:
+    """Autenticación: token válido → usuario real de la base de datos."""
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Credenciales no válidas",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_token(token, settings)
+    except jwt.InvalidTokenError:
+        raise credentials_error from None
+
+    email = payload.get("sub")
+    if not isinstance(email, str):
+        raise credentials_error
+
+    user = session.exec(select(User).where(User.email == email)).first()
+    if user is None:                      # usuario borrado pero token aún válido
+        raise credentials_error
+    return user
+
+
+CurrentUserDep = Annotated[User, Depends(get_current_user)]
+
+
+def require_role(role: str):
+    """Autorización: fabrica una dependencia que exige un rol concreto."""
+    def checker(user: CurrentUserDep) -&gt; User:
+        if user.role != role:             # rol REAL, no el del token
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permisos insuficientes",
+            )
+        return user
+    return checker
+
+
+AdminDep = Annotated[User, Depends(require_role("admin"))]
+</code></pre>
+        <div class="code-file">app/routers/auth.py</div>
+        <pre><code class="language-python">from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlmodel import select
+
+from app.deps import SessionDep, SettingsDep
+from app.models import User
+from app.schemas import TokenResponse
+from app.security import create_access_token, verify_password
+
+router = APIRouter()
+
+
+@router.post("/token", response_model=TokenResponse)
+def login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    session: SessionDep,
+    settings: SettingsDep,
+) -&gt; TokenResponse:
+    """OAuth2 password flow: recibe form-urlencoded, devuelve el access token."""
+    user = session.exec(select(User).where(User.email == form.username)).first()
+    if user is None or not verify_password(form.password, user.hashed_password):
+        # Mismo error para «no existe» y «contraseña mal»: no damos pistas.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(user.email, settings, role=user.role)
+    return TokenResponse(access_token=token)
+</code></pre>
+        <p>El contrato del token y el del histórico público:</p>
+        <div class="code-file">app/schemas.py (fragmentos)</div>
+        <pre><code class="language-python">class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class QueryLogPublic(SQLModel):
+    id: int
+    question: str
+    answer: str | None = None
+    module_slug: str | None = None
+    latency_ms: int | None = None
+    created_at: datetime
+    # owner_id NO se expone: el cliente ya sabe quién es.
+</code></pre>
+        <p>Y los dos cambios en <code>ask.py</code>: exigir usuario y firmar la consulta con su dueño.</p>
+        <div class="code-file">app/routers/ask.py (fragmento)</div>
+        <pre><code class="language-python">@router.post("", response_model=AskResponse)
+def ask(
+    payload: AskRequest,
+    engine: EngineDep,
+    session: SessionDep,
+    user: CurrentUserDep,          # ← sin token, este endpoint es 401
+) -&gt; AskResponse:
+    started = time.perf_counter()
+    result = engine.answer(payload.question, payload.module_slug)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+
+    log = QueryLog(
+        question=payload.question,
+        answer=result.text,
+        module_slug=payload.module_slug,
+        latency_ms=latency_ms,
+        owner_id=user.id,          # ← el histórico ya tiene dueño
+    )
+    session.add(log)
+    session.commit()
+    session.refresh(log)
+
+    return AskResponse(answer=result.text, sources=result.sources,
+                       latency_ms=latency_ms, log_id=log.id)
+</code></pre>
+        <div class="code-file">app/routers/logs.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, HTTPException, Query, status
+from sqlmodel import select
+
+from app.deps import AdminDep, CurrentUserDep, SessionDep
+from app.models import QueryLog
+from app.schemas import QueryLogPublic
+
+router = APIRouter()
+
+
+@router.get("", response_model=list[QueryLogPublic])
+def list_my_logs(
+    user: CurrentUserDep,
+    session: SessionDep,
+    limit: int = Query(default=20, ge=1, le=100),
+) -&gt; list[QueryLog]:
+    """Solo el histórico del usuario autenticado."""
+    statement = (
+        select(QueryLog)
+        .where(QueryLog.owner_id == user.id)
+        .order_by(QueryLog.created_at.desc())
+        .limit(limit)
+    )
+    return list(session.exec(statement).all())
+
+
+@router.get("/all", response_model=list[QueryLogPublic])
+def list_all_logs(
+    admin: AdminDep,          # ← rol admin; si no, 403
+    session: SessionDep,
+    limit: int = Query(default=50, ge=1, le=200),
+) -&gt; list[QueryLog]:
+    statement = select(QueryLog).order_by(QueryLog.created_at.desc()).limit(limit)
+    return list(session.exec(statement).all())
+
+
+@router.get("/{log_id}", response_model=QueryLogPublic)
+def get_log(log_id: int, user: CurrentUserDep, session: SessionDep) -&gt; QueryLog:
+    log = session.get(QueryLog, log_id)
+    # 404, no 403: no revelamos que un recurso ajeno existe.
+    if log is None or log.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Consulta no encontrada",
+        )
+    return log
+</code></pre>
+        <p>Y la migración que hace real todo esto. Generada con <code>alembic revision --autogenerate -m "add users and query_log.owner_id"</code> y revisada a mano:</p>
+        <div class="code-file">migrations/versions/c4d5e6f7a8b9_add_users_and_owner_id.py</div>
+        <pre><code class="language-python">def upgrade() -&gt; None:
+    op.create_table(
+        "users",
+        sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
+        sa.Column("email", sa.String(length=320), nullable=False),
+        sa.Column("hashed_password", sa.String(), nullable=False),
+        sa.Column("role", sa.String(length=32), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_users_email", "users", ["email"], unique=True)
+
+    # owner_id nullable: la tabla ya tiene filas y no podemos inventarles dueño.
+    op.add_column("query_log", sa.Column("owner_id", sa.Integer(), nullable=True))
+    op.create_index("ix_query_log_owner_id", "query_log", ["owner_id"])
+    op.create_foreign_key(
+        "fk_query_log_owner_id_users",
+        "query_log", "users", ["owner_id"], ["id"],
+    )
+
+
+def downgrade() -&gt; None:
+    op.drop_constraint("fk_query_log_owner_id_users", "query_log", type_="foreignkey")
+    op.drop_index("ix_query_log_owner_id", table_name="query_log")
+    op.drop_column("query_log", "owner_id")
+    op.drop_index("ix_users_email", table_name="users")
+    op.drop_table("users")
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Migrar y crear el primer usuario.</strong> Con la migración aplicada (<code>uv run alembic upgrade head</code>), crea el primer usuario con un script que use <code>hash_password</code>; nunca insertes la contraseña a mano en SQL. Lo tienes en el ejercicio guiado.</p>
+        </div>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>hashed_password</code>, no <code>password</code></strong>: el nombre del campo deja claro qué se guarda. Un <code>password</code> con un hash dentro es una trampa para el siguiente que lea el código.</li>
+          <li><strong><code>role</code> como cadena</strong>: para dos roles (<code>user</code>, <code>admin</code>) un <code>str</code> con valores acotados basta; si crecen, un <code>Enum</code> de Python o una tabla de roles. El token lleva el rol, pero la autorización lee <code>user.role</code> de la BD.</li>
+          <li><strong>Un mismo 401 para «no existe» y «contraseña mal»</strong>: no ayudamos a enumerar usuarios.</li>
+          <li><strong><code>get_log</code> responde 404 a un recurso ajeno</strong>: un 403 confirmaría que existe. Para datos privados, el 404 uniforme es la política habitual.</li>
+          <li><strong><code>limit</code> acotado con <code>Query(ge=1, le=100)</code></strong>: sin techo, un cliente puede pedir «todo el histórico». El límite es una barrera de coste y de memoria.</li>
+          <li><strong>Migración en dos tiempos para <code>owner_id</code></strong>: primero nullable. Cuando decidas cerrar la relación, una segunda migración con <em>backfill</em> la hará <code>NOT NULL</code>.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Guardar solo el <em>hash</em> bcrypt</td>
+              <td>Guardar la contraseña o cifrarla de forma reversible</td>
+              <td>Un hash filtrado no permite recuperar la contraseña; un cifrado sí</td>
+            </tr>
+            <tr>
+              <td>Verificar con <code>verify_password</code></td>
+              <td>Comparar hashes con <code>==</code> o comparar en claro</td>
+              <td><code>verify</code> es tiempo constante; <code>==</code> filtra información por tiempos</td>
+            </tr>
+            <tr>
+              <td>Firmar con una clave larga de <code>Settings</code></td>
+              <td>Clave de ejemplo en el código o clave corta</td>
+              <td>Clave descubierta = cualquiera puede firmar tokens válidos</td>
+            </tr>
+            <tr>
+              <td>Restringir <code>algorithms</code> en <code>decode</code></td>
+              <td><code>options={"verify_signature": False}</code> «para que funcione»</td>
+              <td>Desactivar la verificación convierte el JWT en texto plano manipulable</td>
+            </tr>
+            <tr>
+              <td>Revalidar el usuario (y su rol) contra la base de datos</td>
+              <td>Autorizar con lo que dice el token</td>
+              <td>El token es un retrato del pasado; el rol puede haber cambiado</td>
+            </tr>
+            <tr>
+              <td>Una <code>exp</code> corta (minutos)</td>
+              <td>Tokens que no caducan nunca</td>
+              <td>Sin caducidad no hay forma de cerrar la puerta a un token robado</td>
+            </tr>
+            <tr>
+              <td>404 en recursos privados ajenos</td>
+              <td>403 que confirma que el recurso existe</td>
+              <td>Evita enumerar identificadores de otros usuarios</td>
+            </tr>
+            <tr>
+              <td>Migrar el esquema con Alembic</td>
+              <td>Cambiar la BD a mano (<code>ALTER TABLE</code> suelto)</td>
+              <td>El cambio reproducido en producción tiene que ser el mismo que probaste</td>
+            </tr>
+            <tr>
+              <td>Filtrar el histórico por <code>owner_id</code> indexado</td>
+              <td>Traer todo y filtrar en Python</td>
+              <td>El filtro en SQL es correcto y eficiente; en Python es un N+1 sobre toda la tabla</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Comparar contraseñas a mano</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">user = session.exec(select(User).where(User.email == form.username)).first()
+if user is None or user.password == form.password:      # ¿en claro? ¿con ==?
+    token = create_access_token(user.email, settings)
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">if user is None or not verify_password(form.password, user.hashed_password):
+    raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+token = create_access_token(user.email, settings, role=user.role)
+</code></pre>
+        <p>Si guardas la contraseña en claro, una filtración de la base de datos es un desastre. Y si guardas el hash pero comparas con <code>==</code>, no verificas el coste ni el <em>salt</em> de bcrypt, además de comparar en tiempo variable (que filtra información). Usa siempre <code>verify_password</code>.</p>
+
+        <h3>Desactivar la verificación del token</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">payload = jwt.decode(
+    token, settings.secret_key,
+    options={"verify_signature": False},   # «el token de mi front falla, lo quito»
+)
+return payload["sub"]                      # cualquiera puede inventarse un sub
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">try:
+    payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+except jwt.InvalidTokenError:
+    raise credentials_error from None      # firma o exp inválidas → 401
+</code></pre>
+        <p>Desactivar la firma convierte el JWT en un texto editable: todo el modelo de seguridad se cae. Si algo «no funciona» con un token, el problema suele ser que se firmó con otra clave o que ya caducó, no que la verificación estorbe.</p>
+
+        <h3>Autorizar con el rol del token</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def require_admin(token: Annotated[str, Depends(oauth2_scheme)], settings: SettingsDep):
+    payload = decode_token(token, settings)
+    if payload["role"] != "admin":        # rol congelado en el token
+        raise HTTPException(403)
+    return payload["sub"]                  # devuelve un string, no un User
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def require_role(role: str):
+    def checker(user: CurrentUserDep) -&gt; User:
+        if user.role != role:              # rol real, leído de la base de datos
+            raise HTTPException(status_code=403, detail="Permisos insuficientes")
+        return user
+    return checker
+</code></pre>
+        <p>El token dice lo que era cierto al emitirse. Si ayer era admin y hoy es usuario, o si su cuenta se desactivó, el token sigue diciendo «admin» hasta caducar. Revalidar contra la base de datos en cada petición es barato y mantiene la autorización fiel a la realidad.</p>
+
+        <h3>Añadir una columna <code>NOT NULL</code> sin rellenarla</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># Migración que fallará si query_log tiene filas:
+def upgrade() -&gt; None:
+    op.add_column("query_log", sa.Column("owner_id", sa.Integer(), nullable=False))
+# sqlite3.OperationalError: Cannot add a NOT NULL column with default value NULL
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># 1) columna nullable  →  2) rellenar  →  3) (otra migración) cerrar a NOT NULL
+def upgrade() -&gt; None:
+    op.add_column("query_log", sa.Column("owner_id", sa.Integer(), nullable=True))
+    op.create_index("ix_query_log_owner_id", "query_log", ["owner_id"])
+    op.execute("UPDATE query_log SET owner_id = 1 WHERE owner_id IS NULL")
+</code></pre>
+        <p>Una regla de esquema se cambia en pasos porque la base de datos ya tiene datos que no pueden violar la nueva regla. El <em>backfill</em> es el paso intermedio: asignar un valor razonable a lo existente antes de exigir el nuevo contrato.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> migrar el esquema, crear un usuario, obtener un token y comprobar el aislamiento del histórico (401, 403 y 404 incluidos).</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Añade las dependencias de seguridad.</strong>
+            <pre><code class="language-bash">uv add "passlib[bcrypt]" pyjwt
+</code></pre>
+            <p>Resultado esperado: <code>passlib</code> y <code>pyjwt</code> en <code>pyproject.toml</code>. Comprueba el import:</p>
+            <pre><code class="language-bash">uv run python -c "import jwt, passlib; print('ok')"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Escribe los modelos y <code>security.py</code>.</strong> Añade <code>User</code> a <code>app/models.py</code> y <code>owner_id</code> a <code>QueryLog</code>. Copia <code>app/security.py</code> de la sección 4 (hash, verify, crear y decodificar el token).
+          </li>
+          <li>
+            <strong>Paso 3 — Genera y aplica la migración.</strong>
+            <pre><code class="language-bash">uv run alembic revision --autogenerate -m "add users and query_log.owner_id"
+# LEE el fichero generado antes de seguir
+uv run alembic upgrade head
+</code></pre>
+            <p>Resultado esperado: <code>Detected added table 'users'</code> y <code>Detected added column 'query_log.owner_id'</code>. Después, <code>alembic current</code> debe mostrar la nueva revisión. Verifica las tablas:</p>
+            <pre><code class="language-bash">uv run python -c "from sqlalchemy import text; from app.db import engine; print([r[0] for r in engine.connect().execute(text(\"SELECT name FROM sqlite_master WHERE type='table'\"))])"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Crea el primer usuario con un script.</strong> Nunca insertes la contraseña a mano. Crea <code>scripts/create_user.py</code>:
+            <pre><code class="language-python">import sys
+
+from sqlmodel import Session
+
+from app.db import engine
+from app.models import User
+from app.security import hash_password
+
+
+def main(email: str, password: str, role: str = "user") -&gt; None:
+    with Session(engine) as session:
+        session.add(User(email=email, hashed_password=hash_password(password), role=role))
+        session.commit()
+    print("usuario creado:", email, f"({role})")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) &gt; 3 else "user")
+</code></pre>
+            <pre><code class="language-bash">uv run python scripts/create_user.py ana@academy.dev "s3cret-de-ana"
+uv run python scripts/create_user.py root@academy.dev "s3cret-root" admin
+</code></pre>
+            <p>Resultado esperado: dos líneas <code>usuario creado: … (user)</code> y <code>(admin)</code>. Si repites el mismo email, verás un error de unicidad: es la base de datos defendiendo la regla.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Pide un token.</strong> Arranca el servidor y usa el flujo del formulario:
+            <pre><code class="language-bash">TOKEN=$(curl -s -X POST http://127.0.0.1:8000/auth/token \
+  -d "username=ana@academy.dev&amp;password=s3cret-de-ana" | python -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+echo "$TOKEN"
+</code></pre>
+            <p>Resultado esperado: un JWT (tres bloques separados por puntos). Pega el payload en un decodificador y comprueba que contiene <code>sub</code>, <code>role</code>, <code>iat</code> y <code>exp</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Llama al endpoint protegido.</strong>
+            <pre><code class="language-bash">curl -s -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question": "¿Qué es una dependencia?"}'
+curl -s http://127.0.0.1:8000/logs -H "Authorization: Bearer $TOKEN"
+</code></pre>
+            <p>Resultado esperado: el <code>POST /ask</code> responde 200 y <code>GET /logs</code> devuelve solo <em>tus</em> consultas. Repite el <code>POST /ask</code> <strong>sin</strong> cabecera: debe responder 401.</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Comprueba el aislamiento y los roles.</strong>
+            <pre><code class="language-bash"># Token de Ana y consulta de Ana → 200 (404 si pides una que no es tuya)
+curl -s -i http://127.0.0.1:8000/logs/999 -H "Authorization: Bearer $TOKEN"
+# Con el token de Ana, /logs/all debe ser 403
+curl -s -i http://127.0.0.1:8000/logs/all -H "Authorization: Bearer $TOKEN"
+</code></pre>
+            <p>Resultado esperado: un <code>404</code> al pedir un log ajeno (no un 403 que lo delate) y un <code>403</code> al intentar el endpoint de administración. Repite con el token de <code>root@academy.dev</code>: <code>/logs/all</code> responde 200.</p>
+          </li>
+          <li>
+            <strong>Paso 8 — Prueba de fallo.</strong> Pide un token con la contraseña equivocada:
+            <pre><code class="language-bash">curl -s -i -X POST http://127.0.0.1:8000/auth/token \
+  -d "username=ana@academy.dev&amp;password=incorrecta"
+</code></pre>
+            <p>Resultado esperado: <code>401</code> con el mismo mensaje que si el usuario no existiera. Ese mensaje idéntico es intencionado: no filtramos qué emails están registrados.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 <em>Refresh tokens</em> con rotación</h3>
+          <p>Implementa un segundo tipo de token: un <em>refresh token</em> de vida larga (por ejemplo, 7 días) que permita obtener un nuevo <em>access token</em> corto sin volver a escribir la contraseña. Añade un endpoint <code>POST /auth/refresh</code>. Cuando se use, el refresh anterior debe quedar <strong>invalidado</strong> y debe emitirse uno nuevo (<em>rotación</em>); si alguien intenta reutilizar un refresh ya usado, toda la familia de tokens de ese usuario debe revocarse.</p>
+          <p><em>Pistas: el refresh no debería ser un access token reciclado; dale su propio <code>type: "refresh"</code> y comprueba ese campo al usarlo. Para invalidar y detectar reutilización necesitas estado: una tabla <code>RefreshToken</code> (con <code>jti</code>, <code>user_id</code>, <code>expires_at</code>, <code>revoked</code> y, opcionalmente, un <code>family_id</code>) o un almacén rápido tipo Redis. Pregúntate dónde guardar y cómo limpiar los tokens caducados, y qué código de estado devuelves cuando detectas reutilización. Documenta el modelo de amenaza: ¿a quién protege la rotación y de qué?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El histórico gana un <strong>dueño</strong>: <code>QueryLog.owner_id</code> con clave foránea a <code>users.id</code>, indexado.</li>
+          <li>Los cambios de esquema se hacen con <strong>Alembic</strong>: <em>autogenerate</em>, revisión manual, <code>upgrade head</code>. El mismo fichero aplica en todos los entornos.</li>
+          <li>Añadir una columna <code>NOT NULL</code> a una tabla con datos exige <strong>tres pasos</strong>: nullable, relleno y cierre.</li>
+          <li>Las contraseñas se guardan como <strong>hash bcrypt</strong>; se verifican con <code>verify_password</code>, nunca con <code>==</code>.</li>
+          <li>El <strong>JWT</strong> se firma con una clave de <code>Settings</code> y lleva <code>sub</code>, <code>role</code>, <code>iat</code> y <code>exp</code>; su payload es público, su firma no.</li>
+          <li><code>decode</code> valida firma y caducidad y <strong>restringe el algoritmo</strong>; desactivar la verificación es un error grave.</li>
+          <li>La <strong>autenticación</strong> (<code>get_current_user</code>) devuelve el usuario <em>real</em> de la base de datos; la <strong>autorización</strong> (<code>require_role</code>) comprueba su rol.</li>
+          <li>El aislamiento de datos se hace en SQL (<code>where owner_id == user.id</code>) y responde <strong>404</strong> a recursos privados ajenos.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Tabla de usuarios</td><td><code>class User(SQLModel, table=True)</code> con <code>email</code> único</td></tr>
+            <tr><td>Dueño de la consulta</td><td><code>owner_id: int | None = Field(foreign_key="users.id", index=True)</code></td></tr>
+            <tr><td>Migrar el esquema</td><td><code>alembic revision --autogenerate -m "…"</code> → <code>alembic upgrade head</code></td></tr>
+            <tr><td>Hashear / verificar</td><td><code>_pwd.hash(p)</code> · <code>_pwd.verify(p, h)</code></td></tr>
+            <tr><td>Emitir token</td><td><code>jwt.encode({sub, role, iat, exp}, key, algorithm)</code></td></tr>
+            <tr><td>Validar token</td><td><code>jwt.decode(token, key, algorithms=[...])</code></td></tr>
+            <tr><td>Flujo OAuth2</td><td><code>OAuth2PasswordBearer(tokenUrl="/auth/token")</code> + <code>OAuth2PasswordRequestForm</code></td></tr>
+            <tr><td>Autenticación</td><td><code>CurrentUserDep = Annotated[User, Depends(get_current_user)]</code></td></tr>
+            <tr><td>Autorización por rol</td><td><code>AdminDep = Annotated[User, Depends(require_role("admin"))]</code></td></tr>
+            <tr><td>Aislamiento</td><td><code>where(QueryLog.owner_id == user.id)</code> · 404 para ajenos</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué el login usa <em>form-urlencoded</em> y no JSON?</summary>
+            <div>
+              <p>Porque <code>OAuth2PasswordRequestForm</code> implementa el estándar OAuth2: el <em>password flow</em> define <code>username</code> y <code>password</code> como campos de formulario. Seguirlo tiene una ventaja inmediata: el botón <strong>Authorize</strong> de <code>/docs</code> funciona sin escribir una línea de frontend. Podrías aceptar JSON en un endpoint propio, pero perderías la integración con las herramientas estándar. Un matiz: el flujo exige HTTPS en producción, porque el formulario va en claro en cada login.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Guardo el rol en el token o lo consulto siempre?</summary>
+            <div>
+              <p>Las dos cosas, y por razones distintas. En el token va el rol para que sea <em>visible</em> (depuración, UI) y para no obligar a una consulta si algún día mueves la autorización a otro servicio. Pero la decisión de autorización se toma contra el usuario cargado <strong>de la base de datos</strong>: es el único estado que no envejece. Si el rendimiento lo exigiera, guardarías en caché al usuario unos segundos, no confiarías en el token durante toda su vida.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo revoco un token antes de que caduque?</summary>
+            <div>
+              <p>Un JWT firmado es autocontenido: no existe una «lista de revocación» de serie. Por eso su vida es corta. Para revocar de inmediato tienes tres caminos: (1) rol o <code>is_active</code> en la base de datos y revalidar en cada petición —con lo que un <code>UPDATE</code> basta—; (2) una lista negra de <code>jti</code> en un almacén rápido (Redis) consultada en <code>get_current_user</code>; (3) cambiar la clave de firma, que invalida <em>todos</em> los tokens (útil ante un incidente). Cada uno tiene su coste; el curso se queda con el primero por simplicidad y porque ya revalidamos el usuario.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>403</code> o <code>404</code> cuando el recurso es de otro usuario?</summary>
+            <div>
+              <p>Para <strong>datos privados</strong>, un 404 uniforme: no confirmas que el identificador exista. Un 403 le dice a un atacante «este identificador es válido, solo te falta permiso», lo que permite enumerar recursos. Hay excepciones legítimas: si el recurso es público o el usuario necesita saber que existe pero no puede tocarlo, 403 es más honesto. Lo importante es decidirlo <em>conscientemente</em> y no dejarlo al azar de un <code>if</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar SQLite para el histórico en producción?</summary>
+            <div>
+              <p>Para un proyecto de aprendizaje o un servicio con un solo proceso, sí: es rápido, no requiere servidor y el archivo es fácil de respaldar. Pero SQLite serializa las escrituras y no escala con varios procesos ni con tráfico concurrente alto. En cuanto el servicio crece, cambia <code>COPILOTO_DATABASE_URL</code> a PostgreSQL: el código de los modelos, las consultas y las dependencias no se toca, solo las migraciones se aplican contra la nueva URL. Esa portabilidad es, precisamente, el motivo de usar un ORM y migraciones.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

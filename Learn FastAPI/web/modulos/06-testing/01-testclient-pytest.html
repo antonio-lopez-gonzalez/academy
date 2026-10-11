@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-testclient-pytest">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TestClient y pytest — Módulo 6 · Curso FastAPI</title>
+  <meta name="description" content="Tests de endpoints con TestClient (síncrono) y pytest: códigos de estado, cuerpo de la respuesta, casos de error y fixtures básicas aplicados a Copiloto API.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TestClient y pytest</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Testing y calidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya tienes una API que valida, responde con modelos, gestiona errores con Problem Details y persiste en una base de datos. Funciona <em>hoy</em>. Pero cada vez que tocas una ruta, un modelo o una dependencia, ¿cómo sabes que no has roto algo que funcionaba? La respuesta profesional es <strong>tests automatizados</strong>: código que llama a tu API y comprueba que se comporta como esperas, en cada cambio, en cada <em>commit</em>.</p>
+        <p>El problema: probar una API «a mano» (abrir <code>/docs</code>, pulsar <em>Try it out</em>, mirar el resultado) no escala. Es lento, no es repetible y, sobre todo, <strong>no queda registrado</strong>. Un test es una especificación ejecutable: describe una expectativa concreta y la verifica sin intervención humana.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque FastAPI trae <strong><code>TestClient</code></strong>, que ejecuta tu aplicación ASGI <em>en el mismo proceso</em>, sin abrir un puerto ni levantar uvicorn. Combinado con <strong>pytest</strong>, escribir tests de endpoints pasa de ser una tarea pesada a ser algo casi trivial, y eso es lo que hace que de verdad se escriban.</p>
+        </div>
+        <p>Errores típicos que verás en proyectos reales y que evitamos desde el principio: tests que dependen de una base de datos real (frágiles y lentos), comprobar solo que el código sea <code>200</code> sin mirar el cuerpo, y compartir <em>estado</em> entre tests de forma que pasen o fallen según el orden de ejecución.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La pirámide de tests</h3>
+        <p>No todos los tests cuestan lo mismo. Cuanto más abajo en la pirámide, más rápidos y numerosos; cuanto más arriba, más realistas pero más lentos y frágiles. Este módulo se centra en la franja intermedia: tests que ejercitan una <strong>petición HTTP completa</strong> contra tu app, sin llegar a la red.</p>
+        <pre class="diagram">
+                      ▲  más lento, más real
+                     ╱ ╲      E2E (navegador, servicio externo)
+                    ╱───╲     Integración (API + BD real)
+                   ╱─────╲    ◀── aquí: TestClient / httpx  (este módulo)
+                  ╱───────╲   Unitarios (una función, un validador)
+                 ╱_________╲  más rápido, más numeroso
+        </pre>
+
+        <h3><code>TestClient</code>: tu app sin red</h3>
+        <p><code>TestClient</code> es un cliente HTTP <strong>construido sobre httpx</strong> que, en lugar de conectarse por TCP a un servidor, llama directamente al objeto ASGI (<code>app</code>) <em>en memoria</em>. Esto significa que no necesitas <code>uvicorn</code> ni abrir un puerto: cada petición del test recorre el mismo camino que una petición real (middleware, dependencias, validación, ruta) y te devuelve un objeto de respuesta con <code>status_code</code>, <code>json()</code>, <code>headers</code>…</p>
+        <pre class="diagram">
+   TEST                          │   PRODUCCIÓN
+   ──────────────────────────────┼──────────────────────────────
+   client.get("/modules")        │   GET /modules HTTP/1.1
+         │                       │         │
+         ▼                       │         ▼
+   ┌───────────────┐             │   ┌───────────────┐
+   │   TestClient  │  en proceso │   │    uvicorn    │  red
+   │  (httpx ASGI) │──────┐      │   │  + TCP :8000  │
+   └───────────────┘      ▼      │   └───────┬───────┘
+                      ┌────────┐ │           ▼
+                      │  app   │ │      ┌────────┐
+                      │ (ASGI) │ │      │  app   │
+                      └────────┘ │      └────────┘
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> probar con <code>TestClient</code> es como ensayar una obra en el propio escenario, con los actores y el guion reales, pero sin público ni taquilla. El montaje es el definitivo; lo único que te ahorras es el transporte.</p>
+        </div>
+
+        <h3><em>Lifespan</em>: el detalle que casi todos olvidan</h3>
+        <p>Tu app abre recursos en <code>lifespan</code> (Módulo 3, lección 3): el motor de base de datos, clientes HTTP… Si creas <code>client = TestClient(app)</code> y haces peticiones, ese arranque <strong>no se ejecuta</strong>. Para que sí lo haga, usa <code>TestClient</code> como <strong>gestor de contexto</strong>:</p>
+        <pre><code class="language-python">with TestClient(app) as client:   # dispara lifespan.startup ...
+    client.get("/health")
+# ... y al salir del bloque, dispara lifespan.shutdown
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Ojo:</strong> fuera del bloque <code>with</code>, el evento de <em>startup</em> no se ejecuta. Si tu app depende de él para crear la base de datos o preparar estado, tus tests fallarán con errores confusos («no such table», <code>AttributeError</code> sobre un recurso <code>None</code>). Cuando el ciclo de vida importa, usa siempre el <code>with</code>.</p>
+        </div>
+
+        <h3>pytest: el <em>runner</em> estándar</h3>
+        <p>pytest descubre y ejecuta los tests siguiendo tres reglas sencillas: busca archivos <code>test_*.py</code> (o <code>*_test.py</code>), dentro encuentra funciones <code>test_*</code>, y cada una es un test. Basta un <code>assert</code> de Python: pytest reescribe la expresión y, si falla, te muestra <strong>los valores reales</strong> en lugar de un críptico <code>AssertionError</code>.</p>
+        <table>
+          <thead><tr><th>Pieza de pytest</th><th>Qué es</th></tr></thead>
+          <tbody>
+            <tr><td><code>assert</code></td><td>La aserción. Nada de <code>assertEqual</code>: Python puro, con <em>introspección</em> automática</td></tr>
+            <tr><td><code>@pytest.fixture</code></td><td>Prepara un recurso (cliente, base de datos) y lo entrega al test por nombre de parámetro</td></tr>
+            <tr><td><code>conftest.py</code></td><td>Archivo donde viven las fixtures compartidas; pytest lo descubre sin importarlo</td></tr>
+            <tr><td><code>@pytest.mark.parametrize</code></td><td>Ejecuta el mismo test con varios juegos de datos</td></tr>
+            <tr><td><code>pytest.raises</code></td><td>Comprueba que un bloque lanza la excepción esperada</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Fixtures: preparar el mundo antes del test</h3>
+        <p>Una <em>fixture</em> es una función que devuelve (o <em>cede</em>) algo que el test necesita. pytest la inyecta por el nombre del parámetro. Es el mismo concepto que <code>Depends</code> en FastAPI, pero aplicado al mundo de los tests: <strong>inversión de control</strong> para montar el escenario.</p>
+        <pre><code class="language-python">import pytest
+
+
+@pytest.fixture
+def module_payload() -&gt; dict[str, str]:
+    return {"slug": "fastapi", "title": "FastAPI"}
+</code></pre>
+        <pre><code class="language-python">def test_create_module(client, module_payload):
+    response = client.post("/modules", json=module_payload)
+    assert response.status_code == 201
+</code></pre>
+        <p><code>module_payload</code> se pide por nombre; <code>client</code> llegará de una fixture definida en <code>conftest.py</code>. El <code>scope</code> controla cuántas veces se ejecuta: <code>function</code> (por defecto, una vez por test), <code>module</code>, <code>session</code>…</p>
+
+        <h3>El objeto de respuesta</h3>
+        <p>Cada llamada a <code>client.get/post/…</code> devuelve un <code>httpx.Response</code>. Sus propiedades son las que usarás en los <code>assert</code>:</p>
+        <table>
+          <thead><tr><th>Atributo / método</th><th>Qué contiene</th></tr></thead>
+          <tbody>
+            <tr><td><code>response.status_code</code></td><td>El código HTTP, p. ej. <code>200</code>, <code>201</code>, <code>404</code></td></tr>
+            <tr><td><code>response.json()</code></td><td>El cuerpo decodificado como JSON (dict o list)</td></tr>
+            <tr><td><code>response.text</code></td><td>El cuerpo como cadena, tal cual llegó</td></tr>
+            <tr><td><code>response.headers</code></td><td>Las cabeceras de la respuesta (<code>content-type</code>, <code>location</code>…)</td></tr>
+            <tr><td><code>response.raise_for_status()</code></td><td>Lanza excepción si el código es 4xx o 5xx</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p>Un test bien escrito sigue <strong>given / when / then</strong>: prepara el estado, ejecuta <em>una</em> acción y comprueba <em>una</em> cosa. Si un test comprueba cinco cosas a la vez, cuando falle no sabrás cuál se rompió.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La app más pequeña posible y su test. Primero, el proyecto:</p>
+        <div class="code-file">consola</div>
+        <pre><code class="language-bash">uv init copiloto-tests --python 3.12
+cd copiloto-tests
+uv add fastapi
+uv add --dev pytest httpx
+</code></pre>
+        <p><code>httpx</code> es necesario porque <code>TestClient</code> se apoya en él. Ahora la aplicación:</p>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from fastapi import FastAPI
+
+app = FastAPI(title="Copiloto API")
+
+
+@app.get("/health")
+def health() -&gt; dict[str, str]:
+    return {"status": "ok"}
+</code></pre>
+        <p>Y el test:</p>
+        <div class="code-file">tests/test_health.py</div>
+        <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health_returns_ok():
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+</code></pre>
+        <p>Ejecútalo:</p>
+        <div class="code-file">consola</div>
+        <pre><code class="language-bash">uv run pytest -q
+</code></pre>
+        <pre><code class="language-text">.                                                                    [100%]
+1 passed in 0.03s
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>from fastapi.testclient import TestClient</code></strong>: importa el cliente. Está disponible sin instalar nada extra porque FastAPI ya depende de Starlette, que lo construye sobre httpx.</li>
+          <li><strong><code>from app.main import app</code></strong>: importa <em>tu</em> objeto ASGI. El test no arranca uvicorn: llama a <code>app</code> directamente.</li>
+          <li><strong><code>client = TestClient(app)</code></strong>: crea el cliente. Para este ejemplo no necesitamos <em>lifespan</em>, así que no usamos <code>with</code>; en la sección 4 sí.</li>
+          <li><strong><code>client.get("/health")</code></strong>: simula la petición. Recorre validación, dependencias y la función de la ruta, y devuelve la respuesta.</li>
+          <li><strong><code>response.status_code == 200</code></strong>: comprueba el <em>contrato</em> HTTP. Si un cambio futuro devuelve <code>404</code>, el test te lo dice al instante.</li>
+          <li><strong><code>response.json() == {"status": "ok"}</code></strong>: comprueba el cuerpo. Es una comparación de diccionarios completa: el orden de las claves no importa, pero sí el contenido.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>El test se llama <code>test_health_returns_ok</code>: nombre en inglés (convención del código, según las reglas del curso), pero el <em>contenido</em> y los mensajes pueden ir en español. Un buen nombre de test describe el comportamiento esperado, no el método que llama.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Pasemos a <strong>Copiloto API</strong>. Vamos a testear tres endpoints: <code>GET /health</code>, <code>GET /modules</code> (que lee de la base de datos) y <code>POST /ask</code> (que valida la entrada y delega en el «motor» RAG). La pieza central es una <strong>fixture</strong> compartida que monta el cliente con el <em>lifespan</em> ya arrancado y sustituye el motor por un <em>fake</em>.</p>
+        <div class="code-file">app/deps.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+from fastapi import Depends
+from sqlmodel import Session
+
+from app.db import get_session
+from app.models import Module, QueryLog
+
+
+class RagEngine:
+    """Envoltura del motor de RAG del Copiloto. La sustituimos en los tests."""
+
+    def answer(self, question: str) -&gt; str:
+        raise NotImplementedError
+
+
+def get_rag_engine() -&gt; RagEngine:
+    return RagEngine()
+
+
+def get_modules(session: Session = Depends(get_session)) -&gt; list[Module]:
+    from sqlmodel import select
+
+    return list(session.exec(select(Module)).all())
+</code></pre>
+        <p>El archivo estrella es <code>conftest.py</code>: aquí definimos las fixtures que todos los tests comparten. pytest lo carga automáticamente, sin importarlo.</p>
+        <div class="code-file">tests/conftest.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.deps import get_rag_engine
+from app.main import app
+
+
+class FakeRagEngine:
+    """Respuestas deterministas: los tests no dependen de un LLM real."""
+
+    def answer(self, question: str) -&gt; str:
+        return f"Respuesta simulada para: {question}"
+
+
+@pytest.fixture
+def client() -&gt; Iterator[TestClient]:
+    """Cliente con el motor RAG sustituido por un doble."""
+    app.dependency_overrides[get_rag_engine] = FakeRagEngine
+    with TestClient(app) as test_client:      # el with dispara el lifespan
+        yield test_client
+    app.dependency_overrides.clear()          # limpia siempre, pase lo que pase
+</code></pre>
+        <div class="callout callout--note">
+          <p>La fixture usa <code>yield</code>: todo lo que va antes entrega el recurso, y lo que va después es la <strong>limpieza</strong>. Aunque el test falle, pytest ejecuta el código posterior al <code>yield</code>. Es la misma idea que la dependencia <code>get_session</code> con <code>yield</code> que ya conoces (Módulo 3, lección 2).</p>
+        </div>
+        <p>Con eso, los tests de comportamiento quedan cortos y legibles:</p>
+        <div class="code-file">tests/test_api.py</div>
+        <pre><code class="language-python">import pytest
+from fastapi.testclient import TestClient
+
+
+def test_health(client: TestClient) -&gt; None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_modules_lists_seeded_modules(client: TestClient) -&gt; None:
+    response = client.get("/modules")
+
+    assert response.status_code == 200
+    slugs = [module["slug"] for module in response.json()]
+    assert "fastapi" in slugs
+
+
+def test_ask_returns_answer(client: TestClient) -&gt; None:
+    response = client.post("/ask", json={"question": "¿Qué es Depends?"})
+
+    assert response.status_code == 200
+    assert "Depends" in response.json()["answer"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_status"),
+    [
+        ({"question": "ok"}, 200),
+        ({"question": ""}, 422),          # pregunta vacía: falla la validación
+        ({}, 422),                        # falta el campo obligatorio
+        ({"question": "ok", "extra": 1}, 200),  # campo extra: se ignora
+    ],
+)
+def test_ask_validation(client: TestClient, payload: dict, expected_status: int) -&gt; None:
+    response = client.post("/ask", json=payload)
+
+    assert response.status_code == expected_status
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Una fixture <code>client</code>, no un cliente global.</strong> Cada test recibe un cliente limpio y con el <em>lifespan</em> arrancado. Evita el estado compartido entre tests, la causa número uno de tests <em>flaky</em>.</li>
+          <li><strong><code>dependency_overrides</code> en la fixture, no en cada test.</strong> El «motor RAG» real hace red (y costaría dinero); el <em>fake</em> devuelve algo determinista. La lógica de sustitución vive en un solo sitio. A fondo en la lección 3.</li>
+          <li><strong><code>app.dependency_overrides.clear()</code> tras el <code>yield</code>.</strong> Sin esta limpieza, una sustitución se «filtra» al siguiente test y produces falsos verdes imposibles de explicar.</li>
+          <li><strong>La aserción mira el cuerpo, no solo el código.</strong> Un <code>200</code> con un JSON vacío sigue siendo un bug. Comprobar <code>slugs</code> o <code>answer</code> es lo que de verdad protege la funcionalidad.</li>
+          <li><strong><code>@pytest.mark.parametrize</code></strong>: cuatro casos de validación en un solo test. Los casos de error (<code>422</code>) son tan parte del contrato como el caso feliz.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Fíjate en la <em>forma</em> del error <code>422</code>: es el formato de validación de Pydantic que ya viste en el Módulo 1. Si un día cambia, estos tests lo detectan al momento. Ahí está el valor: los tests fijan el contrato que el resto del mundo consume.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un <code>assert</code> por idea, con nombre de test descriptivo</td>
+              <td>Un test gigante con 20 comprobaciones</td>
+              <td>Cuando falle, sabrás exactamente qué comportamiento se rompió</td>
+            </tr>
+            <tr>
+              <td>Crear el cliente en una fixture <code>conftest.py</code></td>
+              <td><code>client = TestClient(app)</code> a nivel de módulo en cada archivo</td>
+              <td>Un único lugar para el <em>lifespan</em> y las sustituciones; menos duplicación</td>
+            </tr>
+            <tr>
+              <td>Usar <code>with TestClient(app) as client</code></td>
+              <td>Instanciarlo sin <code>with</code> cuando dependes del <em>lifespan</em></td>
+              <td>Sin el <code>with</code> no se ejecuta <em>startup</em>: base de datos y recursos no existen</td>
+            </tr>
+            <tr>
+              <td>Comprobar <code>status_code</code> <strong>y</strong> cuerpo</td>
+              <td>Comprobar solo <code>status_code == 200</code></td>
+              <td>Un <code>200</code> con la respuesta equivocada sigue siendo un bug</td>
+            </tr>
+            <tr>
+              <td>Testear también los errores (<code>422</code>, <code>404</code>, <code>401</code>)</td>
+              <td>Testear solo el «camino feliz»</td>
+              <td>Los errores son contrato: definen cómo integra el cliente</td>
+            </tr>
+            <tr>
+              <td>Limpiar <code>dependency_overrides</code> tras cada test</td>
+              <td>Dejar las sustituciones «puestas»</td>
+              <td>Una sustitución filtrada produce falsos positivos y tests dependientes del orden</td>
+            </tr>
+            <tr>
+              <td>Dobles (<em>fakes</em>) para lo externo (LLM, email, pagos)</td>
+              <td>Llamar a servicios reales desde los tests</td>
+              <td>Los tests deben ser rápidos, deterministas y no costar dinero</td>
+            </tr>
+            <tr>
+              <td>Aislar el estado entre tests</td>
+              <td>Compartir listas o diccionarios globales entre tests</td>
+              <td>Un orden de ejecución distinto no debe cambiar el resultado</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Comprobar solo el código de estado</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def test_ask():
+    response = client.post("/ask", json={"question": "¿Qué es Depends?"})
+    assert response.status_code == 200      # ¿y si el answer viene vacío?
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def test_ask():
+    response = client.post("/ask", json={"question": "¿Qué es Depends?"})
+    assert response.status_code == 200
+    assert "Depends" in response.json()["answer"]
+</code></pre>
+        <p>El código de estado dice «la petición llegó y se procesó»; el cuerpo dice «se procesó <em>bien</em>». Un endpoint que siempre devuelve <code>200</code> con un cuerpo vacío pasaría el test incorrecto sin despeinarse.</p>
+
+        <h3>Usar la app con red en lugar de <code>TestClient</code></h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">import httpx
+
+def test_health():
+    # Requiere uvicorn corriendo en localhost:8000 y hace I/O real de red
+    response = httpx.get("http://localhost:8000/health")
+    assert response.status_code == 200
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from app.main import app
+
+def test_health():
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
+</code></pre>
+        <p>El primer test solo pasa si has levantado el servidor a mano antes: no es reproducible en CI, y cualquier fallo de red lo vuelve intermitente. <code>TestClient</code> llama a la app en proceso, sin puerto ni red.</p>
+
+        <h3>Olvidar la limpieza de <code>dependency_overrides</code></h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">client = TestClient(app)
+app.dependency_overrides[get_rag_engine] = FakeRagEngine   # ¡a nivel de módulo!
+
+def test_a(): ...
+
+def test_b():
+    ...   # sigue usando el fake aunque no lo quiera
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@pytest.fixture
+def client():
+    app.dependency_overrides[get_rag_engine] = FakeRagEngine
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+</code></pre>
+        <p>Dejar la sustitución «puesta» contamina todos los tests siguientes, que dejan de probar lo que creen probar. La limpieza va en la fixture, garantizada incluso si el test falla.</p>
+
+        <h3>Un cliente global compartido con estado</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">client = TestClient(app)   # de módulo
+
+def test_create():
+    client.post("/modules", json={"slug": "x", "title": "X"})
+
+def test_count():
+    # Asume que el test anterior creó un módulo: depende del orden
+    assert len(client.get("/modules").json()) == 1
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def test_count(client):
+    # El test prepara su propio estado; no hereda nada del vecino
+    seed_modules(client, n=1)
+    assert len(client.get("/modules").json()) == 1
+</code></pre>
+        <p>Un test debe poder ejecutarse solo, con <code>pytest tests/test_count.py</code>, y dar el mismo resultado. Si depende del orden, tarde o temprano fallará en CI por una razón que no tiene nada que ver con tu cambio.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar desde cero la infraestructura de tests de Copiloto API y cubrir <code>GET /health</code>, <code>GET /modules</code> y <code>POST /ask</code>, incluidos los casos de validación.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Instala las dependencias de desarrollo.</strong>
+            <pre><code class="language-bash">uv add --dev pytest httpx
+</code></pre>
+            <p>Resultado esperado: <code>pytest</code> y <code>httpx</code> aparecen en el grupo <code>dev-dependencies</code> de <code>pyproject.toml</code>. <code>httpx</code> es la base de <code>TestClient</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Configura pytest.</strong> Añade a <code>pyproject.toml</code>:
+            <pre><code class="language-toml">[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+</code></pre>
+            <p>Con <code>testpaths</code>, <code>uv run pytest</code> busca solo en <code>tests/</code>. Resultado esperado: al ejecutarlo sin tests aún, verás <code>no tests ran</code>, no un error de descubrimiento.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Crea la fixture <code>client</code>.</strong> Copia el <code>tests/conftest.py</code> de la sección 4. Comprueba que importa <code>app.dependency_overrides</code> y limpia después del <code>yield</code>.
+          </li>
+          <li>
+            <strong>Paso 4 — Escribe los tres tests felices.</strong> En <code>tests/test_api.py</code>, añade <code>test_health</code>, <code>test_modules_lists_seeded_modules</code> y <code>test_ask_returns_answer</code>.
+            <div class="callout callout--warning">
+              <p><code>test_modules_lists_seeded_modules</code> asume que hay un módulo con <code>slug="fastapi"</code>. Si tu base de datos de test está vacía, el test fallará. En la lección 3 resolvemos esto <em>bien</em> (base de datos temporal por test); por ahora, asegúrate de sembrar los datos en una fixture o de comprobar solo el tipo de la respuesta.</p>
+            </div>
+          </li>
+          <li>
+            <strong>Paso 5 — Añade los casos de validación.</strong> Copia el test parametrizado <code>test_ask_validation</code>. Ejecuta:
+            <pre><code class="language-bash">uv run pytest -q
+</code></pre>
+            <p>Resultado esperado: verás los cuatro casos del <em>parametrize</em> contabilizados como tests distintos:</p>
+            <pre><code class="language-text">.....
+5 passed in 0.21s
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Rompe el contrato a propósito.</strong> Cambia en <code>app/main.py</code> el <code>status_code</code> del endpoint de creación (o el cuerpo de <code>/health</code>) y vuelve a lanzar los tests. Deben fallar con un mensaje que apunte al valor esperado frente al obtenido. Ese es el mecanismo que te protegerá en el futuro.
+            <pre><code class="language-text">E   assert 200 == 201
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 7 — Revisa el informe.</strong> Ejecuta con más detalle para ver el nombre de cada caso parametrizado:
+            <pre><code class="language-bash">uv run pytest -v
+</code></pre>
+            <p>Resultado esperado: una línea por caso, con los parámetros entre corchetes, p. ej. <code>test_ask_validation[payload1-422]</code>. Esa granularidad es la que hace que un fallo en CI sea fácil de diagnosticar.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El contrato de los códigos de estado</h3>
+          <p>Escribe un test parametrizado que recorra <strong>todos</strong> los endpoints de Copiloto API y afirme que, para entradas válidas, el código es el documentado (por ejemplo <code>200</code> en lecturas y <code>201</code> en creación) y el <em>content-type</em> es <code>application/json</code>. Después añade el caso inverso: para cada endpoint, una entrada inválida (falta un campo, tipo equivocado) debe devolver <code>422</code> y un cuerpo con la clave <code>detail</code>.</p>
+          <p><em>Pista: define una lista de tuplas <code>(method, path, payload)</code> y usa <code>@pytest.mark.parametrize</code> sobre ella. Para comprobar el <em>content-type</em>, mira <code>response.headers["content-type"]</code>, que incluirá el sufijo del charset; usa <code>startswith</code> en lugar de igualdad. Piensa qué hacer con los endpoints protegidos por JWT: ¿los incluyes con un token válido o los dejas para la lección de seguridad?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong><code>TestClient</code></strong> ejecuta tu app ASGI en proceso, sin uvicorn ni red; está construido sobre <code>httpx</code>.</li>
+          <li>Usa <code>with TestClient(app) as client</code> cuando el <strong><em>lifespan</em></strong> importe: fuera del <code>with</code> no se ejecuta el <em>startup</em>.</li>
+          <li><strong>pytest</strong> descubre <code>test_*.py</code> y funciones <code>test_*</code>; un <code>assert</code> basta.</li>
+          <li>Las <strong>fixtures</strong> (en <code>conftest.py</code>) preparan el cliente y los datos, y limpian tras el <code>yield</code>.</li>
+          <li>Comprueba <strong>código de estado y cuerpo</strong>; testea también los casos de error (<code>422</code>, <code>404</code>, <code>401</code>).</li>
+          <li><strong><code>dependency_overrides</code></strong> sustituye dependencias reales por dobles; límpialo siempre al terminar.</li>
+          <li>Un test debe ser <strong>independiente del orden</strong>: prepara su propio estado.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Instalar herramientas de test</td><td><code>uv add --dev pytest httpx</code></td></tr>
+            <tr><td>Ejecutar los tests</td><td><code>uv run pytest -q</code> · <code>uv run pytest -v</code></td></tr>
+            <tr><td>Cliente de test</td><td><code>with TestClient(app) as client:</code></td></tr>
+            <tr><td>Petición</td><td><code>client.get("/modules")</code> · <code>client.post("/ask", json=...)</code></td></tr>
+            <tr><td>Comprobar respuesta</td><td><code>response.status_code</code> · <code>response.json()</code> · <code>response.headers</code></td></tr>
+            <tr><td>Fixture</td><td><code>@pytest.fixture</code> + <code>yield</code> para limpiar</td></tr>
+            <tr><td>Varios casos</td><td><code>@pytest.mark.parametrize(("a", "b"), [...])</code></td></tr>
+            <tr><td>Doble de una dependencia</td><td><code>app.dependency_overrides[dep] = fake</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>TestClient</code> levanta un servidor de verdad?</summary>
+            <div>
+              <p>No. <code>TestClient</code> llama al objeto ASGI <code>app</code> directamente, en el mismo proceso donde corre pytest. No hay socket, ni puerto, ni uvicorn. Por eso los tests son rapidísimos: medidos en milisegundos, no en segundos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué necesito instalar <code>httpx</code> si uso <code>TestClient</code>?</summary>
+            <div>
+              <p>Porque <code>TestClient</code> <em>es</em> un cliente httpx adaptado (con un <em>transport</em> ASGI en lugar de uno de red). Starlette lo trae, pero la dependencia de <code>httpx</code> debe estar disponible en tu entorno de desarrollo. En la lección 2 usamos <code>httpx</code> directamente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Tengo que testear cada endpoint con cada combinación de datos?</summary>
+            <div>
+              <p>No hace falta una combinatoria exhaustiva. Céntrate en: el camino feliz, los límites (vacío, máximo, tipos límite) y los errores esperados. La validación detallada de tipos ya la cubre Pydantic con sus propios tests; tú pruebas el <em>comportamiento</em> de tu API.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los tests van en el mismo repositorio?</summary>
+            <div>
+              <p>Sí, en una carpeta <code>tests/</code> hermana de <code>app/</code>. Los tests son parte del código: se versionan, se revisan en los <em>pull requests</em> y se ejecutan en CI. Un test que no está en el repositorio, para el equipo, no existe.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre un <em>fake</em>, un <em>stub</em> y un <em>mock</em>?</summary>
+            <div>
+              <p>Los tres son «dobles» de test. Un <em>stub</em> devuelve respuestas fijas; un <em>fake</em> tiene una implementación simplificada pero funcional (como nuestro <code>FakeRagEngine</code>); un <em>mock</em> registra cómo se le llamó y permite verificarlo. Para APIs, un <em>fake</em> sencillo suele ser más claro y robusto que un <em>mock</em> lleno de expectativas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-cors-headers">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CORS y cabeceras de seguridad — Módulo 5 · Curso FastAPI</title>
+  <meta name="description" content="CORS a fondo en FastAPI: CORSMiddleware, preflight, credenciales y wildcards, más cabeceras de seguridad como X-Content-Type-Options y HSTS.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>CORS y cabeceras de seguridad</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Seguridad</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tu API funciona en <code>curl</code>, pero el frontend que vive en otro dominio recibe un error críptico en la consola del navegador: <em>«blocked by CORS policy»</em>. Nada en tu servidor ha fallado; el navegador se ha negado a entregar la respuesta. Y al revés: cuando por fin consigues que funcione, descubres que CORS no ha protegido la API —<code>curl</code> sigue entrando—, porque CORS es una regla que <em>el navegador</em> se autoimpone, no un cortafuegos del servidor.</p>
+        <p>Esta lección desmonta dos confusiones muy extendidas y las convierte en práctica: qué es <strong>CORS</strong> exactamente (y qué no), cómo se configura con <code>CORSMiddleware</code> en FastAPI, y cómo añadir <strong>cabeceras de seguridad</strong> (las que el navegador usa para defenderse de XSS, clickjacking y sniffing de tipos).</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque CORS es la muralla que más frustración genera al conectar frontend y backend, y las cabeceras de seguridad son la capa que casi nadie configura hasta que un escáner las exige. Ambas son «gratis» de añadir y caras de olvidar. Además, la lección cierra el módulo explicando por qué el navegador distingue un dominio de otro: same-origin policy, la base de todo el modelo.</p>
+        </div>
+        <p>Errores típicos que veremos: poner <code>allow_origins=["*"]</code> junto a <code>allow_credentials=True</code> (el navegador lo rechaza), creer que CORS protege la API, usar una regex que lo permite todo, tratar el preflight <code>OPTIONS</code> como una petición normal, y enviar HSTS en desarrollo (donde puede dejarte el <code>localhost</code> inutilizable).</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La same-origin policy y qué es un «origen»</h3>
+        <p>Por seguridad, el navegador aísla las páginas entre sí: el JavaScript de una web no puede leer libremente las respuestas de otra. Ese es el <strong>same-origin policy (SOP)</strong>, y es lo que impide que <code>malicioso.com</code>, usando la sesión que el usuario tiene abierta en <code>banco.com</code>, lea sus datos sin permiso.</p>
+        <p>Un <strong>origen</strong> es la terna <em>esquema + host + puerto</em>. Todo lo demás (ruta, query) da igual. La comparación es estricta:</p>
+        <table>
+          <thead><tr><th>URL</th><th>Mismo origen que <code>https://app.example</code></th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>https://app.example/api</code></td><td>Sí</td><td>Ruta distinta: irrelevante</td></tr>
+            <tr><td><code>http://app.example</code></td><td>No</td><td>Esquema distinto (<code>http</code> vs <code>https</code>)</td></tr>
+            <tr><td><code>https://api.example</code></td><td>No</td><td>Host distinto (subdominio distinto)</td></tr>
+            <tr><td><code>https://app.example:8443</code></td><td>No</td><td>Puerto distinto</td></tr>
+          </tbody>
+        </table>
+        <p><strong>CORS</strong> (Cross-Origin Resource Sharing) es el mecanismo por el que <em>el origen destino</em> declara que <em>este</em> origen cruzado puede leer sus respuestas. Lo declara con cabeceras de respuesta; el navegador las lee y, si autorizan, entrega el cuerpo al JavaScript. Si no, lo bloquea.</p>
+        <div class="callout callout--warning">
+          <p><strong>CORS no es autenticación ni autorización.</strong> Es una decisión del <em>navegador</em> sobre qué JavaScript puede leer. Un atacante con <code>curl</code>, Postman o un script de servidor ignora CORS por completo. Si quieres bloquear peticiones, eso es <strong>autenticación</strong> (lecciones 1 y 2), no CORS.</p>
+        </div>
+
+        <h3>Peticiones simples y preflight</h3>
+        <p>No todas las peticiones cruzadas se comportan igual. El navegador distingue dos casos:</p>
+        <ul>
+          <li><strong>Petición «simple»</strong>: <code>GET</code>/<code>HEAD</code>/<code>POST</code> con cabeceras estándar y un <code>Content-Type</code> de los simples (<code>text/plain</code>, <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code>). Se envía directamente y el navegador solo bloquea la <em>lectura</em> de la respuesta si el origen no está permitido.</li>
+          <li><strong>Petición «con preflight»</strong>: cualquier otra cosa —<code>PUT</code>, <code>DELETE</code>, <code>Content-Type: application/json</code>, cabeceras como <code>Authorization</code>—. El navegador lanza <strong>antes</strong> una petición <code>OPTIONS</code> de sondeo (<em>preflight</em>) preguntando: «¿puedo hacer esto desde el origen X, con el método M y las cabeceras H?». Solo si el servidor dice que sí, manda la petición real.</li>
+        </ul>
+        <p>Esto explica la mitad de los errores de CORS: una API que devuelve JSON y usa el header <code>Authorization</code> <em>siempre</em> dispara preflight, aunque el endpoint sea un simple <code>POST</code>.</p>
+        <pre class="diagram">
+  Navegador (origen https://app.example)          API (https://api.example)
+      │                                                    │
+      │  OPTIONS /ask            (preflight)               │
+      │  Origin: https://app.example                       │
+      │  Access-Control-Request-Method: POST               │
+      │  Access-Control-Request-Headers: authorization     │
+      ├───────────────────────────────────────────────────►│
+      │                                                    │  decide si permite
+      │  204 No Content                                    │
+      │  Access-Control-Allow-Origin:  https://app.example │
+      │  Access-Control-Allow-Methods: POST                │
+      │  Access-Control-Allow-Headers: Authorization       │
+      │◄───────────────────────────────────────────────────┤
+      │                                                    │
+      │  POST /ask               (peticion real)           │
+      │  Authorization: Bearer ...                         │
+      ├───────────────────────────────────────────────────►│
+      │  200 {answer}                                      │
+      │◄───────────────────────────────────────────────────┤
+        </pre>
+
+        <h3>Credenciales y el wildcard prohibido</h3>
+        <p>Si la petición lleva <em>credenciales</em> (cookies, o cabecera <code>Authorization</code> declarada como tal en modo <code>credentials: "include"</code>), el navegador aplica una regla dura: <strong>no acepta <code>Access-Control-Allow-Origin: *</code></strong>. Debe ser el origen exacto, y además hay que enviar <code>Access-Control-Allow-Credentials: true</code>. Por eso <code>CORSMiddleware</code> <em>rechaza al arrancar</em> la combinación de <code>allow_origins=["*"]</code> con <code>allow_credentials=True</code>: es una configuración que el navegador nunca aceptaría.</p>
+        <pre class="diagram">
+  allow_origins=["*"] + allow_credentials=True   →  configuracion invalida
+  allow_origins=["https://app.example"] + creds   →  OK (origen exacto)
+        </pre>
+
+        <h3>Configurar CORSMiddleware</h3>
+        <p>FastAPI trae el middleware de Starlette. Los parámetros que importan:</p>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Qué hace</th><th>Por defecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>allow_origins</code></td><td>Lista exacta de orígenes permitidos</td><td><code>[]</code></td></tr>
+            <tr><td><code>allow_origin_regex</code></td><td>Regex contra el origen (p. ej. subdominios)</td><td><code>None</code></td></tr>
+            <tr><td><code>allow_methods</code></td><td>Métodos permitidos en preflight</td><td><code>["GET"]</code></td></tr>
+            <tr><td><code>allow_headers</code></td><td>Cabeceras permitidas en preflight</td><td><code>[]</code></td></tr>
+            <tr><td><code>allow_credentials</code></td><td>Permite cookies/credenciales</td><td><code>False</code></td></tr>
+            <tr><td><code>expose_headers</code></td><td>Cabeceras de respuesta legibles por JS</td><td><code>[]</code></td></tr>
+            <tr><td><code>max_age</code></td><td>Segundos que el navegador cachea el preflight</td><td><code>600</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>CORS y cabeceras de seguridad son middleware.</strong> Se añaden con <code>app.add_middleware(...)</code> y envuelven toda la aplicación. El orden importa: el <em>último</em> añadido es el <em>más externo</em>. Añade <code>CORSMiddleware</code> en el borde (normalmente lo último) para que incluso las respuestas de error de otros middlewares salgan con las cabeceras CORS y el navegador pueda leerlas.</p>
+        </div>
+
+        <h3>Cabeceras de seguridad: que el navegador se defienda</h3>
+        <p>CORS no hace seguro tu API, pero las <strong>cabeceras de seguridad</strong> sí endurecen lo que el navegador permite hacer con tus respuestas. Las esenciales:</p>
+        <table>
+          <thead><tr><th>Cabecera</th><th>Qué bloquea</th><th>Valor típico</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>X-Content-Type-Options</code></td>
+              <td>Que el navegador «adivine» el tipo de un archivo (<em>MIME sniffing</em>) y ejecute como script lo que era texto</td>
+              <td><code>nosniff</code></td>
+            </tr>
+            <tr>
+              <td><code>X-Frame-Options</code></td>
+              <td>Que tu página se cargue dentro de un <code>&lt;iframe&gt;</code> ajeno (<em>clickjacking</em>)</td>
+              <td><code>DENY</code></td>
+            </tr>
+            <tr>
+              <td><code>Strict-Transport-Security</code></td>
+              <td>Que el navegador vuelva a usar HTTP en visitas futuras (solo tiene sentido sobre HTTPS)</td>
+              <td><code>max-age=31536000; includeSubDomains</code></td>
+            </tr>
+            <tr>
+              <td><code>Referrer-Policy</code></td>
+              <td>Que se filtre la URL completa (con datos) en la cabecera <code>Referer</code> hacia terceros</td>
+              <td><code>no-referrer</code> o <code>strict-origin-when-cross-origin</code></td>
+            </tr>
+            <tr>
+              <td><code>Content-Security-Policy</code></td>
+              <td>Qué orígenes pueden cargar scripts/estilos/imágenes: la defensa más fuerte contra XSS</td>
+              <td><code>default-src 'self'</code></td>
+            </tr>
+            <tr>
+              <td><code>Cross-Origin-Opener-Policy</code></td>
+              <td>Aislar tu documento de ventanas abiertas de otros orígenes</td>
+              <td><code>same-origin</code></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>HSTS solo en HTTPS.</strong> <code>Strict-Transport-Security</code> le dice al navegador «durante un año, no me hables por HTTP, solo HTTPS». En desarrollo, sobre <code>http://localhost</code>, el navegador lo ignora; el peligro real es activarlo en un dominio que aún no tiene TLS válido: el navegador se negará a cargarlo y no habrá forma de volver atrás hasta que expire el <code>max-age</code>. Se activa <strong>en producción, con TLS ya funcionando</strong>.</p>
+        </div>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> CORS es el portero de la discoteca que solo deja entrar a invitados de determinadas ciudades (el navegador solo <em>enseña</em> la respuesta si la ciudad está en la lista). Las cabeceras de seguridad son el resto del edificio: <code>nosniff</code> dice «no adivines qué es este paquete», <code>X-Frame-Options: DENY</code> dice «no te dejes meter en una vitrina ajena», y HSTS dice «a partir de ahora, entra siempre por la puerta blindada».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Permitir que un frontend de desarrollo (<code>http://localhost:5173</code>, el puerto típico de Vite) consuma la API. Es lo más corto que resuelve el error de consola:</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],   # el origen EXACTO del frontend
+    allow_credentials=True,
+    allow_methods=["*"],                        # o mejor: ["GET", "POST", "DELETE"]
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+@app.post("/ask")
+def ask() -&gt; dict[str, str]:
+    return {"answer": "hola"}
+</code></pre>
+        <p>El preflight se responde solo: <code>CORSMiddleware</code> intercepta el <code>OPTIONS</code> y contesta con las cabeceras <code>Access-Control-*</code> antes de llegar a tu endpoint. Compruébalo a mano:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Simula el preflight que lanza el navegador
+curl -i -X OPTIONS http://127.0.0.1:8000/ask \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type"
+</code></pre>
+        <p>Resultado esperado: <code>200</code> (o <code>204</code>) con cabeceras <code>access-control-allow-origin: http://localhost:5173</code>, <code>access-control-allow-methods</code> y <code>access-control-allow-headers</code>. Cambia el <code>Origin</code> por <code>http://evil.example</code>: la cabecera <code>access-control-allow-origin</code> <strong>no aparece</strong>, y el navegador bloquearía la respuesta.</p>
+        <div class="callout callout--tip">
+          <p><strong>Por qué <code>allow_credentials=True</code> y no <code>"*"</code>.</strong> Si tu frontend envía cookies o el header <code>Authorization</code> con <code>credentials: "include"</code>, el navegador exige el origen exacto. Con <code>allow_origins=["*"]</code> la respuesta llevaría <code>*</code> y el navegador la descartaría. Por eso la lista explícita no es capricho: es requisito del estándar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En Copiloto API CORS se configura desde <code>Settings</code> (Módulo 3), de modo que desarrollo y producción cambian sin tocar el código, y las cabeceras de seguridad se añaden con un middleware propio.</p>
+        <div class="code-file">app/config.py</div>
+        <pre><code class="language-python">from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    secret_key: str
+    cors_origins: list[str] = ["http://localhost:5173"]
+    cors_allow_credentials: bool = True
+    # En produccion, detras de TLS: activa HSTS.
+    enable_hsts: bool = False
+
+    model_config = SettingsConfigDict(env_prefix="fapi_", env_file=".env")
+
+
+settings = Settings()
+</code></pre>
+        <div class="code-file">.env (producción)</div>
+        <pre><code class="language-bash"># Lista separada por comas; pydantic-settings la convierte a list[str]
+FAPI_CORS_ORIGINS=https://app.copiloto.dev,https://admin.copiloto.dev
+FAPI_ENABLE_HSTS=true
+</code></pre>
+        <div class="code-file">app/middleware.py — cabeceras de seguridad</div>
+        <pre><code class="language-python">from collections.abc import Awaitable, Callable
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from app.config import settings
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Anade cabeceras de seguridad a TODAS las respuestas."""
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -&gt; Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        if settings.enable_hsts:
+            # Solo tiene sentido sobre HTTPS; por eso es opt-in.
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+</code></pre>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from app.config import settings
+from app.middleware import SecurityHeadersMiddleware
+
+app = FastAPI(title="Copiloto API")
+
+# 1) Cabeceras de seguridad (capa interna)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# 2) CORS desde settings (capa externa, la ultima en anadirse = la mas externa)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=["GET", "POST", "DELETE", "PATCH"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["X-Request-Id"],   # para que el frontend pueda leerlo
+    max_age=3600,                      # cachea el preflight 1 hora
+)
+
+# 3) Solo atiende peticiones dirigidas a estos hosts (evita Host header injection)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["copiloto.dev", "*.copiloto.dev"])
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>CORS desde <code>Settings</code></strong>: los orígenes permitidos son configuración, no código. En desarrollo es <code>localhost:5173</code>; en producción, los dominios reales, sin recompilar.</li>
+          <li><strong>Métodos y cabeceras explícitos</strong>, no <code>"*"</code>: permites exactamente lo que tu frontend usa. Menos superficie, y evita la trampa del wildcard con credenciales.</li>
+          <li><strong><code>expose_headers=["X-Request-Id"]</code></strong>: por defecto el JavaScript solo puede leer unas pocas cabeceras de respuesta; si quieres que el frontend vea un <em>trace id</em> para correlacionar errores, hay que exponerlo explícitamente.</li>
+          <li><strong><code>max_age=3600</code></strong>: el navegador cachea el resultado del preflight una hora, ahorrando un <code>OPTIONS</code> por cada petición.</li>
+          <li><strong>HSTS es opt-in vía <code>enable_hsts</code></strong>: se activa solo donde hay TLS real. Evita el pie de página clásico de bloquear un dominio por accidente.</li>
+          <li><strong><code>TrustedHostMiddleware</code></strong>: rechaza peticiones cuyo <code>Host</code> no sea de los tuyos, cerrando ataques de <em>Host header injection</em> y cache poisoning.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Detrás de un proxy inverso.</strong> En producción, nginx/Traefik/Caddy sirven TLS y reenvían a uvicorn. Arranca uvicorn con <code>--proxy-headers --forwarded-allow-ips="*"</code> (o la IP del proxy) para que <code>scheme</code> y <code>client.host</code> reflejen la petición original. Muchas cabeceras de seguridad —HSTS incluida— tienen más sentido puestas en el proxy, donde terminan todas las conexiones.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>allow_origins</code> con la lista exacta de dominios</td>
+              <td><code>["*"]</code> «para que funcione»</td>
+              <td>Abrir CORS a todos permite que cualquier web lea respuestas con la sesión del usuario</td>
+            </tr>
+            <tr>
+              <td>Orígenes desde <code>Settings</code></td>
+              <td>Hardcodear el dominio del frontend</td>
+              <td>Dev y producción cambian por configuración, no por despliegue de código</td>
+            </tr>
+            <tr>
+              <td><code>allow_credentials=True</code> junto a orígenes explícitos</td>
+              <td><code>*</code> + credenciales (el navegador lo rechaza)</td>
+              <td>El estándar exige origen exacto cuando hay credenciales</td>
+            </tr>
+            <tr>
+              <td>Métodos y cabeceras concretos</td>
+              <td><code>allow_methods=["*"]</code>, <code>allow_headers=["*"]</code></td>
+              <td>Superficie mínima: solo lo que tu cliente usa de verdad</td>
+            </tr>
+            <tr>
+              <td>Cabeceras de seguridad en todas las respuestas (middleware)</td>
+              <td>Añadirlas endpoint a endpoint</td>
+              <td>Un middleware no se olvida; una cabecera por endpoint sí</td>
+            </tr>
+            <tr>
+              <td>HSTS solo en producción con TLS</td>
+              <td>Enviar HSTS en localhost</td>
+              <td>Puede dejar un dominio inaccesible hasta que expire <code>max-age</code></td>
+            </tr>
+            <tr>
+              <td><em>Regex</em> de orígenes acotada (<code>https://.*\.mipan\.dev</code>)</td>
+              <td><code>allow_origin_regex=".*"</code></td>
+              <td>Una regex que lo permite todo reintroduce el problema del wildcard</td>
+            </tr>
+            <tr>
+              <td>Probar el preflight con <code>curl -X OPTIONS</code></td>
+              <td>Depurar CORS a ciegas desde el navegador</td>
+              <td>Ver las cabeceras reales resuelve el 90 % de los «CORS error» en un minuto</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Wildcard con credenciales</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,   # el navegador DESCARTARA la respuesta
+)
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.copiloto.dev"],   # origen exacto
+    allow_credentials=True,
+)
+</code></pre>
+        <p>Con credenciales, el navegador exige el origen exacto; <code>*</code> es inaceptable por el estándar. <code>CORSMiddleware</code> avisa al arrancar para que no descubras el error en producción.</p>
+
+        <h3>Creer que CORS protege el API</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># "Solo dejo entrar a mi frontend: mi API esta protegida"
+app.add_middleware(CORSMiddleware, allow_origins=["https://app.copiloto.dev"])
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># CORS = que el NAVEGADOR enseñe la respuesta al JS de ese origen.
+# La proteccion real es autenticacion/autorizacion:
+app.add_middleware(CORSMiddleware, allow_origins=["https://app.copiloto.dev"])
+# ... y ademas, en el endpoint:
+def ask(user: CurrentUser = Security(get_current_user, scopes=["ask:write"])): ...
+</code></pre>
+        <p><code>curl</code>, Postman y cualquier servidor ignoran CORS. Limitar orígenes es higiene para el navegador; bloquear clientes no autorizados es tarea de la autenticación.</p>
+
+        <h3>Regex que lo permite todo</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">app.add_middleware(CORSMiddleware, allow_origin_regex=".*")   # = "*"
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">app.add_middleware(
+    CORSMiddleware,
+    # solo subdominios concretos de mi dominio
+    allow_origin_regex=r"https://.*\.copiloto\.dev",
+)
+</code></pre>
+        <p>La regex es potente para permitir todos los subdominios de un dominio propio, pero un <code>.*</code> suelto equivale a <code>["*"]</code> y pierdes toda la restricción. Ancla el patrón al esquema y al dominio que controlas.</p>
+
+        <h3>HSTS en desarrollo</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># En local, sobre http://localhost, esto sobra y puede causar sorpresas
+response.headers["Strict-Transport-Security"] = "max-age=63072000"
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">if settings.enable_hsts:   # solo en produccion, con TLS funcionando
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+</code></pre>
+        <p>El navegador ignora HSTS en <code>localhost</code> sobre HTTP, pero activarlo en un dominio sin TLS válido puede dejarlo inaccesible hasta que expire el <code>max-age</code>. Es opt-in por diseño.</p>
+
+        <h3>Tapar el preflight con otro middleware</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # Exige token ANTES de CORS: el preflight OPTIONS no lleva Authorization
+        # y devuelve 401 -&gt; el navegador nunca completa el CORS.
+        if "authorization" not in request.headers:
+            return Response(status_code=401)
+        return await call_next(request)
+
+app.add_middleware(AuthMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins)  # interno
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># CORS en el borde (ultimo en anadirse) responde el OPTIONS el solo,
+# antes de que ningun middleware de autenticacion lo vea.
+app.add_middleware(AuthMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins)
+# Y la autenticacion se hace en DEPENDENCIAS por endpoint, no en un middleware global.
+</code></pre>
+        <p>El preflight <code>OPTIONS</code> nunca lleva tu token: si un middleware de autenticación global lo rechaza, CORS se rompe para todas las peticiones con credenciales. La autenticación va en dependencias por endpoint (lecciones 1 y 2), no en un middleware que intercepta todo.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> conectar un frontend cruzado a Copiloto API con CORS configurado desde <code>Settings</code>, añadir cabeceras de seguridad y verificar ambos con <code>curl</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Configura los orígenes.</strong> Añade a <code>Settings</code> los campos <code>cors_origins: list[str]</code>, <code>cors_allow_credentials: bool = True</code> y <code>enable_hsts: bool = False</code>. Pon en el <code>.env</code> de desarrollo <code>FAPI_CORS_ORIGINS=http://localhost:5173</code>.
+          </li>
+          <li>
+            <strong>Paso 2 — Añade el middleware CORS.</strong> En <code>app/main.py</code>, registra <code>CORSMiddleware</code> con los valores de <code>settings</code>, métodos explícitos y <code>expose_headers=["X-Request-Id"]</code>. Añádelo <strong>el último</strong> para que quede en el borde.
+          </li>
+          <li>
+            <strong>Paso 3 — Middleware de cabeceras.</strong> Crea <code>app/middleware.py</code> con <code>SecurityHeadersMiddleware</code> (como el ejemplo real) y regístralo antes que CORS. Deja HSTS detrás del flag <code>enable_hsts</code>.
+          </li>
+          <li>
+            <strong>Paso 4 — Verifica el preflight.</strong> Con el servidor en marcha:
+            <pre><code class="language-bash">curl -s -D - -o /dev/null -X OPTIONS http://127.0.0.1:8000/ask \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type" \
+  | findstr /I "access-control"      # en Linux/macOS: | grep -i access-control
+</code></pre>
+            <p>Resultado esperado: aparecen <code>access-control-allow-origin: http://localhost:5173</code>, <code>access-control-allow-methods</code> con <code>POST</code> y <code>access-control-allow-headers</code> con <code>authorization</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Prueba un origen no permitido.</strong> Repite con <code>-H "Origin: http://evil.example"</code>. Resultado esperado: la respuesta <strong>no</strong> incluye <code>access-control-allow-origin</code>; el navegador bloquearía la lectura aunque el endpoint devuelva <code>200</code>. Comprueba también que <code>curl</code> sin <code>Origin</code> sigue entrando: CORS no bloquea a un cliente que no es el navegador.
+          </li>
+          <li>
+            <strong>Paso 6 — Verifica las cabeceras de seguridad.</strong>
+            <pre><code class="language-bash">curl -s -D - -o /dev/null http://127.0.0.1:8000/health \
+  | findstr /I "x-content-type-options x-frame-options referrer-policy"
+</code></pre>
+            <p>Resultado esperado: <code>x-content-type-options: nosniff</code>, <code>x-frame-options: DENY</code> y <code>referrer-policy: strict-origin-when-cross-origin</code>. Sin <code>Strict-Transport-Security</code> (el flag está apagado en desarrollo).</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Comprueba que HSTS es opt-in.</strong> Pon <code>FAPI_ENABLE_HSTS=true</code>, reinicia y repite el paso 6. Resultado esperado: ahora sí aparece <code>strict-transport-security</code>. Vuelve a ponerlo en <code>false</code>: en local no lo quieres.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Una CSP con nonce por petición</h3>
+          <p>Añade una <code>Content-Security-Policy</code> real a Copiloto API. La CSP es la cabecera que más protege contra XSS: declara de qué orígenes se pueden cargar scripts, estilos, imágenes y conexiones. El reto tiene una dificultad añadida: usar un <strong>nonce</strong> (un número de un solo uso) que cambie en <em>cada</em> petición, de modo que solo tus scripts con ese nonce puedan ejecutarse.</p>
+          <p>Necesitas también exponer el nonce al código que genera las plantillas (si sirves un HTML mínimo de bienvenida) y añadir <code>X-Content-Type-Options: nosniff</code> coherente. Al terminar, valida la cabecera con el validador de <a href="https://developer.mozilla.org/docs/Web/HTTP/Headers/Content-Security-Policy">MDN</a> mentalmente: ¿tapa la CSP todos los vectores de XSS conocidos o deja alguno?</p>
+          <p><em>Pistas: genera el nonce por petición con <code>secrets.token_urlsafe(16)</code> (¡no uses <code>random</code>!) y guárdalo en <code>request.state.nonce</code> dentro del middleware; luego construye <code>script-src 'nonce-{valor}' 'strict-dynamic'</code>. Un nonce reutilizado pierde el valor: por eso es por petición y nunca se cachea. Pregúntate: ¿qué pasa con <code>'unsafe-inline'</code> (lo desactiva)? ¿Y con <code>style-src</code> en una app con estilos inline? Empieza en modo <code>Content-Security-Policy-Report-Only</code> con un endpoint que recoja los informes: es la forma sensata de desplegar una CSP sin romper la web. Pista final: no olvides <code>default-src 'self'</code> como red de seguridad.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un <strong>origen</strong> es <em>esquema + host + puerto</em>; la <strong>same-origin policy</strong> aísla las páginas entre sí.</li>
+          <li><strong>CORS</strong> es el permiso que el origen destino declara al navegador para que <em>este</em> origen cruzado pueda leer la respuesta.</li>
+          <li>CORS <strong>no protege la API</strong>: <code>curl</code> lo ignora. La protección real es autenticación y autorización.</li>
+          <li>Las peticiones con <code>Authorization</code> o <code>Content-Type: application/json</code> <strong>disparan preflight</strong> (<code>OPTIONS</code>).</li>
+          <li>Con <strong>credenciales</strong>, el origen debe ser exacto: <code>allow_origins=["*"]</code> + <code>allow_credentials=True</code> es inválido.</li>
+          <li><code>CORSMiddleware</code> va en el <strong>borde</strong> (último en añadirse) para responder el preflight antes que otros middlewares.</li>
+          <li>Las <strong>cabeceras de seguridad</strong> se añaden una vez, en un middleware: <code>nosniff</code>, <code>X-Frame-Options</code>, <code>Referrer-Policy</code>, CSP y HSTS.</li>
+          <li><strong>HSTS</strong> solo en producción con TLS: mal configurado, deja un dominio inaccesible.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Cabecera</th><th>Efecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>Access-Control-Allow-Origin</code></td><td>Qué origen puede leer la respuesta (exacto si hay credenciales)</td></tr>
+            <tr><td><code>Access-Control-Allow-Methods</code></td><td>Métodos permitidos en el preflight</td></tr>
+            <tr><td><code>Access-Control-Allow-Headers</code></td><td>Cabeceras permitidas en el preflight</td></tr>
+            <tr><td><code>Access-Control-Allow-Credentials</code></td><td>Permite cookies/credenciales cruzadas</td></tr>
+            <tr><td><code>Access-Control-Max-Age</code></td><td>Segundos que se cachea el preflight</td></tr>
+            <tr><td><code>X-Content-Type-Options: nosniff</code></td><td>El navegador no adivina el tipo: no ejecuta texto como script</td></tr>
+            <tr><td><code>X-Frame-Options: DENY</code></td><td>La página no puede incrustarse en un iframe (anti-clickjacking)</td></tr>
+            <tr><td><code>Strict-Transport-Security</code></td><td>Fuerza HTTPS en visitas futuras (solo con TLS)</td></tr>
+            <tr><td><code>Referrer-Policy</code></td><td>Limita la URL enviada en <code>Referer</code></td></tr>
+            <tr><td><code>Content-Security-Policy</code></td><td>Qué orígenes pueden cargar scripts y otros recursos</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué en <code>curl</code> funciona y en el navegador no?</summary>
+            <div>
+              <p>Porque CORS lo aplica el navegador, no el servidor. <code>curl</code> no comprueba las cabeceras <code>Access-Control-*</code>: recibe la respuesta y la usa. El navegador, en cambio, solo entrega el cuerpo al JavaScript si el origen destino declara que puede leerlo. Si tu API funciona en <code>curl</code> y falla en el navegador con un error de CORS, el servidor está bien: falta (o está mal) la configuración de <code>CORSMiddleware</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo permitir todos los orígenes en desarrollo y restringir en producción?</summary>
+            <div>
+              <p>Sí, y es lo sensato: en desarrollo el frontend salta de puerto (<code>5173</code>, <code>3000</code>…). Lo limpio es poner los orígenes en <code>Settings</code> (dev: <code>["*"]</code> o la lista de localhost; prod: dominios exactos). Recuerda que <code>["*"]</code> es imposible con <code>allow_credentials=True</code>: si usas cookies o <code>Authorization</code> en modo <em>include</em>, en desarrollo también necesitas orígenes explícitos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el preflight devuelve <code>200</code> y no <code>204</code>?</summary>
+            <div>
+              <p>Ambos valen; el estándar recomienda <code>204 No Content</code> porque el preflight no lleva cuerpo. <code>CORSMiddleware</code> responde según la configuración y, en la práctica, devuelve <code>200</code> con cabeceras. Lo importante no es el código, sino que la respuesta incluya <code>Access-Control-Allow-Origin</code>, <code>Allow-Methods</code> y <code>Allow-Headers</code> con lo que pedía el navegador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde pongo las cabeceras de seguridad: en la app o en nginx?</summary>
+            <div>
+              <p>En producción, donde termina TLS suele ser el sitio natural: nginx/Traefik/Caddy las añaden a todas las respuestas, incluidas las estáticas que no pasan por FastAPI. Aun así, tenerlas también en un middleware de la app te protege si la app se expone directamente o si el proxy se reconfigura. Un buen compromiso: definirlas en el proxy y verificar en un test de integración que llegan (Módulo 6), para que un cambio de infraestructura no las borre en silencio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿CORS y CSRF son lo mismo?</summary>
+            <div>
+              <p>No. CORS decide qué JavaScript puede <em>leer</em> respuestas cruzadas; CSRF (Cross-Site Request Forgery) es el ataque en que una web ajena <em>provoca</em> una petición autenticada tuya sin que lo sepas. Curiosamente, una petición CSRF puede no necesitar leer la respuesta (le basta el efecto). Por eso CORS por sí solo no protege de CSRF: si usas cookies de sesión, añade <code>SameSite=Lax</code> o <code>Strict</code> a la cookie y un token anti-CSRF. Si usas <code>Authorization: Bearer</code> y guardas el token fuera de las cookies, CSRF no aplica, porque el navegador no adjunta credenciales automáticamente.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

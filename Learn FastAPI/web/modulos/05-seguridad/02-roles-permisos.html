@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-roles-permisos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Roles y permisos: autorización — Módulo 5 · Curso FastAPI</title>
+  <meta name="description" content="Autorización en FastAPI: claims de rol y scope, dependencias de autorización reutilizables con Security y SecurityScopes, roles frente a scopes y endpoints protegidos.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Roles y permisos: autorización</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior ya sabemos quién llama: <code>get_current_user</code> convierte un token válido en un <code>User</code>. Pero saber <em>quién</em> es no es suficiente. Copiloto API tiene usuarios que solo preguntan, editores que administran el corpus de módulos y administradores que gestionan cuentas. Todos están autenticados; no todos deberían poder hacer lo mismo. Falta la segunda pregunta: <strong>¿puede este usuario hacer esta acción?</strong> Eso es <em>autorización</em>.</p>
+        <p>Este es el error más común en APIs que empiezan: se protegen los endpoints con «¿hay token?» y punto. Así, cualquier usuario válido puede borrar registros, listar a otros usuarios o cambiar la configuración. La autorización no es un extra: es parte del contrato del API, tan importante como validar el cuerpo de la petición.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque la buena autorización es <em>declarativa y reutilizable</em>. En vez de sembrar <code>if user.role == "admin"</code> por toda la aplicación, se escribe una vez una dependencia (<code>require_role("admin")</code>) y cada endpoint declara qué exige. El <em>check</em> vive en un sitio, se documenta en OpenAPI y no se puede olvidar.</p>
+        </div>
+        <p>Errores típicos que veremos: autorizar dentro del cuerpo del endpoint (fácil de olvidar en un endpoint nuevo), confiar en un rol que envía el cliente, usar roles y scopes como si fueran lo mismo, devolver <code>401</code> cuando lo correcto es <code>403</code>, y esparcir comprobaciones de «superusuario» por todo el código.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos modelos: roles y scopes</h3>
+        <p>Hay dos maneras habituales de expresar permisos, y conviene entender cuándo va cada una:</p>
+        <table>
+          <thead><tr><th></th><th>Roles (RBAC)</th><th>Scopes (OAuth2)</th></tr></thead>
+          <tbody>
+            <tr><td>Qué son</td><td>Etiquetas de identidad: <code>reader</code>, <code>editor</code>, <code>admin</code></td><td>Permisos granulares: <code>ask:read</code>, <code>logs:write</code></td></tr>
+            <tr><td>Granularidad</td><td>Gruesa: un rol agrupa muchos permisos</td><td>Fina: cada scope describe una capacidad concreta</td></tr>
+            <tr><td>Cambian con</td><td>La persona (su puesto)</td><td>La aplicación que actúa en su nombre</td></tr>
+            <tr><td>Ideal para</td><td>Equipos internos, paneles: «¿es moderador?»</td><td>APIs consumidas por terceros: «¿puede leer mis datos?»</td></tr>
+            <tr><td>En el token</td><td>Claim propio <code>roles: ["editor"]</code></td><td>Claim estándar <code>scope: "ask:read ask:write"</code></td></tr>
+          </tbody>
+        </table>
+        <p>El <code>scope</code> es el mecanismo <em>estándar</em> de OAuth2: un claim cuya forma es una lista de permisos separados por espacios. FastAPI lo integra en <code>/docs</code> y en OpenAPI mediante <code>Security(...)</code>. Los roles son un claim propio que tú defines. Puedes usar uno u otro; este curso usa <strong>scopes</strong> para las capacidades del API (porque es lo que el estándar entiende) y menciona <strong>roles</strong> para el modelo más simple de «categorías de usuario».</p>
+        <div class="callout callout--note">
+          <p><strong>Regla práctica:</strong> si un permiso se puede conceder a una aplicación tercera sin que cambie el «puesto» de la persona, es un <em>scope</em>. Si describe a la persona dentro de tu organización, es un <em>rol</em>. Muchos sistemas usan los dos: el rol decide el conjunto inicial de scopes que se ponen en el token.</p>
+        </div>
+
+        <h3>Los claims viajan en el token: qué poner</h3>
+        <p>El JWT de la lección 1 llevaba <code>sub</code> y <code>exp</code>. Para autorizar, añadimos claims. La pregunta de diseño: ¿los permisos se ponen en el token o se consultan en la base de datos?</p>
+        <ul>
+          <li><strong>En el token</strong>: rápido (sin consulta extra) y sin estado, pero los cambios de rol no se notan hasta que caduca. Bien para datos que cambian poco.</li>
+          <li><strong>En la base de datos</strong>: siempre actualizado, pero cada petición consulta. Bien para permisos volátiles o si el token es largo.</li>
+        </ul>
+        <p>El compromiso habitual: token corto con los scopes dentro (como <code>roles</code> del usuario), y revocación por caducidad corta. Aquí ponemos los roles en el token:</p>
+        <div class="code-file">app/security.py — token con roles</div>
+        <pre><code class="language-python">from app.security import create_access_token
+
+# Al hacer login conocemos los roles del usuario: los estampamos en el token.
+token = create_access_token(subject=str(user.id), extra={"roles": user.roles})
+</code></pre>
+        <p>Y en <code>get_current_user</code> se leen al decodificar (no hace falta ir a la base de datos para los roles):</p>
+        <div class="code-file">app/deps.py — leer los roles del payload</div>
+        <pre><code class="language-python">@dataclass
+class CurrentUser:
+    id: int
+    username: str
+    roles: frozenset[str]
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -&gt; CurrentUser:
+    try:
+        payload = decode_access_token(token)
+    except InvalidTokenError:
+        raise credentials_error()
+    return CurrentUser(
+        id=int(payload["sub"]),
+        username=payload.get("username", ""),
+        roles=frozenset(payload.get("roles", [])),   # conjunto inmutable
+    )
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Los roles se firman, no se confían.</strong> El cliente <em>no</em> envía su rol: lo envía el servidor dentro del token firmado. Si aceptaras un rol del cuerpo de la petición o de una cabecera, cualquiera se declararía <code>admin</code>. Nunca leas el rol de un sitio que no sea un token verificado (o la base de datos).</p>
+        </div>
+
+        <h3>Dependencias de autorización reutilizables</h3>
+        <p>Aquí está la idea central de la lección. En vez de comprobar el rol dentro del endpoint, se fabrica una <strong>dependencia que exige el rol</strong> y se declara en el endpoint. Es el patrón «fábrica de dependencias»: una función que <em>devuelve</em> una dependencia.</p>
+        <pre class="diagram">
+   Peticion
+      │
+      ▼
+   ┌───────────────────────┐
+   │ oauth2_scheme         │  extrae el Bearer token
+   └──────────┬────────────┘
+              ▼
+   ┌───────────────────────┐
+   │ get_current_user      │  valida firma/exp  →  CurrentUser(roles)
+   └──────────┬────────────┘
+              ▼
+   ┌───────────────────────┐
+   │ require_role("admin") │  ¿"admin" en roles?   NO → 403
+   └──────────┬────────────┘
+              ▼
+   ┌───────────────────────┐
+   │ endpoint              │  solo si paso el filtro
+   └───────────────────────┘
+        </pre>
+        <div class="code-file">app/deps.py — fábrica de dependencias por rol</div>
+        <pre><code class="language-python">from collections.abc import Callable
+
+
+def require_role(role: str) -&gt; Callable[[CurrentUser], CurrentUser]:
+    """Devuelve una dependencia que exige 'role'. Reutilizable en toda la app."""
+
+    def checker(current_user: CurrentUser = Depends(get_current_user)) -&gt; CurrentUser:
+        if role not in current_user.roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permiso para esta accion",
+            )
+        return current_user
+
+    return checker
+</code></pre>
+        <p>Fíjate en el patrón: <code>require_role("admin")</code> no es una dependencia, <strong>devuelve</strong> una. Cada llamada crea una dependencia concreta que exige un rol. Se usa así:</p>
+        <div class="code-file">app/routers/users.py</div>
+        <pre><code class="language-python">@router.delete("/users/{user_id}", status_code=204)
+def delete_user(
+    user_id: int,
+    admin: CurrentUser = Depends(require_role("admin")),   # solo admin pasa
+    session: Session = Depends(get_session),
+) -&gt; None:
+    ...
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Un <em>check</em>, un sitio.</strong> Si mañana la regla cambia («admin o <em>owner</em> de la cuenta»), tocas <code>require_role</code> y afecta a todos los endpoints que la usan. Esa es toda la ventaja del patrón, frente a los <code>if</code> repetidos.</p>
+        </div>
+
+        <h3>Scopes: el mecanismo estándar</h3>
+        <p>Cuando quieres permisos granulares <em>y</em> que OpenAPI los conozca, FastAPI ofrece <code>Security</code> y <code>SecurityScopes</code>. Se declaran los scopes disponibles en el esquema y cada endpoint pide los suyos:</p>
+        <div class="code-file">app/deps.py — esquema con scopes</div>
+        <pre><code class="language-python">from fastapi import Security
+from fastapi.security import SecurityScopes
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/auth/token",
+    scopes={
+        "ask:read": "Consultar el Copiloto",
+        "ask:write": "Enviar preguntas nuevas",
+        "logs:read": "Leer el historico de consultas",
+        "admin": "Administrar usuarios y corpus",
+    },
+)
+
+
+def get_current_user(
+    security_scopes: SecurityScopes,
+    token: str = Depends(oauth2_scheme),
+) -&gt; CurrentUser:
+    # security_scopes.scopes trae lo que pide EL ENDPOINT que se esta ejecutando
+    user = _decode_and_build(token)          # valida firma, exp y devuelve CurrentUser
+    for needed in security_scopes.scopes:
+        if needed not in user.scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permisos insuficientes",
+                headers={"WWW-Authenticate": f'Bearer scope="{security_scopes.scope_str}"'},
+            )
+    return user
+</code></pre>
+        <p>El endpoint declara lo que necesita con <code>Security</code> en lugar de <code>Depends</code>:</p>
+        <div class="code-file">app/routers/ask.py</div>
+        <pre><code class="language-python">@router.post("/ask", response_model=AskResponse)
+def ask(
+    payload: AskRequest,
+    current_user: CurrentUser = Security(get_current_user, scopes=["ask:write"]),
+) -&gt; AskResponse:
+    return AskResponse(answer="...")
+</code></pre>
+        <p><strong><code>Depends</code> vs <code>Security</code>:</strong> <code>Security</code> es <code>Depends</code> con una lista de scopes que se reporta a OpenAPI. Si no necesitas scopes, <code>Depends</code> es suficiente y más corto.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el rol es tu <em>categoría de entrada</em> al recinto («público», «prensa», «organización»). El scope es un <em>permiso concreto escrito en la pulsera</em> («acceso a la sala de prensa», «acceso a la zona de artistas»). Un fotógrafo de prensa (rol) puede tener permiso para la sala de prensa (scope) pero no para el escenario. La puerta de cada sala comprueba el permiso, no tu carné de prensa por sí solo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Todo el patrón en cuatro piezas pequeñas, sin base de datos ni scopes: solo roles en el token.</p>
+        <div class="code-file">roles_minimo.py</div>
+        <pre><code class="language-python">import os
+from dataclasses import dataclass
+
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+
+SECRET = os.environ["FAPI_SECRET_KEY"]
+ALG = "HS256"
+
+app = FastAPI()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+@dataclass
+class CurrentUser:
+    username: str
+    roles: frozenset[str]
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -&gt; CurrentUser:
+    try:
+        payload = jwt.decode(token, SECRET, algorithms=[ALG])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciales invalidas")
+    return CurrentUser(payload["sub"], frozenset(payload.get("roles", [])))
+
+
+def require_role(role: str):
+    def checker(user: CurrentUser = Depends(get_current_user)) -&gt; CurrentUser:
+        if role not in user.roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Permiso denegado")
+        return user
+    return checker
+
+
+# Endpoint abierto a cualquier usuario autenticado
+@app.get("/reports")
+def read_reports(user: CurrentUser = Depends(get_current_user)) -&gt; dict[str, str]:
+    return {"for": user.username}
+
+
+# Endpoint solo para admins
+@app.delete("/reports/{report_id}")
+def delete_report(
+    report_id: int,
+    admin: CurrentUser = Depends(require_role("admin")),
+) -&gt; dict[str, str]:
+    return {"deleted": str(report_id), "by": admin.username}
+</code></pre>
+        <p>Para probarlo, emite dos tokens distintos desde el mismo secreto:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Token de un usuario normal
+USER=$(uv run python -c "import os,jwt;print(jwt.encode({'sub':'ana','roles':['reader']}, os.environ['FAPI_SECRET_KEY'], algorithm='HS256'))")
+# Token de un admin
+ADMIN=$(uv run python -c "import os,jwt;print(jwt.encode({'sub':'root','roles':['reader','admin']}, os.environ['FAPI_SECRET_KEY'], algorithm='HS256'))")
+
+curl -s http://127.0.0.1:8000/reports -H "Authorization: Bearer $USER"        # 200
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://127.0.0.1:8000/reports/1 -H "Authorization: Bearer $USER"   # 403
+curl -s -X DELETE http://127.0.0.1:8000/reports/1 -H "Authorization: Bearer $ADMIN"   # 200
+</code></pre>
+        <p>Resultado esperado: el usuario normal lee el informe (<code>200</code>) pero al borrar recibe <code>403</code> — está autenticado, simplemente no tiene el rol. El admin pasa ambos.</p>
+        <div class="callout callout--note">
+          <p><strong>401 vs 403, la clave.</strong> <code>401</code> = «no sé quién eres» (falta o es inválido el token). <code>403</code> = «sé quién eres, pero no puedes». Mezclarlos confunde al cliente: un frontend que recibe 401 intenta renovar el token; si le devuelves 401 cuando el problema es de permiso, entra en un bucle de refresco inútil.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Copiloto API con las dos capas juntas: un rol de alto nivel que determina los scopes, y dependencias de scope para cada endpoint. Primero, el módulo de autorización:</p>
+        <div class="code-file">app/security.py — de rol a scopes</div>
+        <pre><code class="language-python">from enum import StrEnum
+
+from app.models import User
+
+
+class Role(StrEnum):
+    READER = "reader"
+    EDITOR = "editor"
+    ADMIN = "admin"
+
+
+# El rol decide que scopes se estampan en el token al hacer login.
+ROLE_SCOPES: dict[Role, frozenset[str]] = {
+    Role.READER: frozenset({"ask:read", "logs:read"}),
+    Role.EDITOR: frozenset({"ask:read", "ask:write", "logs:read"}),
+    Role.ADMIN: frozenset({"ask:read", "ask:write", "logs:read", "logs:write", "admin"}),
+}
+
+
+def scopes_for(user: User) -&gt; list[str]:
+    granted: set[str] = set()
+    for role in user.roles:
+        granted |= ROLE_SCOPES[Role(role)]
+    return sorted(granted)
+</code></pre>
+        <div class="code-file">app/deps.py — autorización reutilizable</div>
+        <pre><code class="language-python">from collections.abc import Callable
+from dataclasses import dataclass
+
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import OAuth2PasswordBearer, SecurityScopes
+from jwt.exceptions import InvalidTokenError
+
+from app.security import decode_access_token
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/auth/token",
+    scopes={
+        "ask:read": "Consultar el Copiloto",
+        "ask:write": "Enviar preguntas nuevas",
+        "logs:read": "Leer el historico",
+        "logs:write": "Borrar el historico",
+        "admin": "Administrar usuarios y corpus",
+    },
+)
+
+
+@dataclass(frozen=True)
+class CurrentUser:
+    id: int
+    username: str
+    scopes: frozenset[str]
+
+
+def get_current_user(
+    security_scopes: SecurityScopes,
+    token: str = Depends(oauth2_scheme),
+) -&gt; CurrentUser:
+    authenticate_value = (
+        f'Bearer scope="{security_scopes.scope_str}"' if security_scopes.scopes else "Bearer"
+    )
+    try:
+        payload = decode_access_token(token)
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales invalidas",
+            headers={"WWW-Authenticate": authenticate_value},
+        )
+    scopes = frozenset(payload.get("scope", "").split())
+    for needed in security_scopes.scopes:
+        if needed not in scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permisos insuficientes",
+                headers={"WWW-Authenticate": authenticate_value},
+            )
+    return CurrentUser(id=int(payload["sub"]), username=payload["username"], scopes=scopes)
+
+
+def require_scopes(*needed: str) -&gt; Callable[..., CurrentUser]:
+    """Azucar: convierte require_scopes('a','b') en una dependencia lista."""
+
+    def checker(
+        current_user: CurrentUser = Security(get_current_user, scopes=list(needed)),
+    ) -&gt; CurrentUser:
+        return current_user
+
+    return checker
+</code></pre>
+        <div class="code-file">app/routers/ask.py — endpoints con distinto nivel</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends, Security
+
+from app.deps import CurrentUser, get_current_user, require_scopes
+from app.schemas import AskRequest, AskResponse, LogPublic
+from app.repositories.queries import QueryLogRepository
+from app.deps import get_query_log_repository
+
+router = APIRouter(tags=["copiloto"])
+
+
+# Leer: cualquier usuario autenticado (sin scope concreto)
+@router.get("/modules")
+def list_modules(user: CurrentUser = Depends(get_current_user)) -&gt; list[dict[str, str]]:
+    return [{"slug": "fastapi", "title": "FastAPI"}]
+
+
+# Preguntar: requiere permiso de escritura sobre el Copiloto
+@router.post("/ask", response_model=AskResponse)
+def ask(
+    payload: AskRequest,
+    user: CurrentUser = Security(get_current_user, scopes=["ask:write"]),
+) -&gt; AskResponse:
+    return AskResponse(answer=f"Respuesta para {user.username}")
+
+
+# Ver el historico: permiso de lectura de logs
+@router.get("/logs", response_model=list[LogPublic])
+def list_logs(
+    user: CurrentUser = Security(get_current_user, scopes=["logs:read"]),
+    repo: QueryLogRepository = Depends(get_query_log_repository),
+):
+    return repo.list_recent()
+
+
+# Borrar el historico: solo admin, dos formas equivalentes
+@router.delete("/logs", status_code=204)
+def clear_logs(
+    user: CurrentUser = Depends(require_scopes("logs:write", "admin")),
+) -&gt; None:
+    ...   # el endpoint solo se alcanza si tiene AMBOS scopes
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>El rol agrupa, el scope autoriza.</strong> La base de datos guarda roles («ana es editora»); al hacer login se traducen a scopes concretos. Así añadir un rol nuevo es tocar <code>ROLE_SCOPES</code>, no cada endpoint.</li>
+          <li><strong>Los scopes se comprueban en una sola dependencia.</strong> <code>get_current_user</code> recibe <code>SecurityScopes</code> —lo que <em>este</em> endpoint pide— y compara. El endpoint nunca escribe el <code>if</code>.</li>
+          <li><strong><code>require_scopes(*needed)</code> como azúcar.</strong> Para el caso común de «esta ruta y nada más», evita repetir <code>Security(get_current_user, ...)</code>.</li>
+          <li><strong>El contrato lo refleja.</strong> En <code>/docs</code>, cada endpoint muestra el candado y los scopes que exige; el botón <strong>Authorize</strong> permite solicitarlos. Un cliente sabe exactamente qué permiso pedir.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Comprobar «ambos scopes».</strong> <code>Security(get_current_user, scopes=["logs:write", "admin"])</code> exige <em>todos</em>: el bucle en <code>get_current_user</code> recorre los pedidos y falla al primero que falte. Si quisieras «cualquiera de los dos», escribirías la regla explícitamente con <code>any(...)</code>: no hay un operador OR nativo, porque el estándar de scopes no lo contempla.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Autorizar con dependencias declaradas en la firma</td>
+              <td><code>if user.role != "admin"</code> dentro del cuerpo</td>
+              <td>La firma es el contrato: se ve en <code>/docs</code> y no se puede olvidar</td>
+            </tr>
+            <tr>
+              <td>Fábricas reutilizables (<code>require_role</code>, <code>require_scopes</code>)</td>
+              <td>Repetir la misma comprobación en diez endpoints</td>
+              <td>Un único <em>check</em> que evoluciona en un sitio</td>
+            </tr>
+            <tr>
+              <td>Leer los permisos de un token firmado o de la BD</td>
+              <td>Aceptar el rol de una cabecera o del body</td>
+              <td>Si el cliente declara su rol, cualquiera es <code>admin</code></td>
+            </tr>
+            <tr>
+              <td><code>403</code> cuando falta permiso</td>
+              <td><code>401</code> para «no puedes»</td>
+              <td>401 dispara refresco de token en el cliente; 403 significa «autenticado, sin permiso»</td>
+            </tr>
+            <tr>
+              <td>Guardar scopes/roles como conjunto inmutable (<code>frozenset</code>)</td>
+              <td>Listas mutables compartidas entre peticiones</td>
+              <td>Un <code>frozenset</code> evita mutaciones accidentales y consultas O(1) de pertenencia</td>
+            </tr>
+            <tr>
+              <td>Denegar por defecto; conceder explícitamente</td>
+              <td>Lista negra de roles prohibidos</td>
+              <td>Un rol nuevo jamás hereda permisos que nadie le concedió</td>
+            </tr>
+            <tr>
+              <td>Registrar el <em>check</em> de autorización denegado en el log</td>
+              <td>Fallar en silencio</td>
+              <td>Los 403 repetidos son la señal de un ataque de escalada o de un bug de permisos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Autorizar dentro del endpoint</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">@router.delete("/modules/{slug}")
+def delete_module(slug: str, user: CurrentUser = Depends(get_current_user)):
+    if "admin" not in user.roles:           # invisible en OpenAPI
+        raise HTTPException(403, "No permitido")
+    ...
+# Riesgo: el endpoint nuevo que copia esto y olvida el 'if'
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@router.delete("/modules/{slug}")
+def delete_module(
+    slug: str,
+    user: CurrentUser = Depends(require_role("admin")),   # en la FIRMA
+):
+    ...
+</code></pre>
+        <p>El <em>check</em> en la firma es parte del contrato: aparece en <code>/docs</code>, se reutiliza y no se puede saltar. El <code>if</code> interno es invisible y fácil de olvidar al copiar el endpoint.</p>
+
+        <h3>Confiar en el rol que envía el cliente</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">class Payload(BaseModel):
+    question: str
+    role: str = "reader"     # el cliente puede mandar "admin"
+
+@router.post("/ask")
+def ask(payload: Payload):
+    if payload.role != "admin":
+        raise HTTPException(403, "No permitido")
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@router.post("/ask")
+def ask(
+    payload: AskRequest,                                    # sin 'role' en el modelo
+    user: CurrentUser = Security(get_current_user, scopes=["ask:write"]),
+):
+    ...
+</code></pre>
+        <p>El rol es un dato del servidor, no del cliente. Debe venir de un token firmado (que solo tú puedes firmar) o de la base de datos. Cualquier rol que llegue en el body es una sugerencia del atacante.</p>
+
+        <h3>401 cuando corresponde 403</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">if "admin" not in user.roles:
+    raise HTTPException(status_code=401, detail="No autorizado")
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">if "admin" not in user.roles:
+    raise HTTPException(status_code=403, detail="Permisos insuficientes")
+</code></pre>
+        <p>El 401 le dice al cliente «tu token no vale, consigue otro»; un frontend intentará refrescar en bucle. El 403 dice «estás autenticado, pero no puedes»: no hay nada que refrescar.</p>
+
+        <h3>Permisos que se pudren en el token</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># Token de 24 horas con TODOS los permisos dentro
+{"sub": "42", "scope": "admin logs:write", "exp": now + timedelta(hours=24)}
+
+# Revocas el rol de admin al usuario... y sigue siendo admin 24 horas mas.
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># Token corto (minutos) + refresh; o consultar roles en la BD en get_current_user
+{"sub": "42", "scope": "ask:read", "exp": now + timedelta(minutes=15)}
+</code></pre>
+        <p>Cuanto más corto el token, menos dura la ventana en la que un permiso revocado sigue vigente. Para permisos volátiles, oblígate a mirar la base de datos en <code>get_current_user</code> en vez de fiarte del claim.</p>
+
+        <h3>Denegar por lista negra</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">FORBIDDEN = {"banned", "suspended"}
+if any(r in FORBIDDEN for r in user.roles):
+    raise HTTPException(403, "Bloqueado")
+# Un rol nuevo que olvidaste listar: permitido por defecto.
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">if "admin" not in user.roles:      # lista blanca: permiso explicito
+    raise HTTPException(403, "Permisos insuficientes")
+</code></pre>
+        <p>Denegar por defecto y conceder explícitamente. Así, un rol que nadie ha previsto no hereda capacidades por olvido.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> introducir roles y scopes en Copiloto API, proteger tres endpoints con niveles distintos y comprobar cada caso límite con <code>curl</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Roles en el modelo.</strong> Añade a <code>User</code> (Módulo 4) un campo <code>roles: list[str] = []</code> (SQLModel lo guarda como JSON). Siembra tres usuarios: <code>lector</code> con <code>["reader"]</code>, <code>editora</code> con <code>["editor"]</code> y <code>root</code> con <code>["admin"]</code>.
+          </li>
+          <li>
+            <strong>Paso 2 — Traduce rol a scopes.</strong> Crea el mapa <code>ROLE_SCOPES</code> como en el ejemplo real y la función <code>scopes_for(user)</code>. En <code>POST /auth/token</code>, estampa <code>extra={"scope": " ".join(scopes_for(user)), "username": user.username}</code> al emitir el token.
+          </li>
+          <li>
+            <strong>Paso 3 — Extrae los scopes.</strong> En <code>get_current_user</code>, lee <code>payload.get("scope", "").split()</code> y guárdalos como <code>frozenset</code>. No olvides el parámetro <code>security_scopes: SecurityScopes</code> y el bucle que compara lo pedido con lo concedido.
+          </li>
+          <li>
+            <strong>Paso 4 — Protege los endpoints.</strong> <code>GET /modules</code> solo requiere autenticación; <code>POST /ask</code> pide <code>ask:write</code>; <code>GET /logs</code> pide <code>logs:read</code>. Declara <code>oauth2_scheme</code> con el diccionario de scopes para que <code>/docs</code> los muestre.
+          </li>
+          <li>
+            <strong>Paso 5 — Añade un endpoint de administración.</strong> <code>DELETE /logs</code> exige <code>logs:write</code> y <code>admin</code>. Úsalo con <code>require_scopes("logs:write", "admin")</code>.
+          </li>
+          <li>
+            <strong>Paso 6 — Prueba la matriz completa.</strong> Con los tres usuarios, ejecuta:
+            <pre><code class="language-bash">for quien in lector:copiloto editora:copiloto root:copiloto; do
+  U=${quien%%:*}; P=${quien##*:}
+  T=$(curl -s -X POST http://127.0.0.1:8000/auth/token -d "username=$U&amp;password=$P" \
+      | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+  echo "$U  ask:$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/ask \
+        -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"question":"hola"}')" \
+       " logs:$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/logs -H "Authorization: Bearer $T")" \
+       " clear:$(curl -s -o /dev/null -w '%{http_code}' -X DELETE http://127.0.0.1:8000/logs -H "Authorization: Bearer $T")"
+done
+</code></pre>
+            <p>Resultado esperado (aproximado, según los scopes que concedas): <code>lector</code> → <code>ask:403 logs:200 clear:403</code>; <code>editora</code> → <code>ask:200 logs:200 clear:403</code>; <code>root</code> → <code>ask:200 logs:200 clear:204</code>. El lector puede leer el histórico pero no preguntar: es la diferencia entre <em>estar autenticado</em> y <em>tener permiso</em>.</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Verifica en OpenAPI.</strong> Abre <code>/openapi.json</code> y busca <code>security</code>. Resultado esperado: <code>POST /ask</code> lista <code>ask:write</code> y <code>DELETE /logs</code> lista <code>logs:write</code> y <code>admin</code>. El contrato documenta los permisos: eso lo heredan los generadores de clientes y el portal de desarrolladores.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Jerarquía de roles y propiedad del recurso</h3>
+          <p>Los roles planos no cubren dos casos reales: (1) <code>admin</code> debería poder hacer todo lo que puede <code>editor</code>, que a su vez puede todo lo de <code>reader</code>, sin enumerar cada permiso; (2) un usuario debe poder editar <em>sus propias</em> preguntas aunque no sea admin — la autorización no siempre es por rol, a veces depende de quién es el dueño del recurso.</p>
+          <p>Impleta las dos cosas: una relación de <strong>jerarquía</strong> (un mapa <code>{"admin": {"editor"}, "editor": {"reader"}, "reader": set()}</code>) que expanda los scopes concedidos, y una dependencia <code>require_owner_or_role(...)</code> que permita la acción si el usuario es <code>admin</code> <strong>o</strong> si el recurso le pertenece. Aplícala a un endpoint <code>DELETE /logs/{log_id}</code>.</p>
+          <p><em>Pistas: la expansión de jerarquía es un recorrido en profundidad sobre el mapa (cuidado con los ciclos: un <code>visited</code> o un <code>frozenset</code> de vistos). Para la propiedad, la dependencia necesita conocer el recurso: pide el <code>log_id</code> por path y el repositorio por dependencia (Módulo 4), carga el log y compara <code>log.user_id</code> con <code>user.id</code>. Pregunta de diseño: ¿devolverías 403 o 404 cuando el recurso existe pero no es tuyo? (pista: un 404 no revela que el recurso existe). Y ojo con el orden: el <em>check</em> de autorización no debe ejecutar trabajo pesado que un usuario sin permiso pueda forzar.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Autenticación</strong> (401) identifica; <strong>autorización</strong> (403) decide. Son capas distintas.</li>
+          <li>Los <strong>roles</strong> agrupan permisos por categoría de usuario; los <strong>scopes</strong> son permisos granulares y estándar en OAuth2 (<code>scope</code> como lista separada por espacios).</li>
+          <li>Los permisos viajan en el <strong>token firmado</strong> (o se consultan en la BD); jamás se aceptan del cliente.</li>
+          <li>La autorización se declara con una <strong>dependencia reutilizable</strong> en la firma del endpoint, no con <code>if</code> internos.</li>
+          <li>La <strong>fábrica de dependencias</strong> (<code>require_role("admin")</code>) devuelve una dependencia configurada con el rol que exige.</li>
+          <li><code>Security</code> es <code>Depends</code> + <strong>scopes declarados</strong>, y por eso aparecen en OpenAPI y en <code>/docs</code>.</li>
+          <li><code>SecurityScopes</code> trae lo que <em>pide el endpoint</em>; la dependencia compara con lo concedido en el token.</li>
+          <li>Denegar por defecto (lista blanca) y no fiarse de permisos «eternos»: tokens cortos o consulta a la BD.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Rol en el token</td><td><code>create_access_token(sub, extra={"roles": user.roles})</code></td></tr>
+            <tr><td>Dependencia por rol</td><td><code>def require_role(role): ...</code> devuelve <code>checker</code></td></tr>
+            <tr><td>Uso en el endpoint</td><td><code>user = Depends(require_role("admin"))</code></td></tr>
+            <tr><td>Esquema con scopes</td><td><code>OAuth2PasswordBearer(tokenUrl=..., scopes={...})</code></td></tr>
+            <tr><td>Exigir scopes</td><td><code>Security(get_current_user, scopes=["ask:write"])</code></td></tr>
+            <tr><td>Leer lo pedido</td><td><code>security_scopes: SecurityScopes</code> → <code>security_scopes.scopes</code></td></tr>
+            <tr><td>Sin permiso</td><td><code>HTTPException(403, "Permisos insuficientes")</code></td></tr>
+            <tr><td>Conjunto de permisos</td><td><code>frozenset(payload.get("scope", "").split())</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Roles o scopes? ¿Cuál uso en Copiloto API?</summary>
+            <div>
+              <p>Usa los dos en capas: el <strong>rol</strong> es cómo la base de datos describe a la persona (lector, editor, admin) y el <strong>scope</strong> es la capacidad concreta que el token lleva estampada. Al hacer login traduces roles a scopes. Ganas lo mejor de cada uno: administras personas por rol y autorizas endpoints por scope granular, con el estándar OAuth2 y la documentación automática. Si tu API no la consumen terceros y los permisos son gruesos, un rol basta y te ahorras una capa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde conviene comprobar los permisos: en la dependencia o en el servicio?</summary>
+            <div>
+              <p>En la <strong>dependencia</strong> para la autorización <em>gruesa</em> («puede usar esta ruta»), porque así es declarativa, visible en OpenAPI y no se olvida. Algunas reglas finas dependen del recurso («solo el dueño»), y esas no se pueden resolver sin cargarlo: van en el servicio o en una dependencia que reciba el recurso. La regla de oro: <strong>denegar antes de hacer trabajo costoso</strong>, y que el endpoint jamás contenga el <code>if</code> de permisos básicos. Ver el reto para el caso dueño-o-admin.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>Security</code> y no <code>Depends</code>?</summary>
+            <div>
+              <p><code>Security</code> es <code>Depends</code> con una lista de <code>scopes</code> que FastAPI reporta a OpenAPI. Si no pides scopes, <code>Depends</code> es suficiente y más corto. La diferencia no es funcional en la ejecución, sino documental: <code>Security(..., scopes=[...])</code> hace que <code>/docs</code> y <code>openapi.json</code> declaren qué permiso necesita cada ruta, y que el botón <strong>Authorize</strong> permita solicitarlos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si cambio los roles de un usuario, ¿cuándo surte efecto?</summary>
+            <div>
+              <p>Solo cuando emita un token nuevo. Los scopes van dentro del JWT y el token es sin estado: el servidor no consulta los roles en cada petición. Cuanto más corta la caducidad del token, menor la ventana de desfase. Si necesitas efecto inmediato, valida los permisos contra la base de datos en <code>get_current_user</code> (a cambio de una consulta por petición) o mantén una <em>denylist</em> de tokens revocados en Redis.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un admin debería pasar todos los <em>checks</em> automáticamente?</summary>
+            <div>
+              <p>No por defecto: eso es un «superusuario mágico» que suele sorprender y complica auditar quién hizo qué. Si quieres que <code>admin</code> herede los permisos de <code>editor</code>, hazlo <strong>explícito</strong> con una jerarquía (ver el reto) en lugar de un <code>if user.is_admin: return True</code> escondido. Explícito significa testeable, predecible y fácil de limitar. Un admin que además no puede borrarse a sí mismo es mejor que un admin omnipotente sin reglas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

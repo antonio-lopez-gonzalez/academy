@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-db-tests">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tests con base de datos — Módulo 6 · Curso FastAPI</title>
+  <meta name="description" content="Tests de endpoints contra una base de datos temporal: SQLite en memoria, StaticPool, dependency_overrides de get_session y aislamiento por test con transacciones.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Tests con base de datos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Testing y calidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Copiloto API guarda un histórico de consultas en SQLite (Módulo 4). Un test que ejercita <code>POST /ask</code> de verdad tiene que <strong>escribir en una base de datos</strong>: no basta con doblar el repositorio, porque entonces no estás probando la consulta SQL, ni la transacción, ni el mapeo de SQLModel. Necesitas una base de datos real… pero <strong>que no sea la tuya</strong>.</p>
+        <p>El problema tiene dos caras. Primero, <strong>aislamiento</strong>: cada test debe empezar con un estado conocido, sin heredar filas del test anterior. Segundo, <strong>rapidez y seguridad</strong>: jamás debes apuntar los tests a la base de datos de desarrollo —un <code>DROP TABLE</code> se lleva tus datos— ni a una compartida, donde los tests pisan entre sí.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque aquí se une todo lo aprendido: la sesión con <code>yield</code> (Módulo 3), SQLModel y transacciones (Módulo 4), el patrón repositorio (Módulo 4) y <code>dependency_overrides</code> (lecciones 1 y 2). La pieza nueva es <strong>dónde vive esa base de datos</strong> y cómo se limpia entre tests.</p>
+        </div>
+        <p>Errores típicos que veremos: usar <code>sqlite://</code> sin <code>StaticPool</code> y recibir un «no such table» desconcertante; dejar un fichero <code>test.db</code> por el repositorio que ensucia las ejecuciones; y olvidar limpiar la sustitución de <code>get_session</code>, con el que la app acaba escribiendo en la base de datos equivocada.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué base de datos usar en los tests</h3>
+        <p>SQLite es ideal para tests: no requiere servidor, se crea en un instante y SQLAlchemy lo trata igual que a PostgreSQL. Hay dos sabores:</p>
+        <table>
+          <thead><tr><th>Variante</th><th>URL</th><th>Ventajas</th><th>Inconvenientes</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>En memoria</td><td><code>sqlite://</code></td>
+              <td>Instantánea; desaparece al cerrar; cero ficheros</td>
+              <td>Hay que forzar una sola conexión (StaticPool)</td>
+            </tr>
+            <tr>
+              <td>Fichero temporal</td><td><code>sqlite:///{tmp_path}/test.db</code></td>
+              <td>Comportamiento real de fichero; inspeccionable</td>
+              <td>Más lento; hay que borrarlo (pytest lo hace con <code>tmp_path</code>)</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Nunca</strong> uses la URL real (<code>sqlite:///copiloto.db</code> o tu PostgreSQL de desarrollo) en los tests. Si un test borra o modifica filas, estás destruyendo tus propios datos. La regla es tajante: <em>entorno de test, base de datos de test</em>.</p>
+        </div>
+
+        <h3>El detalle que rompe a todo el mundo: <code>StaticPool</code></h3>
+        <p>Una base de datos SQLite <strong>en memoria</strong> vive dentro de la conexión. Si el pool abre una conexión nueva para el segundo uso, esa conexión ve otra base de datos… vacía. Por eso, cuando ves «<code>no such table: modules</code>» en un test que acaba de crear las tablas, casi siempre es esto.</p>
+        <pre class="diagram">
+   create_engine("sqlite://")                      sin StaticPool
+   ├── conexión A → crea tablas, inserta filas   (su propia BD en memoria)
+   └── conexión B → ¿tablas? NO EXISTEN          ← "no such table"
+
+   create_engine("sqlite://", poolclass=StaticPool)   con StaticPool
+   └── UNA sola conexión compartida → todos ven la misma BD en memoria  ✔
+        </pre>
+        <div class="callout callout--tip">
+          <p><code>StaticPool</code> obliga al motor a reutilizar <strong>siempre la misma conexión</strong>. Es exactamente lo que quieres para una base de datos en memoria durante un test. Añade además <code>check_same_thread=False</code>, porque <code>TestClient</code> ejecuta la app en otro hilo y SQLite es estricto con el hilo de la conexión.</p>
+        </div>
+        <div class="code-file">tests/conftest.py (motor de test)</div>
+        <pre><code class="language-python">from sqlmodel import SQLModel, create_engine
+from sqlalchemy.pool import StaticPool
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+SQLModel.metadata.create_all(engine)
+</code></pre>
+
+        <h3><code>dependency_overrides</code>: apuntar la app a la base de datos de test</h3>
+        <p>La app no debe saber que está en un test. No cambies <code>app/db.py</code>; sustituye la <strong>dependencia</strong> <code>get_session</code> para que entregue una sesión de la base de datos de test:</p>
+        <pre class="diagram">
+   ENDPOINT  ──► Depends(get_session)
+                      │
+             dependency_overrides
+                      ▼
+        get_test_session()  →  Session(test_engine)  →  SQLite en memoria
+        </pre>
+        <div class="code-file">tests/conftest.py (sustitución)</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from app.db import get_session
+from app.main import app
+
+
+def get_test_session() -&gt; Iterator[Session]:
+    with Session(engine) as session:
+        yield session
+
+
+app.dependency_overrides[get_session] = get_test_session
+</code></pre>
+        <p>El endpoint reutiliza su código de siempre; solo cambia <em>de quién</em> recibe la sesión. Esa indirección la preparaste en el módulo de repositorios, y ahora es la que te da tests sin trucos.</p>
+
+        <h3>Aislamiento: dos estrategias</h3>
+        <p>Con la base de datos en memoria ya tienes donde escribir. Falta que <strong>cada test empiece limpio</strong>. Hay dos caminos, y conviene conocer ambos:</p>
+        <p><strong>Estrategia A — recrear el esquema por test.</strong> Una fixture de <em>scope</em> función que hace <code>drop_all</code> y <code>create_all</code> antes de cada test, o simplemente crea un motor nuevo en memoria. Simple, robusto y del todo suficiente para APIs de tamaño medio.</p>
+        <p><strong>Estrategia B — transacción externa con <em>rollback</em>.</strong> Abres una transacción al principio del test y haces <em>rollback</em> al final: cada test escribe «de verdad», pero nada se guarda de forma permanente. Más rápido, a cambio de un poco más de ceremonia.</p>
+        <div class="code-label code-label--right">✓ Estrategia B — rollback por test (SQLAlchemy 2.0)</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+import pytest
+from sqlalchemy.engine import Engine
+from sqlmodel import Session
+
+
+@pytest.fixture
+def session(engine: Engine) -&gt; Iterator[Session]:
+    """Bindea la sesión a una transacción externa y la revierte al final."""
+    connection = engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    try:
+        yield session
+    finally:
+        session.close()
+        transaction.rollback()      # se descarta todo lo escrito por el test
+        connection.close()
+</code></pre>
+        <div class="callout callout--note">
+          <p><code>join_transaction_mode="create_savepoint"</code> hace que, cuando tu código llame a <code>session.commit()</code>, SQLAlchemy use un <em>SAVEPOINT</em> en lugar de cerrar la transacción externa. Así el <code>commit</code> de la app funciona «como siempre» para el test, pero el <em>rollback</em> final lo deshace todo. Sin este parámetro, el primer <code>commit</code> cerraría la transacción y el aislamiento se perdería.</p>
+        </div>
+        <div class="callout callout--tip">
+          <p><strong>¿Cuál elijo?</strong> Empieza con la estrategia A (recrear el esquema). Pásate a la B cuando la suite crezca y el coste de crear tablas se note. En este curso verás la B en el proyecto final porque demuestra el aislamiento más fino. También verás la variante «fichero con <code>tmp_path</code>» cuando necesites comprobar algo específico del sistema de ficheros.</p>
+        </div>
+
+        <h3>Si tu sesión es async</h3>
+        <p>Todo lo anterior tiene gemelo con <code>AsyncSession</code> y <code>create_async_engine("sqlite+aiosqlite://")</code>. En ese caso las fixtures son async (lección 2) y el <em>override</em> entrega un <code>AsyncSession</code>. El concepto no cambia: <em>motor de test, sesión de test, dependencia sustituida, limpieza garantizada</em>.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una app con un endpoint que escribe y otro que lee, y un test que comprueba el ciclo completo contra SQLite en memoria.</p>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+from fastapi import Depends, FastAPI
+from sqlmodel import Field, Session, SQLModel, create_engine, select
+
+app = FastAPI(title="Copiloto API")
+engine = create_engine("sqlite:///copiloto.db")   # la URL que sustituirá el test
+
+
+class Module(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    slug: str
+
+
+def get_session() -&gt; Iterator[Session]:
+    with Session(engine) as session:
+        yield session
+
+
+@app.post("/modules", status_code=201)
+def create_module(slug: str, session: Session = Depends(get_session)) -&gt; dict:
+    module = Module(slug=slug)
+    session.add(module)
+    session.commit()
+    session.refresh(module)
+    return {"id": module.id, "slug": module.slug}
+
+
+@app.get("/modules")
+def list_modules(session: Session = Depends(get_session)) -&gt; list[dict]:
+    rows = session.exec(select(Module)).all()
+    return [{"slug": row.slug} for row in rows]
+</code></pre>
+        <div class="code-file">tests/test_db_min.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+from fastapi.testclient import TestClient
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
+from app.main import Module, app, get_session
+
+# 1) Motor de test: en memoria, una sola conexión, compartida entre hilos.
+test_engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+SQLModel.metadata.create_all(test_engine)
+
+
+def get_test_session() -&gt; Iterator[Session]:
+    with Session(test_engine) as session:
+        yield session
+
+
+# 2) La app usa la base de datos de test.
+app.dependency_overrides[get_session] = get_test_session
+client = TestClient(app)
+
+
+def test_create_and_list_module() -&gt; None:
+    created = client.post("/modules", params={"slug": "fastapi"})
+    assert created.status_code == 201
+
+    listed = client.get("/modules")
+    assert listed.status_code == 200
+    assert listed.json() == [{"slug": "fastapi"}]
+</code></pre>
+        <p>Ejecútalo y verás el ciclo completo (INSERT + SELECT) sobre una base de datos que no existe en disco:</p>
+        <div class="code-file">consola</div>
+        <pre><code class="language-bash">uv add --dev pytest httpx
+uv run pytest -q
+</code></pre>
+        <pre><code class="language-text">.                                                                    [100%]
+1 passed in 0.06s
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>"sqlite://"</code></strong>: tres barras tras <code>sqlite:</code> apuntan a un fichero; con <em>dos</em> barras y nada detrás, es memoria. El test no deja rastro en disco.</li>
+          <li><strong><code>poolclass=StaticPool</code></strong>: imprescindible. Sin él, la segunda conexión vería una base de datos vacía y el test fallaría con «no such table: module».</li>
+          <li><strong><code>SQLModel.metadata.create_all(test_engine)</code></strong>: crea las tablas <em>en el motor de test</em>. Recuerda que los modelos deben estar importados; aquí importamos <code>Module</code> desde <code>app.main</code>.</li>
+          <li><strong><code>get_test_session</code></strong>: el mismo contrato que <code>get_session</code> (una sesión con <code>yield</code>), pero apuntando al motor de test.</li>
+          <li><strong><code>app.dependency_overrides[get_session] = get_test_session</code></strong>: la app deja de usar su motor real. El endpoint no cambia ni una línea.</li>
+          <li><strong><code>client.post(...)</code> y <code>client.get(...)</code></strong>: dos peticiones reales que pasan por la ruta, la dependencia y SQLModel.</li>
+        </ol>
+        <div class="callout callout--warning">
+          <p>Este ejemplo mínimo sustituye la dependencia <strong>a nivel de módulo</strong>, sin limpiar. Funciona para un único archivo de test, pero en una suite real conviene hacerlo en una fixture con limpieza (como en la lección 1) o, mejor, con aislamiento por test (sección 4). Lo mostramos así a propósito, para que veas el mecanismo desnudo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En <strong>Copiloto API</strong> combinamos las dos piezas: la sustitución de <code>get_session</code> y el aislamiento por transacción. El resultado es una suite donde cada test ve una base de datos «como nueva» y donde nada se filtra de un test a otro.</p>
+        <div class="code-file">tests/conftest.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
+from app.db import get_session
+from app.deps import get_rag_engine
+from app.main import app
+from app.models import Module  # noqa: F401  (importar para registrar la tabla)
+
+
+@pytest.fixture(scope="session")
+def engine() -&gt; Iterator[Engine]:
+    """Un único motor en memoria para toda la sesión de tests."""
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(test_engine)
+    yield test_engine
+
+
+@pytest.fixture
+def session(engine: Engine) -&gt; Iterator[Session]:
+    """Sesión envuelta en una transacción que se revierte al terminar el test."""
+    connection = engine.connect()
+    transaction = connection.begin()
+    test_session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    try:
+        yield test_session
+    finally:
+        test_session.close()
+        transaction.rollback()
+        connection.close()
+
+
+@pytest.fixture
+def client(session: Session) -&gt; Iterator[TestClient]:
+    """Cliente cuya app usa LA sesión del test (con su transacción)."""
+
+    def override_get_session() -&gt; Iterator[Session]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_rag_engine] = FakeRagEngine
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+class FakeRagEngine:
+    async def answer(self, question: str) -&gt; str:
+        return f"Respuesta simulada para: {question}"
+</code></pre>
+        <p>Ahora los tests pueden <strong>sembrar datos</strong> con su propia sesión y consultarlos vía API, con la certeza de que nada sobrevive al test:</p>
+        <div class="code-file">tests/test_query_log.py</div>
+        <pre><code class="language-python">from fastapi.testclient import TestClient
+from sqlmodel import Session, select
+
+from app.models import Module, QueryLog
+
+
+def test_ask_persists_query_log(client: TestClient, session: Session) -&gt; None:
+    response = client.post("/ask", json={"question": "¿Qué es Depends?"})
+    assert response.status_code == 200
+
+    # El endpoint escribió en la MISMA sesión que el test:
+    logs = session.exec(select(QueryLog)).all()
+    assert len(logs) == 1
+    assert logs[0].question == "¿Qué es Depends?"
+
+
+def test_modules_reflects_seeded_rows(client: TestClient, session: Session) -&gt; None:
+    session.add(Module(slug="fastapi", title="FastAPI"))
+    session.commit()          # SAVEPOINT: no cierra la transacción externa
+
+    response = client.get("/modules")
+
+    assert response.status_code == 200
+    assert [m["slug"] for m in response.json()] == ["fastapi"]
+
+
+def test_each_test_starts_clean(client: TestClient) -&gt; None:
+    # Ningún test anterior dejó filas: la transacción se revirtió.
+    response = client.get("/modules")
+    assert response.json() == []
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Motor de <code>scope="session"</code></strong>: se crea una vez y se reutiliza. Lo caro (crear el motor y las tablas) se paga una sola vez; el aislamiento lo aporta la transacción, no el motor.</li>
+          <li><strong>La fixture <code>session</code> es el corazón de la estrategia B.</strong> El test comparte sesión con la app: puede sembrar filas y ver lo que la API ha escrito, porque ambas están en la misma transacción y la misma conexión.</li>
+          <li><strong>El <em>override</em> devuelve <em>esa</em> sesión concreta</strong> (<code>yield session</code>), no una nueva. Es lo que permite que el test y el endpoint compartan estado dentro del test… y solo dentro del test.</li>
+          <li><strong><code>transaction.rollback()</code> en el <code>finally</code></strong>: se ejecuta aunque el test falle, así que un test roto tampoco contamina al siguiente. El aislamiento es una garantía, no una esperanza.</li>
+          <li><strong><code>test_each_test_starts_clean</code></strong>: un test que prueba el andamiaje. Si algún día el rollback se rompe, este test lo delata de inmediato.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Fíjate en el patrón de dependencia entre fixtures: <code>engine</code> → <code>session</code> → <code>client</code>. Así se documenta visualmente la jerarquía de recursos, igual que el grafo de <code>Depends</code> de la app.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Motor separado para tests (memoria o fichero temporal)</td>
+              <td>Apuntar los tests a la base de datos de desarrollo</td>
+              <td>Un test destructivo borraría datos reales; la regla es que nunca comparten base de datos</td>
+            </tr>
+            <tr>
+              <td><code>StaticPool</code> + <code>check_same_thread=False</code> para SQLite en memoria</td>
+              <td><code>create_engine("sqlite://")</code> a secas</td>
+              <td>Sin conexión compartida, cada conexión crea su propia base de datos vacía: «no such table»</td>
+            </tr>
+            <tr>
+              <td>Crear el motor una vez (<code>scope="session"</code>)</td>
+              <td>Crear el motor en cada test</td>
+              <td>Crear tablas es lo caro; el aislamiento se logra con transacciones, no recreando todo</td>
+            </tr>
+            <tr>
+              <td>Aislar por transacción + rollback</td>
+              <td>Depurar borrando filas a mano entre tests</td>
+              <td>El rollback es automático, determinista y se ejecuta incluso si el test falla</td>
+            </tr>
+            <tr>
+              <td>Sustituir <code>get_session</code> con <code>dependency_overrides</code></td>
+              <td>Modificar <code>app/db.py</code> según si estamos en test</td>
+              <td>La app no debe contener lógica de test; la sustitución vive en <code>conftest.py</code></td>
+            </tr>
+            <tr>
+              <td>Usar <code>tmp_path</code> de pytest para bases de datos en fichero</td>
+              <td>Escribir en <code>./test.db</code> del repositorio</td>
+              <td><code>tmp_path</code> es único por test y pytest lo borra: nada que añadir al <code>.gitignore</code></td>
+            </tr>
+            <tr>
+              <td>Importar los modelos antes de <code>create_all</code></td>
+              <td>Confiar en que los modelos «se importan solos»</td>
+              <td><code>create_all</code> solo ve las tablas de los modelos ya importados: si no, crea cero tablas en silencio</td>
+            </tr>
+            <tr>
+              <td>Cerrar sesiones y conexiones en el <code>finally</code></td>
+              <td>Dejar conexiones abiertas</td>
+              <td>SQLite bloquea el fichero con conexiones abiertas: tests que se «cuelgan» sin razón aparente</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>SQLite en memoria sin <code>StaticPool</code></h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">engine = create_engine("sqlite://")      # cada conexión = base de datos nueva
+SQLModel.metadata.create_all(engine)
+
+def get_test_session():
+    with Session(engine) as session:
+        yield session
+# OperationalError: no such table: module
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from sqlalchemy.pool import StaticPool
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,                # una sola conexión compartida
+)
+SQLModel.metadata.create_all(engine)
+</code></pre>
+        <p>El error «no such table» justo después de haber creado las tablas es la firma inconfundible de este problema: la app está usando una conexión distinta de la que creó las tablas.</p>
+
+        <h3>Dejar ficheros de base de datos por el repositorio</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def test_something():
+    engine = create_engine("sqlite:///./test.db")   # se queda en el repo
+    SQLModel.metadata.create_all(engine)
+    ...   # y el siguiente test arranca con los datos del anterior
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def test_something(tmp_path):
+    db_file = tmp_path / "test.db"                  # carpeta única por test
+    engine = create_engine(f"sqlite:///{db_file}")
+    SQLModel.metadata.create_all(engine)
+    ...   # pytest borra tmp_path al terminar
+</code></pre>
+        <p>Un <code>test.db</code> en el repositorio hace que los tests dependan del estado previo (¿pasó ayer?) y obliga a añadirlo al <code>.gitignore</code>. <code>tmp_path</code> te da un fichero nuevo por test, borrado por pytest.</p>
+
+        <h3>Olvidar limpiar la sustitución de sesión</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">app.dependency_overrides[get_session] = get_test_session   # a nivel de módulo
+# Los tests de OTRO archivo siguen usando la sesión de test sin saberlo,
+# o al revés: la app real acaba con la base de datos de test.
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@pytest.fixture
+def client(session):
+    app.dependency_overrides[get_session] = lambda: session
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()     # siempre
+</code></pre>
+        <p>Las sustituciones son <strong>globales</strong> al objeto <code>app</code>. Si no las limpias, el efecto se propaga a tests (y contextos) donde no las quieres.</p>
+
+        <h3>Confundir la sesión de test con una sesión nueva</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">@pytest.fixture
+def client(engine):
+    def override():
+        with Session(engine) as s:     # sesión NUEVA, sin la transacción del test
+            yield s
+    app.dependency_overrides[get_session] = override
+    ...
+# El test siembra con `session`, pero la app escribe en otra sesión
+# y la transacción externa no la envuelve: el aislamiento se rompe.
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">@pytest.fixture
+def client(session):
+    def override_get_session():
+        yield session                 # cede LA MISMA sesión del test
+    app.dependency_overrides[get_session] = override_get_session
+    ...
+</code></pre>
+        <p>Para que el test y la app compartan la transacción, tienen que compartir la <em>sesión</em>. Es la sutileza de la estrategia B: el <em>override</em> no crea sesiones nuevas, cede la del test. Escribirlo como <code>lambda: session</code> también valdría aquí, porque FastAPI acepta tanto un valor como un generador con <code>yield</code>.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> escribir la suite de persistencia de Copiloto API con base de datos temporal y aislamiento por test, y comprobar con un caso deliberado que el aislamiento de verdad funciona.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Monta el motor de test.</strong> En <code>tests/conftest.py</code>, crea la fixture <code>engine</code> con <code>sqlite://</code>, <code>StaticPool</code> y <code>check_same_thread=False</code>. No olvides instalar <code>StaticPool</code> desde <code>sqlalchemy.pool</code> (viene con SQLModel).
+          </li>
+          <li>
+            <strong>Paso 2 — Crea las tablas.</strong> Llama a <code>SQLModel.metadata.create_all(test_engine)</code> dentro de la fixture. Asegúrate de <strong>importar <code>app/models.py</code></strong>: si no, crearás cero tablas.
+            <div class="callout callout--warning">
+              <p>Si al correr los tests ves <code>no such table: module</code>, revisa en este orden: (1) ¿importaste los modelos?, (2) ¿pusiste <code>StaticPool</code>?, (3) ¿creaste las tablas en <em>este</em> motor y no en el de la app?</p>
+            </div>
+          </li>
+          <li>
+            <strong>Paso 3 — Fixture de sesión con rollback.</strong> Copia la fixture <code>session</code> de la sección 4. Presta atención a <code>join_transaction_mode="create_savepoint"</code>: sin él, el primer <code>commit</code> de la app cerraría la transacción externa.
+          </li>
+          <li>
+            <strong>Paso 4 — Fixture de cliente con el <em>override</em>.</strong> Copia la fixture <code>client</code>. Verifica que el <em>override</em> devuelve <strong>la misma</strong> <code>session</code> y que se hace <code>clear()</code> al final.
+          </li>
+          <li>
+            <strong>Paso 5 — Escribe los tres tests.</strong> Usa <code>test_ask_persists_query_log</code>, <code>test_modules_reflects_seeded_rows</code> y <code>test_each_test_starts_clean</code> de la sección 4. Ejecuta:
+            <pre><code class="language-bash">uv run pytest -q
+</code></pre>
+            <p>Resultado esperado:</p>
+            <pre><code class="language-text">...
+3 passed in 0.18s
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Demuestra el aislamiento.</strong> Crea <code>tests/test_isolation.py</code> con dos tests que inserten un módulo cada uno. En ambos, al final, comprueba que <code>GET /modules</code> devuelve <strong>un solo</strong> módulo:
+            <pre><code class="language-python">from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from app.models import Module
+
+
+def test_inserts_one_a(client: TestClient, session: Session) -&gt; None:
+    session.add(Module(slug="a", title="A"))
+    session.commit()
+    assert len(client.get("/modules").json()) == 1
+
+
+def test_inserts_one_b(client: TestClient, session: Session) -&gt; None:
+    session.add(Module(slug="b", title="B"))
+    session.commit()
+    assert len(client.get("/modules").json()) == 1
+</code></pre>
+            <p>Resultado esperado: <code>2 passed</code>. Si el segundo test viera dos módulos, el rollback no estaría funcionando.</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Prueba a romperlo.</strong> Cambia el <em>override</em> para que cree una <code>Session(engine)</code> nueva en lugar de reutilizar <code>session</code>, y vuelve a lanzar. Verás que <code>test_each_test_starts_clean</code> falla: acabas de reproducir, en pequeño, el bug de aislamiento más común. Reverértelo después.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Esquema por migración, no por <code>create_all</code></h3>
+          <p>En el Módulo 4 configuraste Alembic. Cambia la preparación de la base de datos de test para que aplique las <strong>migraciones</strong> en lugar de <code>SQLModel.metadata.create_all()</code>. Después escribe un test que compruebe que el esquema de test y el esquema documentado por los modelos coinciden: ¿hay alguna columna en los modelos que las migraciones no crean (o al revés)?</p>
+          <p><em>Pista: Alembic puede ejecutarse programáticamente con <code>alembic.config.Config</code> y <code>command.upgrade(cfg, "head")</code> apuntando a la URL de test. Para comparar esquemas, <code>sqlalchemy.inspect(engine).get_columns("module")</code> te da las columnas reales; compáralas con las de <code>Model.__table__.columns</code>. Reflexiona: ¿qué ventaja tiene testear contra las migraciones y no contra los modelos? ¿Qué tipo de bug detectarías que hoy se te escapa?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los tests usan una <strong>base de datos propia</strong>: SQLite en memoria o un fichero con <code>tmp_path</code>; nunca la de desarrollo.</li>
+          <li>Para SQLite en memoria: <strong><code>StaticPool</code></strong> + <code>check_same_thread=False</code>, o cada conexión verá una base de datos vacía.</li>
+          <li><strong><code>dependency_overrides[get_session]</code></strong> apunta la app a la base de datos de test sin tocar el código de producción.</li>
+          <li><strong>Aislamiento</strong>: recrear el esquema por test (simple) o envolver cada test en una transacción con <code>rollback</code> (rápido y fino).</li>
+          <li><code>join_transaction_mode="create_savepoint"</code> permite que el <code>commit</code> de la app conviva con la transacción externa del test.</li>
+          <li>Limpia <strong>siempre</strong> <code>dependency_overrides</code> y cierra sesiones y conexiones en el <code>finally</code>.</li>
+          <li>Importa los modelos <strong>antes</strong> de <code>create_all</code>; si no, crea cero tablas en silencio.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / parámetro</th></tr></thead>
+          <tbody>
+            <tr><td>Motor de test en memoria</td><td><code>create_engine("sqlite://", poolclass=StaticPool)</code></td></tr>
+            <tr><td>Hilos de <code>TestClient</code></td><td><code>connect_args={"check_same_thread": False}</code></td></tr>
+            <tr><td>Crear tablas de test</td><td><code>SQLModel.metadata.create_all(engine)</code></td></tr>
+            <tr><td>Sustituir la sesión</td><td><code>app.dependency_overrides[get_session] = get_test_session</code></td></tr>
+            <tr><td>Aislamiento por transacción</td><td><code>Session(bind=connection, join_transaction_mode="create_savepoint")</code></td></tr>
+            <tr><td>Descartar lo escrito</td><td><code>transaction.rollback()</code> en el <code>finally</code></td></tr>
+            <tr><td>Base de datos en fichero</td><td><code>create_engine(f"sqlite:///{tmp_path}/test.db")</code></td></tr>
+            <tr><td>Regenerar esquema</td><td><code>SQLModel.metadata.drop_all(engine)</code> + <code>create_all(...)</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No sería más simple doblar el repositorio y olvidarme de la base de datos?</summary>
+            <div>
+              <p>Para tests unitarios de la lógica de negocio, sí: un <em>fake</em> del repositorio es rápido y no toca SQL. Pero entonces <strong>nadie prueba el SQL</strong>: ni el mapeo de SQLModel, ni las consultas <code>select</code>, ni las transacciones, ni las restricciones (<code>unique</code>, <code>foreign_key</code>). Necesitas ambos niveles: doble para la lógica, base de datos real para la persistencia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué usar SQLite y no PostgreSQL en los tests?</summary>
+            <div>
+              <p>Por velocidad y por cero infraestructura: SQLite arranca en memoria al instante, sin contenedores. Para el 95% de la lógica (validación, rutas, mapeo, relaciones) SQLite y PostgreSQL se comportan igual. Cuando dependas de algo específico del motor —tipos <code>JSONB</code>, restricciones o funciones de PostgreSQL—, añade además un conjunto de tests contra el motor real en CI, pero no para cada cambio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo uso la estrategia A (recrear esquema) y cuándo la B (rollback)?</summary>
+            <div>
+              <p>Empieza por la A: es más fácil de entender y de depurar. Cuando la suite crezca y crear las tablas por test se note (o cuando quieras un esquema inicial compartido y caro de construir), pasa a la B. Muchos equipos usan A con <code>scope="session"</code> para crear el esquema y B dentro para aislar cada test: lo mejor de ambas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Mi test se queda «colgado» y no termina. ¿Por qué?</summary>
+            <div>
+              <p>Casi siempre por una conexión de SQLite que quedó abierta y bloquea el fichero (o la transacción en memoria). Asegúrate de cerrar la <code>Session</code> y la <code>Connection</code> en un <code>finally</code>, y de que no haya peticiones esperando a un recurso que un test anterior no liberó. En tests async, comprueba además que no dejaste una tarea pendiente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo testo endpoints protegidos por JWT contra la base de datos de test?</summary>
+            <div>
+              <p>Necesitas un usuario sembrado en la base de datos de test y un token válido para él. Como la base de datos es la del test, puedes crear el usuario en la fixture y generar el token con la misma función que usa la app. La lección de seguridad (Módulo 5) definió el <code>get_current_user</code>; en el reto del Módulo 7 harás un <em>override</em> de esa dependencia para los tests que no quieran pasar por el flujo completo de login.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

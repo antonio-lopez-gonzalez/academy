@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-paginacion-y-filtros">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Paginación y filtros — Módulo 2 · Curso FastAPI</title>
+  <meta name="description" content="Listados con paginación (limit/offset), orden seguro con enums, filtrado y su modelado con Query en Copiloto API.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Paginación y filtros</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Respuestas y errores</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p><code>GET /modules</code> que devuelve <em>todos</em> los módulos funciona hoy, con doce filas. Mañana son doce mil, y tu endpoint se convierte en una bomba: consulta gigante, JSON enorme, cliente que se queda sin memoria. Una colección sin paginación es una deuda técnica que siempre explota.</p>
+        <p>Esta lección cierra el módulo con la pieza que hace usables los listados: <strong>paginación</strong> (traer un trozo a la vez), <strong>orden</strong> (traerlo en un orden definido) y <strong>filtrado</strong> (traer solo lo que interesa). Y todo modelado con <code>Query</code>, con límites de seguridad para que el cliente no pueda pedir «un millón de filas».</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué es importante el orden?</strong> Sin un criterio de orden <em>estable</em>, una base de datos no garantiza en qué orden devuelve las filas. Con paginación eso es un desastre: la página 2 puede repetir un elemento de la página 1 y saltarse otro. Paginar exige ordenar por algo único (casi siempre el <code>id</code>).</p>
+        </div>
+        <div class="callout callout--note">
+          <p>Aquí lo haremos en memoria para centrarnos en el <em>modelado</em> del endpoint. En el módulo 4 verás el <code>LIMIT</code>/<code>OFFSET</code> de SQL y, en el módulo 7, la versión con base de datos real. Lo que aprendas hoy se traduce directamente a SQL.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3><code>limit</code> y <code>offset</code>: la pareja canónica</h3>
+        <p>Dos números controlan el trozo que pides:</p>
+        <ul>
+          <li><strong><code>limit</code></strong>: cuántos elementos quieres (el tamaño de la página).</li>
+          <li><strong><code>offset</code></strong>: cuántos te saltas desde el principio (dónde empieza la página).</li>
+        </ul>
+        <pre class="diagram">
+   offset=0, limit=3         offset=3, limit=3         offset=6, limit=3
+   +---+---+---+             +---+---+---+             +---+---+---+
+   | 1 | 2 | 3 |             | 4 | 5 | 6 |             | 7 | 8 | 9 |
+   +---+---+---+             +---+---+---+             +---+---+---+
+     pagina 1                  pagina 2                  pagina 3
+        </pre>
+        <p>La correspondencia con SQL es directa: <code>SELECT … ORDER BY id LIMIT :limit OFFSET :offset</code>. Alternativamente puedes exponer <code>page</code> y <code>size</code> (más amigable para un humano) y calcular <code>offset = (page - 1) * size</code>. Ambas son válidas; el curso usa <code>limit</code>/<code>offset</code> porque es lo que traduce la base de datos sin conversión.</p>
+
+        <h3>El «sobre» de paginación</h3>
+        <p>Devolver una <code>list</code> pelada deja al cliente sin saber cuántos elementos hay en total ni si hay más páginas. Envuelve el listado en un modelo:</p>
+        <div class="code-file">app/schemas/page.py</div>
+        <pre><code class="language-python"># app/schemas/page.py — sobre generico y reutilizable.
+from typing import Generic, TypeVar
+
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    items: list[T]
+    total: int          # cuantos hay en total (sin paginar)
+    limit: int          # tamano de pagina solicitado
+    offset: int         # desde donde empieza esta pagina
+</code></pre>
+        <p>Con Pydantic v2 el modelo es <strong>genérico</strong>: <code>Page[ModuleOut]</code> es un sobre cuyas <code>items</code> son módulos; <code>Page[SourceOut]</code>, uno de fuentes. Un solo molde, tipado y documentado.</p>
+        <div class="callout callout--tip">
+          <p>También puedes informar del total en una cabecera <code>X-Total-Count</code> (estilo GitHub) en vez de en el cuerpo. El sobre en el cuerpo es más fácil de consumir desde JavaScript y se autodocumenta en el OpenAPI; las cabeceras ahorran espacio. Elige una y sé consistente.</p>
+        </div>
+
+        <h3>Orden: nunca desde un <code>str</code> libre</h3>
+        <p>«Déjame ordenar por cualquier columna» suena bien hasta que el cliente envía <code>?order_by=title;DROP TABLE modules</code>. El orden se modela con un <strong>enum</strong>: el cliente solo puede elegir entre opciones que tú defines.</p>
+        <pre><code class="language-python">from enum import Enum
+
+
+class ModuleSort(str, Enum):
+    title = "title"
+    chunk_count = "chunk_count"
+    created_at = "created_at"
+</code></pre>
+        <p>Después traduces el enum a la columna real. El cliente elige de una lista cerrada; tú traduces de forma segura. El enum además aparece en el OpenAPI como un desplegable, que es documentación gratis.</p>
+
+        <h3>Filtros: opcionales, tipados y acotados</h3>
+        <p>Un filtro es un parámetro opcional con el que el cliente reduce la colección: <code>?tag=rag&amp;search=embedding</code>. Se modela con <code>Query</code> y <code>Annotated</code> para añadir límites:</p>
+        <pre><code class="language-python">from typing import Annotated
+
+from fastapi import Query
+
+limit: Annotated[int, Query(ge=1, le=100)] = 20
+search: Annotated[str | None, Query(min_length=2, max_length=100)] = None
+</code></pre>
+        <p>El <code>le=100</code> del <code>limit</code> es una <strong>barrera de seguridad</strong>: aunque el cliente pida <code>?limit=1000000</code>, la validación lo rechaza como 422 (que, gracias a la lección 2, ya sale como Problem Details).</p>
+        <table>
+          <thead><tr><th style="width:22%">Patrón</th><th>Cuándo usarlo</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td><code>limit</code> / <code>offset</code></td><td>Colecciones pequeñas o medianas, con «ir a la página N»</td><td>El <code>OFFSET</code> alto degrada: la BD lee y descarta</td></tr>
+            <tr><td><code>page</code> / <code>size</code></td><td>Interfaz con páginas numeradas para humanos</td><td>Igual que offset, con una conversión extra</td></tr>
+            <tr><td><em>Cursor</em> (<code>?after=…</code>)</td><td>Feeds grandes, scroll infinito, datos que cambian</td><td>No permite «salto» arbitrario a una página</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> <code>offset</code> es «lee las primeras 10 000 cartas, tira las 9 980 primeras y dame 20». Funciona, pero desperdicia trabajo. Un <em>cursor</em> es «empieza por la carta cuyo número es 9 981»: la bibliotecaria va directa al estante. Por eso los listados masivos usan cursores.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un listado paginado sobre datos en memoria: el cliente pide <code>limit</code>, <code>offset</code> y un orden acotado, y recibe un sobre con <code>total</code>.</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python"># main.py — listado paginado y ordenado sin base de datos.
+from enum import Enum
+from typing import Annotated, Generic, TypeVar
+
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+
+app = FastAPI()
+
+MODULES = [
+    {"id": 1, "title": "Rutas y datos"},
+    {"id": 2, "title": "Respuestas y errores"},
+    {"id": 3, "title": "Dependencias"},
+    {"id": 4, "title": "Datos y persistencia"},
+    {"id": 5, "title": "Seguridad"},
+]
+
+
+class ModuleOut(BaseModel):
+    id: int
+    title: str
+
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
+
+
+class ModuleSort(str, Enum):
+    id = "id"
+    title = "title"
+</code></pre>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">@app.get("/modules", response_model=Page[ModuleOut])
+async def list_modules(
+    limit: Annotated[int, Query(ge=1, le=100)] = 2,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    order_by: ModuleSort = ModuleSort.id,
+    desc: bool = False,
+):
+    items = sorted(MODULES, key=lambda m: m[order_by.value], reverse=desc)
+    page = items[offset : offset + limit]
+    return {"items": page, "total": len(items), "limit": limit, "offset": offset}
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">uv run fastapi dev main.py
+# Pagina 2, orden descendente por titulo:
+curl -s "http://127.0.0.1:8000/modules?limit=2&amp;offset=2&amp;order_by=title&amp;desc=true"
+</code></pre>
+        <p>Salida esperada:</p>
+        <div class="code-file">JSON</div>
+        <pre><code class="language-json">{
+  "items": [
+    { "id": 2, "title": "Respuestas y errores" },
+    { "id": 1, "title": "Rutas y datos" }
+  ],
+  "total": 5,
+  "limit": 2,
+  "offset": 2
+}
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>limit: Annotated[int, Query(ge=1, le=100)] = 2</code></strong>: el <code>le=100</code> impide pedir páginas gigantes; <code>ge=1</code> prohíbe un límite de cero o negativo.</li>
+          <li><strong><code>offset: Annotated[int, Query(ge=0)] = 0</code></strong>: un <code>offset</code> negativo no tiene sentido y daría errores raros en la BD.</li>
+          <li><strong><code>order_by: ModuleSort</code></strong>: el cliente elige de un enum cerrado; <code>m[order_by.value]</code> es seguro porque solo acepta claves que tú definiste.</li>
+          <li><strong><code>items[offset : offset + limit]</code></strong>: el corte de la página. En SQL será <code>.offset(offset).limit(limit)</code>.</li>
+          <li><strong><code>response_model=Page[ModuleOut]</code></strong>: el sobre se valida y se documenta; el filtrado de campos sigue vigente.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El listado real de Copiloto API: <code>GET /modules</code> con paginación, orden seguro, búsqueda por texto y filtro por etiqueta, todo devuelto en un <code>Page[ModuleOut]</code>.</p>
+        <div class="code-file">proyectos/copiloto-api/app/schemas/module.py</div>
+        <pre><code class="language-python"># app/schemas/module.py — salida del listado y parametros de orden.
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ModuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    title: str
+    tags: list[str] = Field(default_factory=list)
+
+
+class ModuleSort(str, Enum):
+    """Ordenes permitidos por el cliente (nunca una columna libre)."""
+
+    title = "title"
+    created_at = "created_at"
+    chunk_count = "chunk_count"
+</code></pre>
+        <div class="code-file">proyectos/copiloto-api/app/routers/modules.py</div>
+        <pre><code class="language-python"># app/routers/modules.py — listado paginado, ordenado y filtrado.
+from typing import Annotated
+
+from fastapi import APIRouter, Query
+
+from app.repos.modules_repo import modules_repo
+from app.schemas.module import ModuleOut, ModuleSort
+from app.schemas.page import Page
+
+router = APIRouter(prefix="/modules", tags=["modules"])
+
+
+@router.get("", response_model=Page[ModuleOut])
+async def list_modules(
+    limit: Annotated[int, Query(ge=1, le=100, description="Tamano de pagina")] = 20,
+    offset: Annotated[int, Query(ge=0, description="Elementos a saltar")] = 0,
+    order_by: ModuleSort = ModuleSort.title,
+    desc: Annotated[bool, Query(description="Orden descendente")] = False,
+    search: Annotated[
+        str | None, Query(min_length=2, max_length=100, description="Busca en titulo y slug")
+    ] = None,
+    tag: Annotated[str | None, Query(max_length=40, description="Filtra por etiqueta")] = None,
+) -&gt; Page[ModuleOut]:
+    rows, total = await modules_repo.list(
+        limit=limit,
+        offset=offset,
+        order_by=order_by.value,
+        desc=desc,
+        search=search,
+        tag=tag,
+    )
+    return Page[ModuleOut](items=rows, total=total, limit=limit, offset=offset)
+</code></pre>
+        <div class="code-file">proyectos/copiloto-api/app/repos/modules_repo.py</div>
+        <pre><code class="language-python"># app/repos/modules_repo.py — la capa que traduce el contrato a consulta.
+# (Version en memoria; el modulo 4 lo sustituye por SQLModel + SQL real.)
+from collections.abc import Sequence
+
+ORDERABLE = {
+    "title": lambda m: m.title,
+    "created_at": lambda m: m.created_at,
+    "chunk_count": lambda m: m.chunk_count,
+}
+
+
+class ModulesRepo:
+    async def list(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        order_by: str,
+        desc: bool,
+        search: str | None,
+        tag: str | None,
+    ) -&gt; tuple[Sequence, int]:
+        rows = list(self._all())
+        # Filtros (en SQL serian WHERE ...).
+        if search:
+            needle = search.lower()
+            rows = [m for m in rows if needle in m.title.lower() or needle in m.slug.lower()]
+        if tag:
+            rows = [m for m in rows if tag in m.tags]
+
+        total = len(rows)                       # COUNT(*) en SQL
+        # Orden estable: por el criterio pedido y, como desempate, por id.
+        rows.sort(key=ORDERABLE[order_by], reverse=desc)
+        rows.sort(key=lambda m: m.id)           # desempate estable
+        if desc:
+            rows.reverse()
+        return rows[offset : offset + limit], total     # LIMIT / OFFSET
+
+
+modules_repo = ModulesRepo()
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Busca "rag", filtra por tag "fastapi", ordena por fecha descendente:
+curl -s "http://127.0.0.1:8000/modules?search=rag&amp;tag=fastapi&amp;order_by=created_at&amp;desc=true&amp;limit=10"
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>limit</code> con <code>le=100</code></strong>: el tope duro impide que un cliente (o un bot) pida toda la tabla. Es la barrera entre un listado sano y una denegación de servicio autoinfligida.</li>
+          <li><strong><code>order_by</code> como enum</strong>: el repositorio usa <code>ORDERABLE[order_by]</code>, es decir, una clave ya validada. Cero inyección por orden.</li>
+          <li><strong>Desempate por <code>id</code></strong>: garantiza un orden total y estable. Sin él, dos módulos con el mismo <code>title</code> podrían intercambiarse entre páginas y perder o duplicar filas.</li>
+          <li><strong><code>search</code> con <code>min_length=2</code></strong>: una búsqueda de un solo carácter rara vez es útil y castiga el índice. La longitud mínima es validación, no capricho.</li>
+          <li><strong>Separación router/repo</strong>: el router habla HTTP (Query, tipado, sobre); el repositorio habla datos (filtros, orden, corte). El módulo 4 hará que ese repositorio emita SQL.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>El coste oculto del <code>offset</code> alto.</strong> <code>?offset=1000000</code> obliga a la base de datos a leer y descartar un millón de filas aunque solo devuelva veinte. Si tu colección crece, migra a <strong>paginación por cursor</strong> («dame los posteriores a este id»): <code>WHERE id &gt; :after ORDER BY id LIMIT :limit</code>. Verás esa técnica en el módulo 7.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Tope máximo en <code>limit</code> (<code>le=100</code>)</td>
+              <td>Permitir <code>?limit=100000</code></td>
+              <td>Protege la base de datos y tu propio proceso</td>
+            </tr>
+            <tr>
+              <td>Orden <em>estable</em> con desempate por <code>id</code></td>
+              <td>Ordenar solo por <code>title</code></td>
+              <td>Evita filas perdidas o duplicadas entre páginas</td>
+            </tr>
+            <tr>
+              <td>Ordenar por un enum cerrado</td>
+              <td>Aceptar un <code>str</code> libre como columna</td>
+              <td>Elimina la inyección por <code>order_by</code></td>
+            </tr>
+            <tr>
+              <td>Devolver un sobre con <code>total</code></td>
+              <td>Devolver una <code>list</code> pelada</td>
+              <td>El cliente sabe cuántas páginas hay</td>
+            </tr>
+            <tr>
+              <td>Valores por defecto sensatos (<code>limit=20</code>)</td>
+              <td>Obligar a paginar siempre</td>
+              <td>Un listado simple funciona sin parámetros</td>
+            </tr>
+            <tr>
+              <td>Filtros opcionales y acotados</td>
+              <td>Filtros obligatorios o de longitud ilimitada</td>
+              <td>Mantiene el endpoint flexible y protegido</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Sin tope en <code>limit</code></h3>
+        <span class="code-label code-label--wrong">Mal — el cliente decide cuánto cargas</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ ?limit=500000 tumba la base de datos y llena la memoria.
+@app.get("/modules")
+async def list_modules(limit: int = 20, offset: int = 0):
+    return await repo.list(limit=limit, offset=offset)
+</code></pre>
+        <span class="code-label code-label--right">Bien — tope duro y validación</span>
+        <pre class="code-right"><code class="language-python"># ✅ le=100 rechaza con 422 cualquier peticion abusiva.
+from typing import Annotated
+from fastapi import Query
+
+@app.get("/modules")
+async def list_modules(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    return await repo.list(limit=limit, offset=offset)
+</code></pre>
+
+        <h3>Orden desde una cadena arbitraria</h3>
+        <span class="code-label code-label--wrong">Mal — la columna la elige el cliente</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ order_by llega como texto libre: puerta abierta a inyeccion SQL.
+@app.get("/modules")
+async def list_modules(order_by: str = "title"):
+    return await repo.list(f"ORDER BY {order_by}")      # ¡peligro!
+</code></pre>
+        <span class="code-label code-label--right">Bien — enum cerrado y traducción segura</span>
+        <pre class="code-right"><code class="language-python"># ✅ Solo se aceptan las opciones del enum; el valor va a una consulta parametrizada.
+@app.get("/modules")
+async def list_modules(order_by: ModuleSort = ModuleSort.title):
+    return await repo.list(order=order_by.value)        # repositorio traduce con ORDERABLE
+</code></pre>
+
+        <h3>Devolver una lista sin total</h3>
+        <span class="code-label code-label--wrong">Mal — el cliente no sabe si hay más</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Llegan 20 elementos, ¿son todos? ¿hay pagina 2? Se queda sin saber.
+@app.get("/modules")
+async def list_modules(limit: int = 20, offset: int = 0) -&gt; list[ModuleOut]:
+    return await repo.list(limit=limit, offset=offset)
+</code></pre>
+        <span class="code-label code-label--right">Bien — sobre con metadatos</span>
+        <pre class="code-right"><code class="language-python"># ✅ Page[ModuleOut] lleva items, total, limit y offset.
+@app.get("/modules", response_model=Page[ModuleOut])
+async def list_modules(limit: int = 20, offset: int = 0) -&gt; Page[ModuleOut]:
+    rows, total = await repo.list(limit=limit, offset=offset)
+    return Page[ModuleOut](items=rows, total=total, limit=limit, offset=offset)
+</code></pre>
+
+        <h3>Paginar sin orden determinista</h3>
+        <span class="code-label code-label--wrong">Mal — el orden «natural» no está garantizado</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ Sin ORDER BY la BD puede devolver filas en cualquier orden y la
+#    pagina 2 repite o pierde elementos respecto a la pagina 1.
+rows = await db.fetch("SELECT * FROM modules LIMIT :l OFFSET :o", l=limit, o=offset)
+</code></pre>
+        <span class="code-label code-label--right">Bien — orden total y estable</span>
+        <pre class="code-right"><code class="language-python"># ✅ ORDER BY con desempate unico: cada fila tiene una posicion fija.
+rows = await db.fetch(
+    "SELECT * FROM modules ORDER BY title, id LIMIT :l OFFSET :o",
+    l=limit, o=offset,
+)
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir a Copiloto API un endpoint <code>GET /ask/history</code> que pagine el histórico de consultas, con orden y un filtro de fechas, y comprobar los metadatos del sobre.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea el sobre genérico y el esquema de salida:
+            <pre><code class="language-python"># app/schemas/page.py
+from typing import Generic, TypeVar
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+class Page(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
+</code></pre>
+            <pre><code class="language-python"># app/schemas/ask.py (anade al archivo existente)
+class HistoryItem(BaseModel):
+    id: int
+    question: str
+    asked_at: str        # ISO-8601; en el modulo 4 sera datetime
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> define el orden permitido con un enum:
+            <pre><code class="language-python"># app/schemas/ask.py
+from enum import Enum
+
+class HistorySort(str, Enum):
+    asked_at = "asked_at"
+    question = "question"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> escribe el endpoint con <code>Query</code>, filtro de fechas y límites:
+            <pre><code class="language-python"># app/routers/ask.py
+from typing import Annotated
+
+from fastapi import APIRouter, Query
+
+from app.schemas.ask import HistoryItem, HistorySort
+from app.schemas.page import Page
+
+router = APIRouter(tags=["ask"])
+
+
+@router.get("/ask/history", response_model=Page[HistoryItem])
+async def ask_history(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    order_by: HistorySort = HistorySort.asked_at,
+    desc: bool = True,
+    since: Annotated[str | None, Query(description="ISO-8601, inclusive")] = None,
+) -&gt; Page[HistoryItem]:
+    rows, total = await history_repo.list(
+        limit=limit, offset=offset, order_by=order_by.value, desc=desc, since=since
+    )
+    return Page[HistoryItem](items=rows, total=total, limit=limit, offset=offset)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> implementa el repositorio en memoria con filtro y desempate por <code>id</code>:
+            <pre><code class="language-python"># app/repos/history_repo.py
+ORDERS = {"asked_at": lambda h: h["asked_at"], "question": lambda h: h["question"]}
+
+class HistoryRepo:
+    async def list(self, *, limit, offset, order_by, desc, since):
+        rows = list(self._all())
+        if since:
+            rows = [h for h in rows if h["asked_at"] &gt;= since]
+        total = len(rows)
+        rows.sort(key=lambda h: h["id"])            # desempate estable
+        rows.sort(key=ORDERS[order_by], reverse=desc)
+        return rows[offset : offset + limit], total
+
+history_repo = HistoryRepo()
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación):</strong> arranca y pide dos ejercicios: una página normal y un <code>limit</code> abusivo.
+            <pre><code class="language-bash">uv run fastapi dev app/main.py
+
+curl -s "http://127.0.0.1:8000/ask/history?limit=5&amp;offset=0&amp;order_by=asked_at&amp;desc=true"
+
+curl -s -i "http://127.0.0.1:8000/ask/history?limit=100000"
+</code></pre>
+            <p>Resultado esperado: la primera llamada devuelve <code>items</code>, <code>total</code>, <code>limit</code> y <code>offset</code> coherentes (<code>len(items) &lt;= limit</code>). La segunda es rechazada con <code>422</code> y, gracias a la lección 2, con el cuerpo Problem Details que indica el campo <code>query.limit</code>. Abre <code>/docs</code>: <code>limit</code> muestra sus límites y <code>order_by</code> un desplegable con los valores del enum.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Paginación por cursor y enlaces de navegación</h3>
+          <p>Mejora el listado de módulos con (1) una variante de <strong>paginación por cursor</strong>: <code>GET /modules?after=&lt;id&gt;&amp;limit=20</code> que devuelva los siguientes por <code>id</code> sin usar <code>offset</code>, pensada para scroll infinito; y (2) un «sobre» enriquecido que incluya <code>next_cursor</code> (el id del último elemento, o <code>null</code> si no hay más) y cabeceras <code>Link</code> con <code>rel="next"</code>/<code>rel="prev"</code>. Añade un test que pida todas las páginas con el cursor y compruebe que el conjunto de <code>id</code>s recibidos es <em>exactamente</em> el total, sin duplicados ni huecos —incluso si ordenas descendente y luego ascendente—.</p>
+          <p><em>Pista: el cursor debe ser un valor <strong>único y estable</strong> (el <code>id</code> lo es). Para descendente se invierte la comparación (<code>WHERE id &lt; :after</code>). Piensa por qué un cursor sobre <code>title</code> (que puede repetirse) necesitaría un desempate compuesto <code>(title, id)</code>; ese es el motivo por el que el cursor suele ir sobre una clave monótona. Documenta el endpoint con <code>responses={422: {"model": ProblemDetail}}</code> para completar el contrato.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Ninguna colección sin paginar: <strong><code>limit</code>/<code>offset</code></strong> es el punto de partida.</li>
+          <li>Pon siempre un <strong>tope máximo</strong> al <code>limit</code> (<code>Query(le=100)</code>).</li>
+          <li>Devuelve un <strong>sobre</strong> (<code>Page[T]</code>) con <code>items</code>, <code>total</code>, <code>limit</code> y <code>offset</code>.</li>
+          <li>El orden debe ser <strong>estable</strong>: criterio pedido + desempate único por <code>id</code>.</li>
+          <li>El orden se modela con un <strong>enum</strong>, nunca con una columna libre.</li>
+          <li>Filtros: opcionales, tipados y acotados con <code>Query</code>.</li>
+          <li>Con colecciones grandes, plantea <strong>paginación por cursor</strong>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Límite acotado</td><td><code>Annotated[int, Query(ge=1, le=100)]</code></td></tr>
+            <tr><td>Saltar elementos</td><td><code>Annotated[int, Query(ge=0)] = 0</code></td></tr>
+            <tr><td>Orden seguro</td><td><code>order_by: ModuleSort = ModuleSort.title</code></td></tr>
+            <tr><td>Sobre genérico</td><td><code>class Page(BaseModel, Generic[T])</code></td></tr>
+            <tr><td>Respuesta paginada</td><td><code>response_model=Page[ModuleOut]</code></td></tr>
+            <tr><td>Corte de página</td><td><code>rows[offset : offset + limit]</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>limit</code>/<code>offset</code> o <code>page</code>/<code>size</code>?</summary>
+            <div>
+              <p>Funcionalmente equivalentes; <code>page</code>/<code>size</code> se calcula como <code>offset = (page - 1) * size</code>. <code>limit</code>/<code>offset</code> traduce directo a SQL y es el que usan muchas APIs públicas. <code>page</code>/<code>size</code> es más cómodo para una interfaz con «página 3 de 10». Elige uno y mantenlo en toda la API; mezclarlos confunde a los clientes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El <code>total</code> en cada página no es caro?</summary>
+            <div>
+              <p>Requiere un <code>COUNT(*)</code> aparte, que en tablas enormes puede ser caro. Opciones: calcular el total solo cuando se pide explícitamente, usar una estimación, o pasarte a cursor y ofrecer solo «hay más / no hay más». Para la mayoría de APIs, un <code>COUNT</code> con un índice adecuado es perfectamente asumible. Mide antes de optimizar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el desempate por <code>id</code> es necesario?</summary>
+            <div>
+              <p>Porque el criterio principal puede repetirse: si ordenas por <code>title</code> y hay dos módulos con el mismo título, la base de datos puede devolverlos en cualquier orden relativo, y ese orden puede variar entre la página 1 y la 2. Añadir <code>, id</code> al <code>ORDER BY</code> rompe los empates de forma determinista: cada fila tiene una posición fija y la paginación deja de perder o duplicar elementos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo merece la pena pasar a paginación por cursor?</summary>
+            <div>
+              <p>Cuando la colección es grande o cambia mucho: el <code>OFFSET</code> alto es caro (leer y descartar) y, además, si se insertan filas mientras paginas, puedes duplicar o saltar elementos. El cursor («posteriores a este id») es <code>O(1)</code> por índice, estable ante inserciones y perfecto para scroll infinito. El precio: no puedes saltar a «página 5» y no hay número de página que mostrar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los filtros van en el router o en el repositorio?</summary>
+            <div>
+              <p>Los <em>parámetros</em> (con su tipo y validación) viven en el router, que es la frontera HTTP. La <em>consulta</em> (dónde y cómo se filtra) vive en el repositorio, que es la capa de datos. El router traduce <code>tag="rag"</code> a «añade una condición WHERE»; el repositorio sabe si esa condición es un <code>LIKE</code>, un <code>=</code> o una búsqueda full-text. Esa separación es la que te permitirá cambiar de almacenamiento sin tocar el contrato del endpoint.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-async-httpx">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tests async con httpx — Módulo 6 · Curso FastAPI</title>
+  <meta name="description" content="Tests asíncronos con httpx.AsyncClient y ASGITransport, pytest-asyncio, fixtures async y pruebas de concurrencia aplicadas a Copiloto API.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Tests async con httpx</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Testing y calidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior testeas con <code>TestClient</code> en funciones <code>def</code> normales. Eso cubre el 90% de los casos y es lo primero que debes dominar. Pero hay situaciones donde el test tiene que ser <strong>asíncrono</strong>: tu app usa una sesión de base de datos async (<code>AsyncSession</code>), llamas a un cliente HTTP async, o quieres comprobar que varias peticiones <strong>concurrentes</strong> se comportan bien (por ejemplo, el <em>rate limiting</em> del Módulo 5).</p>
+        <p>El problema aparece en cuanto escribes un test <code>async def</code> y usas <code>TestClient</code> dentro: <code>TestClient</code> es <strong>síncrono</strong> —por dentro ejecuta la app en un hilo aparte— y no se puede usar desde código async sin bloquear el bucle de eventos. FastAPI te da una salida limpia: <strong><code>httpx.AsyncClient</code> con un <code>ASGITransport</code></strong>, es decir, el mismo mecanismo que usa <code>TestClient</code> pero en versión <code>await</code>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «async» no es una preferencia estética: es lo que permite testear concurrencia de verdad y recursos async. Saber cuándo usar <code>TestClient</code> (sync, simple) y cuándo <code>AsyncClient</code> (async, potente) es una decisión de ingeniería, no un detalle de sintaxis.</p>
+        </div>
+        <p>Errores típicos que veremos: usar la forma antigua <code>AsyncClient(app=app)</code> (eliminada en httpx 0.27), olvidar el marcador que hace <em>await-able</em> el test —y que entonces pase <strong>sin ejecutarse</strong>— y asumir que el <em>lifespan</em> corre solo (no corre).</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué <code>TestClient</code> no sirve dentro de un test async</h3>
+        <p>Una app FastAPI es, por debajo, un objeto ASGI: una corrutina. <code>TestClient</code> es síncrono y resuelve el desajuste ejecutando esa corrutina en un <strong>hilo de fondo</strong> con un <em>portal</em> de AnyIO, y bloqueando hasta que termina. Ese truco funciona perfectamente desde una función <code>def</code>… pero si tu test ya está dentro de un bucle de eventos, bloquearlo para esperar otro bucle es un error.</p>
+        <pre class="diagram">
+   test def  ──► TestClient ──► [hilo AnyIO] ──► app (async)    ✔ funciona
+   test async def ──► TestClient ──► bloquear loop ──✗ deadlock / error
+        </pre>
+        <p>La solución no es «hacer el test sync», sino usar un cliente que también sea async: <code>httpx.AsyncClient</code> con un <em>transport</em> que llama a la app ASGI directamente.</p>
+
+        <h3><code>ASGITransport</code>: el puente en proceso</h3>
+        <p>El <em>transport</em> es la pieza de httpx que decide <em>por dónde</em> viaja la petición. En producción es TCP; en tests es ASGI en memoria. Desde httpx 0.27 la forma correcta <strong>ya no es</strong> <code>AsyncClient(app=app)</code>: hay que construir explícitamente el transport.</p>
+        <div class="code-label code-label--wrong">✗ Forma antigua (eliminada)</div>
+        <pre><code class="language-python">from httpx import AsyncClient
+
+client = AsyncClient(app=app, base_url="http://test")   # TypeError en httpx ≥ 0.27
+</code></pre>
+        <div class="code-label code-label--right">✓ Forma actual</div>
+        <pre><code class="language-python">from httpx import ASGITransport, AsyncClient
+
+transport = ASGITransport(app=app)
+client = AsyncClient(transport=transport, base_url="http://test")
+</code></pre>
+        <div class="callout callout--note">
+          <p><code>base_url</code> es obligatorio: httpx lo necesita para resolver rutas relativas. El valor no importa (se usa <code>http://test</code> por convención), pero si lo omites verás un error de «no se puede construir la URL».</p>
+        </div>
+
+        <h3><em>Lifespan</em>: aquí tampoco corre solo</h3>
+        <p>El <code>ASGITransport</code> envía peticiones HTTP a la app, pero <strong>no</strong> envía los eventos de ciclo de vida (<code>startup</code>/<code>shutdown</code>). Si tu app abre recursos en <code>lifespan</code> y los guarda en <code>app.state</code>, con <code>AsyncClient</code> no existirán. La solución estándar es envolver el cliente en un <em>gestor de lifespan</em>:</p>
+        <div class="code-file">tests/conftest.py (fragmento)</div>
+        <pre><code class="language-python">from asgi_lifespan import LifespanManager
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+
+async def make_client() -&gt; AsyncClient:
+    async with LifespanManager(app):                     # dispara startup ... shutdown
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+</code></pre>
+        <p>Instálalo con <code>uv add --dev asgi-lifespan</code>. Si tu app no usa <em>lifespan</em> para nada crítico, puedes prescindir de él; pero conviene saber <em>por qué</em> los recursos no aparecen cuando sí importan.</p>
+
+        <h3>pytest-asyncio: hacer que pytest espere corrutinas</h3>
+        <p>pytest, por sí solo, no sabe ejecutar una función <code>async def</code>: la llamaría, obtendría una corrutina y la descartaría. El plugin <strong><code>pytest-asyncio</code></strong> cierra ese hueco de dos maneras:</p>
+        <table>
+          <thead><tr><th>Modo</th><th>Cómo se marca</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>strict</code> (por defecto)</td><td>Solo los tests con <code>@pytest.mark.asyncio</code> se ejecutan como async</td><td>Proyectos que mezclan varias librerías async</td></tr>
+            <tr><td><code>auto</code></td><td>El marcador se añade solo a toda función <code>async def</code></td><td>Proyectos 100% asyncio, como el nuestro (recomendado)</td></tr>
+          </tbody>
+        </table>
+        <div class="code-file">pyproject.toml</div>
+        <pre><code class="language-toml">[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>El fallo silencioso más peligroso.</strong> En modo <code>strict</code>, si olvidas <code>@pytest.mark.asyncio</code> en un test <code>async def</code>, pytest-asyncio lo <em>salta</em> con un aviso («async def functions are not natively supported»). Resultado: un test que aparece como <em>skip</em> y <strong>nunca comprueba nada</strong>. Con <code>asyncio_mode = "auto"</code> ese problema desaparece.</p>
+        </div>
+
+        <h3>Fixtures async</h3>
+        <p>Una fixture que necesita <code>await</code> se declara con <code>@pytest_asyncio.fixture</code> (no con <code>@pytest.fixture</code> a secas). En modo <code>auto</code>, las fixtures async también se gestionan solas, pero ser explícito es más claro. Mira los dos planos: el <em>scope</em> de caché (cuántas veces se crea) y el <em>loop scope</em> (en qué bucle de eventos corre).</p>
+        <div class="code-file">tests/conftest.py</div>
+        <pre><code class="language-python">import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+
+@pytest_asyncio.fixture
+async def client() -&gt; AsyncClient:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as async_client:
+        yield async_client
+</code></pre>
+        <div class="callout callout--tip">
+          <p>La regla del <em>loop scope</em>: la fixture no puede cambiar de bucle de eventos a mitad. Si una fixture de <code>scope="session"</code> corre en el bucle de sesión, los tests que la usen deben hacerlo también. En un proyecto pequeño, deja los valores por defecto y ajusta solo si ves errores de <em>«attached to a different loop»</em>.</p>
+        </div>
+
+        <h3>Lo que <code>AsyncClient</code> desbloquea: concurrencia real</h3>
+        <p>Con un cliente síncrono, «concurrente» es difícil de expresar. Con async, lanzas N peticiones a la vez y esperas a todas:</p>
+        <pre><code class="language-python">import asyncio
+
+
+responses = await asyncio.gather(*(client.get("/health") for _ in range(20)))
+assert all(r.status_code == 200 for r in responses)
+</code></pre>
+        <p>Esto es exactamente lo que necesitas para probar que un <em>rate limiter</em> corta la petición número 21, o que el «motor RAG» no comparte estado entre consultas simultáneas. La concurrencia <strong>se testea</strong>, no se supone.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El mismo <code>/health</code> de la lección anterior, ahora en versión async.</p>
+        <div class="code-file">consola</div>
+        <pre><code class="language-bash">uv add --dev pytest httpx pytest-asyncio
+</code></pre>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from fastapi import FastAPI
+
+app = FastAPI(title="Copiloto API")
+
+
+@app.get("/health")
+async def health() -&gt; dict[str, str]:
+    return {"status": "ok"}
+</code></pre>
+        <div class="code-file">pyproject.toml</div>
+        <pre><code class="language-toml">[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+</code></pre>
+        <div class="code-file">tests/test_health_async.py</div>
+        <pre><code class="language-python">from httpx import ASGITransport, AsyncClient
+
+from app.main import app
+
+
+async def test_health_async() -&gt; None:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+</code></pre>
+        <p>Ejecútalo:</p>
+        <div class="code-file">consola</div>
+        <pre><code class="language-bash">uv run pytest -q
+</code></pre>
+        <pre><code class="language-text">.                                                                    [100%]
+1 passed in 0.05s
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>async def test_health_async()</code></strong>: el test es una corrutina. Con <code>asyncio_mode = "auto"</code>, pytest-asyncio la ejecuta con <em>await</em> sin que añadas ningún marcador.</li>
+          <li><strong><code>ASGITransport(app=app)</code></strong>: el transport que llama a la app en proceso. Aquí está la magia: no hay red.</li>
+          <li><strong><code>AsyncClient(transport=..., base_url="http://test")</code></strong>: el cliente. El <code>async with</code> garantiza que se cierre al salir del bloque.</li>
+          <li><strong><code>await client.get("/health")</code></strong>: la petición es asíncrona; el <em>await</em> cede el control al bucle mientras la app la procesa.</li>
+          <li><strong><code>assert response.status_code == 200</code></strong>: idéntica comprobación que en el test sincrónico. El objeto de respuesta es el mismo <code>httpx.Response</code>.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Compáralo con la lección 1: el test síncrono tenía 3 líneas de cuerpo; este tiene 5 y un <code>async with</code>. Esa diferencia de «peso» es real. Por eso <strong>no</strong> conviertas todos tus tests a async sin motivo: usa el cliente async cuando el test lo necesite (concurrencia, recursos async), no por moda.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En <strong>Copiloto API</strong> el endpoint <code>POST /ask</code> llama a un motor RAG asíncrono. Vamos a montar la infraestructura async completa: una fixture de cliente, un doble del motor y una prueba de <strong>concurrencia</strong>.</p>
+        <div class="code-file">app/deps.py</div>
+        <pre><code class="language-python">class AsyncRagEngine:
+    """Motor de RAG asíncrono: en producción consulta un vector store."""
+
+    async def answer(self, question: str) -&gt; str:
+        raise NotImplementedError
+
+
+def get_rag_engine() -&gt; AsyncRagEngine:
+    return AsyncRagEngine()
+</code></pre>
+        <div class="code-file">tests/conftest.py</div>
+        <pre><code class="language-python">from collections.abc import AsyncIterator
+
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from app.deps import get_rag_engine
+from app.main import app
+
+
+class FakeAsyncRagEngine:
+    """Doble async: determinista y sin I/O de red."""
+
+    def __init__(self) -&gt; None:
+        self.calls: int = 0
+
+    async def answer(self, question: str) -&gt; str:
+        self.calls += 1
+        return f"Respuesta simulada para: {question}"
+
+
+@pytest_asyncio.fixture
+async def client() -&gt; AsyncIterator[AsyncClient]:
+    app.dependency_overrides[get_rag_engine] = FakeAsyncRagEngine
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as async_client:
+        yield async_client
+    app.dependency_overrides.clear()
+</code></pre>
+        <p>Los tests quedan expresivos, y el último mide concurrencia de verdad:</p>
+        <div class="code-file">tests/test_ask_async.py</div>
+        <pre><code class="language-python">import asyncio
+
+from httpx import AsyncClient
+
+
+async def test_ask_returns_answer(client: AsyncClient) -&gt; None:
+    response = await client.post("/ask", json={"question": "¿Qué es Depends?"})
+
+    assert response.status_code == 200
+    assert "Depends" in response.json()["answer"]
+
+
+async def test_ask_rejects_empty_question(client: AsyncClient) -&gt; None:
+    response = await client.post("/ask", json={"question": ""})
+
+    assert response.status_code == 422
+    assert "detail" in response.json()
+
+
+async def test_concurrent_requests_are_independent(client: AsyncClient) -&gt; None:
+    questions = [f"pregunta {i}" for i in range(20)]
+
+    responses = await asyncio.gather(
+        *(client.post("/ask", json={"question": q}) for q in questions)
+    )
+
+    assert all(r.status_code == 200 for r in responses)
+    answers = [r.json()["answer"] for r in responses]
+    # Cada petición recibe SU respuesta: no hay cruce de estado entre corrutinas.
+    assert answers == [f"Respuesta simulada para: {q}" for q in questions]
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>La fixture <code>client</code> es <code>async</code></strong> y usa <code>async with</code>: el <code>yield</code> se ejecuta dentro del bucle de eventos, así que la limpieza (<code>dependency_overrides.clear()</code>) es <em>await-able</em> de forma implícita y siempre corre.</li>
+          <li><strong><code>FakeAsyncRagEngine.calls</code></strong>: además de devolver respuestas, cuenta llamadas. Así un test puede comprobar cuántas veces se invocó al motor: útil para detectar dobles consultas al RAG.</li>
+          <li><strong><code>asyncio.gather</code> con 20 peticiones</strong>: lanza todas a la vez y espera. Es la forma de probar que no hay estado compartido ni condiciones de carrera en el endpoint.</li>
+          <li><strong>La aserción compara la lista completa de respuestas</strong>: no basta con que cada respuesta sea válida; comprueba que <em>cada pregunta obtiene su respuesta</em>. Si hubiera cruce de estado, el orden se rompería.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Si tu app abre el motor de base de datos en <code>lifespan</code>, envuelve el bloque con <code>LifespanManager(app)</code> (visto en la teoría). Sin él, el test async encontrará recursos sin inicializar. <code>TestClient</code> lo hace por ti con el <code>with</code>; <code>AsyncClient</code>, no.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>AsyncClient</code> solo cuando el test lo necesita</td>
+              <td>Convertir todos los tests a async «porque FastAPI es async»</td>
+              <td>El cliente síncrono es más simple y cubre la mayoría; usa async para concurrencia o recursos async</td>
+            </tr>
+            <tr>
+              <td><code>ASGITransport(app=app)</code> explícito</td>
+              <td><code>AsyncClient(app=app)</code></td>
+              <td>La forma antigua se eliminó en httpx 0.27 y lanza un error</td>
+            </tr>
+            <tr>
+              <td><code>asyncio_mode = "auto"</code> en proyectos 100% asyncio</td>
+              <td>Depender de marcadores que se olvidan</td>
+              <td>Evita el fallo silencioso del test que se «salta» sin ejecutarse</td>
+            </tr>
+            <tr>
+              <td>Fixtures async con <code>@pytest_asyncio.fixture</code></td>
+              <td>Usar <code>@pytest.fixture</code> con una corrutina</td>
+              <td>La decoración correcta garantiza que la fixture se <em>awaitee</em> y se limpie bien</td>
+            </tr>
+            <tr>
+              <td>Declarar <code>base_url</code> siempre</td>
+              <td>Omitirla «porque es local»</td>
+              <td>httpx la necesita para resolver rutas; sin ella, error en la primera petición</td>
+            </tr>
+            <tr>
+              <td><code>LifespanManager</code> si dependes del <em>lifespan</em></td>
+              <td>Asumir que <code>ASGITransport</code> dispara <em>startup</em></td>
+              <td>El transport solo manda la petición; el ciclo de vida es otro canal ASGI</td>
+            </tr>
+            <tr>
+              <td>Probar concurrencia con <code>asyncio.gather</code></td>
+              <td>Suponer que «como es async, es seguro»</td>
+              <td>Las condiciones de carrera existen y solo se detectan con peticiones simultáneas</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Pasar la app al cliente en lugar de al transport</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">from httpx import AsyncClient
+
+# httpx &lt; 0.27; hoy lanza: TypeError: __init__() got an unexpected keyword 'app'
+client = AsyncClient(app=app, base_url="http://test")
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from httpx import ASGITransport, AsyncClient
+
+client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+</code></pre>
+        <p>httpx separó la decisión del <em>transport</em> de la del cliente. El cliente ya no conoce a la app: se lo dice el transport.</p>
+
+        <h3>Olvidar el marcador y «saltarse» el test</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># en modo strict, sin marcador:
+async def test_ask():
+    ...   # se marca como SKIPPED y nunca ejecuta la aserción
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-toml"># pyproject.toml — modo auto, o bien el marcador explícito
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+</code></pre>
+        <p>Un test que se salta no protege nada, pero el resumen de pytest puede pasarte por alto con un simple <em>«skipped»</em>. Con <code>asyncio_mode = "auto"</code> eliminas la causa de raíz.</p>
+
+        <h3>Usar <code>TestClient</code> dentro de un test async</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">from fastapi.testclient import TestClient
+
+async def test_health():
+    client = TestClient(app)          # síncrono y bloqueante dentro de un loop async
+    response = client.get("/health")
+    assert response.status_code == 200
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from httpx import ASGITransport, AsyncClient
+
+async def test_health():
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health")
+    assert response.status_code == 200
+</code></pre>
+        <p>El cliente síncrono intenta bloquear el bucle de eventos que ya estás usando. Si el test es async, el cliente también debe serlo.</p>
+
+        <h3>Fixture async declarada como <code>@pytest.fixture</code></h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">import pytest
+
+@pytest.fixture          # devuelve una corrutina sin resolverse
+async def client():
+    ...
+
+async def test_ask(client):
+    response = await client.post("/ask", json={"question": "x"})
+    # AttributeError: 'coroutine' object has no attribute 'post'
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">import pytest_asyncio
+
+@pytest_asyncio.fixture
+async def client():
+    ...
+</code></pre>
+        <p>El error <em>«coroutine object has no attribute…»</em> casi siempre significa lo mismo: decoraste una fixture async con la herramienta equivocada (o te faltó el plugin).</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> dotar a Copiloto API de una suite async completa y escribir un test de concurrencia que detecte un «motor» con estado compartido.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Instala el plugin.</strong>
+            <pre><code class="language-bash">uv add --dev pytest-asyncio httpx
+</code></pre>
+            <p>Resultado esperado: <code>pytest-asyncio</code> aparece en las dependencias de desarrollo. Si no lo instalas, pytest te avisará de que no sabe ejecutar <code>async def</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Configura el modo auto.</strong> Añade a <code>pyproject.toml</code>:
+            <pre><code class="language-toml">[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Crea la fixture async.</strong> Copia el <code>conftest.py</code> de la sección 4: <code>ASGITransport</code>, <code>AsyncClient</code>, <code>dependency_overrides</code> al <code>FakeAsyncRagEngine</code> y <code>clear()</code> tras el <code>yield</code>.
+          </li>
+          <li>
+            <strong>Paso 4 — Traduce un test sync a async.</strong> Toma <code>test_ask_returns_answer</code> de la lección 1 y reescríbelo con <code>await client.post(...)</code>. Comprueba que pasa:
+            <pre><code class="language-bash">uv run pytest -q
+</code></pre>
+            <p>Resultado esperado: el test pasa igual que su versión síncrona, pero ahora se ejecuta en el bucle de eventos.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Añade el test de concurrencia.</strong> Copia <code>test_concurrent_requests_are_independent</code>. Lánzalo 5 veces seguidas para descartar intermitencias.
+            <pre><code class="language-bash">for i in 1 2 3 4 5; do uv run pytest tests/test_ask_async.py::test_concurrent_requests_are_independent -q; done
+</code></pre>
+            <p>Resultado esperado: <code>1 passed</code> en las cinco ejecuciones. Cualquier fallo intermitente aquí sería la señal de una condición de carrera.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Introduce el bug a propósito.</strong> Cambia el fake para que guarde la última pregunta en un atributo de instancia y devuelva <em>esa</em>, en lugar del argumento recibido:
+            <pre><code class="language-python">class FakeAsyncRagEngine:
+    def __init__(self) -&gt; None:
+        self.last_question = ""
+
+    async def answer(self, question: str) -&gt; str:
+        self.last_question = question          # estado compartido entre corrutinas
+        return f"Respuesta simulada para: {self.last_question}"
+</code></pre>
+            <p>Vuelve a lanzar el test de concurrencia. <strong>Debe fallar</strong> (algunas respuestas no coincidirán con su pregunta): acabas de demostrar que la prueba detecta un estado compartido entre peticiones simultáneas. Revertir el fake después.</p>
+          </li>
+          <li>
+            <strong>Paso 7 — Decora el <em>lifespan</em>, si aplica.</strong> Si tu <code>app/main.py</code> abre el motor de base de datos en <code>lifespan</code>, añade <code>LifespanManager</code> alrededor del <code>async with AsyncClient</code> y confirma que los tests siguen pasando. Resultado esperado: sin errores de recursos no inicializados.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Concurrencia contra el <em>rate limit</em></h3>
+          <p>En el Módulo 5 limitaste las peticiones por IP. Escribe un test async que lance, con <code>asyncio.gather</code>, más peticiones de las permitidas en la misma ventana y que compruebe que <strong>exactamente las primeras N devuelven 200</strong> y el resto devuelven <code>429</code>, con la cabecera <code>Retry-After</code> presente.</p>
+          <p><em>Pista: añade <code>client.headers["X-Forwarded-For"]</code> o una IP fija para que todas las peticiones cuenten contra el mismo cubo; sin eso, cada petición podría caer en una clave distinta. Piensa si el límite debe testearse con un reloj real o con uno inyectado (<code>freezegun</code> o un <em>fake</em> de tiempo): ¿el test sería determinista si dependiera del reloj del sistema? Justifica tu elección.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>TestClient</code> es <strong>síncrono</strong>; no se puede usar dentro de un test <code>async</code>.</li>
+          <li>Para tests async: <strong><code>AsyncClient</code> + <code>ASGITransport(app=app)</code></strong> (no <code>AsyncClient(app=app)</code>).</li>
+          <li><strong><code>pytest-asyncio</code></strong> ejecuta corrutinas; <code>asyncio_mode = "auto"</code> evita el fallo silencioso del test marcado como <em>skip</em>.</li>
+          <li>Las fixtures async usan <strong><code>@pytest_asyncio.fixture</code></strong>.</li>
+          <li><code>ASGITransport</code> <strong>no</strong> dispara el <em>lifespan</em>: usa <code>LifespanManager</code> si dependes de él.</li>
+          <li><strong><code>asyncio.gather</code></strong> permite probar concurrencia y detectar estado compartido.</li>
+          <li>Usa async <strong>cuando lo necesites</strong> (concurrencia, recursos async), no por defecto.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Instalar plugin async</td><td><code>uv add --dev pytest-asyncio httpx</code></td></tr>
+            <tr><td>Modo auto</td><td><code>asyncio_mode = "auto"</code></td></tr>
+            <tr><td>Transport en proceso</td><td><code>ASGITransport(app=app)</code></td></tr>
+            <tr><td>Cliente async</td><td><code>async with AsyncClient(transport=..., base_url="http://test") as client:</code></td></tr>
+            <tr><td>Petición</td><td><code>await client.get("/health")</code></td></tr>
+            <tr><td>Fixture async</td><td><code>@pytest_asyncio.fixture</code> + <code>async def</code> + <code>yield</code></td></tr>
+            <tr><td>Lifespan en tests async</td><td><code>async with LifespanManager(app):</code></td></tr>
+            <tr><td>Concurrencia</td><td><code>asyncio.gather(*(client.get("/x") for _ in range(N)))</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Convierto toda mi suite a async?</summary>
+            <div>
+              <p>No. <code>TestClient</code> es más simple y suficiente para la mayoría de tests. Usa tests async cuando: (a) necesites <code>await</code> para recursos async, (b) quieras lanzar peticiones concurrentes, o (c) tu app use una sesión de base de datos async. Mezclar ambos estilos en la misma suite es perfectamente válido.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>pytest-asyncio</code> o <code>anyio</code>?</summary>
+            <div>
+              <p>Ambos funcionan. La documentación de FastAPI muestra <code>@pytest.mark.anyio</code> porque FastAPI es <em>agnóstico</em>: funciona sobre asyncio o Trio. Si tu stack es asyncio puro (el caso habitual, y el de este curso), <code>pytest-asyncio</code> con <code>asyncio_mode = "auto"</code> es la opción más directa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi test async aparece como <em>skipped</em> y no como <em>passed</em>?</summary>
+            <div>
+              <p>Casi siempre porque no está ejecutándose: en modo <code>strict</code> sin <code>@pytest.mark.asyncio</code>, pytest-asyncio lo salta con un aviso de que las funciones <code>async</code> «no están soportadas nativamente». Es un falso verde peligroso. Cambia a <code>asyncio_mode = "auto"</code> o añade el marcador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si mi app abre el motor de BD en <code>lifespan</code> y uso <code>AsyncClient</code>?</summary>
+            <div>
+              <p>Que el <em>startup</em> no se ejecuta y los recursos no existen: verás errores como <code>AttributeError</code> sobre <code>None</code> o «no such table». Envuelve la app con <code>LifespanManager(app)</code> de <code>asgi-lifespan</code> para que el ciclo de vida se dispare también en los tests async.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo hacer <code>asyncio.gather</code> de 1000 peticiones?</summary>
+            <div>
+              <p>Técnicamente sí, pero ten sentido común: 1000 corrutinas simultáneas contra una base de datos SQLite derivarán en errores de conexión. Un buen test de concurrencia usa un número representativo (10-50) y, si buscas detectar el límite, comprueba el comportamiento justo en el borde (N y N+1), no una cifra arbitraria.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

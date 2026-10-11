@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-sesiones-y-transacciones">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sesiones y transacciones — Módulo 4 · Curso FastAPI</title>
+  <meta name="description" content="La sesión como dependencia de FastAPI con yield: ciclo de vida, commit, rollback, una transacción por petición, versión async y cómo evitar el problema N+1.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Sesiones y transacciones</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Datos y persistencia</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior creaste <code>Session(engine)</code> dentro de un bloque <code>with</code> de un script. En una API eso no sirve tal cual: cada petición HTTP debe tener su <strong>propia sesión</strong>, abierta al empezar y cerrada al terminar, pase lo que pase. Si esa sesión se filtra entre peticiones, empiezas a ver datos «fantasma», bloqueos y conexiones agotadas. Aquí la convertimos en una <strong>dependencia de FastAPI con <code>yield</code></strong>.</p>
+        <p>La segunda mitad del problema es la <strong>atomicidad</strong>. Muchas operaciones no son una sola escritura: cuando Copiloto API responde a una pregunta, escribe la consulta en el histórico <em>y</em> actualiza un contador del módulo. Si lo primero se guarda y lo segundo falla, tu base de datos queda inconsistente. Las <strong>transacciones</strong> y el <strong><code>rollback</code></strong> existen para que esas dos escrituras sean una sola: o las dos, o ninguna.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el 90% de los bugs «raros» de una API con base de datos se reducen a dos cosas: la sesión se gestiona mal (global, filtrada o nunca cerrada) o falta una transacción (una parte del cambio se aplica y la otra no). Entender el ciclo de vida de la sesión es lo que separa una demo de un sistema que no corrompe datos.</p>
+        </div>
+        <p>Errores típicos que verás y corregimos: una sesión global compartida entre peticiones, hacer <code>commit()</code> dentro de cada función auxiliar (rompiendo la atomicidad), no hacer <code>rollback</code> ante una excepción, y disparar una consulta por cada elemento de un bucle sin darte cuenta (el famoso <strong>N+1</strong>).</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Motor, sesión y conexión: tres cosas distintas</h3>
+        <p>Confundirlas es la raíz de casi todo. El <strong>motor</strong> es único y vive todo el proceso; la <strong>conexión</strong> es un canal abierto a la base de datos que sale del pool; la <strong>sesión</strong> es una <em>unidad de trabajo</em> que usa una conexión cuando lo necesita y lleva la cuenta de lo que has ido cambiando.</p>
+        <pre class="diagram">
+   PROCESO (toda la vida)        PETICIÓN (una sesión)      TRANSACCIÓN
+   ┌────────────────────┐        ┌───────────────────┐      ┌───────────────┐
+   │ Engine             │        │ Session           │      │ BEGIN         │
+   │  └─ pool           │──────► │  obj A (nuevo)    │────► │ INSERT A      │
+   │      ├─ conexión 1 │        │  obj B (editado)  │      │ UPDATE B      │
+   │      └─ conexión 2 │        │  SELECT ...       │      │ COMMIT / ROLL │
+   └────────────────────┘        └───────────────────┘      └───────────────┘
+        </pre>
+        <p>La sesión abre una <strong>transacción</strong> en cuanto toca la base de datos y la cierra con <code>commit()</code> (confirma) o <code>rollback()</code> (descarta). Mientras tanto, todo queda «pendiente»: la base de datos aún no ve tus cambios.</p>
+
+        <h3>La dependencia de sesión con <code>yield</code></h3>
+        <p>Aquí enlazas con el Módulo 3: <code>Depends</code> y las dependencias con <code>yield</code>. Este es el patrón canónico de SQLModel y FastAPI:</p>
+        <div class="code-file">app/db.py</div>
+        <pre><code class="language-python">def get_session():
+    with Session(engine) as session:
+        yield session          # FastAPI inyecta esto en el endpoint
+    # al salir del 'with', la sesión se cierra: pasa SIEMPRE, haya error o no
+</code></pre>
+        <p>Lo bonito del <code>yield</code> es el orden de ejecución. Fíjate en el diagrama de tiempos:</p>
+        <pre class="diagram">
+   ANTES del yield          →    endpoint se ejecuta    →   DESPUÉS del yield
+   Session(engine).__enter__      tu lógica con session     Session.__exit__
+   (sesión abierta)               (add / commit / rollback) (sesión CERRADA)
+        </pre>
+        <p>FastAPI llama a la dependencia <strong>una vez por petición</strong>: abre la sesión, la entrega a tu endpoint y, cuando el endpoint termina (incluso si lanza una excepción), reanuda la dependencia para cerrarla. Ese «incluso si lanza excepción» es justo lo que necesitas para no dejar conexiones colgadas.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> la sesión es como el <em>carrito de una compra</em>. Metes productos (<code>add</code>), los cambias (<code>update</code>) y solo cuando pasas por caja (<code>commit</code>) se cobran. Si algo se tuerce antes de pagar, vacías el carrito (<code>rollback</code>) y todo vuelve a como estaba. Ese carrito es tuyo y de nadie más: no lo compartes con el cliente de al lado.</p>
+        </div>
+
+        <h3><code>commit</code>, <code>flush</code> y <code>rollback</code></h3>
+        <table>
+          <thead><tr><th>Operación</th><th>Qué hace</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td><code>session.add(obj)</code></td><td>Marca el objeto para la transacción (aún <code>None</code> id)</td><td>Al crear/actualizar</td></tr>
+            <tr><td><code>session.flush()</code></td><td>Envía el SQL (INSERT/UPDATE) sin confirmar; asigna el <code>id</code></td><td>Cuando necesitas el id antes del commit</td></tr>
+            <tr><td><code>session.commit()</code></td><td>Confirma la transacción: los cambios se vuelven permanentes</td><td>Al final de una unidad de trabajo correcta</td></tr>
+            <tr><td><code>session.refresh(obj)</code></td><td>Recarga el objeto desde la base de datos (trae valores generados)</td><td>Tras el commit, para devolver el registro actualizado</td></tr>
+            <tr><td><code>session.rollback()</code></td><td>Descarta todos los cambios pendientes de la transacción</td><td>Tras un error, antes de continuar</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Una transacción, un <code>commit</code>.</strong> Si haces <code>commit()</code> dentro de una función de servicio y otra vez en el endpoint, has partido una operación atómica en dos. Decide <strong>quién</strong> es el dueño de la transacción (normalmente el caso de uso o el endpoint) y que sea el único que confirme.</p>
+        </div>
+
+        <h3><code>AsyncSession</code>: la misma idea, en async</h3>
+        <p>Si tu endpoint es <code>async def</code> y tu driver lo soporta, usas el motor async y la dependencia cambia de forma, pero no de concepto:</p>
+        <div class="code-file">app/db.py</div>
+        <pre><code class="language-python">from collections.abc import AsyncIterator
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+engine = create_async_engine(settings.database_url)          # p. ej. sqlite+aiosqlite:///...
+async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+async def get_session() -&gt; AsyncIterator[AsyncSession]:
+    async with async_session() as session:
+        yield session
+</code></pre>
+        <p>La regla sigue siendo la misma: <strong>una sesión por petición</strong>. Y una advertencia: no compartas una <code>AsyncSession</code> entre tareas concurrentes; no está pensada para eso.</p>
+
+        <h3>El problema N+1</h3>
+        <p>Las relaciones en SQLAlchemy se cargan de forma <strong>perezosa</strong> (<em>lazy</em>) por defecto: la primera vez que accedes a <code>module.logs</code>, se lanza una consulta. Si dentro de un bucle recorres N módulos y tocas su relación, disparas <strong>1 consulta para la lista + N consultas</strong>, una por elemento. De ahí el nombre: <em>N+1</em>.</p>
+        <div class="code-label code-label--wrong">✗ N+1: una consulta por módulo</div>
+        <pre><code class="language-python">modules = session.exec(select(Module)).all()   # 1 consulta
+for module in modules:                          # N consultas (una por module)
+    print(module.slug, len(module.logs))        # lazy load: SELECT ... WHERE module_id = ?
+</code></pre>
+        <div class="code-label code-label--right">✓ Carga anticipada con <code>selectinload</code></div>
+        <pre><code class="language-python">from sqlalchemy.orm import selectinload
+
+statement = select(Module).options(selectinload(Module.logs))
+modules = session.exec(statement).all()         # 2 consultas en total
+for module in modules:
+    print(module.slug, len(module.logs))        # ya están cargados, sin consultas extra
+</code></pre>
+        <p>Regla práctica: si vas a recorrer una relación de muchos objetos, <strong>cárgala anticipadamente</strong> con <code>selectinload</code> (una consulta extra con <code>IN</code>) o <code>joinedload</code> (un <code>JOIN</code>). El N+1 no se ve en desarrollo con 5 filas; se ve en producción con 5000.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La sesión inyectada en un endpoint. El ejemplo completo vive en dos archivos.</p>
+        <div class="code-file">app/db.py</div>
+        <pre><code class="language-python">from collections.abc import Iterator
+
+from sqlmodel import Session, SQLModel, create_engine
+
+engine = create_engine("sqlite:///copiloto.db")
+
+
+def get_session() -&gt; Iterator[Session]:
+    with Session(engine) as session:
+        yield session
+</code></pre>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
+from fastapi import Depends, FastAPI
+from sqlmodel import Session, SQLModel, select
+
+from app.db import engine, get_session
+from app.models import Module
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -&gt; AsyncIterator[None]:
+    SQLModel.metadata.create_all(engine)   # solo dev/tests (Módulo 3, lección 3)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/modules")
+def list_modules(session: Session = Depends(get_session)) -&gt; list[Module]:
+    return session.exec(select(Module)).all()
+</code></pre>
+        <p>Salida esperada al pedir <code>GET /modules</code> (con datos precargados):</p>
+        <pre><code class="language-json">[{"id": 1, "slug": "fastapi", "title": "FastAPI", "summary": "APIs modernas"}]
+</code></pre>
+        <p>Lo esencial: el endpoint no abre ni cierra nada. Recibe una <code>Session</code> lista para usar, declara su intención con <code>Depends(get_session)</code> y FastAPI se encarga del resto. Si el endpoint lanza una excepción, el <code>with</code> del <code>yield</code> cierra la sesión igualmente.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En Copiloto API, <code>POST /ask</code> hace dos cosas que deben ir juntas: guarda la consulta en <code>query_log</code> y actualiza un contador en el módulo. O las dos, o ninguna.</p>
+        <div class="code-file">app/routers/ask.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends, HTTPException, status
+from sqlmodel import Session, select
+
+from app.db import get_session
+from app.models import Module, QueryLog
+from app.schemas import AskRequest, AskResponse, QueryLogPublic
+
+router = APIRouter()
+
+
+@router.post("/ask", response_model=AskResponse, status_code=status.HTTP_201_CREATED)
+def ask(payload: AskRequest, session: Session = Depends(get_session)) -&gt; AskResponse:
+    module = session.exec(select(Module).where(Module.slug == payload.module_slug)).first()
+    if module is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Módulo '{payload.module_slug}' no encontrado",
+        )
+
+    log = QueryLog(question=payload.question, module_slug=module.slug)
+    answer = generate_answer(payload.question, module)   # tu función de RAG
+
+    try:
+        # Una sola transacción para ambas escrituras.
+        session.add(log)
+        module.queries_count += 1
+        session.add(module)
+        log.answer = answer
+        session.commit()
+    except Exception:
+        session.rollback()           # deja la transacción limpia y propaga el error
+        raise
+
+    session.refresh(log)
+    return AskResponse(answer=answer, log=QueryLogPublic.model_validate(log))
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Una transacción, dos escrituras</strong>: el <code>commit()</code> está <em>fuera</em> del RAG y cubre tanto el <code>INSERT</code> del log como el <code>UPDATE</code> del contador. Si el contador falla, el log tampoco se guarda.</li>
+          <li><strong><code>rollback()</code> ante cualquier excepción</strong>: deja la sesión reutilizable y garantiza que nada a medias se confirme. Como el objeto <code>log</code> ya está «sucio» en la sesión, sin el rollback el estado quedaría inconsistente.</li>
+          <li><strong><code>raise</code> de nuevo</strong>: no te tragas el error; lo registras o lo dejas subir para que FastAPI lo convierta en respuesta (Módulo 2) sin perder el <code>rollback</code>.</li>
+          <li><strong><code>QueryLogPublic.model_validate(log)</code></strong>: la respuesta se modela aparte del modelo de tabla, como viste en la lección 1.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Si integras el RAG de forma <strong>async</strong> (llamadas a un modelo o a un servicio HTTP), haz el endpoint <code>async def</code> y usa <code>AsyncSession</code>. Pero recuerda: la transacción debe seguir siendo una sola, y no debes mantener la sesión abierta mientras esperas a un servicio externo lento si puedes evitarlo.</p>
+        </div>
+        <div class="callout callout--note">
+          <p>El contador <code>queries_count</code> vive en el modelo <code>Module</code>. Un <code>UPDATE ... SET queries_count = queries_count + 1</code> es lo correcto en producción (evita condiciones de carrera); para la lectura del curso, <code>module.queries_count += 1</code> sobre la sesión es suficiente y más claro.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Una sesión por petición, vía <code>Depends(get_session)</code></td>
+              <td>Una sesión global creada en el arranque</td>
+              <td>La sesión no es segura entre hilos/requests; compartirla provoca mezclas de datos</td>
+            </tr>
+            <tr>
+              <td>Cerrar la sesión siempre (el <code>with</code> del <code>yield</code> lo hace)</td>
+              <td>Dejar sesiones abiertas «para reutilizar»</td>
+              <td>Agotas el pool de conexiones y bloqueas la base de datos</td>
+            </tr>
+            <tr>
+              <td>Un único dueño de la transacción (un <code>commit</code> por unidad de trabajo)</td>
+              <td><code>commit()</code> en cada función auxiliar</td>
+              <td>Partes operaciones atómicas y dejas la base de datos a medias</td>
+            </tr>
+            <tr>
+              <td><code>rollback()</code> en el <code>except</code> antes de re-lanzar</td>
+              <td>Ignorar el error y seguir usando la sesión</td>
+              <td>Una sesión con una transacción fallida queda inutilizable hasta el rollback</td>
+            </tr>
+            <tr>
+              <td>Cargar relaciones con <code>selectinload</code> cuando las vas a recorrer</td>
+              <td>Acceder a relaciones dentro de un bucle</td>
+              <td>Evita el N+1 y el mareo de consultas en los logs de SQL</td>
+            </tr>
+            <tr>
+              <td>Logging con <code>echo=True</code> solo en desarrollo</td>
+              <td><code>echo=True</code> en producción</td>
+              <td>Ver el SQL ayuda a cazar N+1, pero en producción inunda los logs</td>
+            </tr>
+            <tr>
+              <td>Trabajo pesado fuera de la sesión</td>
+              <td>Mantener la sesión abierta durante llamadas de red largas</td>
+              <td>Cada segundo con la sesión abierta es una conexión retenida del pool</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>La sesión global compartida</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python"># app/db.py
+session = Session(engine)          # ¡una sola sesión para toda la app!
+
+# app/main.py
+def list_modules() -&gt; list[Module]:
+    return session.exec(select(Module)).all()   # carrera entre peticiones
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python"># app/db.py
+def get_session() -&gt; Iterator[Session]:
+    with Session(engine) as session:
+        yield session          # cada petición recibe la suya
+
+# app/main.py
+def list_modules(session: Session = Depends(get_session)) -&gt; list[Module]:
+    return session.exec(select(Module)).all()
+</code></pre>
+        <p>La <code>Session</code> de SQLAlchemy no es segura para hilos: dos peticiones que la usen a la vez comparten su estado interno y pueden ver filas que no les corresponden o pisarse los cambios.</p>
+
+        <h3>Commit dentro de la función auxiliar</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def save_log(session: Session, log: QueryLog) -&gt; None:
+    session.add(log)
+    session.commit()          # ¡confirma aquí!
+
+def bump_counter(session: Session, module: Module) -&gt; None:
+    module.queries_count += 1
+    session.add(module)
+    session.commit()          # operación separada: si falla, el log ya se guardó
+
+# En el endpoint: dos commits = dos transacciones = no atómico
+save_log(session, log)
+bump_counter(session, module)
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def save_log(session: Session, log: QueryLog) -&gt; None:
+    session.add(log)          # solo 'add': no confirma
+
+def bump_counter(session: Session, module: Module) -&gt; None:
+    module.queries_count += 1
+    session.add(module)
+
+# El endpoint es dueño de la transacción: un solo commit para todo
+save_log(session, log)
+bump_counter(session, module)
+session.commit()
+</code></pre>
+        <p>Las funciones auxiliares <em>preparan</em> el cambio; el caso de uso <em>confirma</em>. Así puedes componer varias operaciones en una sola transacción.</p>
+
+        <h3>No hacer <code>rollback</code> tras un error</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">try:
+    session.add(log)
+    session.commit()
+except Exception:
+    raise            # la transacción queda abortada y la sesión, atascada
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">try:
+    session.add(log)
+    session.commit()
+except Exception:
+    session.rollback()   # limpia la transacción antes de re-lanzar
+    raise
+</code></pre>
+        <p>Tras un fallo, la transacción queda en estado abortado: cualquier operación posterior sobre esa misma sesión fallará hasta que hagas <code>rollback()</code>.</p>
+
+        <h3>El N+1 disfrazado</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">modules = session.exec(select(Module)).all()
+response = [{"slug": m.slug, "logs": len(m.logs)} for m in modules]   # N+1
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from sqlalchemy.orm import selectinload
+
+statement = select(Module).options(selectinload(Module.logs))
+modules = session.exec(statement).all()
+response = [{"slug": m.slug, "logs": len(m.logs)} for m in modules]   # 2 consultas
+</code></pre>
+        <p>Una comprensible línea de Python se convierte en cientos de <code>SELECT</code>. Con <code>echo=True</code> lo ves al instante: cientos de consultas idénticas cambiando solo el parámetro.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar la sesión como dependencia, ejecutar una operación transaccional y comprobar con un test que el <code>rollback</code> funciona.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Dependencia de sesión.</strong> En tu proyecto de la lección 1, añade a <code>app/db.py</code>:
+            <pre><code class="language-python">from collections.abc import Iterator
+from sqlmodel import Session
+
+def get_session() -&gt; Iterator[Session]:
+    with Session(engine) as session:
+        yield session
+</code></pre>
+            <p>Resultado esperado: importa sin errores y el test de arranque no crea sesiones de más.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Un endpoint que solo lee.</strong> Crea <code>GET /logs</code> que devuelva el histórico ordenado por <code>created_at</code> descendente, usando <code>Depends(get_session)</code> y <code>column(QueryLog.created_at).desc()</code>. Comprueba con <code>/docs</code> que responde.
+          </li>
+          <li>
+            <strong>Paso 3 — Fuerza una transacción y provoca un fallo.</strong> Crea un endpoint temporal <code>POST /logs/_boom</code> que añada un <code>QueryLog</code> y luego lance una excepción <em>antes</em> de confirmar:
+            <pre><code class="language-python">@app.post("/logs/_boom")
+def boom(session: Session = Depends(get_session)) -&gt; dict:
+    log = QueryLog(question="no debería guardarse")
+    session.add(log)
+    raise RuntimeError("fallo simulado antes del commit")
+</code></pre>
+            <p>No hagas <code>commit</code>: al salir el endpoint con excepción, el <code>with</code> del <code>yield</code> cierra la sesión y la transacción pendiente <em>nunca</em> se confirma. Llama al endpoint y luego a <code>GET /logs</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Verifica con un test.</strong> Añade <code>tests/test_tx.py</code>:
+            <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_fallo_no_persiste():
+    antes = len(client.get("/logs").json())
+    client.post("/logs/_boom")                 # provoca la excepción
+    despues = len(client.get("/logs").json())
+    assert despues == antes                   # nada se guardó
+</code></pre>
+            <p>Ejecuta <code>uv run pytest -q</code>. Resultado esperado: <code>1 passed</code>. Esto demuestra que, sin <code>commit</code>, el cambio no llega a la base de datos aunque el objeto se añadiera a la sesión.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Añade el <code>rollback</code> explícito.</strong> Modifica el endpoint para capturar la excepción, hacer <code>session.rollback()</code> y re-lanzarla. Vuelve a ejecutar el test: sigue pasando, y ahora la sesión queda limpia para el resto de la petición.
+          </li>
+          <li>
+            <strong>Paso 6 — Caza un N+1.</strong> Si tienes la relación <code>Module.logs</code>, pon <code>echo=True</code> en el motor, recorre 5 módulos accediendo a <code>.logs</code> y cuenta las consultas. Después introduce <code>selectinload</code> y vuelve a contar: deberías pasar de 6 a 2.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Endpoint de «reintento» transaccional</h3>
+          <p>Implementa <code>POST /ask/retry/{log_id}</code>: si la consulta identificada por <code>log_id</code> tiene <code>answer is None</code> (quedó a medias), genera la respuesta, la guarda y —en la <em>misma</em> transacción— incrementa el contador del módulo y marca un campo <code>retried_at</code>. Si algo falla en cualquier punto, ninguno de los tres cambios debe persistir.</p>
+          <p><em>Pista: usa un único <code>session.commit()</code> al final y envuelve todo en <code>try/except</code> con <code>rollback()</code>. Piensa cómo comprobarías con un test que, al forzar el fallo, ni <code>answer</code> ni <code>queries_count</code> ni <code>retried_at</code> cambiaron. Añade el campo <code>retried_at</code> como columna nueva: ¿qué comando de Alembic necesitarás la próxima lección?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>motor</strong> vive todo el proceso; la <strong>sesión</strong> vive <strong>una petición</strong>. Nunca compartas la sesión.</li>
+          <li>La dependencia <code>get_session</code> con <code>yield</code> abre y <strong>cierra</strong> la sesión por ti, incluso si el endpoint falla.</li>
+          <li>La sesión agrupa cambios en una <strong>transacción</strong>: <code>commit()</code> la confirma, <code>rollback()</code> la descarta.</li>
+          <li>Un solo dueño de la transacción: <strong>un <code>commit</code> por unidad de trabajo</strong>, no uno por función.</li>
+          <li>Tras un error, <code>rollback()</code> <strong>siempre</strong>, antes de re-lanzar.</li>
+          <li>El problema <strong>N+1</strong> se evita cargando relaciones con <code>selectinload</code> / <code>joinedload</code>.</li>
+          <li>Con drivers async, <code>AsyncSession</code> + <code>async_sessionmaker</code>: mismo concepto, <code>async with</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código / parámetro</th></tr></thead>
+          <tbody>
+            <tr><td>Dependencia de sesión</td><td><code>def get_session(): with Session(engine) as s: yield s</code></td></tr>
+            <tr><td>Usarla en el endpoint</td><td><code>session: Session = Depends(get_session)</code></td></tr>
+            <tr><td>Añadir / confirmar</td><td><code>session.add(obj)</code> · <code>session.commit()</code></td></tr>
+            <tr><td>Recargar tras commit</td><td><code>session.refresh(obj)</code></td></tr>
+            <tr><td>Descartar cambios</td><td><code>session.rollback()</code></td></tr>
+            <tr><td>Versión async</td><td><code>AsyncSession</code> + <code>async_sessionmaker</code> + <code>async with</code></td></tr>
+            <tr><td>Evitar N+1</td><td><code>select(Module).options(selectinload(Module.logs))</code></td></tr>
+            <tr><td>Ver el SQL</td><td><code>create_engine(url, echo=True)</code> (solo en desarrollo)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuál es exactamente la diferencia entre <code>flush</code> y <code>commit</code>?</summary>
+            <div>
+              <p><code>flush()</code> envía el SQL a la base de datos dentro de la transacción, pero no la cierra: puedes seguir cambiando cosas y aún puedes hacer <code>rollback()</code>. <code>commit()</code> cierra la transacción y hace los cambios permanentes. Normalmente dejas que el <code>commit</code> haga el <code>flush</code> implícito; solo llamas a <code>flush()</code> si necesitas el <code>id</code> generado antes de confirmar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no reutilizar una sesión para todo el proceso y ahorrar recursos?</summary>
+            <div>
+              <p>Porque la sesión acumula estado (identity map, transacción en curso) y no es segura entre hilos. Reutilizarla mezcla objetos de distintas peticiones y puede confirmar cambios que no esperabas. Ahorras un objeto Python barato a cambio de bugs carísimos. Lo que sí se reutiliza es el <strong>motor</strong> y su pool de conexiones.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde debe vivir el <code>commit</code>?</summary>
+            <div>
+              <p>En el <strong>dueño de la unidad de trabajo</strong>: normalmente el endpoint (controlador) o la capa de servicio si la usas. Lo importante es que sea <em>uno</em> y que abarque todas las escrituras que deben ser atómicas. Las funciones de acceso a datos solo hacen <code>add</code>/<code>select</code>; no confirman.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si mi código tiene un N+1?</summary>
+            <div>
+              <p>Activa <code>echo=True</code> en el motor (solo en desarrollo) y mira el log: si ves muchas consultas casi idénticas variando solo el <code>WHERE id = ?</code>, tienes un N+1. La solución suele ser <code>selectinload</code> para listas y <code>joinedload</code> para relaciones uno-a-uno. En el Módulo 6 medirás esto con tests.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Uso <code>Session</code> o <code>AsyncSession</code>?</summary>
+            <div>
+              <p>Coincide con el estilo del endpoint y con el driver. Si tu ruta es <code>async def</code> y trabajas con <code>aiosqlite</code>, <code>asyncpg</code> o <code>psycopg</code> async, usa <code>AsyncSession</code>. Si el endpoint es síncrono, usa <code>Session</code> (FastAPI lo ejecuta en un hilo aparte). No mezcles: una <code>AsyncSession</code> no se puede usar desde código síncrono bloqueante.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-lifespan-y-recursos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lifespan y recursos — Módulo 3 · Curso FastAPI</title>
+  <meta name="description" content="Lifespan en FastAPI: abrir y cerrar el motor de base de datos y clientes HTTP una sola vez, por qué no usar on_event y compartir recursos con app.state.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1><code>lifespan</code>: recursos que viven una sola vez</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Dependencias y configuración</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hay recursos que no pertenecen a una petición: el <strong>motor de base de datos</strong>, el <strong>cliente HTTP</strong> hacia un servicio externo, el <strong>índice de vectores</strong> del RAG, la <strong>caché</strong> en memoria. Crearlos es caro (abren sockets, leen ficheros, reservan memoria) y deben vivir <em>mientras viva la aplicación</em>. Crearlos en cada petición sería un despilfarro; crearlos al <code>importar</code> el módulo es peor, porque entonces no hay contexto de aplicación ni forma limpia de cerrarlos.</p>
+        <p>FastAPI da un sitio exacto para eso: el <strong><code>lifespan</code></strong>. Es una función con dos mitades separadas por un <code>yield</code>: lo de antes corre al <strong>arrancar</strong> (crear) y lo de después, al <strong>apagar</strong> (cerrar). Lo que crees ahí lo guardas en <code>app.state</code> y las dependencias lo leen por petición, sin reconstruirlo.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todos los proyectos acaban con fugas de recursos («el pool de conexiones se agota», «los sockets se quedan en TIME_WAIT», «el test no cierra el cliente»). Y casi siempre es la misma causa: crear algo caro por petición o al importar, sin un punto único que lo cierre. <code>lifespan</code> es ese punto.</p>
+        </div>
+        <p>Errores típicos: usar el antiguo <code>@app.on_event("startup")</code> (deprecado), olvidar <code>engine.dispose()</code> al apagar, guardar en <code>app.state</code> algo que sí depende del usuario, y creer que <code>lifespan</code> corre una vez por <em>proceso</em> cuando en producción tienes varios workers.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El ciclo de vida de la aplicación</h3>
+        <p>Uvicorn (el servidor ASGI) tiene tres fases: arranque del proceso, servicio de peticiones y apagado. <code>lifespan</code> se engancha a la primera y a la tercera, dejando la del medio —el manejo de peticiones— a tus endpoints y dependencias.</p>
+        <pre class="diagram">
+  ┌──────────────────── uvicorn arranca ────────────────────┐
+  │ 1. IMPORT de app.main  (aquí NO se conecta nada)         │
+  │ 2. LIFESPAN · parte antes del yield:   crear recursos    │
+  │      engine = create_engine(...)                         │
+  │      client = httpx.AsyncClient(...)                     │
+  │      app.state.engine = engine                           │
+  └───────────────────────┬──────────────────────────────────┘
+                          ▼
+     ┌──────────────────────────────────────────────┐
+     │ 3. SIRVIENDO:  muchas peticiones              │
+     │    cada una LEE app.state (no reconstruye)    │
+     └───────────────────────┬──────────────────────┘
+                          ▼
+  ┌──────────────────── uvicorn se apaga ───────────────────┐
+  │ 4. LIFESPAN · parte tras el yield:  cerrar recursos      │
+  │      await client.aclose()                               │
+  │      engine.dispose()                                    │
+  └──────────────────────────────────────────────────────────┘
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> montar una tienda. Antes de abrir al público enciendes las luces, montas la caja y descargas el género (<em>antes del yield</em>). Durante el día atiendes a los clientes sin reinstalar la tienda cada vez (<em>peticiones leyendo <code>app.state</code></em>). Y al cerrar, apagas las luces y bajas la persiana (<em>después del yield</em>). Nadie monta la tienda de cero para cada cliente ni la deja abierta toda la noche.</p>
+        </div>
+
+        <h3>Escribir <code>lifespan</code></h3>
+        <p>Se define con <code>@asynccontextmanager</code>, recibe la app y separa las dos mitades con <code>yield</code>:</p>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- ARRANQUE ---
+    app.state.resource = open_resource()
+    try:
+        yield                      # aquí la app sirve peticiones
+    finally:
+        # --- APAGADO --- (siempre se ejecuta, incluso si el arranque falló a medias)
+        app.state.resource.close()
+
+
+app = FastAPI(lifespan=lifespan)
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Usa <code>try/finally</code> alrededor del <code>yield</code>.</strong> Igual que en las dependencias con <code>yield</code>, garantiza que el apagado ocurre aunque algo falle. Si creas tres recursos, créalos con sus <em>locks</em> o con cuidado: si el segundo falla, el <code>finally</code> debe cerrar el primero.</p>
+        </div>
+        <p>La función puede ser <code>async</code> (lo normal, para poder hacer <code>await client.aclose()</code>) o síncrona. Guarda <strong>una sola vez</strong> la referencia en <code>app.state</code> y léela desde las dependencias:</p>
+        <pre><code class="language-python">from typing import Annotated
+from fastapi import Depends, Request
+
+
+def get_engine(request: Request):
+    return request.app.state.engine      # NO se crea: ya existe desde el arranque
+
+
+EngineDep = Annotated[object, Depends(get_engine)]
+</code></pre>
+
+        <h3>Por qué no usar <code>@app.on_event</code></h3>
+        <p>Verás en código antiguo los decoradores <code>@app.on_event("startup")</code> y <code>@app.on_event("shutdown")</code>. FastAPI los marcó como <strong>deprecados</strong> a favor de <code>lifespan</code>. Las razones son concretas:</p>
+        <table>
+          <thead><tr><th>Aspecto</th><th><code>@app.on_event</code> (deprecado)</th><th><code>lifespan</code> (recomendado)</th></tr></thead>
+          <tbody>
+            <tr><td>Estado compartido entre arranque y apagado</td><td>Difícil: son dos funciones distintas, hay que usar globales</td><td>Natural: variables locales del <code>asynccontextmanager</code></td></tr>
+            <tr><td>Cierre garantizado</td><td>El shutdown no siempre corre si el startup falló</td><td><code>try/finally</code> explícito alrededor del <code>yield</code></td></tr>
+            <tr><td>Orden de ejecución</td><td>Múltiples handlers en orden poco claro</td><td>Una sola función, orden secuencial y obvio</td></tr>
+            <tr><td>Ecosistema</td><td>Deprecado; se eliminará</td><td>Compatible con el protocolo ASGI <code>lifespan</code> estándar</td></tr>
+            <tr><td>Tests</td><td>Se dispara igual, pero sin control de errores</td><td>Se integra con <code>with TestClient(app)</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>No mezcles los dos.</strong> Si tienes <code>on_event</code> y <code>lifespan</code> a la vez, el orden de arranque se vuelve impredecible. Migra todo a <code>lifespan</code>.</p>
+        </div>
+
+        <h3><code>app.state</code>: la caja de recursos de la aplicación</h3>
+        <p><code>app.state</code> es un objeto al que puedes colgar atributos (<code>app.state.engine</code>, <code>app.state.http</code>, <code>app.state.rag</code>). Es compartido por todos los endpoints y solo debes guardar ahí cosas <strong>seguras entre peticiones y usuarios</strong>: pools, clientes, índices inmutables, cachés con control propio. Nunca el usuario, la sesión de BD ni nada específico de una petición.</p>
+        <pre><code class="language-python"># ✅ Bueno: recurso compartido, sin estado de usuario
+app.state.engine = create_engine(settings.database_url)
+
+# ❌ Malo: esto es por petición, no de la app
+app.state.current_user = user
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Tipado:</strong> <code>app.state</code> no está tipado. Puedes definir una <code>dataclass</code> con tus recursos y colgarla como <code>app.state.resources</code>, o usar una clave tipada, para que el editor te ayude. La siguiente lección (settings) muestra el patrón completo.</p>
+        </div>
+
+        <h3>Un detalle de producción: <em>workers</em></h3>
+        <p>En producción suele arrancarse más de un <em>worker</em> (proceso) para aprovechar los núcleos. Cada proceso ejecuta su <strong>propio</strong> <code>lifespan</code>: si lanzas <code>uvicorn --workers 4</code>, tendrás <strong>cuatro</strong> motores y cuatro clientes. Por eso los recursos que <code>lifespan</code> crea <strong>no</strong> se pueden usar para contadores globales ni locks en memoria entre peticiones repartidas. Para eso, un servicio externo (Redis, la propia BD).</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un <code>lifespan</code> que «abre» y «cierra» un recurso falso y lo expone en <code>/health</code>. Verás en la consola del servidor cuándo arranca y cuándo se apaga. Ejecutable con <code>uv</code>.</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request
+
+STATE: dict[str, list[str]] = {"events": []}
+
+
+def open_resource():
+    print("[lifespan] abro recurso")
+    return {"name": "fake-db"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- ARRANQUE: crear el recurso UNA vez ---
+    app.state.resource = open_resource()
+    try:
+        yield
+    finally:
+        # --- APAGADO: cerrarlo cuando el servidor se detiene ---
+        print("[lifespan] cierro recurso")
+        app.state.resource = None
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_resource(request: Request) -&gt; dict:
+    return request.app.state.resource
+
+
+ResourceDep = Annotated[dict, Depends(get_resource)]
+
+
+@app.get("/health")
+def health(resource: ResourceDep):
+    return {"status": "ok", "resource": resource["name"]}
+</code></pre>
+        <p>Arranca el servidor:</p>
+        <pre><code class="language-bash">uv run uvicorn main:app --reload
+</code></pre>
+        <p>Verás en la consola:</p>
+        <pre><code class="language-text">INFO:     Application startup complete.
+[lifespan] abro recurso
+</code></pre>
+        <p>Llama a <code>GET /health</code> (botón «Try it out» en <code>/docs</code> o con <code>curl</code>) y recibirás <code>{"status":"ok","resource":"fake-db"}</code>. El recurso <strong>no se vuelve a crear</strong> en cada petición: se creó en el arranque.</p>
+        <p>Ahora detén el servidor con <code>Ctrl+C</code> y observa:</p>
+        <pre><code class="language-text">INFO:     Shutting down
+INFO:     Application shutdown complete.
+[lifespan] cierro recurso
+</code></pre>
+        <p>Qué ha pasado, paso a paso:</p>
+        <ol class="steps">
+          <li><strong>uvicorn importa <code>app</code></strong>: se registra el <code>lifespan</code>, pero <em>no</em> se ejecuta todavía. El <code>print</code> no aparece porque «abro recurso» está dentro de la función.</li>
+          <li><strong>uvicorn arranca el servidor</strong>: ejecuta la primera mitad del <code>lifespan</code> hasta el <code>yield</code>. Se crea el recurso y se guarda en <code>app.state.resource</code>.</li>
+          <li><strong>Cada petición</strong> a <code>/health</code> ejecuta <code>get_resource</code>, que solo <em>lee</em> <code>request.app.state.resource</code>. Sin coste de creación.</li>
+          <li><strong>Al apagar</strong>, uvicorn retoma el <code>lifespan</code> después del <code>yield</code> y cierra el recurso. El <code>finally</code> lo garantiza.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Este es el montaje que usaremos en el <strong>Copiloto API</strong>: crear el <strong>motor de SQLModel</strong> y un <strong>cliente <code>httpx</code></strong> en el arranque, guardarlos en <code>app.state</code> y cerrarlos al apagar. El endpoint de <code>/health</code> comprueba que ambos responden.</p>
+        <div class="code-file">app/config.py</div>
+        <pre><code class="language-python">from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    database_url: str = "sqlite:///./copiloto.db"
+    rag_service_url: str = "http://127.0.0.1:9000"
+    environment: str = "dev"
+
+
+def get_settings() -&gt; Settings:
+    return Settings()
+</code></pre>
+        <div class="code-file">app/main.py</div>
+        <pre><code class="language-python">from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI
+from sqlmodel import create_engine
+
+from app.config import get_settings
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    # --- ARRANQUE: recursos caros, una sola vez por proceso ---
+    app.state.engine = create_engine(settings.database_url, echo=False)
+    app.state.http = httpx.AsyncClient(
+        base_url=settings.rag_service_url,
+        timeout=httpx.Timeout(10.0),
+    )
+    try:
+        yield
+    finally:
+        # --- APAGADO: liberar sockets y conexiones ---
+        await app.state.http.aclose()
+        app.state.engine.dispose()
+
+
+app = FastAPI(title="Copiloto API", lifespan=lifespan)
+
+
+from app.routers import ask, health   # noqa: E402  (import tras definir lifespan)
+
+app.include_router(health.router)
+app.include_router(ask.router)
+</code></pre>
+        <div class="code-file">app/deps.py</div>
+        <pre><code class="language-python">from typing import Annotated
+
+import httpx
+from fastapi import Depends, Request
+from sqlalchemy import Engine
+
+from app.config import Settings, get_settings
+
+
+def get_engine(request: Request) -&gt; Engine:
+    """Motor creado en lifespan; la dependencia solo lo entrega."""
+    return request.app.state.engine
+
+
+def get_http(request: Request) -&gt; httpx.AsyncClient:
+    """Cliente HTTP compartido, con pool de conexiones reutilizado."""
+    return request.app.state.http
+
+
+EngineDep = Annotated[Engine, Depends(get_engine)]
+HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+</code></pre>
+        <div class="code-file">app/routers/health.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter
+from sqlalchemy import text
+
+from app.deps import EngineDep, HttpClientDep, SettingsDep
+
+router = APIRouter()
+
+
+@router.get("/health")
+async def health(
+    engine: EngineDep,
+    http: HttpClientDep,
+    settings: SettingsDep,
+):
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))          # la BD responde
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "rag_service": str(http.base_url),
+    }
+</code></pre>
+        <p><strong>Decisiones explicadas:</strong></p>
+        <ul>
+          <li><strong>Crear en <code>lifespan</code>, no en la dependencia.</strong> El motor y el cliente se crean una vez por proceso; las peticiones los reutilizan. El pool de <code>httpx</code> reutiliza conexiones, así que no se abre un socket por petición.</li>
+          <li><strong>Cerrar con <code>dispose()</code> y <code>aclose()</code>.</strong> <code>engine.dispose()</code> devuelve las conexiones del pool; <code>await client.aclose()</code> cierra los sockets del cliente. Sin esto, verías avisos de recursos no cerrados al apagar.</li>
+          <li><strong><code>try/finally</code>.</strong> Si algo falla al arrancar el cliente después de crear el motor, el <code>finally</code> del apagado sigue intentando limpiar.</li>
+          <li><strong>Acceso por dependencia, no por import.</strong> Los endpoints piden <code>EngineDep</code> o <code>HttpClientDep</code>; no importan un global. Así los tests pueden sustituirlos y el contrato se ve en la firma.</li>
+          <li><strong>Los <code>import</code> de routers van después.</strong> Es un detalle de organización, no una obligación: separar el <code>lifespan</code> de los routers evita ciclos de importación.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Ojo con <code>--reload</code>.</strong> En desarrollo, uvicorn reinicia el proceso en cada cambio, así que verás «abro/cierro recurso» muchas veces. En <code>--workers 4</code>, verás el arranque <strong>cuatro veces</strong>, una por worker. Es lo esperado: cada proceso tiene su propio <code>lifespan</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Recursos caros en <code>lifespan</code></td>
+              <td>Crear el engine/cliente dentro de la dependencia</td>
+              <td>Se reharía por petición; <code>lifespan</code> lo hace una vez por proceso</td>
+            </tr>
+            <tr>
+              <td>Envuélvelo en <code>try/finally</code></td>
+              <td>Dejar el cleanup sin proteger</td>
+              <td>Garantiza el cierre aunque el arranque o el apagado fallen a medias</td>
+            </tr>
+            <tr>
+              <td>Cierra explícitamente (<code>dispose</code>, <code>aclose</code>)</td>
+              <td>Confiar en que el proceso «ya limpiará»</td>
+              <td>En tests y reinicios se notan los recursos sin cerrar</td>
+            </tr>
+            <tr>
+              <td>Guarda solo recursos sin estado de usuario en <code>app.state</code></td>
+              <td>Guardar el usuario o la sesión de BD</td>
+              <td><code>app.state</code> se comparte entre todas las peticiones: sería una fuga de datos</td>
+            </tr>
+            <tr>
+              <td>Lee recursos por dependencia (<code>request.app.state</code>)</td>
+              <td>Importar un objeto global desde otro módulo</td>
+              <td>Rompe el acoplamiento oculto y permite sustituirlo en tests</td>
+            </tr>
+            <tr>
+              <td>Asume un <code>lifespan</code> por worker</td>
+              <td>Usar <code>app.state</code> para contadores globales entre workers</td>
+              <td>Cada proceso tiene su propia memoria: usa Redis o la BD</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Usar <code>@app.on_event</code> (deprecado)</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@app.on_event("startup")
+def startup():
+    app.state.engine = create_engine("sqlite:///./db.sqlite")
+
+@app.on_event("shutdown")
+def shutdown():
+    app.state.engine.dispose()   # dos funciones, estado compartido vía app.state
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = create_engine("sqlite:///./db.sqlite")
+    app.state.engine = engine
+    try:
+        yield
+    finally:
+        engine.dispose()
+
+app = FastAPI(lifespan=lifespan)
+</code></pre>
+        <p>Una sola función, el recurso es una <strong>variable local</strong> (no hay que rebuscarlo en <code>app.state</code> para cerrarlo) y el cierre está garantizado por <code>try/finally</code>.</p>
+
+        <h3>2. Crear el motor dentro de la dependencia</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">def get_engine() -&gt; Engine:
+    # Cada petición crea un motor NUEVO: abre pool, reserva recursos... y nunca se cierra
+    return create_engine("sqlite:///./db.sqlite")
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">def get_engine(request: Request) -&gt; Engine:
+    # El motor ya existe: lo creó lifespan y se cerrará en el apagado
+    return request.app.state.engine
+</code></pre>
+
+        <h3>3. Olvidar cerrar los recursos</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient()
+    yield
+    # ...nada: el cliente queda abierto y Python avisa al salir
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    client = httpx.AsyncClient()
+    app.state.http = client
+    try:
+        yield
+    finally:
+        await client.aclose()   # se cierran todos los sockets del pool
+</code></pre>
+
+        <h3>4. Estado de usuario en <code>app.state</code></h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@app.get("/me")
+def me(request: Request):
+    request.app.state.current_user = authenticate(request)   # ¡se ve desde OTRA petición!
+    return request.app.state.current_user
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python">@app.get("/me")
+def me(user: CurrentUser):      # dependencia por petición, aislada
+    return user
+</code></pre>
+        <p><code>app.state</code> es global al proceso: si guardas ahí el usuario, una petición puede leer el del anterior. Lo que depende del usuario va por dependencia (lección 1) o a la base de datos.</p>
+
+        <h3>5. Contadores globales entre workers</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre><code class="language-python">@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.request_count = 0     # con --workers 4 hay CUATRO contadores distintos
+    yield
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre><code class="language-python"># El conteo compartido va a un servicio externo accesible por todos los workers
+from redis.asyncio import Redis
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.redis = Redis.from_url("redis://localhost:6379")
+    try:
+        yield
+    finally:
+        await app.state.redis.aclose()
+</code></pre>
+        <p>Cada worker es un proceso con su propia memoria. Cualquier estado que deba ser único para toda la aplicación vive fuera: Redis, la base de datos, un servicio de métricas.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar un <code>lifespan</code> que cree y cierre un recurso, comprobar que se crea <em>una sola vez</em>, y verificar el ciclo de vida tanto en el servidor como en un test.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto:</strong>
+            <pre><code class="language-bash">uv init copiloto-lifespan
+cd copiloto-lifespan
+uv add fastapi "uvicorn[standard]"
+</code></pre>
+          </li>
+          <li>
+            <strong>Escribe la app</strong> con un recurso que lleva la cuenta de aperturas en <code>main.py</code>:
+            <pre><code class="language-python">from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request
+
+_opens = 0
+
+
+class Resource:
+    def __init__(self) -&gt; None:
+        self.items = ["alpha", "beta", "gamma"]
+
+    def close(self) -&gt; None:
+        self.items = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _opens
+    _opens += 1
+    app.state.resource = Resource()
+    try:
+        yield
+    finally:
+        app.state.resource.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_resource(request: Request) -&gt; Resource:
+    return request.app.state.resource
+
+
+ResourceDep = Annotated[Resource, Depends(get_resource)]
+
+
+@app.get("/items")
+def list_items(resource: ResourceDep):
+    return {"items": resource.items, "opens": _opens}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "opens": _opens}
+</code></pre>
+          </li>
+          <li>
+            <strong>Arranca y comprueba que se abre una sola vez:</strong>
+            <pre><code class="language-bash">uv run uvicorn main:app --reload
+
+# En otra terminal, llama varias veces:
+curl http://127.0.0.1:8000/items
+curl http://127.0.0.1:8000/items
+curl http://127.0.0.1:8000/health
+</code></pre>
+            <p><strong>Resultado esperado:</strong> <code>opens</code> vale <code>1</code> en todas las respuestas. El recurso se creó al arrancar y se reutiliza.</p>
+          </li>
+          <li>
+            <strong>Deja de usar el recurso por petición y comprueba el apagado:</strong> detén el servidor con <code>Ctrl+C</code>. En la consola verás el mensaje de <code>Application shutdown complete</code> y, si añades un <code>print("[lifespan] cierro")</code> en el <code>finally</code>, lo verás una sola vez por apagado (o por reinicio con <code>--reload</code>).</li>
+          <li>
+            <strong>Verifica el ciclo de vida en un test</strong> (guarda esto como <code>test_main.py</code>). Ojo: hay que usar <code>TestClient</code> como <em>context manager</em> para que dispare el <code>lifespan</code>:
+            <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from main import app
+
+
+def test_lifespan_inicia_y_cierra():
+    with TestClient(app) as client:
+        r = client.get("/items")
+        # Dentro del "with", el lifespan ya corrió: hay recursos
+        assert r.status_code == 200
+        assert r.json()["items"] == ["alpha", "beta", "gamma"]
+
+    # Fuera del "with", el lifespan ya se cerró: el recurso se vació
+    assert app.state.resource.items == []
+</code></pre>
+            <pre><code class="language-bash">uv run pytest -q
+# 1 passed
+</code></pre>
+          </li>
+          <li><strong>Verificación final:</strong> abre <code>/docs</code> y ejecuta <code>/items</code> varias veces. Todas devuelven <code>"opens": 1</code>. Cambia ahora <code>get_resource</code> para que <code>return Resource()</code> directamente y repite: verás los recursos multiplicarse. Acabas de demostrar por qué <code>lifespan</code> existe.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El arranque del Copiloto API</h3>
+          <p>Diseña el <code>lifespan</code> real del Copiloto API con tres recursos y su cierre ordenado. Debes lograr que:</p>
+          <ul>
+            <li>Se cree el <strong>motor de base de datos</strong> (<code>create_engine</code>) y un <strong>cliente <code>httpx.AsyncClient</code></strong> hacia el servicio de RAG.</li>
+            <li>Se cargue un <strong>índice en memoria</strong> (simúlalo con un <code>dict</code>) y se guarde en <code>app.state.rag_index</code>.</li>
+            <li>Al apagar, se cierren en <strong>orden inverso</strong> al de creación: primero el cliente, luego el índice y por último el engine (<code>dispose()</code>).</li>
+            <li>Si el cliente HTTP falla al crearse, el <code>finally</code> <strong>sigue</strong> cerrando el engine ya creado (protege el arranque parcial).</li>
+            <li>Un test con <code>with TestClient(app)</code> compruebe que <code>/health</code> ve los tres recursos, y que tras salir del <code>with</code> el índice quedó liberado.</li>
+          </ul>
+          <p><em>Pista: declara los recursos como variables locales y asígnalos a <code>app.state</code>; en el <code>finally</code>, cierra cada uno comprobando que no sea <code>None</code> (por si el arranque se quedó a medias). Recuerda que <code>httpx.AsyncClient.aclose()</code> es <em>awaitable</em> y que <code>lifespan</code> debe ser <code>async</code>. Si quieres ordenar el cierre, ciérralos con un <code>try/finally</code> anidado o guarda las funciones de cierre en una lista y ejecútalas en reversa.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>lifespan</code> es un <code>@asynccontextmanager</code> que separa el <strong>arranque</strong> (antes del <code>yield</code>) del <strong>apagado</strong> (después).</li>
+          <li>Los recursos caros e <strong>inmutables</strong> (engine, cliente HTTP, índice) se crean <strong>una vez por proceso</strong> y se guardan en <code>app.state</code>.</li>
+          <li>Las dependencias los <strong>leen</strong> con <code>request.app.state...</code>; nunca los construyen.</li>
+          <li><code>@app.on_event</code> está <strong>deprecado</strong>: usa <code>lifespan</code>, con <code>try/finally</code> y cierre explícito.</li>
+          <li>En <code>app.state</code> <strong>nunca</strong> va estado de usuario; y con varios workers hay un <code>lifespan</code> por worker.</li>
+          <li>En tests, <code>with TestClient(app) as client</code> dispara el <code>lifespan</code>; sin el <code>with</code>, no corre.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Definir lifespan</td><td><code>@asynccontextmanager</code> + <code>async def lifespan(app): ... yield ...</code></td></tr>
+            <tr><td>Registrarlo</td><td><code>app = FastAPI(lifespan=lifespan)</code></td></tr>
+            <tr><td>Compartir un recurso</td><td><code>app.state.engine = create_engine(...)</code></td></tr>
+            <tr><td>Leerlo por petición</td><td><code>request.app.state.engine</code> dentro de la dependencia</td></tr>
+            <tr><td>Cerrar limpiamente</td><td><code>engine.dispose()</code> / <code>await client.aclose()</code></td></tr>
+            <tr><td>Test con lifespan</td><td><code>with TestClient(app) as client:</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>lifespan</code> se ejecuta una vez por petición o una vez por proceso?</summary>
+            <div>
+              <p>Una vez por <strong>proceso</strong> de servidor: al arrancar y al apagar. En desarrollo con <code>--reload</code>, cada reinicio dispara un ciclo completo. En producción con <code>--workers N</code>, hay <em>N</em> <code>lifespan</code> independientes, uno por worker.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo seguir usando <code>@app.on_event("startup")</code>?</summary>
+            <div>
+              <p>Técnicamente sí, pero está <strong>deprecado</strong> y desaparecerá. <code>lifespan</code> lo sustituye con ventajas claras: una sola función, estado compartido natural entre arranque y apagado, cierre garantizado con <code>try/finally</code> y compatibilidad con el protocolo ASGI estándar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi recurso no se cierra al parar con <code>Ctrl+C</code>?</summary>
+            <div>
+              <p>Probablemente creaste el recurso al <strong>importar</strong> el módulo (a nivel de módulo) o sin <code>finally</code>, o estás matando el proceso de forma abrupta. <code>lifespan</code> solo garantiza el apagado en una parada ordenada; para señales duras haz el cleanup dentro del <code>finally</code> y evita crear recursos fuera de <code>lifespan</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi test no ejecuta el <code>lifespan</code>?</summary>
+            <div>
+              <p>Porque <code>TestClient(app)</code> sin el <code>with</code> no arranca el ciclo de vida. Usa <code>with TestClient(app) as client:</code> para que se ejecute el arranque antes del <code>with</code> y el apagado al salir. Es la forma de probar que tus recursos se crean y se liberan de verdad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde guardo la conexión de base de datos de <em>una</em> petición si el engine va en <code>app.state</code>?</summary>
+            <div>
+              <p>El <strong>engine</strong> (pool) va en <code>app.state</code> porque es caro y compartido. La <strong>sesión</strong> (<code>Session(engine)</code>) es por petición y va en una dependencia con <code>yield</code>, como viste en la lección 2. Uno vive con la app; la otra, con la petición.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-repositorios">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>El patrón repositorio — Módulo 4 · Curso FastAPI</title>
+  <meta name="description" content="Patrón repositorio en FastAPI: separa las capas, esconde el acceso a datos detrás de una interfaz e inyecta el repositorio por dependencia para ganar testabilidad.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>El patrón repositorio</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Datos y persistencia</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora, tus endpoints contienen SQL: abren la sesión, escriben <code>select(...)</code>, filtran, ordenan y devuelven. Funciona. Pero cuando la misma consulta aparece en tres endpoints, cuando quieres cambiar cómo se guarda algo y tocas diez sitios, o cuando quieres <strong>testear un endpoint sin base de datos</strong>, ese acoplamiento se convierte en un lastre. La capa HTTP está haciendo de capa de datos, y eso es mezclar responsabilidades.</p>
+        <p>El <strong>patrón repositorio</strong> es la respuesta clásica: crear un objeto cuyo único trabajo es <em>obtener y guardar</em> entidades de dominio, y esconder detrás de él <em>cómo</em> se hace. Tus endpoints piden «dame los últimos logs» y no saben (ni les importa) si eso es un <code>SELECT</code> en SQLite, una llamada a PostgreSQL o un diccionario en memoria.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque es la costura que une todo el módulo: los modelos (lección 1) se persisten a través de una sesión (lección 2) cuyo esquema evoluciona con Alembic (lección 3), y el repositorio es quien encapsula esas consultas. Además enlaza con la inyección de dependencias del Módulo 3: el repositorio es una dependencia más, y por eso se puede <strong>sustituir por un doble en los tests</strong> (Módulo 6).</p>
+        </div>
+        <p>Errores típicos que veremos: repositorios que hacen <code>commit()</code> (robando la transacción al caso de uso), repositorios que devuelven objetos ORM con relaciones perezosas (y disparan un N+1 fuera de la sesión), repositorios que lanzan peticiones HTTP o mandan correos, y abstracciones exageradas donde cada consulta tiene su método.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Separar capas: quién hace qué</h3>
+        <p>Una API sana tiene capas con responsabilidades claras. El repositorio introduce una frontera entre la lógica de aplicación y el acceso a datos.</p>
+        <pre class="diagram">
+   ┌──────────┐   Pydantic   ┌────────────┐   entidades   ┌──────────────┐
+   │  Router  │ ───────────► │  Servicio  │ ────────────► │ Repositorio  │
+   │ (HTTP)   │ ◄─────────── │ (casos de  │ ◄──────────── │ (consultas)  │
+   └──────────┘   models     │  uso)      │   modelos     └──────┬───────┘
+        ▲                     └────────────┘                      │
+        │                                                          ▼
+   contrato OpenAPI                                        ┌──────────────┐
+                                                           │ Session / DB │
+                                                           └──────────────┘
+        </pre>
+        <ul>
+          <li><strong>Router</strong>: traduce HTTP a llamadas de Python. Valida la entrada, decide el código de estado, modela la salida. <em>No sabe SQL.</em></li>
+          <li><strong>Servicio</strong> (opcional pero recomendable): orquesta el caso de uso, es el dueño de la <strong>transacción</strong> y del <code>commit</code> (lección 2).</li>
+          <li><strong>Repositorio</strong>: encapsula las consultas y la persistencia. Sabe SQL; no sabe nada de HTTP ni de reglas de negocio.</li>
+        </ul>
+
+        <h3>El repositorio es un <em>puerto</em></h3>
+        <p>La idea viene de la arquitectura hexagonal: defines un <strong>puerto</strong> (una interfaz, en Python un <code>Protocol</code>) que describe <em>qué</em> operaciones necesitas, y un <strong>adaptador</strong> que las implementa con una tecnología concreta. Tu código de aplicación depende del puerto, no del adaptador.</p>
+        <div class="code-file">app/repositories/queries.py — el puerto</div>
+        <pre><code class="language-python">from typing import Protocol
+
+from app.models import QueryLog
+
+
+class QueryLogRepository(Protocol):
+    """Puerto: lo que la aplicación necesita, sin tecnología detrás."""
+
+    def add(self, log: QueryLog) -&gt; None: ...
+    def get(self, log_id: int) -&gt; QueryLog | None: ...
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]: ...
+</code></pre>
+        <p>Fíjate en que la interfaz no menciona <code>Session</code>, ni SQL, ni SQLite. Solo habla de <code>QueryLog</code>. Ese es el contrato que el resto de la aplicación conoce.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un restaurante no dice «tráeme el plato de la cocina del fondo, en la bandeja metálica, con el cocinero de turno». Dice «tráeme la sopa». El camarero (puerto) conoce el menú; la cocina (adaptador) decide cómo se prepara. Si mañana cambian los fogones, el camarero sigue pidiendo «la sopa» igual.</p>
+        </div>
+
+        <h3>El adaptador: la implementación con SQLModel</h3>
+        <div class="code-file">app/repositories/queries.py — el adaptador</div>
+        <pre><code class="language-python">from sqlmodel import Session, select
+
+from app.models import QueryLog
+
+
+class SqlQueryLogRepository:
+    """Adaptador: implementa el puerto sobre SQLModel + SQLAlchemy."""
+
+    def __init__(self, session: Session) -&gt; None:
+        self._session = session          # la sesión es un detalle privado
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)           # NO confirma: eso es del caso de uso
+
+    def get(self, log_id: int) -&gt; QueryLog | None:
+        return self._session.get(QueryLog, log_id)
+
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]:
+        statement = select(QueryLog).order_by(QueryLog.created_at.desc()).limit(limit)
+        return list(self._session.exec(statement).all())
+</code></pre>
+        <p>El <code>session</code> se pasa en el constructor y se guarda como <code>self._session</code>: nadie de fuera lo ve. El repositorio <strong>no confirma</strong> la transacción; solo <em>prepara</em> cambios (<code>add</code>) y <em>lee</em>. Quién confirma lo decide la capa superior, para que una operación que toca varias tablas siga siendo atómica (lección 2).</p>
+
+        <h3>Inyectar el repositorio por dependencia</h3>
+        <p>Como es un objeto normal de Python, se construye con la sesión y se ofrece a los endpoints con <code>Depends</code>, exactamente igual que en el Módulo 3:</p>
+        <div class="code-file">app/deps.py</div>
+        <pre><code class="language-python">from fastapi import Depends
+from sqlmodel import Session
+
+from app.db import get_session
+from app.repositories.queries import QueryLogRepository, SqlQueryLogRepository
+
+
+def get_query_log_repository(
+    session: Session = Depends(get_session),
+) -&gt; QueryLogRepository:
+    return SqlQueryLogRepository(session)   # devuelve el puerto, no el adaptador
+</code></pre>
+        <p>El endpoint depende del <strong>tipo del puerto</strong> (<code>QueryLogRepository</code>) y FastAPI le inyecta el adaptador concreto. Esa indirección de un solo nivel es lo que hace que en los tests puedas cambiar el adaptador por un <em>fake</em> sin tocar el endpoint.</p>
+
+        <h3>La recompensa: testabilidad</h3>
+        <p>Con <code>dependency_overrides</code> de FastAPI, sustituyes la implementación real por una en memoria. El test corre sin base de datos, sin ficheros y sin limpieza:</p>
+        <div class="code-file">tests/test_logs.py</div>
+        <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from app.deps import get_query_log_repository
+from app.main import app
+from app.models import QueryLog
+
+
+class FakeQueryLogRepository:
+    def __init__(self) -&gt; None:
+        self._items: list[QueryLog] = []
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._items.append(log)
+
+    def get(self, log_id: int) -&gt; QueryLog | None:
+        return next((item for item in self._items if item.id == log_id), None)
+
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]:
+        return list(self._items[-limit:])
+
+
+def test_list_logs_sin_base_de_datos() -&gt; None:
+    fake = FakeQueryLogRepository()
+    fake.add(QueryLog(id=1, question="¿Qué es Depends?"))
+    app.dependency_overrides[get_query_log_repository] = lambda: fake
+
+    client = TestClient(app)
+    response = client.get("/logs")
+
+    assert response.status_code == 200
+    assert response.json()[0]["question"] == "¿Qué es Depends?"
+
+    app.dependency_overrides.clear()
+</code></pre>
+        <div class="callout callout--tip">
+          <p>El <em>fake</em> no simula la base de datos: simula el <strong>puerto</strong>. Por eso es tan corto. En el Módulo 6 verás cuándo conviene un <em>fake</em> (rápido, sin infraestructura) y cuándo una base de datos temporal de verdad (para probar el SQL real).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un repositorio, sin interfaces ni capas, para ver la idea desnuda. Solo encapsula dos consultas:</p>
+        <div class="code-file">app/repositories/queries.py</div>
+        <pre><code class="language-python">from sqlmodel import Session, select
+
+from app.models import QueryLog
+
+
+class QueryLogRepository:
+    def __init__(self, session: Session) -&gt; None:
+        self._session = session
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)
+
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]:
+        statement = (
+            select(QueryLog)
+            .order_by(QueryLog.created_at.desc())
+            .limit(limit)
+        )
+        return list(self._session.exec(statement).all())
+</code></pre>
+        <p>Y el endpoint, ya sin SQL a la vista:</p>
+        <div class="code-file">app/routers/logs.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends
+
+from app.deps import get_query_log_repository
+from app.repositories.queries import QueryLogRepository
+
+router = APIRouter()
+
+
+@router.get("/logs")
+def list_logs(repo: QueryLogRepository = Depends(get_query_log_repository)) -&gt; list[QueryLog]:
+    return repo.list_recent()
+</code></pre>
+        <p>Compara con la versión acoplada:</p>
+        <div class="code-label code-label--wrong">✗ El endpoint sabe SQL, sesión y orden</div>
+        <pre><code class="language-python">@router.get("/logs")
+def list_logs(session: Session = Depends(get_session)):
+    statement = select(QueryLog).order_by(QueryLog.created_at.desc()).limit(20)
+    return session.exec(statement).all()
+</code></pre>
+        <div class="code-label code-label--right">✓ El endpoint pide el resultado, no la consulta</div>
+        <pre><code class="language-python">@router.get("/logs")
+def list_logs(repo: QueryLogRepository = Depends(get_query_log_repository)):
+    return repo.list_recent()
+</code></pre>
+        <p>Con una sola consulta, ambos parecen iguales. La diferencia aparece cuando esa consulta se reutiliza, cuando cambia el orden por defecto, o cuando quieres testear el endpoint sin base de datos.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Copiloto API, con las tres capas bien separadas. El router orquesta, el servicio decide, el repositorio consulta.</p>
+        <div class="code-file">app/repositories/queries.py</div>
+        <pre><code class="language-python">from typing import Protocol
+
+from sqlmodel import Session, select
+
+from app.models import QueryLog
+
+
+class QueryLogRepository(Protocol):
+    def add(self, log: QueryLog) -&gt; None: ...
+    def get(self, log_id: int) -&gt; QueryLog | None: ...
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]: ...
+    def list_by_module(self, module_slug: str) -&gt; list[QueryLog]: ...
+
+
+class SqlQueryLogRepository:
+    def __init__(self, session: Session) -&gt; None:
+        self._session = session
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)
+
+    def get(self, log_id: int) -&gt; QueryLog | None:
+        return self._session.get(QueryLog, log_id)
+
+    def list_recent(self, limit: int = 20) -&gt; list[QueryLog]:
+        statement = select(QueryLog).order_by(QueryLog.created_at.desc()).limit(limit)
+        return list(self._session.exec(statement).all())
+
+    def list_by_module(self, module_slug: str) -&gt; list[QueryLog]:
+        statement = (
+            select(QueryLog)
+            .where(QueryLog.module_slug == module_slug)
+            .order_by(QueryLog.created_at.desc())
+        )
+        return list(self._session.exec(statement).all())
+</code></pre>
+        <div class="code-file">app/services/ask.py</div>
+        <pre><code class="language-python">from app.models import QueryLog
+from app.repositories.queries import QueryLogRepository
+
+
+def register_question(repo: QueryLogRepository, question: str, module_slug: str) -&gt; QueryLog:
+    """Caso de uso: registra la pregunta. NO confirma la transacción."""
+    log = QueryLog(question=question, module_slug=module_slug)
+    repo.add(log)
+    return log
+</code></pre>
+        <div class="code-file">app/routers/logs.py</div>
+        <pre><code class="language-python">from fastapi import APIRouter, Depends
+from sqlmodel import Session
+
+from app.db import get_session
+from app.deps import get_query_log_repository
+from app.repositories.queries import QueryLogRepository
+from app.schemas import QueryLogPublic
+from app.services.ask import register_question
+
+router = APIRouter()
+
+
+@router.get("/logs", response_model=list[QueryLogPublic])
+def list_logs(repo: QueryLogRepository = Depends(get_query_log_repository)):
+    return repo.list_recent()
+
+
+@router.get("/modules/{slug}/logs", response_model=list[QueryLogPublic])
+def list_module_logs(
+    slug: str,
+    repo: QueryLogRepository = Depends(get_query_log_repository),
+):
+    return repo.list_by_module(slug)
+
+
+@router.post("/logs", response_model=QueryLogPublic, status_code=201)
+def create_log(
+    question: str,
+    module_slug: str,
+    repo: QueryLogRepository = Depends(get_query_log_repository),
+    session: Session = Depends(get_session),      # dueño de la transacción
+):
+    log = register_question(repo, question, module_slug)
+    session.commit()                              # un solo commit, aquí
+    session.refresh(log)
+    return log
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Tres capas, tres responsabilidades</strong>: el repo sabe <em>cómo</em> consultar (SQL, orden, límite), el servicio sabe <em>qué</em> operaciones componen el caso de uso, y el router sabe de HTTP.</li>
+          <li><strong>La transacción vive en el router/servicio, no en el repo</strong>: <code>register_question</code> solo hace <code>add</code>; el <code>commit</code> está en el borde. Así el caso de uso puede componer varias escrituras atómicas.</li>
+          <li><strong>El repo devuelve modelos de dominio</strong> (los <code>QueryLog</code> de SQLModel), no diccionarios ni filas crudas. La conversión a schema público la hace <code>response_model</code>.</li>
+          <li><strong>El endpoint depende del <code>Protocol</code></strong>, no de <code>SqlQueryLogRepository</code>: el tipo que ve el router es el puerto, y eso documenta la intención y habilita el <em>override</em> en tests.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>¿Merece la pena siempre?</strong> No. Para un CRUD de tres endpoints, el repositorio puede ser ceremonia. Merece la pena cuando las consultas se repiten, cuando hay reglas que quieres testear sin base de datos, o cuando prevés cambiar de tecnología. Como toda abstracción, se paga en capas y se cobra en flexibilidad.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un repositorio por agregado/entidad (<code>QueryLogRepository</code>)</td>
+              <td>Un «GodRepository» con métodos de todo</td>
+              <td>Mantiene cada clase pequeña y con una responsabilidad clara</td>
+            </tr>
+            <tr>
+              <td>Operar dentro de una sesión que <em>no</em> es tuya</td>
+              <td>Que el repositorio haga <code>commit()</code></td>
+              <td>La transacción pertenece al caso de uso; el repo solo prepara y lee</td>
+            </tr>
+            <tr>
+              <td>Devolver modelos de dominio ya cargados</td>
+              <td>Devolver ORM con relaciones perezosas sin cargar</td>
+              <td>El consumidor dispara un N+1 fuera de la sesión: <code>DetachedInstanceError</code></td>
+            </tr>
+            <tr>
+              <td>Modelar el puerto con <code>Protocol</code></td>
+              <td>Hacer que el router instancie <code>SqlQueryLogRepository</code> a mano</td>
+              <td>Permite sustituir el adaptador (tests, otra base de datos) sin tocar el router</td>
+            </tr>
+            <tr>
+              <td>Métodos por <em>necesidad del dominio</em> (<code>list_recent</code>)</td>
+              <td>Un método genérico <code>query(**kwargs)</code> que todo lo puede</td>
+              <td>Un repositorio que acepta cualquier filtro es SQL disfrazado: no abstrae nada</td>
+            </tr>
+            <tr>
+              <td>Dejar que las excepciones de datos suban</td>
+              <td>Capturarlas y devolver <code>None</code> «para no romper»</td>
+              <td>Ocultar errores convierte bugs en datos corruptos silenciosos</td>
+            </tr>
+            <tr>
+              <td>Efectos de red/correo fuera del repositorio</td>
+              <td>Enviar emails o llamar APIs dentro del repo</td>
+              <td>El repo accede a datos; los efectos externos son otro puerto</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>El repositorio roba la transacción</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">class SqlQueryLogRepository:
+    def __init__(self, session: Session) -&gt; None:
+        self._session = session
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)
+        self._session.commit()      # ¡confirma dentro del repo!
+
+# El caso de uso que quería dos escrituras atómicas ya no puede
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">class SqlQueryLogRepository:
+    def __init__(self, session: Session) -&gt; None:
+        self._session = session
+
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)      # solo prepara
+
+# El dueño de la transacción confirma cuando terminó su unidad de trabajo
+session.commit()
+</code></pre>
+        <p>Con <code>commit</code> dentro del repo, cada llamada es una transacción y ninguna operación multi-tabla es atómica. La lección 2 lo dejó claro: un solo dueño del <code>commit</code>.</p>
+
+        <h3>Devolver ORM con relaciones perezosas</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def get_module(self, slug: str) -&gt; Module | None:
+    return self._session.exec(select(Module).where(Module.slug == slug)).first()
+
+# Fuera del repo, la sesión ya se cerró:
+# module.logs  →  DetachedInstanceError (o un N+1 si sigue abierta)
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">from sqlalchemy.orm import selectinload
+
+def get_module_with_logs(self, slug: str) -&gt; Module | None:
+    statement = (
+        select(Module)
+        .where(Module.slug == slug)
+        .options(selectinload(Module.logs))    # se carga aquí, dentro de la sesión
+    )
+    return self._session.exec(statement).first()
+</code></pre>
+        <p>Si el repositorio entrega un objeto con relaciones sin cargar, el que lo consume intentará tocarlas cuando la sesión ya no exista. Carga lo que vayas a usar <strong>antes</strong> de devolverlo.</p>
+
+        <h3>El repositorio hace de todo</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">class QueryLogRepository:
+    def create_and_notify(self, question: str) -&gt; QueryLog:
+        log = QueryLog(question=question)
+        self._session.add(log)
+        self._session.commit()
+        send_email("admin@copiloto.dev", question)   # efecto externo
+        requests.post("https://metrics/...")         # red (y además sync en async)
+        return log
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">class QueryLogRepository:
+    def add(self, log: QueryLog) -&gt; None:
+        self._session.add(log)        # solo datos
+
+# La notificación es otro puerto/servicio, y se hace fuera de la transacción
+repo.add(log)
+session.commit()
+notifier.send(log)                    # efecto externo, aparte
+</code></pre>
+        <p>Un repositorio que manda correos o llama a APIs deja de ser testeable, mezcla responsabilidades y complica las transacciones (¿qué pasa si el email se envía y luego falla el <code>commit</code>?).</p>
+
+        <h3>Abstracción excesiva</h3>
+        <div class="code-label code-label--wrong">✗ Incorrecto</div>
+        <pre><code class="language-python">def query(self, **filters) -&gt; list[QueryLog]:
+    statement = select(QueryLog)
+    for key, value in filters.items():
+        statement = statement.where(getattr(QueryLog, key) == value)
+    return list(self._session.exec(statement).all())
+# El router acaba escribiendo: repo.query(module_slug="fastapi")  → es SQL con otro nombre
+</code></pre>
+        <div class="code-label code-label--right">✓ Correcto</div>
+        <pre><code class="language-python">def list_by_module(self, module_slug: str) -&gt; list[QueryLog]:
+    statement = select(QueryLog).where(QueryLog.module_slug == module_slug)
+    return list(self._session.exec(statement).all())
+# El router dice QUÉ quiere, no CÓMO filtrarlo
+</code></pre>
+        <p>Un método que acepta cualquier combinación de filtros es SQL disfrazado: no esconde nada, solo lo hace menos seguro de tipos. Los métodos del repositorio se nombran por <strong>intención</strong>, no por mecánica.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir un repositorio para <code>Module</code>, inyectarlo como dependencia y probar el endpoint con un <em>fake</em>, sin base de datos.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Define el puerto.</strong> Crea <code>app/repositories/modules.py</code>:
+            <pre><code class="language-python">from typing import Protocol
+
+from app.models import Module
+
+
+class ModuleRepository(Protocol):
+    def get_by_slug(self, slug: str) -&gt; Module | None: ...
+    def list_all(self) -&gt; list[Module]: ...
+    def add(self, module: Module) -&gt; None: ...
+</code></pre>
+            <p>Resultado esperado: el <code>Protocol</code> importa sin dependencia de SQLAlchemy (la interfaz es pura aplicación).</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Implementa el adaptador.</strong> En el mismo fichero, <code>SqlModuleRepository</code> con <code>Session</code> en el constructor. <code>get_by_slug</code> usa <code>select(Module).where(Module.slug == slug)</code>; <code>list_all</code> ordena por <code>Module.title</code>.
+          </li>
+          <li>
+            <strong>Paso 3 — Dependencia.</strong> En <code>app/deps.py</code>, añade <code>get_module_repository(session: Session = Depends(get_session)) -> ModuleRepository</code> que devuelva <code>SqlModuleRepository(session)</code>.
+          </li>
+          <li>
+            <strong>Paso 4 — Endpoint sin SQL.</strong> Reescribe <code>GET /modules</code> para que use <code>repo.list_all()</code> y no mencione <code>Session</code> ni <code>select</code>. Comprueba en <code>/docs</code> que el contrato no cambió (mismo <code>response_model</code>).
+          </li>
+          <li>
+            <strong>Paso 5 — El <em>fake</em> y el test.</strong> Crea <code>tests/test_modules.py</code>:
+            <pre><code class="language-python">from fastapi.testclient import TestClient
+
+from app.deps import get_module_repository
+from app.main import app
+from app.models import Module
+
+
+class FakeModuleRepository:
+    def __init__(self, items: list[Module]) -&gt; None:
+        self._items = items
+
+    def get_by_slug(self, slug: str) -&gt; Module | None:
+        return next((m for m in self._items if m.slug == slug), None)
+
+    def list_all(self) -&gt; list[Module]:
+        return sorted(self._items, key=lambda m: m.title)
+
+    def add(self, module: Module) -&gt; None:
+        self._items.append(module)
+
+
+def test_modules_sin_db():
+    fake = FakeModuleRepository([Module(id=1, slug="fastapi", title="FastAPI")])
+    app.dependency_overrides[get_module_repository] = lambda: fake
+
+    client = TestClient(app)
+    response = client.get("/modules")
+
+    assert response.status_code == 200
+    assert [m["slug"] for m in response.json()] == ["fastapi"]
+    app.dependency_overrides.clear()
+</code></pre>
+            <p>Ejecuta <code>uv run pytest -q</code>. Resultado esperado: <code>1 passed</code>. El test no toca ninguna base de datos: sustituye el puerto por un doble.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Verifica la separación.</strong> Busca en <code>app/routers/</code> las apariciones de <code>select(</code> o <code>Session</code>:
+            <pre><code class="language-bash">grep -rn "select(\|Session" app/routers/ || echo "Los routers no conocen la base de datos"
+</code></pre>
+            <p>Resultado esperado: ninguna aparición (o solo la dependencia de <code>session</code> cuando el endpoint es dueño del <code>commit</code>). Los routers han dejado de saber SQL.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un repositorio base genérico</h3>
+          <p>Escribe una clase <code>BaseRepository[T]</code> genérica (usa <code>TypeVar</code> y <code>Generic</code>) que implemente <code>add</code>, <code>get</code>, <code>list_all</code> y <code>delete</code> para cualquier modelo de SQLModel con <code>id</code> entero. Después haz que <code>SqlQueryLogRepository</code> y <code>SqlModuleRepository</code> la hereden y solo añadan sus métodos específicos (<code>list_recent</code>, <code>get_by_slug</code>…).</p>
+          <p><em>Pistas: necesitas conocer la clase del modelo en tiempo de ejecución; pasa el tipo al constructor (<code>model: type[T]</code>) y guárdalo en <code>self._model</code>, o usa los genéricos de SQLAlchemy. Para el <code>Protocol</code>, defínete un puerto genérico equivalente. Y respóndete a esto: ¿el <code>BaseRepository</code> genérico hace el código <strong>más claro</strong> o solo <strong>más corto</strong>? Un repositorio genérico que expone <code>list_all</code> para todo puede tentarte a saltarte consultas con nombre de dominio: si eso pasa, has perdido la principal ventaja del patrón. Documenta tu decisión.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>repositorio</strong> encapsula el acceso a datos detrás de métodos con nombre de dominio, y esconde <em>cómo</em> se consulta.</li>
+          <li>Separación de capas: <strong>router</strong> (HTTP) → <strong>servicio</strong> (casos de uso y transacción) → <strong>repositorio</strong> (SQL) → <strong>sesión/DB</strong>.</li>
+          <li>El puerto se modela con <code>Protocol</code>; el adaptador (<code>SqlXRepository</code>) lo implementa con SQLModel.</li>
+          <li>Se <strong>inyecta por dependencia</strong>: el endpoint depende del puerto, FastAPI entrega el adaptador.</li>
+          <li>El repositorio <strong>no confirma</strong> la transacción: solo prepara cambios y lee; el <code>commit</code> vive en el caso de uso.</li>
+          <li>Los métodos se nombran por <strong>intención</strong> (<code>list_recent</code>), no por mecánica (<code>query(**filters)</code>).</li>
+          <li>La gran recompensa es la <strong>testabilidad</strong>: <code>dependency_overrides</code> cambia el adaptador por un <em>fake</em> y el test corre sin base de datos.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Puerto (interfaz)</td><td><code>class QueryLogRepository(Protocol): ...</code></td></tr>
+            <tr><td>Adaptador</td><td><code>class SqlQueryLogRepository:</code> con <code>Session</code> en <code>__init__</code></td></tr>
+            <tr><td>Dependencia</td><td><code>def get_query_log_repository(session=Depends(get_session)): ...</code></td></tr>
+            <tr><td>Uso en el endpoint</td><td><code>repo: QueryLogRepository = Depends(get_query_log_repository)</code></td></tr>
+            <tr><td>Transacción</td><td><code>session.commit()</code> en la capa de caso de uso, no en el repo</td></tr>
+            <tr><td>Test sin DB</td><td><code>app.dependency_overrides[get_query_log_repository] = lambda: fake</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No es demasiada indirección para una API pequeña?</summary>
+            <div>
+              <p>A veces sí. Si tu API son tres endpoints y no crece, el repositorio puede ser ceremonia. El patrón se paga cuando las consultas se reutilizan, cuando quieres testear la lógica sin base de datos o cuando prevés cambiar de tecnología. Adóptalo cuando el dolor de no tenerlo sea real, no por dogma.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>Protocol</code> y no una clase abstracta (<code>ABC</code>)?</summary>
+            <div>
+              <p><code>Protocol</code> permite <em>tipado estructural</em>: cualquier clase que tenga los métodos correctos satisface la interfaz, sin heredar de nada. Eso hace que el <em>fake</em> de los tests sea trivial (no necesita importar tu jerarquía). Con <code>ABC</code> tendrías que heredar explícitamente. Ambos son válidos; <code>Protocol</code> encaja mejor con dependencias intercambiables.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El repositorio debe conocer los <em>schemas</em> de Pydantic?</summary>
+            <div>
+              <p>No. El repositorio trabaja con <strong>modelos de dominio</strong> (los de SQLModel). La traducción a schemas de entrada/salida es responsabilidad del router y de <code>response_model</code>. Mantener esa frontera evita que un cambio de contrato HTTP obligue a tocar la capa de datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Quién cierra la sesión del repositorio?</summary>
+            <div>
+              <p>La dependencia <code>get_session</code> con <code>yield</code> (lección 2). El repositorio recibe una sesión ya abierta y la usa, pero no la cierra. Como el repositorio también se construye por dependencia, FastAPI compone la cadena: abre la sesión, construye el repo, ejecuta el endpoint y cierra todo al terminar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un repositorio puede abarcar varias entidades relacionadas?</summary>
+            <div>
+              <p>Sí, si forman un <em>agregado</em> (se guardan y se consultan juntas). La regla práctica es un repositorio por agregado, no por tabla. Si dos entidades siempre se usan por separado, mejor dos repositorios; si una no tiene sentido sin la otra, van juntas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

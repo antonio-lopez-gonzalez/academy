@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="03-validacion-y-tipos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Validación y tipos — Módulo 1 · Curso FastAPI</title>
+  <meta name="description" content="Validación en Pydantic v2: Field y constraints, field_validator y model_validator, tipos especiales (EmailStr, HttpUrl, UUID, Enum, Literal) y la forma exacta del error 422 de FastAPI.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('fapi-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Validación y tipos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Rutas y datos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior viste que <em>el tipo define la validación</em>: un campo <code>int</code> rechaza un texto. Pero las reglas de negocio reales van mucho más allá del tipo: «la pregunta debe tener al menos 3 caracteres», «el <code>top_k</code> está entre 1 y 10», «el email debe tener forma de email», «el slug solo admite minúsculas y guiones». Esta lección te enseña a expresar todo eso <strong>dentro del modelo</strong>, con <code>Field</code>, constraints y validadores.</p>
+        <p>Y como toda validación puede fallar, dedicamos la segunda mitad a la pieza que hace a FastAPI tan agradable de depurar: la <strong>forma del error 422</strong>. Entender su estructura (<code>detail</code>, <code>loc</code>, <code>type</code>, <code>msg</code>, <code>input</code>, <code>ctx</code>) es lo que te permite leer un error y arreglarlo sin adivinar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué declarar las reglas en el modelo y no en el handler?</strong> Porque así existe <em>una sola fuente de verdad</em>: la regla valida la petición, se documenta en <code>/docs</code>, alimenta el esquema OpenAPI y puede reutilizarse en tests y en otros endpoints. Una regla escrita en un <code>if</code> dentro del handler no documenta nada y hay que recordar mantenerla en cada sitio.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La cadena de validación de Pydantic v2</h3>
+        <p>Antes de empezar, ubiquémonos. Cuando llega una petición, Pydantic v2 recorre el modelo en capas:</p>
+        <div class="diagram">
+JSON recibido
+   │
+   ▼
+[1] Parseo JSON           -> ¿es JSON válido?
+   │
+   ▼
+[2] Conversión de tipos   -> "4" -> 4, "2026-01-31" -> datetime
+   │
+   ▼
+[3] Constraints de Field  -> ge/le, min_length, pattern, ...
+   │
+   ▼
+[4] Validadores           -> field_validator / model_validator
+   │
+   ▼
+Instancia del modelo (datos garantizados)
+        </div>
+        <p>Todas las capas, al fallar, producen el mismo formato de error. Y todas se declaran de forma <strong>declarativa</strong> en la clase.</p>
+
+        <h3><code>Field</code>: restricciones y metadatos por campo</h3>
+        <p><code>Field</code> se usa (con <code>Annotated</code>) para añadir restricciones y documentación a un campo:</p>
+        <pre><code class="language-python">from typing import Annotated
+from pydantic import BaseModel, Field
+
+class AskRequest(BaseModel):
+    question: Annotated[str, Field(min_length=3, max_length=2000,
+                                   description="La pregunta del usuario")]
+    top_k: Annotated[int, Field(ge=1, le=10)] = 4
+    temperature: Annotated[float, Field(ge=0.0, le=2.0)] = 0.2
+</code></pre>
+        <table>
+          <thead><tr><th>Constraint</th><th>Aplica a</th><th>Significado</th></tr></thead>
+          <tbody>
+            <tr><td><code>gt</code> / <code>ge</code></td><td>números</td><td>mayor que / mayor o igual</td></tr>
+            <tr><td><code>lt</code> / <code>le</code></td><td>números</td><td>menor que / menor o igual</td></tr>
+            <tr><td><code>min_length</code> / <code>max_length</code></td><td>str, list, set, dict</td><td>longitud mínima/máxima</td></tr>
+            <tr><td><code>pattern</code></td><td>str</td><td>expresión regular que debe cumplir</td></tr>
+            <tr><td><code>multiple_of</code></td><td>números</td><td>debe ser múltiplo de ese valor</td></tr>
+            <tr><td><code>description</code>, <code>examples</code>, <code>title</code></td><td>todos</td><td>metadatos que salen en <code>/docs</code></td></tr>
+            <tr><td><code>default_factory</code></td><td>list/dict/set</td><td>fábrica del valor por defecto</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Vienes de Pydantic v1:</strong> <code>conint</code>, <code>constr</code>, <code>conlist</code> siguen existiendo pero la forma actual es <code>Annotated[int, Field(...)]</code>. Además, para listas, <code>min_items</code>/<code>max_items</code> se llaman ahora <code>min_length</code>/<code>max_length</code>. Usa siempre el estilo de v2.</p>
+        </div>
+
+        <h3>Tipos especiales: validación «de dominio» gratis</h3>
+        <p>Pydantic v2 trae tipos que ya saben validar conceptos comunes. Reutilizarlos es mejor que escribir tu propia expresión regular:</p>
+        <table>
+          <thead><tr><th>Tipo</th><th>Valida</th><th>Notas</th></tr></thead>
+          <tbody>
+            <tr><td><code>EmailStr</code></td><td>Un email con forma válida</td><td>Requiere <code>uv add email-validator</code></td></tr>
+            <tr><td><code>HttpUrl</code></td><td>Una URL http/https válida</td><td>Devuelve un objeto URL</td></tr>
+            <tr><td><code>UUID</code></td><td>Un identificador UUID</td><td>Convierte texto a <code>UUID</code></td></tr>
+            <tr><td><code>datetime</code> / <code>date</code> / <code>time</code></td><td>Fechas y horas ISO 8601</td><td>Del módulo estándar <code>datetime</code></td></tr>
+            <tr><td><code>Decimal</code></td><td>Decimales exactos</td><td>Para dinero</td></tr>
+            <tr><td><code>Enum</code></td><td>Un conjunto cerrado y nombrado</td><td>Mejor que <code>Literal</code> si necesitas reutilizar/comparar</td></tr>
+            <tr><td><code>Literal["a", "b"]</code></td><td>Un conjunto cerrado en línea</td><td>Sintaxis directa de <code>typing</code></td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-python">from enum import Enum
+from pydantic import BaseModel, EmailStr, HttpUrl
+
+class Level(str, Enum):           # heredar de str facilita serializar
+    basico = "basico"
+    intermedio = "intermedio"
+    avanzado = "avanzado"
+
+class Feedback(BaseModel):
+    author_email: EmailStr
+    module_url: HttpUrl
+    level: Level = Level.basico
+</code></pre>
+
+        <h3>Validadores: reglas que no caben en un constraint</h3>
+        <p>Cuando la regla es más compleja que un rango o una longitud, se escribe un <strong>validador</strong>. En v2 se declaran con decoradores:</p>
+        <pre><code class="language-python">from pydantic import BaseModel, field_validator
+
+class AskRequest(BaseModel):
+    question: str
+    tags: list[str] = []
+
+    @field_validator("question")
+    @classmethod
+    def question_no_vacia(cls, value: str) -&gt; str:
+        # Normaliza: quita espacios y exige longitud tras recortar.
+        value = value.strip()
+        if len(value) &lt; 3:
+            # Lanzar ValueError convierte esto en un 422 automáticamente.
+            raise ValueError("La pregunta debe tener al menos 3 caracteres útiles")
+        return value
+</code></pre>
+        <p>Puntos clave de los validadores v2:</p>
+        <ul>
+          <li>Decorador <code>@field_validator("campo")</code> (o varios campos a la vez) y <code>@classmethod</code> debajo.</li>
+          <li>Por defecto corren <strong>después</strong> de la conversión de tipo; con <code>mode="before"</code> corren antes (útil para limpiar el dato crudo).</li>
+          <li>Deben <strong>devolver</strong> el valor (posiblemente transformado).</li>
+          <li>Lanzar <code>ValueError</code> se transforma en un error de validación (422), no en un 500.</li>
+        </ul>
+        <p>Para reglas que cruzan varios campos se usa <code>model_validator(mode="after")</code>, que recibe el modelo ya construido:</p>
+        <pre><code class="language-python">from pydantic import BaseModel, model_validator
+
+class RAGConfig(BaseModel):
+    top_k: int = 4
+    temperature: float = 0.2
+
+    @model_validator(mode="after")
+    def coherente(self):
+        if self.temperature &gt; 1.0 and self.top_k &gt; 5:
+            raise ValueError("Con alta creatividad, reduce top_k (max 5)")
+        return self
+</code></pre>
+
+        <h3>La forma del error 422</h3>
+        <p>Cuando algo no valida, FastAPI responde <strong>HTTP 422 Unprocessable Entity</strong> con este cuerpo:</p>
+        <div class="code-file">cuerpo de la respuesta 422</div>
+        <pre><code class="language-json">{
+  "detail": [
+    {
+      "type": "string_too_short",
+      "loc": ["body", "question"],
+      "msg": "String should have at least 3 characters",
+      "input": "hi",
+      "ctx": { "min_length": 3 }
+    },
+    {
+      "type": "less_than_equal",
+      "loc": ["body", "top_k"],
+      "msg": "Input should be less than or equal to 10",
+      "input": 99,
+      "ctx": { "le": 10 }
+    }
+  ]
+}
+</code></pre>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué es</th></tr></thead>
+          <tbody>
+            <tr><td><code>detail</code></td><td>Lista con <strong>un elemento por error</strong>; puede haber varios a la vez.</td></tr>
+            <tr><td><code>loc</code></td><td>Ruta hasta el campo: primero el origen (<code>"body"</code>, <code>"query"</code>, <code>"path"</code>) y luego los nombres/índices.</td></tr>
+            <tr><td><code>type</code></td><td>Identificador estable del error (<code>missing</code>, <code>string_too_short</code>, <code>greater_than_equal</code>…). Ideal para programar contra él.</td></tr>
+            <tr><td><code>msg</code></td><td>Mensaje legible para humanos. Traducible/personalizable.</td></tr>
+            <tr><td><code>input</code></td><td>El valor que llegó y falló (útil para depurar).</td></tr>
+            <tr><td><code>ctx</code></td><td>Contexto extra, p. ej. el límite incumplido (<code>le: 10</code>).</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Programa contra <code>type</code>, no contra <code>msg</code>.</strong> Los mensajes pueden cambiar de idioma o de redacción entre versiones; el <code>type</code> y la <code>loc</code> son estables. Si en un cliente quieres traducir los errores, hazlo a partir de <code>type</code> + <code>loc</code>.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>422 no es lo mismo que 400 ni que 500.</strong> 422 significa «entendí la petición pero los datos no cumplen el contrato». Un 400 es una petición mal formada en un sentido más general, y un 500 es un fallo <em>tuyo</em>. Volveremos sobre esto en la lección de códigos de estado y en <em>Problem Details</em> (Módulo 2).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un modelo con una restricción (<code>Field</code>) y un validador que normaliza el texto. Observa cómo el <code>ValueError</code> del validador se convierte en 422.</p>
+        <div class="code-file">main.py</div>
+        <pre><code class="language-python"># main.py — Field + field_validator en el ejemplo más pequeño
+from typing import Annotated
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, field_validator
+
+app = FastAPI()
+
+
+class Username(BaseModel):
+    # Constraint declarativo: 3 a 20 caracteres.
+    name: Annotated[str, Field(min_length=3, max_length=20)]
+
+    # Validador: una regla que no se expresa con un constraint.
+    @field_validator("name")
+    @classmethod
+    def sin_espacios(cls, value: str) -&gt; str:
+        if " " in value:
+            raise ValueError("El nombre no puede contener espacios")
+        return value
+
+
+@app.post("/users")
+def create_user(payload: Username):
+    return {"name": payload.name}
+</code></pre>
+        <pre><code class="language-bash">uv run uvicorn main:app --reload
+
+# Válido
+curl -X POST "http://127.0.0.1:8000/users" \
+  -H "Content-Type: application/json" -d '{"name": "ada"}'
+# -&gt; {"name":"ada"}
+
+# Demasiado corto: lo corta el Field
+curl -X POST "http://127.0.0.1:8000/users" \
+  -H "Content-Type: application/json" -d '{"name": "ad"}'
+# -&gt; 422 type=string_too_short  loc=["body","name"]
+
+# Espacio: lo corta el validador
+curl -X POST "http://127.0.0.1:8000/users" \
+  -H "Content-Type: application/json" -d '{"name": "ada lovelace"}'
+# -&gt; 422 type=value_error  loc=["body","name"]  msg="Value error, El nombre no puede..."
+</code></pre>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El modelo <code>AskRequest</code> de Copiloto API, ahora con validación de verdad: rangos en la configuración RAG, normalización de la pregunta y una coherencia cruzada entre campos. Todo declarado, nada en el handler.</p>
+        <div class="code-file">app/schemas/ask.py</div>
+        <pre><code class="language-python"># app/schemas/ask.py — validación completa del cuerpo de /ask
+from typing import Annotated
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Un alias de tipo para no repetir Annotated en cada campo.
+TopK = Annotated[int, Field(ge=1, le=10, description="Fragmentos a recuperar")]
+
+
+class RAGConfig(BaseModel):
+    top_k: TopK = 4
+    temperature: Annotated[float, Field(ge=0.0, le=2.0)] = 0.2
+
+    @model_validator(mode="after")
+    def combinacion_coherente(self):
+        # Regla de negocio que cruza dos campos.
+        if self.temperature &gt; 1.0 and self.top_k &gt; 5:
+            raise ValueError("Con temperature &gt; 1.0, top_k no puede pasar de 5")
+        return self
+
+
+class AskRequest(BaseModel):
+    question: Annotated[str, Field(min_length=3, max_length=2000)]
+    module_id: Annotated[int | None, Field(ge=1)] = None
+    config: RAGConfig = RAGConfig()
+
+    @field_validator("question")
+    @classmethod
+    def normalizar(cls, value: str) -&gt; str:
+        # Recortamos espacios; si tras recortar queda corto, es error.
+        value = value.strip()
+        if len(value) &lt; 3:
+            raise ValueError("La pregunta debe tener al menos 3 caracteres")
+        return value
+
+    @model_validator(mode="after")
+    def revisar_config(self):
+        # Reutiliza la coherencia del submodelo: aquí ya está validada.
+        return self
+</code></pre>
+        <pre><code class="language-bash"># Válido y con defaults
+curl -X POST "http://127.0.0.1:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "   Que es ASGI?   "}'
+# -&gt; la pregunta llega recortada a "Que es ASGI?"
+
+# top_k fuera de rango
+curl -X POST "http://127.0.0.1:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "hola", "config": {"top_k": 99}}'
+# -&gt; 422 type=less_than_equal loc=["body","config","top_k"] ctx={"le": 10}
+
+# Coherencia cruzada (dos campos)
+curl -X POST "http://127.0.0.1:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "hola", "config": {"top_k": 8, "temperature": 1.5}}'
+# -&gt; 422 type=value_error loc=["body","config"] msg="... top_k no puede pasar de 5"
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Fíjate en la <code>loc</code> del error cruzado:</strong> <code>["body","config"]</code>, no un campo concreto, porque el fallo está en la <em>combinación</em>. Un <code>model_validator</code> apunta al modelo; un <code>field_validator</code>, al campo. Esa diferencia te dice dónde colocar la corrección.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Usa <code>Annotated[tipo, Field(...)]</code></td>
+              <td><code>conint(ge=1)</code> o <code>constr(min_length=3)</code></td>
+              <td>El estilo v2 es más legible y composable; los <code>con*</code> se mantienen por compatibilidad.</td>
+            </tr>
+            <tr>
+              <td>Reutiliza tipos especiales (<code>EmailStr</code>, <code>HttpUrl</code>, <code>UUID</code>)</td>
+              <td>Expresiones regulares propias para emails/URLs</td>
+              <td>Ya están probados; tu regex casi siempre será peor y menos legible.</td>
+            </tr>
+            <tr>
+              <td>Normaliza con validadores (<code>strip</code>, minúsculas)</td>
+              <td>Esperar que el cliente mande los datos «limpios»</td>
+              <td>La API es la última frontera: normalizar ahí evita duplicados («ada» vs « ada »).</td>
+            </tr>
+            <tr>
+              <td>Lanza <code>ValueError</code> en validadores</td>
+              <td>Lanzar <code>HTTPException</code> dentro de un modelo</td>
+              <td>El modelo no conoce HTTP; <code>ValueError</code> produce el 422 estándar con <code>loc</code> correcta.</td>
+            </tr>
+            <tr>
+              <td>Escribe mensajes concretos</td>
+              <td>«valor inválido»</td>
+              <td>El <code>msg</code> es lo que ve quien integra la API; sé específico (qué campo, qué regla).</td>
+            </tr>
+            <tr>
+              <td>Usa <code>model_validator</code> para reglas cruzadas</td>
+              <td>Validar la combinación en el endpoint</td>
+              <td>Se mantiene con el modelo, se documenta y se reutiliza donde se use el modelo.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar el decorador de Pydantic v1</h3>
+        <pre><code class="language-python"># ❌ @validator es v1: en v2 genera avisos de deprecación
+from pydantic import BaseModel, validator
+
+class M(BaseModel):
+    name: str
+
+    @validator("name")
+    def check(cls, v):
+        return v.strip()
+
+# ✅ En v2: @field_validator + @classmethod, y devuelve el valor
+from pydantic import BaseModel, field_validator
+
+class M(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def check(cls, value: str) -&gt; str:
+        return value.strip()
+</code></pre>
+
+        <h3>Usar <code>min_items</code> en listas</h3>
+        <pre><code class="language-python"># ❌ min_items/max_items eran de v1
+from pydantic import BaseModel, Field
+from typing import Annotated
+
+class M(BaseModel):
+    tags: Annotated[list[str], Field(min_items=1)]   # no existe en v2
+
+# ✅ En v2 la longitud de una lista se llama min_length/max_length
+class M(BaseModel):
+    tags: Annotated[list[str], Field(min_length=1, max_length=5)]
+</code></pre>
+
+        <h3>Olvidar <code>@classmethod</code> o no devolver el valor</h3>
+        <pre><code class="language-python"># ❌ Sin @classmethod, Pydantic v2 no ejecuta bien el validador;
+#    y si no devuelves, el valor se pierde (queda None y falla el tipo)
+from pydantic import field_validator
+
+class M(BaseModel):
+    name: str
+
+    @field_validator("name")            # falta @classmethod
+    def check(cls, value):
+        value.strip()                    # no devuelve nada
+
+# ✅
+class M(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def check(cls, value: str) -&gt; str:
+        return value.strip()
+</code></pre>
+
+        <h3>Lanzar la excepción equivocada en un validador</h3>
+        <pre><code class="language-python"># ❌ Un raise genérico se convierte en 500 (error del servidor), no en 422
+from fastapi import HTTPException
+from pydantic import field_validator
+
+@field_validator("question")
+@classmethod
+def check(cls, value):
+    raise HTTPException(status_code=400, detail="pregunta inválida")  # mal
+
+# ✅ ValueError =&gt; 422 con forma estándar y loc correcta
+@field_validator("question")
+@classmethod
+def check(cls, value: str) -&gt; str:
+    raise ValueError("la pregunta no es válida")   # bien
+</code></pre>
+
+        <h3>Confundir <code>EmailStr</code> con un <code>str</code> y olvidar la dependencia</h3>
+        <pre><code class="language-bash"># ❌ ImportError: email-validator is not installed
+uv run uvicorn main:app --reload
+
+# ✅ Instala la extra que Pydantic necesita para EmailStr
+uv add email-validator
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Los validadores no deben hacer trabajo pesado ni I/O.</strong> No consultes la base de datos ni llames a un servicio dentro de un <code>field_validator</code>: se ejecuta en la fase de validación, es síncrono y debe ser rápido y puro. El acceso a datos va en el endpoint o en una dependencia (Módulo 3).</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> endurecer el modelo de feedback del Copiloto con <code>Field</code>, un tipo especial y un validador, y leer los 422 que produce.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Añade restricciones.</strong> Al <code>FeedbackRequest</code> de la lección anterior, acota la valoración a 1..5 y limita el comentario a 500 caracteres.
+            <div class="code-file">app/schemas/feedback.py</div>
+            <pre><code class="language-python">from typing import Annotated
+
+from pydantic import BaseModel, Field, EmailStr, field_validator
+
+
+class FeedbackRequest(BaseModel):
+    rating: Annotated[int, Field(ge=1, le=5, description="1 a 5 estrellas")]
+    comment: Annotated[str | None, Field(max_length=500)] = None
+    author_email: EmailStr                      # tipo especial: valida forma de email
+    module_id: Annotated[int, Field(ge=1)]
+
+    @field_validator("comment")
+    @classmethod
+    def limpiar(cls, value: str | None) -&gt; str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None    # un comentario vacío se convierte en None
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Instala la dependencia del tipo especial.</strong>
+            <pre><code class="language-bash">uv add email-validator    # EmailStr lo necesita
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Prueba un cuerpo válido y observa la normalización.</strong>
+            <pre><code class="language-bash">uv run uvicorn app.main:app --reload
+
+curl -X POST "http://127.0.0.1:8000/feedback" \
+  -H "Content-Type: application/json" \
+  -d '{"rating": 5, "comment": "   ", "author_email": "ana@example.com", "module_id": 1}'
+# -&gt; comment llega como null (el "   " se normalizó a None)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Provoca cada tipo de error y lee la forma del 422.</strong>
+            <pre><code class="language-bash"># rating fuera de rango -&gt; less_than_equal / greater_than_equal
+curl -X POST "http://127.0.0.1:8000/feedback" -H "Content-Type: application/json" \
+  -d '{"rating": 9, "author_email": "ana@example.com", "module_id": 1}'
+
+# email mal formado -&gt; type=value_error con msg de EmailStr
+curl -X POST "http://127.0.0.1:8000/feedback" -H "Content-Type: application/json" \
+  -d '{"rating": 5, "author_email": "no-soy-email", "module_id": 1}'
+
+# varios errores a la vez: detail trae una lista con uno por campo
+curl -X POST "http://127.0.0.1:8000/feedback" -H "Content-Type: application/json" \
+  -d '{"rating": 0, "comment": "x", "author_email": "malo", "module_id": 0}'
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Verificación final.</strong> En el último <code>curl</code> debes ver <strong>cuatro</strong> entradas en <code>detail</code>. Comprueba que cada <code>loc</code> apunta al campo correcto y que <code>input</code> muestra el valor recibido. Si sabes leer eso, sabes depurar cualquier 422.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un tipo de dominio reutilizable</h3>
+          <p>Crea una validación reutilizable para los <strong>slugs</strong> de Copiloto API: una cadena en minúsculas, con palabras separadas por un único guion (<code>rutas-y-datos</code>), sin empezar ni terminar en guion y con longitud 3..50. Tu reto: empaquétala como un <strong>tipo anotado</strong> (<code>Slug = Annotated[str, ...]</code>) que puedas usar en dos modelos distintos sin repetir la regla.</p>
+          <p><strong>Pista:</strong> puedes combinar <code>Field(pattern=..., min_length=..., max_length=...)</code> con un <code>field_validator</code> para los casos que una regex deja incómodos (por ejemplo, guiones duplicados). Pregúntate qué error quieres obtener: una parte la resolverá el <code>pattern</code> (<code>type=string_pattern_mismatch</code>) y otra tu validador (<code>type=value_error</code>). Documenta ambos caminos y no lo resuelvas de una sola forma: experimenta.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>Field</code> (con <code>Annotated</code>) añade <strong>constraints</strong> y metadatos a un campo: <code>ge</code>, <code>le</code>, <code>min_length</code>, <code>pattern</code>…</li>
+          <li>Los <strong>tipos especiales</strong> (<code>EmailStr</code>, <code>HttpUrl</code>, <code>UUID</code>, <code>datetime</code>, <code>Decimal</code>) validan conceptos de dominio sin código propio.</li>
+          <li><code>Literal</code> y <code>Enum</code> expresan <strong>conjuntos cerrados</strong> de valores.</li>
+          <li><code>@field_validator</code> valida un campo; <code>@model_validator(mode="after")</code> valida reglas <strong>cruzadas</strong>.</li>
+          <li>En un validador se lanza <code>ValueError</code> (nunca <code>HTTPException</code>): se convierte en <strong>422</strong>.</li>
+          <li>El error 422 tiene la forma <code>{"detail": [{type, loc, msg, input, ctx}]}</code>; <code>loc</code> señala dónde y <code>type</code> es el identificador estable.</li>
+          <li>Programa contra <code>type</code>+<code>loc</code>, no contra <code>msg</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Necesitas</th><th>Código</th></tr></thead>
+          <tbody>
+            <tr><td>Rango numérico</td><td><code>Annotated[int, Field(ge=1, le=10)]</code></td></tr>
+            <tr><td>Longitud de texto/lista</td><td><code>Field(min_length=3, max_length=50)</code></td></tr>
+            <tr><td>Regex</td><td><code>Field(pattern=r"^[a-z-]+$")</code></td></tr>
+            <tr><td>Email / URL</td><td><code>EmailStr</code> / <code>HttpUrl</code></td></tr>
+            <tr><td>Validar un campo</td><td><code>@field_validator("x")</code> + <code>@classmethod</code></td></tr>
+            <tr><td>Validar la combinación</td><td><code>@model_validator(mode="after")</code></td></tr>
+            <tr><td>Error de validación</td><td><code>raise ValueError("...")</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué 422 y no 400 para errores de validación?</summary>
+            <div>
+              <p>El código 422 «Unprocessable Entity» (definido en la especificación WebDAV y recogido por la práctica) describe exactamente esto: la petición está sintácticamente bien formada, pero su <em>contenido</em> no cumple el contrato. FastAPI lo usa por convención y porque separa «JSON mal formado» (400) de «JSON bien formado con datos inválidos» (422). Es un valor por defecto configurable, pero la comunidad lo ha adoptado así.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar los mensajes de error para traducirlos al español?</summary>
+            <div>
+              <p>Sí. La vía limpia es registrar un <em>exception handler</em> para <code>RequestValidationError</code> y transformar la lista <code>detail</code> a tu propio formato (por ejemplo, Problem Details, como haremos en el Módulo 2). Para traducir, mapea por <code>type</code>+<code>loc</code> en lugar de reemplazar por <code>msg</code>, porque los textos pueden cambiar entre versiones.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un validador puede modificar el valor, o solo aceptarlo o rechazarlo?</summary>
+            <div>
+              <p>Puede modificarlo: esa es una de sus grandes ventajas. Por ejemplo, recortar espacios, pasar a minúsculas o convertir <code>""</code> en <code>None</code>. Solo recuerda <strong>devolver</strong> el valor (transformado o no); si no devuelves, se pierde.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>Field</code> también sirve para la respuesta, o solo para el cuerpo de entrada?</summary>
+            <div>
+              <p>Para ambos. Cualquier modelo Pydantic puede usarse como entrada (cuerpo) o como salida (<code>response_model</code>). Las restricciones de <code>Field</code> y los validadores se aplican igual cuando el modelo valida la respuesta, lo que ayuda a detectar bugs en tus propios datos antes de enviarlos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde veo todas las restricciones cuando tengo muchos modelos?</summary>
+            <div>
+              <p>En <code>/docs</code> y en el esquema OpenAPI (<code>/openapi.json</code>): cada constraint aparece como parte de la definición del campo, y el JSON Schema de Pydantic incluye los ejemplos. Ese esquema es, además, la fuente de verdad para generar clientes tipados.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
