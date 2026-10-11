@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-despliegue-y-cicd">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Despliegue y CI/CD — Módulo 7 · Curso Cloud</title>
+  <meta name="description" content="Del commit a la URL con GitHub Actions y OIDC federado: build de la imagen, push al ACR y terraform apply, sin ninguna clave de larga vida guardada en GitHub.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Despliegue y CI/CD</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: Copiloto en la nube</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya tienes el plano (lección 01) y el Terraform que lo crea (lección 02). Falta lo que convierte esto en un proyecto de verdad: <strong>que cada push a <code>main</code> despliegue el Copiloto solo</strong>, sin que nadie abra una terminal, y —esta es la parte que separa a un aficionado de un profesional— <strong>sin ninguna clave de larga vida guardada en GitHub</strong>.</p>
+        <p>El pipeline hace tres cosas, en este orden:</p>
+        <pre class="diagram">
+  git push  --&gt;  GitHub Actions
+                   |
+                   | (1) az acr build     &lt;-- construye la imagen y la sube al ACR
+                   | (2) terraform apply  &lt;-- crea/actualiza la infraestructura
+                   | (3) curl --fail .../health  &lt;-- verifica que la URL responde 200
+                   |
+                   v
+              Copiloto en producción
+        </pre>
+        <p>La autenticación contra Azure no usa contraseñas: usa <strong>OIDC federado</strong>. GitHub firma un token diciendo «soy este repositorio en esta rama» y Azure lo cambia por un token de acceso temporal, tras comprobar que se lo habías autorizado de antemano. No hay secreto que robar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «desplegar a mano» no escala: es lento, no queda registrado y depende de que la persona recuerde los pasos. El CI/CD es el que garantiza que <strong>lo que hay en producción es lo que hay en <code>main</code></strong>, construido de forma reproducible. Y hacerlo con OIDC elimina el eslabón más débil de cualquier pipeline: la credencial guardada que se filtra.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema de las claves de larga vida</h3>
+        <p>La forma tradicional de desplegar desde un pipeline es crear un <em>service principal</em> y guardar su <strong>client secret</strong> como secreto del repositorio. Funciona… y tiene los problemas de siempre: el secreto no caduca solo, hay que rotarlo a mano, si se filtra da acceso hasta que alguien lo note, y queda copiado en los logs de quien lo configuró.</p>
+        <table>
+          <thead><tr><th></th><th>Service principal con client secret</th><th>OIDC federado (sin secreto)</th></tr></thead>
+          <tbody>
+            <tr><td>Qué se guarda en GitHub</td><td>Una contraseña de larga vida</td><td>Nada secreto: ids que no son sensibles</td></tr>
+            <tr><td>Caducidad</td><td>Manual, fácil de olvidar</td><td>El token dura minutos y expira solo</td></tr>
+            <tr><td>Si se filtra</td><td>Acceso hasta rotarlo</td><td>No hay nada que filtrar</td></tr>
+            <tr><td>Rotación</td><td>Un trabajo programado en el calendario</td><td>No existe: no hay credencial que rotar</td></tr>
+            <tr><td>Alcance de la confianza</td><td>El secreto vale para todo</td><td>Se limita a <em>este</em> repo, <em>esta</em> rama/entorno</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cómo funciona OIDC, paso a paso</h3>
+        <p>Parece magia, pero son cinco pasos mecánicos:</p>
+        <ol class="steps">
+          <li><strong>GitHub emite un token OIDC</strong> para el job, solo si el workflow declara <code>permissions: id-token: write</code>. Ese token lleva <em>claims</em> (afirmaciones): el repositorio, la rama, el entorno.</li>
+          <li><strong>La acción <code>azure/login</code></strong> envía ese token a Entra ID pidiendo cambiarlo por un token de Azure.</li>
+          <li><strong>Azure comprueba el token</strong> contra una <strong>credencial federada</strong> que configuraste antes: «confío en tokens cuyo <em>subject</em> sea <code>repo:mi-org/mi-repo:ref:refs/heads/main</code>».</li>
+          <li>Si coincide, <strong>Azure devuelve un token de acceso temporal</strong> con los permisos del rol asignado.</li>
+          <li>El resto del job usa ese token como si hubieras hecho <code>az login</code>: ninguna contraseña ha tocado el disco.</li>
+        </ol>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el <em>secret de larga vida</em> es una llave física que copias y guardas en un cajón (y que si pierdes, hay que cambiar la cerradura). El <strong>OIDC</strong> es un portero que solo te abre si te reconoce por la cara: llegas, comprueba tu identidad en el momento, te deja pasar un rato y se cierra solo. No hay llave que robar porque nunca hubo una.</p>
+        </div>
+
+        <h3>Crear la credencial federada (una vez)</h3>
+        <p>Azure necesita saber en quién confía. Se registra una identidad (una <em>app registration</em> o una identidad gestionada) y se le añade una credencial federada cuyo <em>subject</em> ata la confianza al repositorio y la rama:</p>
+        <table>
+          <thead><tr><th>Claim</th><th>Valor típico</th><th>Para qué sirve</th></tr></thead>
+          <tbody>
+            <tr><td><em>issuer</em></td><td><code>https://token.actions.githubusercontent.com</code></td><td>Quién emite el token (GitHub)</td></tr>
+            <tr><td><em>audience</em></td><td><code>api://AzureADTokenExchange</code></td><td>Para qué se emite</td></tr>
+            <tr><td><em>subject</em></td><td><code>repo:mi-org/infra-cloud:ref:refs/heads/main</code></td><td>Qué repo y qué rama concreta pueden usarlo</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>El <em>subject</em> es la cerradura.</strong> Si pones un comodín, cualquier rama o cualquier repo de tu organización podría pedir ese token. Ata la confianza a la rama que despliega (<code>main</code>) o, mejor, a un <strong>GitHub Environment</strong> (<code>environment:production</code>) que exija aprobación manual. Eso convierte «cualquiera con push» en «quien tú apruebes».</p>
+        </div>
+
+        <h3>Qué permisos necesita el pipeline</h3>
+        <p>El principio del mínimo privilegio también aplica aquí. La identidad federada necesita justo dos capacidades:</p>
+        <ul>
+          <li><strong>Empujar imágenes al ACR:</strong> <code>AcrPush</code> sobre el registro.</li>
+          <li><strong>Gestionar la infraestructura:</strong> permiso para crear/actualizar los recursos del entorno. En el laboratorio vale <code>Contributor</code> sobre el grupo de recursos; en producción, un rol a medida con lo justo. Nunca <code>Owner</code>.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Los <strong>ids</strong> de la identidad (<code>client-id</code>, <code>tenant-id</code>, <code>subscription-id</code>) <strong>no son secretos</strong>: son identificadores públicos. Guárdalos como <em>variables</em> del repositorio (<code>vars</code>), no como <em>secrets</em>. Es la señal de que entendiste OIDC: si algo es un secreto en tu pipeline, es que el OIDC está mal montado.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El workflow más pequeño que demuestra que el OIDC funciona: autenticarse y listar los grupos de recursos. Nada de build ni apply todavía.</p>
+        <div class="code-file">.github/workflows/login-minimo.yml</div>
+        <pre><code class="language-yaml">name: login-minimo
+
+on:
+  workflow_dispatch:        # solo manual, para probar
+
+# Sin este permiso, GitHub NO emite el token OIDC y el login falla.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  probar-login:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login en Azure con OIDC (sin secreto)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Comprobar que estamos dentro
+        run: az group list --query "[].name" --output tsv
+</code></pre>
+        <p>Fíjate en las tres cosas que hacen que esto sea seguro y no un atajo:</p>
+        <ol class="steps">
+          <li><strong><code>permissions: id-token: write</code>:</strong> habilita la emisión del token OIDC para este job. Sin esa línea, <code>azure/login</code> no tiene nada que intercambiar.</li>
+          <li><strong><code>azure/login@v2</code>:</strong> hace el intercambio del token de GitHub por el de Azure. No se le pasa contraseña: solo los tres identificadores.</li>
+          <li><strong><code>vars</code>, no <code>secrets</code>:</strong> los ids no son secretos. Guardarlos como <em>secrets</em> «por costumbre» es una señal de que no entendiste el modelo.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El pipeline completo del Copiloto. Primero, configurar la confianza en Azure una sola vez (por CLI, reproducible):</p>
+        <div class="code-file">terminal — registrar identidad, credencial federada y roles</div>
+        <pre><code class="language-bash"># 1) Crea la identidad de la aplicación (no confundir con la app de usuario).
+APP_ID=$(az ad app create --display-name "gh-infra-cloud" --query appId --output tsv)
+SP_ID=$(az ad sp create --id "$APP_ID" --query id --output tsv)
+
+# 2) Añade la credencial federada: confía SOLO en pushes a main del repo.
+az ad app federated-credential create \
+  --id "$APP_ID" \
+  --parameters '{
+    "name": "github-main",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:mi-org/infra-cloud:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+
+# 3) Da permisos mínimos: empujar al ACR y gestionar el grupo de recursos.
+ACR_ID=$(az acr show --name copilotoacrprod --query id --output tsv)
+az role assignment create --assignee "$SP_ID" \
+  --role "AcrPush" --scope "$ACR_ID"
+
+az role assignment create --assignee "$SP_ID" \
+  --role "Contributor" --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-copiloto-prod"
+</code></pre>
+        <p>Ahora el workflow. Tiene dos trabajos encadenados: <strong>build</strong> (imagen al ACR con el SHA del commit) y <strong>deploy</strong> (Terraform y verificación):</p>
+        <div class="code-file">.github/workflows/deploy.yml</div>
+        <pre><code class="language-yaml">name: deploy-copiloto
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Un solo despliegue a la vez: si llega otro push, cancela el anterior.
+concurrency:
+  group: copiloto-prod
+  cancel-in-progress: false
+
+permissions:
+  id-token: write        # imprescindible para OIDC
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-copiloto-prod
+  ACR_NAME: copilotoacrprod
+  IMAGE: copiloto-api
+
+jobs:
+  # ------------------------------------------------ (1) BUILD Y PUSH
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Etiqueta inmutable a partir del commit
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"
+
+      # Construye DENTRO de Azure (no hace falta Docker en el runner) y publica.
+      - name: Construir y subir la imagen al ACR
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "$IMAGE:${{ steps.meta.outputs.tag }}" \
+            --file Dockerfile \
+            .
+
+  # ------------------------------------------------ (2) APPLY
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production      # puede exigir aprobación manual en GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.5"
+
+      # El state vive en Blob Storage; la clave llega del entorno del runner.
+      - name: terraform init
+        working-directory: infra
+        run: terraform init
+        env:
+          ARM_ACCESS_KEY: ${{ secrets.TFSTATE_ACCESS_KEY }}
+
+      # El secreto de la base de datos viaja como TF_VAR_*, no en el repo.
+      - name: terraform plan
+        working-directory: infra
+        run: terraform plan -var-file=prod.tfvars -out=tfplan -input=false
+        env:
+          ARM_ACCESS_KEY: ${{ secrets.TFSTATE_ACCESS_KEY }}
+          TF_VAR_db_admin_password: ${{ secrets.DB_ADMIN_PASSWORD }}
+          TF_VAR_database_url: ${{ secrets.DATABASE_URL }}
+          TF_VAR_image_tag: ${{ needs.build.outputs.tag }}
+
+      - name: terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve tfplan
+        env:
+          ARM_ACCESS_KEY: ${{ secrets.TFSTATE_ACCESS_KEY }}
+          TF_VAR_db_admin_password: ${{ secrets.DB_ADMIN_PASSWORD }}
+          TF_VAR_database_url: ${{ secrets.DATABASE_URL }}
+          TF_VAR_image_tag: ${{ needs.build.outputs.tag }}
+
+      # -------------------------------------------- (3) VERIFICAR
+      - name: Comprobar que la URL responde
+        working-directory: infra
+        run: |
+          HEALTH=$(terraform output -raw health_url)
+          echo "Comprobando $HEALTH"
+          curl --fail --retry 10 --retry-delay 5 --retry-all-errors "$HEALTH"
+</code></pre>
+        <p>Merece la pena detenerse en las decisiones del workflow:</p>
+        <ul>
+          <li><strong><code>concurrency</code>:</strong> impide que dos despliegues se pisen. <code>cancel-in-progress: false</code> deja terminar el que está en marcha en vez de cortarlo a mitad de un <code>apply</code>.</li>
+          <li><strong>Etiqueta por SHA (<code>${GITHUB_SHA::7}</code>):</strong> cada commit produce una imagen <em>inmutable</em> y trazable. Sabes exactamente qué código corre en producción y puedes volver atrás desplegando el tag anterior.</li>
+          <li><strong><code>needs: build</code>:</strong> el deploy no arranca si el build falla. Nada de aplicar infraestructura apuntando a una imagen que no existe.</li>
+          <li><strong><code>az acr build</code>:</strong> construye la imagen en Azure, sin depender del Docker del runner y sin exponer el registro a la máquina del CI.</li>
+          <li><strong><code>environment: production</code>:</strong> permite exigir <em>aprobación manual</em> antes de tocar producción. El pipeline prepara el despliegue; un humano decide cuándo.</li>
+          <li><strong><code>TF_VAR_*</code> desde <code>secrets</code>:</strong> los secretos de verdad (contraseña de la BD, clave del state) llegan al <code>apply</code> como variables de entorno <strong>en el runner</strong>, sin escribir jamás en el repositorio.</li>
+          <li><strong><code>curl --fail</code> con reintentos:</strong> si la URL no responde 200 tras los reintentos, el paso falla y <strong>el pipeline se pone en rojo</strong>. Un despliegue sin verificación no es un despliegue: es una esperanza.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>¿Y la contraseña de la base de datos?</strong> Aparece como <code>secrets.DATABASE_URL</code>, sí, pero solo porque el laboratorio guarda el secreto en GitHub para simplificar. El destino final (reto de la lección 02) es que la app lea ese secreto de <strong>Key Vault con su identidad</strong> y el pipeline ni lo vea. Avanzamos hacia ahí.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Autenticar con <strong>OIDC</strong> y atar el <em>subject</em> a repo + rama/entorno</td>
+              <td>Un <em>client secret</em> guardado en GitHub</td>
+              <td>Sin credencial de larga vida no hay nada que filtrar ni que rotar</td>
+            </tr>
+            <tr>
+              <td>Guardar los ids en <code>vars</code>, no en <code>secrets</code></td>
+              <td>Meter <code>AZURE_CLIENT_ID</code> como secreto</td>
+              <td>Los ids no son secretos; tratarlos como tal delata un OIDC mal entendido</td>
+            </tr>
+            <tr>
+              <td>Fijar la versión de la identidad a un <strong>entorno con aprobación</strong></td>
+              <td>Confiar en <code>repo:mi-org/mi-repo:*</code> (comodín)</td>
+              <td>Un comodín deja que cualquier rama despliegue a producción</td>
+            </tr>
+            <tr>
+              <td>Alcance mínimo: <code>AcrPush</code> + rol acotado al grupo de recursos</td>
+              <td><code>Contributor</code> u <code>Owner</code> sobre toda la suscripción</td>
+              <td>Un pipeline comprometido no debe poder tocar el resto de la nube</td>
+            </tr>
+            <tr>
+              <td>Fijar acciones por versión mayor o SHA (<code>@v4</code>, <code>@v2</code>)</td>
+              <td><code>@main</code> o <code>@master</code></td>
+              <td>Una acción que sigue su rama puede cambiar bajo tus pies o ser comprometida</td>
+            </tr>
+            <tr>
+              <td><code>concurrency</code> por entorno</td>
+              <td>Varios despliegues en paralelo sobre el mismo state</td>
+              <td>Dos <code>apply</code> a la vez pueden corromper el state o pisarse recursos</td>
+            </tr>
+            <tr>
+              <td>Verificar con <code>curl --fail</code> tras desplegar</td>
+              <td>Marcar el pipeline en verde «porque el apply salió bien»</td>
+              <td>Un <code>apply</code> correcto no garantiza que la app responda; la salud sí</td>
+            </tr>
+            <tr>
+              <td>Etiquetas de imagen inmutables (SHA), no <code>:latest</code></td>
+              <td>Desplegar <code>:latest</code></td>
+              <td>Reproducibilidad y vuelta atrás fiable</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Olvidar <code>id-token: write</code> y culpar al OIDC</h3>
+        <span class="code-label code-label--wrong">Incorrecto — sin permiso de token</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Sin `permissions`, GitHub no emite token y azure/login falla con
+# "no OIDC token available". No es Azure: es el workflow.
+name: deploy
+on: [ push ]
+jobs:
+  deploy: { runs-on: ubuntu-latest, steps: [...] }
+</code></pre>
+        <span class="code-label code-label--right">Correcto — permiso explícito</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El job pide permiso para obtener el token OIDC.
+permissions:
+  id-token: write
+  contents: read
+</code></pre>
+
+        <h3>2. Un <em>subject</em> con comodín</h3>
+        <span class="code-label code-label--wrong">Incorrecto — confianza demasiado amplia</span>
+        <pre class="code-wrong"><code class="language-json">{
+  "subject": "repo:mi-org/infra-cloud:*"
+}
+</code></pre>
+        <span class="code-label code-label--right">Correcto — rama o entorno concretos</span>
+        <pre class="code-right"><code class="language-json">{
+  "subject": "repo:mi-org/infra-cloud:environment:production"
+}
+</code></pre>
+        <p>Con el comodín, cualquier rama —incluida una creada por un atacante con permiso de push— podría pedir un token con los permisos de despliegue. Fijarlo a un <em>environment</em> con aprobación reduce aún más la superficie que atar solo a la rama.</p>
+
+        <h3>3. Guardar el <em>client secret</em> «por si el OIDC falla»</h3>
+        <pre><code class="language-yaml"># ❌ Guardas un secreto de larga vida como red de seguridad.
+# Vuelves a tener el problema que OIDC venía a resolver: credencial que robar.
+with:
+  creds: ${{ secrets.AZURE_CREDENTIALS }}   # un JSON con un client secret dentro
+
+# ✅ Sin secreto: solo los ids, y la confianza federada en Azure.
+with:
+  client-id:       ${{ vars.AZURE_CLIENT_ID }}
+  tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+  subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+</code></pre>
+        <p>Si mantienes un secreto «por si acaso», has migrado la superficie de ataque a un sitio más difícil de ver. OIDC no es un extra: es el sustituto del secreto.</p>
+
+        <h3>4. Ejecutar código de un PR con secretos a mano</h3>
+        <pre><code class="language-yaml"># ❌ `pull_request_target` con acceso a secretos y checkout del código del PR
+# permite a un PR malicioso exfiltrar tus secretos.
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+# ✅ Para PRs, solo `pull_request` (sin secretos) y como mucho `terraform plan`,
+#    que no necesita credenciales con permiso de escritura.
+on:
+  pull_request:
+    branches: [ main ]
+</code></pre>
+        <p>Esta es una de las vulnerabilidades de CI/CD más explotadas. Para un PR solo necesitas <em>planificar</em>, no aplicar. Deja el <code>apply</code> para pushes a <code>main</code>, tras revisión.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar la confianza federada y conseguir que un workflow se autentique y despliegue sin ningún secreto de larga vida.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — crea la identidad y la credencial federada.</strong> Cambia <code>mi-org</code> por tu usuario u organización de GitHub:
+            <pre><code class="language-bash">APP_ID=$(az ad app create --display-name "gh-infra-cloud" --query appId --output tsv)
+SP_ID=$(az ad sp create --id "$APP_ID" --query id --output tsv)
+
+az ad app federated-credential create --id "$APP_ID" --parameters '{
+  "name": "github-main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:mi-org/infra-cloud:ref:refs/heads/main",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+echo "client-id=$APP_ID  (guárdalo como variable del repo)"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — asigna los permisos mínimos.</strong>
+            <pre><code class="language-bash">SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+ACR_ID=$(az acr show --name copilotoacrprod --query id --output tsv)
+
+az role assignment create --assignee "$SP_ID" --role "AcrPush" --scope "$ACR_ID"
+az role assignment create --assignee "$SP_ID" --role "Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-copiloto-prod"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — guarda los ids como variables (no secretos) en GitHub.</strong>
+            <pre><code class="language-bash"># Con la CLI de GitHub: son IDs públicos, van como `vars`.
+gh variable set AZURE_CLIENT_ID       --body "$APP_ID"
+gh variable set AZURE_TENANT_ID       --body "$(az account show --query tenantId -o tsv)"
+gh variable set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — añade el workflow.</strong> Copia <code>deploy.yml</code> (ejemplo real) a <code>.github/workflows/</code> y confirma que tiene <code>permissions: id-token: write</code>.
+            <pre><code class="language-bash">ls .github/workflows/deploy.yml
+# Revisa que la rama del `subject` coincide con la que despilega (main).
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — dispara el despliegue y observa.</strong>
+            <pre><code class="language-bash">git checkout -b ci-oidc
+git add .github/workflows/deploy.yml
+git commit -m "ci: despliegue con OIDC"
+git push origin ci-oidc
+# Abre el PR, fusiónalo a main y mira el workflow en la pestaña Actions.
+# Esperado: login OK, imagen publicada con el SHA, apply correcto y curl 200.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 (verificación) — confirma que no hay secretos guardados.</strong>
+            <pre><code class="language-bash"># ¿Qué secretos tiene el repo? Idealmente solo los del state y la BD,
+# NINGUNO de tipo "azure credentials" o "client secret".
+gh secret list
+gh variable list
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Resultado esperado:</strong> al fusionar a <code>main</code>, el pipeline se autentica por OIDC (sin contraseña), publica la imagen etiquetada con el SHA, aplica el Terraform y termina con un <code>curl</code> que recibe 200 de <code>/health</code>. En <code>gh secret list</code> no aparece ninguna credencial de larga vida de Azure.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Despliegue azul/verde con revisión previa y vuelta atrás</h3>
+          <p>Lleva el pipeline al siguiente nivel de seguridad de despliegue: que <strong>nunca</strong> cambie el 100&nbsp;% del tráfico a una versión nueva de golpe. Diseña un workflow que, en cada push a <code>main</code>: (1) publique la imagen nueva; (2) cree una <strong>revisión nueva</strong> de la Container App y le mande un porcentaje pequeño de tráfico (por ejemplo 10&nbsp;%); (3) espere y compruebe salud y errores con ese porcentaje; (4) suba el tráfico al 100&nbsp;% solo si la comprobación pasa; y (5) si algo falla, <strong>vuelva solo</strong> a la revisión anterior sin intervención humana.</p>
+          <p>Además, en <strong>cada pull request</strong> el pipeline debe publicar un <code>terraform plan</code> como comentario del PR (usando <code>pull_request</code>, sin secretos de escritura) para que el revisor vea exactamente qué va a cambiar antes de aprobar.</p>
+          <p><em>Pista: Container Apps soporta <code>revision_mode = "Multiple"</code> con <em>traffic weights</em> (módulo 4, <code>01-container-apps</code> y <code>03-escalado</code>). Para el paso 4–5, mira las métricas de la revisión nueva con Azure Monitor y decide en función de ellas; para el comentario del PR, el paso de <code>plan</code> produce una salida que puedes publicar, pero <strong>cuidado con exponer valores sensibles en el comentario</strong>.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El CI/CD convierte <strong><code>push</code> → <code>build</code> → <code>apply</code> → <code>verify</code></strong> en un proceso automático, reproducible y registrado.</li>
+          <li><strong>OIDC federado</strong> sustituye al <em>client secret</em>: GitHub emite un token, Azure lo valida contra una credencial federada y devuelve uno temporal. No hay clave de larga vida.</li>
+          <li>El <strong><em>subject</em></strong> de la credencial federada es la cerradura: átalo al repo y a la rama o al <em>environment</em> con aprobación.</li>
+          <li>Los <strong>ids</strong> (<code>client-id</code>, <code>tenant-id</code>, <code>subscription-id</code>) son <code>vars</code>, no <code>secrets</code>.</li>
+          <li>Permisos mínimos: <code>AcrPush</code> y un rol acotado al grupo de recursos; nunca <code>Owner</code> sobre la suscripción.</li>
+          <li><code>concurrency</code>, imágenes etiquetadas por SHA, <code>needs:</code> y <code>environment:</code> de producción hacen el pipeline seguro y ordenado.</li>
+          <li>El despliegue <strong>termina verificando</strong> con un <code>curl --fail</code>: en verde solo si la app responde de verdad.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>En GitHub Actions (Azure)</th><th>Equivalente conceptual (AWS)</th></tr></thead>
+          <tbody>
+            <tr><td>Login sin clave</td><td><code>azure/login@v2</code> con OIDC</td><td><code>aws-actions/configure-aws-credentials</code> con OIDC</td></tr>
+            <tr><td>Identidad de confianza</td><td>App registration + credencial federada</td><td>Rol de IAM con <em>trust policy</em> de OIDC</td></tr>
+            <tr><td>Permiso al registro</td><td><code>AcrPush</code></td><td>Permiso de push a ECR</td></tr>
+            <tr><td>Construir en la nube</td><td><code>az acr build</code></td><td><code>docker buildx</code> + push a ECR</td></tr>
+            <tr><td>Verificar el despliegue</td><td><code>curl --fail $HEALTH_URL</code></td><td>Igual</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué el login falla con «no OIDC token available»?</summary>
+            <div>
+              <p>Casi siempre por falta de <code>permissions: id-token: write</code> en el job. GitHub solo emite el token OIDC si el workflow lo pide de forma explícita. Si ya lo tienes, revisa que el <em>subject</em> de la credencial federada coincide <strong>exactamente</strong> con el repositorio y la rama del workflow: un solo carácter distinto (por ejemplo <code>refs/heads/main</code> frente a <code>pull_request</code>) hace que Azure rechace el token.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito algún secreto guardado en GitHub?</summary>
+            <div>
+              <p>Para la autenticación con Azure, <strong>ninguno</strong>: eso es justo lo que aporta OIDC. Puedes necesitar <em>secrets</em> para otras cosas del pipeline (la clave de acceso al backend del state, la contraseña de la BD del laboratorio), pero nunca una credencial de Azure de larga vida. Si tu pipeline tiene un <code>AZURE_CREDENTIALS</code> guardado, es que aún no has terminado la migración a OIDC.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>az acr build</code> o construyo con Docker en el runner?</summary>
+            <div>
+              <p><code>az acr build</code> construye la imagen <strong>dentro de Azure</strong>, así que el runner no necesita Docker ni exponer credenciales del registro: solo el permiso <code>AcrPush</code>. Es más simple, más rápido (caché en el registro) y más seguro. Usa Docker en el runner solo si necesitas algo que ACR Tasks no soporta (por ejemplo, un <em>build multi-arquitectura</em> muy específico).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo despliego a dev sin tocar prod?</summary>
+            <div>
+              <p>Con <strong>environments</strong> de GitHub Actions y ficheros de variables distintos. En vez de un único <code>environment: production</code>, tienes <code>environment: dev</code> y <code>environment: production</code>, cada uno con su propia credencial federada (o el mismo <em>subject</em> por rama) y su <code>-var-file</code>. El workflow elige el <code>tfvars</code> según el entorno. Así dev y prod nunca comparten state ni credenciales.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si el <code>apply</code> queda a medias y el pipeline se corta?</summary>
+            <div>
+              <p>El <em>state</em> remoto de Terraform es transaccional por recurso, así que un corte deja la infraestructura en un estado intermedio pero <strong>consistente con el state</strong>. Vuelve a lanzar el pipeline: el siguiente <code>plan</code> mostrará exactamente qué falta por crear y <code>apply</code> lo completará. Lo que <strong>no</strong> debes hacer nunca es borrar el state «para empezar limpio»: eso convertiría recursos reales en huérfanos invisibles para Terraform. Para eso existe <code>concurrency</code> con <code>cancel-in-progress: false</code>.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

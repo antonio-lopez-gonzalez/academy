@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-cache-y-cola">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caché y colas — Módulo 3 · Curso Cloud</title>
+  <meta name="description" content="Caché gestionada (Azure Cache for Redis / ElastiCache) y colas/eventos (Service Bus / SQS): patrones, garantías de entrega y su relación con lo ya visto.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caché y colas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Almacenamiento y datos</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Dos problemas aparecen siempre que el Copiloto crece. El primero: la misma consulta a la base de datos se repite mil veces por segundo y la base se ahoga. El segundo: el usuario pide un informe que tarda dos minutos en generarse y no puede quedarse mirando una pantalla en blanco. Las soluciones clásicas son una <strong>caché</strong> y una <strong>cola</strong>, y en la nube se compran gestionadas.</p>
+        <p>Una <strong>caché</strong> (Azure Cache for Redis, ElastiCache) guarda resultados ya calculados en memoria para responder en microsegundos y descargar la base de datos. Una <strong>cola</strong> (Azure Service Bus, Amazon SQS) guarda mensajes para que un <em>worker</em> los procese en su ritmo, desacoplando al que pide del que hace. Son dos piezas distintas que resuelven dos <em>«por qué»</em> distintos —rapidez y desacoplamiento— y esta lección las aborda sin confundirlas.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque ya viste Redis en <em>Learn Redis</em>, pero allí lo entendiste como tecnología; aquí lo ves como <strong>servicio gestionado de la nube</strong>: cuándo añadirlo, cuánto cuesta y qué te aporta el proveedor. Y porque las colas son la puerta de entrada a los eventos, que serán el corazón del módulo 5.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Caché: por qué una respuesta en memoria lo cambia todo</h3>
+        <p>Leer de una base de datos relacional implica disco, planes de consulta y viajes de red: milisegundos. Leer de una caché en memoria es microsegundos. Ese salto de dos órdenes de magnitud permite, con la misma base de datos, atender cien veces más tráfico. La caché no sustituye a la base: <strong>absorbe las lecturas repetidas</strong>.</p>
+        <p>El patrón canónico se llama <strong>cache-aside</strong> (o <em>lazy loading</em>) y se resume en tres pasos:</p>
+        <pre class="diagram">
+  Petición --> ¿Está en la CACHÉ?
+                 |                     |
+                SÍ -> devolver (microsegundos)  [HIT]
+                 |
+                NO -> leer de la BASE DE DATOS  [MISS]
+                      --> guardar en la CACHÉ con un TTL
+                      --> devolver
+        </pre>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Por qué importa</th></tr></thead>
+          <tbody>
+            <tr><td><strong>TTL</strong></td><td>Tiempo de vida de una clave</td><td>Sin TTL el dato caduca mal; con TTL, se refresca solo y el error del que olvidó invalidar duele menos</td></tr>
+            <tr><td><strong>Invalidación</strong></td><td>Borrar/actualizar al cambiar el origen</td><td>La caché no ve tus escrituras por sí sola; si no invalida, sirve basura</td></tr>
+            <tr><td><strong>Eviction (LRU)</strong></td><td>Qué se borra al llenarse</td><td>La caché tiene tope de memoria: necesita decidir a quién sacrifica</td></tr>
+            <tr><td><em>Cache stampede</em></td><td>Muchos MISS a la vez sobre la misma clave</td><td>Puede tumbar la base; se mitiga con <em>locking</em> o TTL con <em>jitter</em></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>La caché no es fuente de verdad.</strong> El dato autoritativo vive en la base de datos; la caché es una copia que <em>puede</em> desaparecer en cualquier momento. Trátala siempre como material regenerable. Si al borrar la caché tu sistema pierde datos, no tenías una caché: tenías una base de datos mal configurada.</p>
+        </div>
+
+        <h3>Azure Cache for Redis y ElastiCache: qué niveles existen</h3>
+        <table>
+          <thead><tr><th>Nivel Azure</th><th>AWS equivalente</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td>Basic</td><td>ElastiCache <em>node</em> sin réplica</td><td>Desarrollo; sin SLA alto ni HA</td></tr>
+            <tr><td>Standard</td><td>ElastiCache con <em>replica</em></td><td>Producción básica: réplica para failover</td></tr>
+            <tr><td>Premium</td><td>ElastiCache con <em>cluster mode</em></td><td>Clustering, persistencia, VNet, más memoria</td></tr>
+          </tbody>
+        </table>
+        <p>El proveedor gestiona lo que en un Redis propio te tocaría a ti: parchear, sustituir nodos, promover réplicas y, en los niveles altos, persistir en disco. Tú eliges tamaño y si quieres clustering.</p>
+
+        <h3>Colas y eventos: desacoplar para no bloquear</h3>
+        <p>Una cola invierte el flujo: en vez de que el usuario espere a que la operación termine, la API <em>encola</em> un mensaje y responde «recibido» al instante. Un <em>worker</em> lo toma cuando puede. El diagrama es siempre el mismo:</p>
+        <pre class="diagram">
+  API  --->  COLA  --->  WORKER (uno o varios)
+   |                       |
+   |                       +--> escribe resultado en la BASE
+   +--> responde 202 Accepted al usuario inmediatamente
+
+  Si el worker se cae, el mensaje sigue en la cola.
+  Si hay más carga, se lanzan más workers: la cola absorbe el pico.
+        </pre>
+        <p>Hay dos grandes familias de servicio y conviene no confundirlas:</p>
+        <table>
+          <thead><tr><th>Tipo</th><th>Azure</th><th>AWS</th><th>Idea</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cola</strong></td><td>Service Bus (Queues)</td><td>SQS</td><td>Un consumidor procesa cada mensaje una vez</td></tr>
+            <tr><td><strong>Pub/Sub</strong></td><td>Service Bus (Topics/Subscriptions)</td><td>SNS</td><td>Un mensaje llega a varios suscriptores</td></tr>
+            <tr><td><strong>Eventos/reactor</strong></td><td>Event Grid</td><td>EventBridge</td><td>Reaccionar a «algo pasó» (blob creado, usuario registrado)</td></tr>
+            <tr><td><strong>Streaming</strong></td><td>Event Hubs</td><td>Kinesis (o Kafka/MSK)</td><td>Flujo continuo y ordenado con muchos consumidores</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Dato clave:</strong> «cola» y «streaming» no son lo mismo. Una cola <em>reparte</em> el trabajo (cada mensaje, un worker); un <em>stream</em> lo <em>difunde</em> y lo conserva durante días (varios consumidores leen los mismos eventos). Elige según si repartes tareas o alimentas varios sistemas con el mismo flujo.</p>
+        </div>
+
+        <h3>Garantías de entrega: aquí se gana la fiabilidad</h3>
+        <ul>
+          <li><strong>At-least-once (al menos una vez):</strong> el caso por defecto. Un mensaje puede entregarse <em>dos veces</em> (por ejemplo, si el worker cae justo tras procesarlo). Consecuencia: <strong>el consumidor debe ser idempotente</strong>.</li>
+          <li><strong>At-most-once (como mucho una vez):</strong> se puede perder, no se duplica. Sirve para métricas, no para dinero.</li>
+          <li><strong>Exactly-once</strong>: casi siempre es una ilusión práctica; se consigue sumando entregas at-least-once + idempotencia en el consumidor.</li>
+        </ul>
+        <p>Y dos mecanismos que te salvan la operación:</p>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Visibility timeout</strong></td><td>El mensaje desaparece temporalmente mientras se procesa; si el worker no confirma, vuelve a estar visible</td></tr>
+            <tr><td><strong>Dead-letter queue (DLQ)</strong></td><td>Mensajes que fallaron N veces van a una cola aparte para que no bloqueen ni se pierdan silenciosamente</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Su relación con lo que ya sabes</h3>
+        <ul>
+          <li><strong>Con la base de datos (lección 02):</strong> la caché descarga lecturas; la cola descarga escrituras lentas. Ambas protegen la misma base que acabas de aprender a dimensionar.</li>
+          <li><strong>Con el almacenamiento de objetos (lección 01):</strong> el worker de una cola suele <em>escribir el resultado</em> (un PDF) en un contenedor y guardar solo la referencia en la base.</li>
+          <li><strong>Con la red (módulo 2):</strong> tanto la caché como la cola deben ser privadas, accedidas por identidad gestionada o claves en Key Vault, nunca con acceso público.</li>
+          <li><strong>Con el módulo 5:</strong> las colas de hoy son la base de las arquitecturas serverless por eventos de mañana.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Dos líneas para una caché, dos para una cola. Primero, la caché: guardar un valor con TTL y recuperarlo.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># --- CACHÉ: guardar con tiempo de vida (TTL) de 60 segundos ---
+# SET con el flag EX: el valor se autodestruye a los 60 s. Nunca olvides el TTL.
+redis-cli SET "usuario:42:saludo" "hola copiloto" EX 60
+
+# GET devuelve el valor si sigue vivo; si expiró, devuelve nil.
+redis-cli GET "usuario:42:saludo"
+# TTL dice cuántos segundos le quedan antes de desaparecer.
+redis-cli TTL "usuario:42:saludo"
+</code></pre>
+        <p>Y ahora la cola: crear una cola y enviar un mensaje que un worker procesará más tarde.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># --- COLA: crear una cola en Service Bus ---
+az servicebus queue create \
+  --resource-group rg-copiloto \
+  --namespace-name copiloto-bus \
+  --name informes \
+  --max-delivery-count 5        # tras 5 intentos fallidos -> dead-letter
+
+# Enviar un trabajo: "genera el informe del usuario 42".
+az servicebus queue message send \
+  --resource-group rg-copiloto \
+  --namespace-name copiloto-bus \
+  --queue-name informes \
+  --body '{"user_id":42,"tipo":"informe_mensual"}'
+</code></pre>
+        <p>Qué acaba de pasar:</p>
+        <ol class="steps">
+          <li><strong><code>SET ... EX 60</code>:</strong> la clave existe en memoria 60 segundos. El <code>EX</code> es el seguro contra datos obsoletos.</li>
+          <li><strong><code>TTL</code>:</strong> no adivines cuándo caduca: pregúntalo. Un TTL que se acaba de repente explica muchos bugs fantasma.</li>
+          <li><strong><code>max-delivery-count 5</code>:</strong> si el worker falla cinco veces, el mensaje va a la DLQ en lugar de reintentarse para siempre.</li>
+          <li><strong><code>message send</code>:</strong> la API no genera el informe, solo <em>deja el encargo</em>. Volverá a responder inmediatamente al usuario.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El Copiloto usa <strong>las dos piezas juntas</strong>. Redis cachea las respuestas del modelo que se repiten (una pregunta frecuente no vuelve a costar una llamada al modelo), y Service Bus encola la generación de informes para no bloquear la API. Terraform:</p>
+        <div class="code-file">cache.tf</div>
+        <pre><code class="language-hcl"># Caché gestionada para respuestas repetidas del Copiloto.
+resource "azurerm_redis_cache" "copiloto" {
+  name                = "copiloto-cache"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+
+  # Standard: tiene réplica para failover. Basic no lo uses en producción.
+  sku_name = "Standard"
+  capacity = 1                 # tamaño del nodo; ajusta tras medir
+
+  family             = "C"
+  non_ssl_port_enabled = false # forzamos TLS: nada de tráfico en claro
+
+  # Solo accesible desde la red del Copiloto, no desde Internet.
+  public_network_access_enabled = false
+
+  redis_configuration {
+    maxmemory_policy = "allkeys-lru"   # al llenarse, desaloja lo menos usado
+  }
+
+  tags = { project = "copiloto", env = "prod" }
+}
+</code></pre>
+        <div class="code-file">queue.tf</div>
+        <pre><code class="language-hcl"># Espacio de nombres de mensajería.
+resource "azurerm_servicebus_namespace" "copiloto" {
+  name                = "copiloto-bus"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  sku                 = "Standard"
+  tags                = { project = "copiloto", env = "prod" }
+}
+
+# La cola de trabajos largos (generar informes).
+resource "azurerm_servicebus_queue" "informes" {
+  name         = "informes"
+  namespace_id = azurerm_servicebus_namespace.copiloto.id
+
+  # Si el worker falla 5 veces, el mensaje va a la dead-letter: no se pierde ni bloquea.
+  max_delivery_count = 5
+
+  # Tiempo que un mensaje queda "invisible" mientras se procesa.
+  # Si el worker tarda más, otro lo recoge: por eso el worker debe ser idempotente.
+  lock_duration = "PT5M"   # formato ISO 8601: 5 minutos
+
+  # Guardamos el mensaje 7 días si nadie lo consume.
+  default_message_ttl = "P7D"
+}
+</code></pre>
+        <p>El flujo completo, y por qué cada pieza está donde está:</p>
+        <ol class="steps">
+          <li><strong>La API recibe una pregunta.</strong> Antes de llamar al modelo, busca la respuesta en Redis (clave derivada de la pregunta). Si hay <em>HIT</em>, responde en microsegundos y no gasta ni base ni modelo.</li>
+          <li><strong>Si no hay <em>HIT</em>,</strong> llama al modelo y guarda el resultado en Redis con un TTL razonable (por ejemplo 1 hora). Las siguientes preguntas idénticas son gratis.</li>
+          <li><strong>Si el usuario pide un informe,</strong> la API escribe el PDF pendiente en un contenedor de blobs (lección 01) y publica un mensaje en la cola <code>informes</code>.</li>
+          <li><strong>El worker</strong> consume el mensaje, genera el informe, lo sube a blobs y actualiza la base. Si falla, el mensaje vuelve; tras 5 intentos, va a la DLQ para que alguien lo mire.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Azure ↔ AWS:</strong> Redis gestionado es <code>aws_elasticache_replication_group</code> (ElastiCache); la cola es <code>aws_sqs_queue</code> (con <code>redrive_policy</code> para la DLQ); el pub/sub es SNS y los eventos, EventBridge. El patrón —caché en memoria delante de la base, cola entre la API y el worker— es idéntico cambie el nombre que cambie.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Poner siempre un <strong>TTL</strong> a las claves de caché</td>
+              <td>Claves inmortales «porque nunca cambian»</td>
+              <td>Todo dato cambia alguna vez; sin TTL, un fallo de invalidación deja datos obsoletos para siempre</td>
+            </tr>
+            <tr>
+              <td>Tratar la caché como <strong>material regenerable</strong></td>
+              <td>Guardar en ella datos que no existen en otro sitio</td>
+              <td>La caché puede vaciarse o perderse; si es tu única copia, no es una caché</td>
+            </tr>
+            <tr>
+              <td>Consumidores <strong>idempotentes</strong></td>
+              <td>Asumir que cada mensaje llega exactamente una vez</td>
+              <td>La entrega es <em>at-least-once</em>: tu worker recibirá duplicados tarde o temprano</td>
+            </tr>
+            <tr>
+              <td>Configurar <strong>max-delivery-count</strong> y <strong>DLQ</strong></td>
+              <td>Reintentos infinitos</td>
+              <td>Un mensaje «venenoso» que siempre falla bloquea la cola si no hay un vertedero a donde mandarlo</td>
+            </tr>
+            <tr>
+              <td>Ajustar el <strong>visibility timeout</strong> al tiempo real del trabajo</td>
+              <td>Timeout por defecto con trabajos largos</td>
+              <td>Si el trabajo tarda más que el timeout, otro worker reprocesa el mismo mensaje</td>
+            </tr>
+            <tr>
+              <td>Red <strong>privada</strong> y TLS para ambos servicios</td>
+              <td>Puerto sin TLS o acceso público abierto</td>
+              <td>Caché y cola llevan datos sensibles; exponerlos es regalar tu información interna</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Error 1: usar la caché como base de datos</h3>
+        <p>Guardar en Redis la única copia de algo (por ejemplo, el carrito de la compra) funciona hasta que la caché se reinicia o se desaloja una clave.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — la caché es la única copia</span>
+        <pre><code class="language-bash"># El carrito vive SOLO en Redis, sin TTL y sin respaldo.
+redis-cli SET "carrito:42" '{"items":["libro"]}'
+# Si el nodo se reinicia o se desaloja la clave, el carrito desaparece.
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — la base manda, la caché acelera</span>
+        <pre><code class="language-bash"># La base de datos es la fuente de verdad; Redis solo replica la lectura.
+# Al escribir: actualiza la base  y  refresca/invalida la caché.
+redis-cli SET "carrito:42" '{"items":["libro"]}' EX 900
+# La caché caduca sola y, si se pierde, se reconstruye desde la base.
+</code></pre>
+
+        <h3>Error 2: un worker que no es idempotente</h3>
+        <p>Con entregas <em>at-least-once</em>, el mismo mensaje puede llegar dos veces. Si el worker no lo tolera, cobrarás (o enviarás) dos veces.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — procesar sin comprobar</span>
+        <pre><code class="language-text"># El worker recibe el mensaje y suma 1 a un contador o envía un email.
+# Si el mensaje se entrega dos veces -> contador mal / email duplicado.
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — clave de idempotencia</span>
+        <pre><code class="language-sql">-- Antes de actuar, registra el id del mensaje. Si ya existe, ignóralo.
+INSERT INTO procesados (message_id)
+VALUES ('a1b2c3')
+ON CONFLICT (message_id) DO NOTHING;
+
+-- Solo si esta inserción insertó una fila (affected_rows = 1),
+-- el worker ejecuta el efecto de negocio. Si ya existía, no hace nada.
+</code></pre>
+
+        <h3>Error 3: olvidar la dead-letter queue</h3>
+        <p>Sin DLQ, un mensaje que siempre falla se reintenta indefinidamente y esconde el problema.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — reintentos infinitos</span>
+        <pre><code class="language-hcl">resource "azurerm_servicebus_queue" "informes" {
+  name         = "informes"
+  namespace_id = azurerm_servicebus_namespace.copiloto.id
+  # Sin max_delivery_count ajustado: el mensaje "venenoso" no tiene salida.
+}
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — límite y DLQ</span>
+        <pre><code class="language-hcl">resource "azurerm_servicebus_queue" "informes" {
+  name               = "informes"
+  namespace_id       = azurerm_servicebus_namespace.copiloto.id
+  max_delivery_count = 5    # tras 5 fallos, el mensaje va a la dead-letter
+  dead_lettering_on_message_expiration = true
+}
+# Alguien (una alerta del módulo 6) vigila la DLQ: si crece, hay un bug.
+</code></pre>
+
+        <h3>Error 4: cachear sin invalidar</h3>
+        <p>El usuario cambia su nombre, pero la caché sigue sirviendo el viejo porque nadie la invalidó.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — escribir y no tocar la caché</span>
+        <pre><code class="language-sql">-- El usuario actualiza su perfil y solo escribimos en la base.
+UPDATE usuarios SET nombre = 'Ana Gómez' WHERE id = 42;
+-- La clave usuarios:42:cached sigue con el nombre viejo hasta que caduque.
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — invalidar tras escribir</span>
+        <pre><code class="language-bash"># Tras el UPDATE, borra la clave: la próxima lectura la reconstruye.
+redis-cli DEL "usuarios:42:cached"
+# Alternativa robusta: publicar un evento de "usuario actualizado"
+# y que quien cachea esa clave reaccione (módulo 5).
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver en tu terminal el patrón cache-aside (con <em>miss</em> y <em>hit</em>) y el ciclo de un mensaje en una cola, incluido el paso por la dead-letter. Resultado esperado: el primer <em>GET</em> falla, el segundo acierta, y un mensaje que falla acaba en la DLQ.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> simula una caché con un diccionario en memoria local (no necesitas Redis gestionado para entender el patrón):
+            <pre><code class="language-bash"># Primer acceso: MISS. "base de datos" simulada con un sleep.
+# Segundo acceso: HIT, sin espera.
+redis-cli -u "$REDIS_URL" SET "pregunta:hola" "respuesta cacheada" EX 30
+redis-cli -u "$REDIS_URL" GET "pregunta:hola"   # HIT
+redis-cli -u "$REDIS_URL" TTL "pregunta:hola"   # quedan menos de 30 s
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea un espacio de nombres y una cola de práctiva en Service Bus:
+            <pre><code class="language-bash">az servicebus namespace create \
+  --resource-group rg-cloud-lab --name copiloto-bus-lab \
+  --location westeurope --sku Standard
+
+az servicebus queue create \
+  --resource-group rg-cloud-lab --namespace-name copiloto-bus-lab \
+  --name informes --max-delivery-count 2
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> envía dos mensajes, uno bueno y uno «venenoso»:
+            <pre><code class="language-bash">az servicebus queue message send \
+  --resource-group rg-cloud-lab --namespace-name copiloto-bus-lab \
+  --queue-name informes --body '{"user_id":42}'
+
+az servicebus queue message send \
+  --resource-group rg-cloud-lab --namespace-name copiloto-bus-lab \
+  --queue-name informes --body '{"user_id":"NO_EXISTE"}'
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> inspecciona el <em>conteo</em> de mensajes y de la dead-letter:
+            <pre><code class="language-bash">az servicebus queue show \
+  --resource-group rg-cloud-lab --namespace-name copiloto-bus-lab \
+  --name informes \
+  --query "{activos:countDetails.activeMessageCount, dlq:countDetails.deadLetterMessageCount}"
+</code></pre>
+            <p>Si simulas el consumo dejando fallar el mensaje malo más de <code>max-delivery-count</code> veces, verás cómo <code>dlq</code> crece. Ese contador es el que vigilarás con una alerta.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (limpieza):</strong> borra el grupo de recursos:
+            <pre><code class="language-bash">az group delete --name rg-cloud-lab --yes --no-wait
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Lo importante no son los comandos,</strong> sino los dos contadores: el de mensajes <em>activos</em> (trabajo pendiente) y el de la <em>DLQ</em> (trabajo que fracasó). Si el primero crece sin parar, faltan workers; si crece el segundo, hay un bug. Ambas cosas son candidatas a alarma en el módulo 6.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Endpoint de informe: rápido, idempotente y sin perder trabajos</h3>
+          <p>Diseña (en papel y con las piezas de Terraform que necesites) el flujo completo para <code>POST /informes</code> en el Copiloto, cumpliendo cuatro condiciones a la vez: (1) la petición responde en menos de 50 ms, (2) un mensaje entregado dos veces no genera dos informes, (3) si el worker cae a mitad, el trabajo no se pierde, y (4) si el informe se pide dos veces en cinco minutos, el segundo se sirve desde caché.</p>
+          <p>Explica en tres frases qué pieza resuelve cada condición y cómo interactúan la cola, la clave de idempotencia y la caché. <em>Pista: la API responde <code>202 Accepted</code> con un <code>job_id</code>; el worker es idempotente por <code>job_id</code>; el resultado se cachea con TTL bajo una clave derivada de los parámetros del informe. El reto queda abierto: no hay solución en esta página.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La <strong>caché</strong> (Redis) responde en microsegundos y descarga las lecturas repetidas; se usa con el patrón <strong>cache-aside</strong> y <strong>siempre con TTL</strong>.</li>
+          <li>La caché <strong>no es fuente de verdad</strong>: es material regenerable que puede desaparecer.</li>
+          <li>La <strong>cola</strong> desacopla al que pide del que hace: la API responde al instante y el worker procesa a su ritmo.</li>
+          <li>No confundas <strong>cola</strong> (reparte trabajo), <strong>pub/sub</strong> (difunde), <strong>eventos</strong> (reacciona) y <strong>streaming</strong> (conserva el flujo).</li>
+          <li>La entrega es <strong>at-least-once</strong>: el consumidor debe ser <strong>idempotente</strong>.</li>
+          <li><strong>Visibility timeout</strong> y <strong>dead-letter queue</strong> son los dos mecanismos que evitan perder trabajos o bloquearte con un mensaje venenoso.</li>
+          <li>Todo esto protege la misma base de datos que dimensionaste en la lección anterior.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Caché en memoria</td><td>Azure Cache for Redis</td><td>ElastiCache (Redis/Valkey)</td></tr>
+            <tr><td>Cola</td><td>Service Bus (Queues)</td><td>SQS</td></tr>
+            <tr><td>Pub/Sub</td><td>Service Bus (Topics)</td><td>SNS</td></tr>
+            <tr><td>Eventos</td><td>Event Grid</td><td>EventBridge</td></tr>
+            <tr><td>Streaming</td><td>Event Hubs</td><td>Kinesis / MSK</td></tr>
+            <tr><td>Mensajes fallidos</td><td>Dead-letter queue</td><td>Dead-letter queue</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿De verdad necesito una caché? ¿No basta con índices y una base más grande?</summary>
+            <div>
+              <p>A veces sí basta. La caché se justifica cuando hay <strong>lecturas muy repetidas</strong> desde varias instancias, o cuando la operación es <strong>cara</strong> (una llamada a un modelo, un agregado pesado). Añadir Redis solo porque «todo el mundo lo usa» es coste y complejidad sin beneficio. Mide primero; el <em>hit ratio</em> bajo es la señal de que no la necesitabas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La cola reemplaza a la base de datos?</summary>
+            <div>
+              <p>No. La cola transporta <em>órdenes de trabajo</em>; el estado de negocio vive en la base. Un mensaje no es un registro: se procesa y se va. Lo que aprendiste en la lección 02 sigue siendo válido: la base es la fuente de verdad, la cola es el mensajero.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre Service Bus y Event Grid?</summary>
+            <div>
+              <p>Service Bus transporta <strong>mensajes de negocio</strong> que alguien debe procesar (genera este informe), con reintentos y DLQ. Event Grid <strong>reacciona a hechos</strong> del sistema («se creó un blob», «se registró un usuario») y notifica a quien esté suscrito. A veces se combinan: un hecho dispara un mensaje en la cola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que un mensaje se procese dos veces si la entrega es at-least-once?</summary>
+            <div>
+              <p>Haciendo el consumidor <strong>idempotente</strong>: el efecto de procesar el mismo mensaje dos veces debe ser igual al de procesarlo una. La técnica habitual es registrar el identificador del mensaje antes de actuar (una tabla de <em>procesados</em> o una clave en Redis con SETNX) y no repetir el efecto si ya está.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi worker reprocesa el mismo mensaje si ya lo había empezado?</summary>
+            <div>
+              <p>Casi siempre por el <strong>visibility timeout</strong>: si el trabajo tarda más que ese tiempo, el mensaje vuelve a estar visible y otro worker lo toma. Solución: ajusta el timeout al tiempo real del trabajo, o extiende el <em>lock</em> mientras procesas. Y, en cualquier caso, que el worker sea idempotente para que un reproceso no haga daño.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

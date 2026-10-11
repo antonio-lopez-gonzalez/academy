@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-terraform-azure">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Terraform para Azure — Módulo 7 · Curso Cloud</title>
+  <meta name="description" content="El Terraform que crea toda la infraestructura del Copiloto en Azure: providers, state remoto, variables, outputs, etiquetas de coste y cero secretos en el repositorio.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Terraform para Azure</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: Copiloto en la nube</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La lección anterior fijó el plano. Esta lo convierte en <strong>código que crea la infraestructura entera de una sola vez</strong>: red, registro, cómputo, base de datos, secretos y observabilidad. Es el corazón del proyecto <code>proyectos/infra-cloud/</code>.</p>
+        <p>Pero «escribir Terraform» no es vaciar recursos en un <code>main.tf</code> y darle a <code>apply</code>. Un Terraform de proyecto real tiene tres cosas que un script de principiante no tiene:</p>
+        <ol class="steps">
+          <li><strong>Un <code>backend</code> remoto y versionado</strong>, para que el <em>state</em> no viva en el portátil de nadie y no acabe en el repositorio.</li>
+          <li><strong>Variables y outputs</strong>, para que lo mismo sirva para <em>dev</em> y para <em>prod</em> sin copiar y pegar archivos.</li>
+          <li><strong>Etiquetas de coste</strong> y <strong>cero secretos</strong>, las dos reglas no negociables del curso.</li>
+        </ol>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque aquí es donde se decide si tu infraestructura es <em>repetible</em> o <em>artesanal</em>. Con lo que escribas aquí, la lección 03 podrá crear y actualizar todo el Copiloto desde un pipeline sin tocar la consola, y la lección 04 podrá etiquetar, presupuestar y observar cada recurso. Si el Terraform es desordenado, todo lo que viene detrás arrastra ese desorden.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Cómo lee Terraform un proyecto</h3>
+        <p>Terraform no «ejecuta» un archivo: lee <strong>toda la carpeta</strong> <code>.tf</code> como una sola unidad. Por eso da igual llamar a los archivos <code>main.tf</code>, <code>red.tf</code> o <code>datos.tf</code>: lo que importa es organizarlos por responsabilidad. La estructura que usaremos:</p>
+        <pre class="diagram">
+  infra-cloud/
+  ├── versions.tf     &lt;-- versión de Terraform + providers (azurerm)
+  ├── backend.tf      &lt;-- dónde vive el STATE (remoto, no en git)
+  ├── variables.tf    &lt;-- ENTRADAS: lo que cambia entre dev y prod
+  ├── main.tf         &lt;-- los recursos (el plano de la lección 01)
+  ├── outputs.tf      &lt;-- SALIDAS: URL, ids, nombres de recursos
+  ├── dev.tfvars      &lt;-- valores para dev  (sin secretos)
+  └── prod.tfvars     &lt;-- valores para prod (sin secretos)
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el <em>state</em> es el <strong>inventario de la obra</strong>. Terraform no recuerda lo que creó mirando Azure; lo recuerda leyendo ese inventario. Si lo pierdes, no sabe qué existe y qué tiene que borrar o modificar. En el portátil, ese inventario es único y frágil; por eso vive en un <strong>backend remoto</strong> (un contenedor de Blob Storage), compartido y bloqueado mientras alguien aplica.</p>
+        </div>
+
+        <h3>El state remoto: por qué nunca en el repositorio</h3>
+        <p>El <em>state</em> contiene <strong>todo</strong> lo que Terraform sabe, incluidos valores que a veces son sensibles. Las tres reglas de oro:</p>
+        <table>
+          <thead><tr><th>Regla</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Nunca en <code>.git</code></td><td>El state puede contener secretos y, además, es un archivo binario que se pisa a cada <code>apply</code></td></tr>
+            <tr><td>Siempre en un backend remoto</td><td>Un solo estado compartido: todo el equipo y el pipeline ven lo mismo</td></tr>
+            <tr><td>Con <em>state locking</em></td><td>Evita que dos <code>apply</code> a la vez corrompan el inventario (Azure lo hace con un <em>lease</em> del blob)</td></tr>
+          </tbody>
+        </table>
+        <p>El backend <code>azurerm</code> guarda el state en un <em>contenedor</em> de una cuenta de almacenamiento. Esos datos (cuenta, contenedor, clave de acceso) <strong>no son secretos</strong>: se pueden crear por CLI y se pasan con <code>terraform init -backend-config</code>, o como variables de entorno:</p>
+        <div class="code-file">terminal — crear el backend (una sola vez)</div>
+        <pre><code class="language-bash"># La cuenta y el contenedor del state se crean a mano, UNA vez, fuera del
+# Terraform (el huevo y la gallina: el state no puede depender de sí mismo).
+az group create --name rg-tfstate --location westeurope
+az storage account create \
+  --name sttfstatecopiloto --resource-group rg-tfstate \
+  --sku Standard_LRS --encryption-services blob
+az storage container create --name tfstate --account-name sttfstatecopiloto
+</code></pre>
+        <div class="callout callout--tip">
+          <p>El backend se configura una vez y no se toca más. Terraform puede <strong>leer</strong> la clave de la cuenta desde el entorno (<code>ARM_ACCESS_KEY</code>) o —mejor— usar la identidad del pipeline contra el backend. Lo importante: esa credencial <strong>no va en el repositorio</strong>.</p>
+        </div>
+
+        <h3>Variables, <em>locals</em> y <em>tfvars</em>: una sola base de código</h3>
+        <p>La diferencia entre dev y prod no debe ser un archivo duplicado. Debe ser <strong>un valor distinto</strong>. Para eso están tres cosas que se confunden a menudo:</p>
+        <table>
+          <thead><tr><th>Pieza</th><th>Qué es</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>variable</strong></td><td>Una entrada que quien aplica puede cambiar</td><td><code>var.environment = "prod"</code></td></tr>
+            <tr><td><strong>local</strong></td><td>Un valor calculado dentro del código, no editable desde fuera</td><td><code>local.tags = { project = "copiloto", … }</code></td></tr>
+            <tr><td><strong>.tfvars</strong></td><td>El archivo con los valores concretos por entorno</td><td><code>prod.tfvars</code></td></tr>
+          </tbody>
+        </table>
+        <p>Un truco que usarás siempre: <strong>derivar los nombres de los recursos de <code>var.environment</code></strong>. Así <code>terraform apply -var-file=dev.tfvars</code> crea el entorno de dev y <code>prod.tfvars</code> el de producción, sin tocar el código:</p>
+        <div class="code-file">infra/main.tf — el nombre sale del entorno</div>
+        <pre><code class="language-hcl">resource "azurerm_virtual_network" "vnet" {
+  name = "vnet-copiloto-${var.environment}"   # vnet-copiloto-dev | vnet-copiloto-prod
+  # ...
+}
+</code></pre>
+
+        <h3>El patrón «protegido»: lo que nunca entra en el repositorio</h3>
+        <p>El curso repite una y otra vez: <strong>ningún secreto en el repositorio</strong>. En Terraform esto se traduce en una regla concreta: una variable que contiene un secreto se declara con <code>sensitive = true</code> y su valor <strong>nunca</strong> se escribe en un <code>.tfvars</code> versionado —se pasa por variable de entorno o, mejor, se guarda en Key Vault y se lee con <code>data</code>.</p>
+        <div class="code-file">infra/variables.tf — la variable sensible</div>
+        <pre><code class="language-hcl">variable "db_admin_password" {
+  description = "Password del administrador de PostgreSQL (llega en apply, no en git)"
+  type        = string
+  sensitive   = true          # Terraform la enmascara en el plan y en los logs
+}
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Ojo:</strong> <code>sensitive = true</code> oculta el valor en la salida, pero el valor <strong>sigue guardándose en el state</strong>. Por eso el state debe estar en un backend protegido y cifrado, y por eso en la lección 03 el pipeline inyecta el secreto desde el entorno, nunca desde un archivo del repositorio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El esqueleto mínimo de un proyecto Terraform de Azure: fijar versiones, declarar el provider y el backend, y leer la suscripción con un <code>data source</code>. Sin esto, nada más funciona bien.</p>
+        <div class="code-file">infra/versions.tf — versiones fijadas y provider</div>
+        <pre><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.6.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~&gt; 4.0"        # permite 4.x, evita un salto mayor sin revisar
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}                  # bloque obligatorio, aunque esté vacío
+}
+
+# Saber en qué suscripción y tenant trabajamos (sin escribirlos a mano).
+data "azurerm_client_config" "current" {}
+</code></pre>
+        <div class="code-file">infra/backend.tf — el state, remoto</div>
+        <pre><code class="language-hcl">terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstatecopiloto"
+    container_name       = "tfstate"
+    key                  = "copiloto.tfstate"   # un state por despliegue
+  }
+}
+</code></pre>
+        <p>Tres decisiones que acabas de tomar:</p>
+        <ol class="steps">
+          <li><strong><code>required_version</code> y <code>~&gt; 4.0</code>:</strong> fijas la versión mayor del provider. Terraform avisa si el provider cambia de mayor; no te sorprende un <code>apply</code> con una API distinta.</li>
+          <li><strong><code>features {}</code>:</strong> el provider <code>azurerm</code> exige este bloque aunque esté vacío (allí se configuran comportamientos concretos del ciclo de vida).</li>
+          <li><strong><code>data.azurerm_client_config</code>:</strong> te da <code>tenant_id</code> y <code>subscription_id</code> sin hardcodearlos. Lo usarás en el Key Vault.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El proyecto completo <code>infra-cloud</code>, pieza a pieza. Empieza por las <strong>variables</strong> y las <strong>etiquetas</strong>, que son el contrato del proyecto:</p>
+        <div class="code-file">infra/variables.tf — el contrato de entrada</div>
+        <pre><code class="language-hcl">variable "location" {
+  description = "Región de Azure"
+  type        = string
+  default     = "westeurope"
+}
+
+variable "environment" {
+  description = "Entorno de despliegue"
+  type        = string
+  validation {                                 # evita typos que crean entornos fantasma
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment debe ser 'dev' o 'prod'."
+  }
+}
+
+variable "owner" {
+  description = "Responsable del proyecto (para etiquetas de coste)"
+  type        = string
+}
+
+variable "cost_center" {
+  description = "Centro de coste al que se imputa el gasto"
+  type        = string
+}
+
+variable "db_admin_password" {
+  description = "Password del administrador de PostgreSQL"
+  type        = string
+  sensitive   = true
+}
+</code></pre>
+        <div class="code-file">infra/main.tf — recursos, etiquetas y composición</div>
+        <pre><code class="language-hcl"># ---------------------------------------------------------- GRUPO Y ETIQUETAS
+resource "azurerm_resource_group" "main" {
+  name     = "rg-copiloto-${var.environment}"
+  location = var.location
+  tags     = local.tags
+}
+
+locals {
+  # UN único punto de verdad de las etiquetas: si aparece una nueva,
+  # se añade aquí y llega a TODOS los recursos a la vez.
+  tags = {
+    course      = "cloud"
+    project     = "copiloto"
+    environment = var.environment
+    owner       = var.owner
+    cost_center = var.cost_center
+  }
+}
+
+# ------------------------------------------------------------------ RED
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-copiloto-${var.environment}"
+  location            = azurerm_resource_group.main.location
+  resource_group_name = azurerm_resource_group.main.name
+  address_space       = ["10.20.0.0/16"]
+  tags                = local.tags
+}
+
+resource "azurerm_subnet" "app" {
+  name                 = "snet-app"
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.1.0/24"]
+}
+
+# --------------------------------------------------------------- REGISTRO
+resource "azurerm_container_registry" "acr" {
+  name                = "copilotoacr${var.environment}"   # sin guiones, único
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  sku                 = "Standard"
+  admin_enabled       = false
+  tags                = local.tags
+}
+
+# -------------------------------------------------- OBSERVABILIDAD (primero)
+# El entorno de Container Apps necesita el workspace, así que este va antes.
+resource "azurerm_log_analytics_workspace" "law" {
+  name                = "log-copiloto-${var.environment}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+  tags                = local.tags
+}
+
+# ---------------------------------------------------------------- CÓMPUTO
+resource "azurerm_container_app_environment" "env" {
+  name                       = "cae-copiloto-${var.environment}"
+  resource_group_name        = azurerm_resource_group.main.name
+  location                   = azurerm_resource_group.main.location
+  infrastructure_subnet_id   = azurerm_subnet.app.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.law.id
+  tags                       = local.tags
+}
+
+resource "azurerm_user_assigned_identity" "app" {
+  name                = "id-copiloto-${var.environment}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  tags                = local.tags
+}
+
+resource "azurerm_role_assignment" "acr_pull" {
+  scope                = azurerm_container_registry.acr.id
+  role_definition_name = "AcrPull"                     # solo lectura de imágenes
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+}
+
+resource "azurerm_container_app" "api" {
+  name                         = "copiloto-api"
+  container_app_environment_id = azurerm_container_app_environment.env.id
+  resource_group_name          = azurerm_resource_group.main.name
+  revision_mode                = "Single"
+  tags                         = local.tags
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.app.id]
+  }
+
+  registry {
+    server   = azurerm_container_registry.acr.login_server
+    identity = azurerm_user_assigned_identity.app.id
+  }
+
+  template {
+    container {
+      name   = "api"
+      image  = "${azurerm_container_registry.acr.login_server}/copiloto-api:${var.image_tag}"
+      cpu    = 0.5
+      memory = "1Gi"
+
+      # El secreto se inyecta como variable de entorno: la app lee DATABASE_URL.
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+    }
+    min_replicas = 1
+    max_replicas = 5
+  }
+
+  secret {
+    name  = "database-url"
+    value = var.database_url          # variable sensible; valor solo en apply
+  }
+
+  ingress {
+    external_enabled           = true
+    target_port                = 8000
+    allow_insecure_connections = false
+  }
+}
+
+# ------------------------------------------------------------------- DATOS
+resource "azurerm_private_dns_zone" "postgres" {
+  name                = "private.postgres.database.azure.com"
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = local.tags
+}
+
+resource "azurerm_postgresql_flexible_server" "db" {
+  name                   = "psql-copiloto-${var.environment}"
+  resource_group_name    = azurerm_resource_group.main.name
+  location               = azurerm_resource_group.main.location
+  version                = "16"
+  administrator_login    = "copiloto"
+  administrator_password = var.db_admin_password
+  storage_mb             = 32768
+  sku_name               = "B_Standard_B1ms"
+  backup_retention_days  = 7
+  tags                   = local.tags
+}
+
+# ----------------------------------------------------------------- SECRETOS
+resource "azurerm_key_vault" "kv" {
+  name                       = "kv-copiloto-${var.environment}"
+  resource_group_name        = azurerm_resource_group.main.name
+  location                   = azurerm_resource_group.main.location
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "standard"
+  rbac_authorization_enabled = true
+  purge_protection_enabled   = true
+  tags                       = local.tags
+}
+</code></pre>
+        <p>Y las <strong>salidas</strong>, para que nadie tenga que buscar nada en la consola:</p>
+        <div class="code-file">infra/outputs.tf — lo que el pipeline necesita leer</div>
+        <pre><code class="language-hcl">output "resource_group" {
+  description = "Grupo de recursos del entorno"
+  value       = azurerm_resource_group.main.name
+}
+
+output "acr_login_server" {
+  description = "Servidor del registro para hacer docker/tag y push"
+  value       = azurerm_container_registry.acr.login_server
+}
+
+output "copiloto_url" {
+  description = "URL HTTPS pública de la Copiloto API"
+  value       = "https://${azurerm_container_app.api.ingress[0].fqdn}"
+}
+
+output "health_url" {
+  description = "Endpoint de salud para la verificación del pipeline"
+  value       = "https://${azurerm_container_app.api.ingress[0].fqdn}/health"
+}
+</code></pre>
+        <p>Los valores concretos por entorno, en dos archivos <strong>sin secretos</strong>:</p>
+        <div class="code-file">infra/dev.tfvars y infra/prod.tfvars</div>
+        <pre><code class="language-hcl"># dev.tfvars — nada sensible aquí
+environment = "dev"
+owner       = "tu-nombre"
+cost_center = "formacion"
+
+# prod.tfvars
+environment = "prod"
+owner       = "plataforma"
+cost_center = "pdt-1234"
+</code></pre>
+        <p>Y el ciclo de trabajo de un día normal:</p>
+        <div class="code-file">terminal — inicializar, planificar y aplicar</div>
+        <pre><code class="language-bash">cd proyectos/infra-cloud
+
+# init lee el backend y coloca los providers.
+terraform init
+
+# Valida sintaxis y coherencia interna (rápido, antes de tocar la nube).
+terraform validate
+
+# Plan: SIEMPRE con el archivo del entorno. El secreto llega del entorno, no del .tfvars.
+export TF_VAR_db_admin_password="$DB_ADMIN_PASSWORD"
+export TF_VAR_database_url="$DATABASE_URL"
+
+terraform plan  -var-file=dev.tfvars -out=tfplan
+terraform apply tfplan
+
+terraform output copiloto_url
+</code></pre>
+        <ul>
+          <li><strong>Un <code>local.tags</code> y nada más:</strong> las etiquetas se definen una vez y se esparcen por referencia. Añadir <code>team = "x"</code> es editar una línea, no treinta.</li>
+          <li><strong>El nombre de cada recurso deriva de <code>var.environment</code>:</strong> el mismo código crea dev y prod. Nada de <code>main-dev.tf</code> y <code>main-prod.tf</code>.</li>
+          <li><strong>El secreto entra por <code>TF_VAR_*</code> (variable de entorno):</strong> el valor de <code>db_admin_password</code> y <code>database_url</code> nunca aparece en un archivo del repositorio. El <code>.tfvars</code> solo lleva lo no sensible.</li>
+          <li><strong><code>terraform validate</code> antes de <code>apply</code>:</strong> detecta errores de tipo y de referencia en segundos, sin gastar dinero creando nada.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Truco de orden:</strong> en <code>main.tf</code> colocamos el <em>workspace de Log Analytics antes del entorno de Container Apps</em> porque el entorno lo referencia. Terraform resuelve el orden con el grafo de dependencias, pero agrupar los recursos por capa (grupo → red → observabilidad → cómputo → datos → secretos) hace el archivo legible y el <code>plan</code> fácil de revisar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Backend remoto con <em>locking</em> desde el primer día</td>
+              <td>State local en el portátil o (peor) en git</td>
+              <td>Un state local no se comparte y puede contener secretos; en git, se corrompe con cada conflicto</td>
+            </tr>
+            <tr>
+              <td>Fijar versiones (<code>required_version</code>, <code>~&gt;</code>)</td>
+              <td>Dejar los providers «a la última» sin control</td>
+              <td>Un salto de versión mayor puede cambiar la API de un recurso y romper el <code>apply</code></td>
+            </tr>
+            <tr>
+              <td>Variables con <code>validation</code> para los valores críticos</td>
+              <td><code>environment = "production"</code> por error</td>
+              <td>Un typo en el entorno crea un despliegue fantasma y una factura fantasma</td>
+            </tr>
+            <tr>
+              <td>Un <code>local.tags</code> único aplicado a todo</td>
+              <td>Etiquetas copiadas a mano recurso a recurso</td>
+              <td>Etiquetas coherentes = atribución de coste fiable y automatizable</td>
+            </tr>
+            <tr>
+              <td>Secretos como variables <code>sensitive</code> inyectadas en runtime</td>
+              <td>Secretos en <code>.tfvars</code> versionados</td>
+              <td>Regla del curso: nada de secretos en el repositorio, ni siquiera en un <code>.tfvars</code></td>
+            </tr>
+            <tr>
+              <td>Sacar por <code>output</code> todo lo que otro sistema necesita</td>
+              <td>Que el pipeline busque valores «a mano» con <code>az ... show</code></td>
+              <td>Todo como código: las salidas son el contrato con el CI/CD y con otros equipos</td>
+            </tr>
+            <tr>
+              <td>Formatear y validar antes de commitear</td>
+              <td>Revisiones de PR llenas de cambios de sangría</td>
+              <td><code>terraform fmt -check</code> y <code>validate</code> en el pipeline detectan lo trivial automáticamente</td>
+            </tr>
+            <tr>
+              <td>Separar por <em>entorno</em>, no por tipo de recurso</td>
+              <td>Un <code>prod</code> y un <code>dev</code> mezclados en la misma carpeta/state</td>
+              <td>Cada entorno tiene su state: un <code>destroy</code> en dev no puede tocar prod</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Dejar el <em>state</em> en el repositorio</h3>
+        <span class="code-label code-label--wrong">Incorrecto — state local, versionado por accidente</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ Sin backend: terraform escribe terraform.tfstate en la carpeta del proyecto.
+# git lo ve como un archivo más y, un commit despistado, lo sube al repositorio.
+# Contiene valores sensibles y se corrompe en cuanto hay dos personas.
+[sin bloque backend]
+</code></pre>
+        <span class="code-label code-label--right">Correcto — backend remoto y un <code>.gitignore</code> a prueba de balas</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ El state vive en Blob Storage; el repo solo guarda código.
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstatecopiloto"
+    container_name       = "tfstate"
+    key                  = "copiloto.tfstate"
+  }
+}
+</code></pre>
+        <pre><code class="language-text"># Y en el .gitignore del proyecto, por si acaso:
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+.terraform/
+</code></pre>
+
+        <h3>2. Escribir el secreto en un <code>.tfvars</code> versionado</h3>
+        <span class="code-label code-label--wrong">Incorrecto — la contraseña va en git</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ prod.tfvars — commit y a rezar. La contraseña queda en el historial para siempre.
+db_admin_password = "Sup3rS3cret0!"
+database_url      = "postgres://copiloto:Sup3rS3cret0!@psql.../copiloto"
+</code></pre>
+        <span class="code-label code-label--right">Correcto — el valor entra por el entorno en <code>apply</code></span>
+        <pre class="code-right"><code class="language-bash"># ✅ El .tfvars solo lleva lo NO sensible; los secretos llegan del entorno.
+export TF_VAR_db_admin_password="$DB_ADMIN_PASSWORD"
+export TF_VAR_database_url="$DATABASE_URL"
+terraform apply -var-file=prod.tfvars
+</code></pre>
+
+        <h3>3. Un <code>apply</code> que toca el entorno equivocado</h3>
+        <pre><code class="language-bash"># ❌ Nadie pasó el -var-file: Terraform usa los defaults y crea/actualiza
+# recursos sin el sufijo del entorno esperado. Aparecen «entornos fantasma».
+terraform apply
+
+# ✅ El archivo del entorno es obligatorio y el valor está validado.
+terraform apply -var-file=prod.tfvars
+</code></pre>
+        <p>La <code>validation</code> de <code>environment</code> en <code>variables.tf</code> evita el typo, pero la disciplina de pasar siempre <code>-var-file</code> evita el olvido. En el pipeline (lección 03) esto no depende de la memoria: el entorno fija el <code>-var-file</code>.</p>
+
+        <h3>4. Recrear recursos que no debían recrearse</h3>
+        <pre><code class="language-hcl"># ❌ Cambiar un atributo inmutable (como el nombre) fuerza destroy + create:
+# la base de datos se borra y se vuelve a crear → pérdida de datos.
+resource "azurerm_postgresql_flexible_server" "db" {
+  name = "psql-copiloto-v2"     # ¡nombre nuevo = recurso nuevo!
+}
+
+# ✅ Mira el plan: si ves "must be replaced", PARA y decide.
+#    Usa `terraform state mv` o `moved {}` para renombrar sin recrear.
+moved {
+  from = azurerm_postgresql_flexible_server.db[0]
+  to   = azurerm_postgresql_flexible_server.db
+}
+</code></pre>
+        <p><strong>Regla:</strong> nunca hagas <code>apply</code> sin leer el plan. La línea <code>-/+ must be replaced</code> sobre una base de datos es la diferencia entre un despliegue y un incidente.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> inicializar el proyecto con backend remoto, validarlo, generar un plan para <em>dev</em> y comprobar que <strong>no hay ningún secreto en los archivos versionados</strong>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — prepara el backend remoto (una vez).</strong>
+            <pre><code class="language-bash">az group create --name rg-tfstate --location westeurope
+az storage account create \
+  --name sttfstatecopiloto --resource-group rg-tfstate \
+  --sku Standard_LRS --encryption-services blob
+az storage container create --name tfstate --account-name sttfstatecopiloto
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — inicializa y valida.</strong>
+            <pre><code class="language-bash">cd proyectos/infra-cloud
+terraform init
+terraform fmt -check        # ¿está todo formateado?
+terraform validate          # ¿hay errores de referencia o de tipo?
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — pasa los secretos por el entorno, no por archivos.</strong>
+            <pre><code class="language-bash">export TF_VAR_db_admin_password="$(openssl rand -base64 24)"
+export TF_VAR_database_url="postgres://copiloto:${TF_VAR_db_admin_password}@psql-copiloto-dev.postgres.database.azure.com:5432/copiloto"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — genera el plan de dev y revísalo.</strong>
+            <pre><code class="language-bash">terraform plan -var-file=dev.tfvars -out=tfplan
+# Lee el resumen: cuántos recursos se añaden, cuántos se cambian y cuántos se destruyen.
+# Esperado: ~12 recursos "to add", 0 "to change", 0 "to destroy" en el primer apply.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — comprueba que no hay secretos versionados.</strong>
+            <pre><code class="language-bash"># Debe salir vacío: ninguna contraseña ni cadena de conexión en los archivos del repo.
+grep -RInE "password|datABASE_URL.*://|secret" *.tf *.tfvars 2&gt;/dev/null
+
+# Y confirma que git ignora el state y los tfvars automáticos:
+git status --porcelain | grep -E "tfstate|tfvars"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — aplica el plan y lee la salida.</strong>
+            <pre><code class="language-bash">terraform apply tfplan
+terraform output copiloto_url
+terraform output health_url
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 7 — limpia (solo dev).</strong>
+            <pre><code class="language-bash">terraform destroy -var-file=dev.tfvars
+# El state se queda en el backend; el grupo de recursos se borra.
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Resultado esperado:</strong> el proyecto se inicializa contra el backend remoto, <code>validate</code> pasa en limpio, el plan para <em>dev</em> es revisable y <strong>la búsqueda de secretos no encuentra nada</strong>. Has montado un Terraform repetible; en la lección 03 el mismo código se disparará desde GitHub Actions sin credenciales guardadas.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Key Vault como única fuente de secretos</h3>
+          <p>Hoy el secreto del Copiloto (<code>database_url</code>) entra como variable sensible de Terraform. Ese valor acaba en el <em>state</em>. El reto es <strong>sacar los secretos de Terraform</strong>: que el código cree el Key Vault, guarde el secreto ahí y que la Container App lo lea <strong>directamente de Key Vault con su identidad gestionada</strong>, de forma que el valor nunca transite por el state de Terraform.</p>
+          <p>Requisitos del reto: (1) el secreto se guarda en Key Vault (por <code>az</code> o por un recurso de Terraform, tú decides el equilibrio); (2) la identidad de la app recibe <strong>solo</strong> el rol <code>Key Vault Secrets User</code> sobre ese Key Vault concreto; (3) la Container App referencia el secreto desde Key Vault y no como <code>secret</code> plano; y (4) documentas en el código qué secreto sigue «viviendo» en el state y por qué es aceptable o cómo evitarlo del todo.</p>
+          <p><em>Pista: mira el módulo 2 (<code>02-secretos</code>). Container Apps permite declarar un <code>secret</code> cuyo valor es la <code>versionless_id</code> de un secreto de Key Vault, y la app lo lee con su identidad. La pregunta fina —la que separa un junior de un senior— es <strong>quién</strong> pone el valor en Key Vault y si ese «quién» vuelve a arrastrar un secreto consigo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Terraform lee <strong>toda la carpeta</strong> <code>.tf</code>: organízala por responsabilidad (<code>versions</code>, <code>backend</code>, <code>variables</code>, <code>main</code>, <code>outputs</code>).</li>
+          <li>El <strong>state es el inventario</strong>: siempre en backend remoto con <em>locking</em>, nunca en git.</li>
+          <li><strong>Variables + <code>.tfvars</code> + <em>locals</em></strong> = una sola base de código para <em>dev</em> y <em>prod</em>; los nombres derivan del entorno.</li>
+          <li>Los <strong>secretos</strong> se declaran <code>sensitive</code> y llegan por el entorno (<code>TF_VAR_*</code>) o desde Key Vault; <strong>nunca</strong> en un archivo versionado.</li>
+          <li><code>local.tags</code> único aplicado a todos los recursos: atribución de coste desde el minuto uno.</li>
+          <li><code>outputs</code> como contrato con el CI/CD (URL, health, servidor del registro).</li>
+          <li><strong>Lee siempre el plan</strong>: <code>must be replaced</code> sobre datos es un incidente, no una actualización.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Pieza de Terraform</th><th>Rol en el proyecto</th><th>Equivalente conceptual en AWS</th></tr></thead>
+          <tbody>
+            <tr><td><code>versions.tf</code></td><td>Provider <code>azurerm</code> y versiones</td><td>Provider <code>aws</code></td></tr>
+            <tr><td><code>backend.tf</code></td><td>State remoto en Blob Storage</td><td>State remoto en S3 + DynamoDB lock</td></tr>
+            <tr><td><code>variables.tf</code></td><td>Entradas por entorno</td><td>Igual (independiente del proveedor)</td></tr>
+            <tr><td><code>main.tf</code></td><td>Recursos y <code>local.tags</code></td><td>Recursos AWS y <code>default_tags</code></td></tr>
+            <tr><td><code>outputs.tf</code></td><td>Contrato con el pipeline</td><td>Igual</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Terraform u OpenTofu? ¿Cambia algo de lo que he escrito?</summary>
+            <div>
+              <p>OpenTofu es el <em>fork</em> abierto de Terraform y usa la misma sintaxis HCL y los mismos providers, así que todo el código de esta lección funciona igual. Cambia el binario (<code>tofu</code> en vez de <code>terraform</code>) y algunos detalles del registro de providers. Para el curso usamos <code>terraform</code>; si tu organización migró a OpenTofu, el 95&nbsp;% del trabajo es idéntico y solo cambian comandos puntuales.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo tener varios <code>.tfstate</code> para el mismo proyecto?</summary>
+            <div>
+              <p>Sí, y a menudo conviene. La regla es <strong>un state por entorno</strong> (dev y prod separados: un error en dev no puede tocar prod). Si el proyecto crece mucho, puedes separar también por «ciclo de vida» (por ejemplo, red compartida frente a aplicaciones). Lo que <strong>no</strong> se hace es tener el mismo entorno repartido en varios states sin querer: acabarías con recursos que se crean dos veces o que se destruyen por sorpresa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito escribir la contraseña a mano en cada <code>apply</code>?</summary>
+            <div>
+              <p>No la escribes: la exportas una vez en el entorno (<code>export TF_VAR_db_admin_password=...</code>) o —mejor— dejas que el pipeline la inyecte desde su <em>secrets store</em> en la lección 03. La clave es no teclearla en un archivo. Si te ves copiándola a un <code>.tfvars</code> «solo por comodidad», ese es justo el momento en que se convierte en una fuga.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo uso <code>count</code>/<code>for_each</code> y cuándo recursos repetidos a mano?</summary>
+            <div>
+              <p>Cuando el número de recursos es <strong>dinámico</strong> o depende de una lista de configuración, usa <code>for_each</code> (casi siempre preferible a <code>count</code>, porque las claves no se reordenan al quitar un elemento). Para 3–4 recursos fijos y distintos entre sí, escribirlos a mano es más legible. No conviertas el Terraform en un lenguaje de programación: si necesitas mucha lógica, probablemente quieras un <em>módulo</em>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debería envolver todo esto en un módulo reutilizable?</summary>
+            <div>
+              <p>Cuando vayas a desplegar el <strong>mismo patrón varias veces</strong> (por ejemplo, un entorno por cliente o por equipo). Un módulo encapsula el conjunto «red + cómputo + datos + secretos» y expone variables y outputs, para que crear un entorno nuevo sea una llamada de veinte líneas. Para el proyecto del curso, un solo despliegue no necesita módulo; pero saber cuándo extraerlo es parte del criterio senior.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

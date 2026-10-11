@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-oidc-sin-claves">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OIDC: desplegar sin claves — Módulo 2 · Curso Cloud</title>
+  <meta name="description" content="Federación de identidad con OIDC: cómo GitHub Actions despliega el Copiloto en Azure y AWS sin guardar claves de larga vida en el repositorio ni en los secretos de CI.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>OIDC: desplegar sin claves</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Identidad y seguridad</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El pipeline de CI/CD es, sin querer, uno de los mayores agujeros de seguridad de un proyecto. Para que GitHub Actions despliegue en tu cuenta de cloud, alguien creó un «secreto» de despliegue: una clave de larga vida guardada en <code>Settings → Secrets</code>. Esa clave no caduca, sirve desde cualquier sitio y, si se filtra en un log o en un PR malicioso, da acceso a tu cuenta hasta que alguien se acuerde de revocarla.</p>
+        <p>Esta lección elimina ese secreto de raíz con <strong>OIDC</strong> (<em>OpenID Connect</em>): el pipeline demuestra <em>quién es</em> con un token que GitHub firma y que caduca en minutos, y el cloud le da credenciales temporales a cambio. No hay nada que guardar, nada que rotar y nada que robar más allá de unos minutos.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección cierra el módulo?</strong> Porque aplica todo lo anterior a la pieza que más claves de larga vida acumula: la automatización. Identidad (lección 01) + sin secretos guardados (lección 02) + mínimo privilegio y ámbito (lecciones 01 y 03) + federación en vez de password. OIDC es el patrón que hace que tu pipeline sea igual de seguro que tu aplicación en ejecución.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Errores típicos:</strong> guardar <code>AZURE_CREDENTIALS</code> o las claves de AWS como secreto de GitHub, crear un usuario de CI con clave de acceso permanente, usar un subject con comodín (<code>repo:org/*</code>) que permite desplegar desde cualquier repositorio de la organización, y olvidar el permiso <code>id-token: write</code>, que hace que OIDC simplemente no funcione.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema de las claves de larga vida</h3>
+        <p>Una clave de despliegue vive demasiado. Entre que se crea y se revoca, pasa por muchos sitios: la configuración del repositorio, portátiles de quien la copió, logs del pipeline, cachés. Y su <strong>radio de daño</strong> suele ser enorme, porque se le concede «lo que haga falta» para desplegar. OIDC invierte la lógica: en vez de un secreto que llevas contigo, demuestras tu identidad y recibes un permiso temporal.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> la clave de larga vida es una <em>llave maestra que copias y repartes</em>. OIDC es un <em>portero que comprueba tu identidad en el momento</em> y te deja pasar a la zona que te corresponde, con un pase que caduca en el mismo turno. Si alguien intercepta el pase, al minuto ya no sirve.</p>
+        </div>
+
+        <h3>Cómo funciona la federación (paso a paso)</h3>
+        <pre class="diagram">
+ 1. El workflow pide un token OIDC a GitHub       GitHub Actions
+    (necesita permiso id-token: write)           (token.actions.githubusercontent.com)
+             |                                          |
+             |------ "dame un token firmado" --------->|
+             |<----- JWT firmado, dura ~minutos -------|
+             |
+ 2. El workflow presenta el JWT al cloud
+             |
+ 3. El cloud comprueba la FIRMA y las CLAIMS
+    (issuer, audience, subject) contra la CONFIANZA
+    que le configuraste previamente
+             |
+ 4. Si coincide, emite credenciales TEMPORALES
+    para el rol/identidad que toca
+             |
+ 5. El workflow despliega en Azure/AWS con esas credenciales
+    (sin haber guardado ninguna clave en el repositorio)
+        </pre>
+        <p>Las <strong>claims</strong> del token son las que deciden si se concede el acceso. Las que más se usan para restringir:</p>
+        <table>
+          <thead><tr><th>Claim</th><th>Ejemplo</th><th>Por qué importa</th></tr></thead>
+          <tbody>
+            <tr><td><code>iss</code> (issuer)</td><td><code>https://token.actions.githubusercontent.com</code></td><td>Identifica a GitHub como emisor de confianza</td></tr>
+            <tr><td><code>aud</code> (audience)</td><td><code>api://AzureADTokenExchange</code> (Azure) · <code>sts.amazonaws.com</code> (AWS)</td><td>Evita que un token emitido para otro servicio sirva aquí</td></tr>
+            <tr><td><code>sub</code> (subject)</td><td><code>repo:mi-org/mi-repo:ref:refs/heads/main</code></td><td><strong>La restricción más importante:</strong> saber qué repo, rama o entorno puede usarlo</td></tr>
+            <tr><td><code>environment</code></td><td><code>production</code></td><td>Permite exigir aprobación humana antes de desplegar</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>El patrón <code>environment</code>:</strong> si configuras el subject como <code>repo:org/repo:environment:production</code> y el workflow declara <code>environment: production</code>, entonces el despliegue necesita pasar por las <em>protection rules</em> de ese entorno (aprobación, ramas permitidas, espera). Es la forma más limpia de que un despliegue a producción requiera un visto bueno humano sin añadir secretos.</p>
+        </div>
+
+        <h3>Azure y AWS: mismo concepto, distinto vocabulario</h3>
+        <table>
+          <thead><tr><th>Pieza</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Confianza en el emisor</td><td>Federated identity credential sobre una app o identidad gestionada</td><td>IAM OIDC Identity Provider</td></tr>
+            <tr><td>A quién se concede el token</td><td>El <code>subject</code> de la credencial federada</td><td>La <em>trust policy</em> del rol (condición sobre <code>sub</code>)</td></tr>
+            <tr><td>Permisos resultantes</td><td>Roles de Azure asignados a esa identidad</td><td>Policies unidas al rol</td></tr>
+            <tr><td>Action del workflow</td><td><code>azure/login</code> con <code>client-id</code>/<code>tenant-id</code>/<code>subscription-id</code></td><td><code>aws-actions/configure-aws-credentials</code> con <code>role-to-assume</code></td></tr>
+            <tr><td>Audiencia</td><td><code>api://AzureADTokenExchange</code></td><td><code>sts.amazonaws.com</code></td></tr>
+          </tbody>
+        </table>
+        <p>Fíjate en algo importante: <strong>ninguno de los identificadores que verás en el workflow es un secreto</strong>. El <code>client-id</code> de Azure o el ARN del rol de AWS son datos públicos. Lo que protege el acceso es la <em>condición de confianza</em>, no el ocultamiento.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El workflow más pequeño que se autentica en Azure con OIDC: dos bloques, uno que concede el permiso para pedir el token y otro que hace el login. Nada de <code>secrets</code>.</p>
+        <div class="code-file">.github/workflows/deploy.yml</div>
+        <pre><code class="language-yaml">name: deploy
+
+on:
+  push:
+    branches: [main]
+
+# 1) El permiso CLAVE: sin id-token: write, GitHub no emite el token OIDC
+#    y azure/login se cae. Es la causa numero uno de "no funciona".
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 2) Login federado: NO hay password ni client secret.
+      #    client-id, tenant-id y subscription-id son IDENTIFICADORES
+      #    publicos, no secretos.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # 3) A partir de aqui el token dura minutos: despliega lo que necesites.
+      - name: Comprueba la identidad en Azure
+        run: az account show --query "{cuenta:name, usuario:user.name}" -o table
+</code></pre>
+        <p>Qué acaba de pasar:</p>
+        <ol class="steps">
+          <li><strong><code>permissions: id-token: write</code></strong>: autoriza al workflow a pedir un token OIDC. Sin esta línea el resto es papel mojado.</li>
+          <li><strong><code>azure/login@v2</code> con <code>client-id</code></strong>: el action pide el token a GitHub, lo presenta a Entra ID y recibe credenciales temporales para la identidad federada. Todo automático.</li>
+          <li><strong><code>az account show</code></strong>: verifica que el login funcionó. Es tu «hello world»: si muestra la cuenta correcta, la federación está bien configurada.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Los valores van en <code>vars</code> (variables del repositorio), no en <code>secrets</code>. No es un detalle estético: al ponerlos como variables dejas claro en el propio workflow que <strong>no hay ningún secreto</strong> y que la seguridad viene de la configuración de confianza.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el Copiloto, la identidad de despliegue es una <strong>identidad gestionada user-assigned</strong> con una <em>federated identity credential</em> que solo acepta tokens de la rama <code>main</code> de tu repositorio. Esa identidad recibe el mínimo permiso para desplegar la infraestructura.</p>
+        <div class="code-file">proyectos/infra-cloud/oidc.tf</div>
+        <pre><code class="language-hcl"># ---------------------------------------------------------------------------
+# Identidad dedicada al pipeline (no la del dia a dia de una persona).
+# ---------------------------------------------------------------------------
+resource "azurerm_user_assigned_identity" "github" {
+  name                = "id-copiloto-github"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+# ---------------------------------------------------------------------------
+# LA CONFIANZA: aceptamos tokens de GitHub, del repo concreto y de la rama
+# main. El subject es lo que impide que otro repo use esta identidad.
+#  - audience: el valor que Entra ID espera para el token de intercambio.
+#  - issuer:   el emisor OIDC de GitHub Actions.
+# ---------------------------------------------------------------------------
+resource "azurerm_federated_identity_credential" "github_main" {
+  name                = "github-main"
+  user_assigned_identity_id = azurerm_user_assigned_identity.github.id
+  audience            = ["api://AzureADTokenExchange"]
+  issuer              = "https://token.actions.githubusercontent.com"
+  subject             = "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+}
+
+# ---------------------------------------------------------------------------
+# El rol que ese pipeline puede ejercer: Contributor sobre el grupo de
+# recursos, donde vive todo lo que despliega (nunca Owner ni la suscripcion).
+# ---------------------------------------------------------------------------
+resource "azurerm_role_assignment" "github_deploy" {
+  scope                = azurerm_resource_group.rg.id
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_user_assigned_identity.github.principal_id
+}
+</code></pre>
+        <p>Y así se usa desde el workflow, sin un solo secreto guardado:</p>
+        <div class="code-file">.github/workflows/terraform.yml</div>
+        <pre><code class="language-yaml">name: terraform
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "proyectos/infra-cloud/**"
+
+permissions:
+  id-token: write   # pedir el token OIDC
+  contents: read    # leer el repositorio
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform apply
+        working-directory: proyectos/infra-cloud
+        run: |
+          terraform init
+          terraform apply -auto-approve
+</code></pre>
+        <p>Y el equivalente en AWS, donde la confianza vive en la <em>trust policy</em> del rol. En Terraform se escribe así, sin JSON a mano:</p>
+        <div class="code-file">proyectos/infra-cloud/aws-oidc.tf (alternativa AWS)</div>
+        <pre><code class="language-hcl"># Proveedor OIDC de GitHub: AWS confia en los tokens que GitHub firma.
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  # Solo hace falta aportar thumbprints en proveedores antiguos;
+  # AWS valida el certificado de GitHub para este emisor conocido.
+}
+
+# Trust policy del rol: quien puede asumirlo y con que claims.
+data "aws_iam_policy_document" "github_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+
+    # Audiencia: el token es para AWS.
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # Subject: solo la rama main de ESTE repositorio.
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_deploy" {
+  name               = "copiloto-github-deploy"
+  assume_role_policy = data.aws_iam_policy_document.github_trust.json
+}
+</code></pre>
+        <p>Y en el workflow de AWS se usa la action oficial con el ARN del rol, que es público:</p>
+        <div class="code-file">.github/workflows/deploy-aws.yml (fragmento)</div>
+        <pre><code class="language-yaml">permissions:
+  id-token: write
+  contents: read
+
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Configura credenciales AWS (OIDC)
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      aws-region: eu-west-1
+</code></pre>
+        <p>Tres decisiones que merecen explicación:</p>
+        <ol class="steps">
+          <li><strong>El <code>subject</code> fija el repositorio Y la rama.</strong> No es «cualquier repo de la organización»: es exactamente <code>org/repo</code> en <code>main</code>. Eso es mínimo privilegio aplicado a la identidad del pipeline.</li>
+          <li><strong><code>Contributor</code> sobre el grupo de recursos</strong>, no <code>Owner</code> en la suscripción. El pipeline puede crear y cambiar recursos, pero no repartir permisos ni tocar otras suscripciones.</li>
+          <li><strong>Ningún identificador es un secreto.</strong> Si alguien ve el <code>client-id</code>, no puede hacer nada sin un token de <em>ese</em> repositorio y <em>esa</em> rama.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Para producción, sube el listón:</strong> usa <code>subject = "repo:org/repo:environment:production"</code> y declara <code>environment: production</code> en el workflow. Así el despliegue pasa a depender de una aprobación registrada, y el rol de producción queda separado del de <em>staging</em> (dos identidades federadas distintas).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Federación OIDC para todo pipeline que toque el cloud</td>
+              <td>Guardar claves de cloud como secretos de GitHub</td>
+              <td>Sin secreto permanente no hay nada que filtrar ni que rotar</td>
+            </tr>
+            <tr>
+              <td>Restringe el <code>subject</code> al repo y a la rama (o entorno)</td>
+              <td>Comodines como <code>repo:org/*</code> o <code>ref:refs/heads/*</code></td>
+              <td>Un comodín convierte cualquier repo comprometido en una vía de despliegue</td>
+            </tr>
+            <tr>
+              <td>Una identidad de despliegue por entorno (dev, staging, prod)</td>
+              <td>Una sola identidad con permisos en todos los entornos</td>
+              <td>Limita el daño de un workflow comprometido a un solo entorno</td>
+            </tr>
+            <tr>
+              <td>Declara <code>id-token: write</code> solo en el job que lo necesita</td>
+              <td>Conceder <code>id-token: write</code> a todo el workflow por costumbre</td>
+              <td>Menos permisos efectivos y más difícil que un paso ajeno abuse del token</td>
+            </tr>
+            <tr>
+              <td>Usa <code>environment</code> con reglas de protección para producción</td>
+              <td>Desplegar a producción con cualquier push a cualquier rama</td>
+              <td>Añade una revisión humana sin introducir credenciales nuevas</td>
+            </tr>
+            <tr>
+              <td>Registra en Terraform las credenciales federadas y los roles</td>
+              <td>Crear la federación a mano en el portal</td>
+              <td>La confianza queda revisable en un <em>pull request</em> y reproducible</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Ojo con los <em>pull requests</em> de forks:</strong> un PR desde un fork no recibe permisos de escritura ni <code>id-token</code> por defecto, precisamente para que no pueda desplegar. No «arregles» esto concediendo <code>id-token: write</code> a eventos de PR: es la barandilla que te protege de un PR malicioso.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Guardar un JSON de credenciales como secreto de GitHub</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-yaml"># El clasico: un client secret de larga vida en los secretos de CI.
+# No caduca, se copia a forks y logs, y hay que rotarlo a mano.
+- name: Azure login
+  uses: azure/login@v2
+  with:
+    creds: ${{ secrets.AZURE_CREDENTIALS }}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-yaml"># OIDC: identificadores publicos + token efimero que GitHub firma.
+- name: Azure login
+  uses: azure/login@v2
+  with:
+    client-id:       ${{ vars.AZURE_CLIENT_ID }}
+    tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+    subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+</code></pre>
+        <p>La diferencia no es de comodidad: es la diferencia entre un secreto que vive años y un permiso que vive minutos. OIDC no elimina el secreto, <strong>elimina la necesidad de guardarlo</strong>.</p>
+
+        <h3>Usar comodines en el subject</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-hcl"># Cualquier repositorio de la organizacion puede asumir esta identidad.
+# Un repo de pruebas comprometido despliega en tu produccion.
+resource "azurerm_federated_identity_credential" "github" {
+  name                      = "github-any"
+  user_assigned_identity_id = azurerm_user_assigned_identity.github.id
+  audience                  = ["api://AzureADTokenExchange"]
+  issuer                    = "https://token.actions.githubusercontent.com"
+  subject                   = "repo:${var.github_org}/*:ref:refs/heads/main"
+}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-hcl"># Repositorio exacto y rama exacta. Nada de comodines.
+resource "azurerm_federated_identity_credential" "github" {
+  name                      = "github-main"
+  user_assigned_identity_id = azurerm_user_assigned_identity.github.id
+  audience                  = ["api://AzureADTokenExchange"]
+  issuer                    = "https://token.actions.githubusercontent.com"
+  subject                   = "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+}
+</code></pre>
+        <p>El <code>subject</code> es la frontera de seguridad. Un comodín ahí equivale a dar la llave a toda la organización para «no tener que configurarla cada vez». Es exactamente el tipo de atajo que se convierte en incidente.</p>
+
+        <h3>Olvidar el permiso <code>id-token: write</code></h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-yaml"># Sin permisos declarados, GITHUB_TOKEN no puede emitir el token OIDC.
+# El login falla con un error poco descriptivo.
+on: [push]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-yaml"># id-token: write es OBLIGATORIO para que GitHub emita el token OIDC.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+</code></pre>
+        <p>Es el fallo más habitual al configurar OIDC por primera vez, y despista porque el error no dice «te falta el permiso». Regla mnemotécnica: <strong>si tocas el cloud sin claves, necesitas <code>id-token: write</code></strong>.</p>
+
+        <h3>Reutilizar una sola identidad para todos los entornos</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-hcl"># Una unica identidad con permisos en TODO: si un workflow se compromete,
+# el atacante puede tocar tambien produccion.
+resource "azurerm_role_assignment" "github_all" {
+  scope                = data.azurerm_subscription.current.id
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_user_assigned_identity.github.principal_id
+}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-hcl"># Identidad distinta por entorno, y cada una con su propio subject
+# (staging: rama develop; produccion: environment production).
+resource "azurerm_role_assignment" "github_staging" {
+  scope                = azurerm_resource_group.staging.id
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_user_assigned_identity.github_staging.principal_id
+}
+
+resource "azurerm_role_assignment" "github_prod" {
+  scope                = azurerm_resource_group.prod.id
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_user_assigned_identity.github_prod.principal_id
+}
+</code></pre>
+        <p>Cada entorno con su identidad y su condición de confianza. El radio de daño de un workflow comprometido se limita al entorno que le corresponde, no a toda la cuenta.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> configurar una federación OIDC real y comprobar el login desde un workflow sin haber creado ningún secreto.</p>
+        <div class="callout callout--warning">
+          <p><strong>Antes de empezar:</strong> necesitas permiso para crear app registrations y asignar roles. En un tenant de laboratorio lo tienes; en una empresa puede que no. Si no puedes, sigue los pasos para entender el flujo y pásalos a un compañero con permisos.</p>
+        </div>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea la aplicación (identidad) y su service principal:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash"># La "app registration" es la identidad; el service principal es su
+# presencia en el tenant (la entidad a la que se asignan roles).
+APP_ID=$(az ad app create --display-name copiloto-gh-oidc --query appId -o tsv)
+az ad sp create --id "$APP_ID"
+
+TENANT_ID=$(az account show --query tenantId -o tsv)
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+echo "APP_ID=$APP_ID"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Añade la credencial federada con el subject exacto:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash"># Cambia ORG/REPO por los tuyos. El subject fija repo y rama.
+az ad app federated-credential create \
+  --id "$APP_ID" \
+  --parameters '{
+    "name": "github-main",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:ORG/REPO:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Da el mínimo permiso necesario:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash"># Un grupo de recursos dedicado al despliegue, con el rol Contributor.
+az group create --name rg-oidc-lab --location westeurope --tags curso=cloud
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+
+az role assignment create \
+  --assignee "$SP_OBJECT_ID" --role Contributor \
+  --scope "$(az group show -n rg-oidc-lab --query id -o tsv)"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Publica los identificadores como variables del repositorio:</strong>
+            <div class="code-file">GitHub → Settings</div>
+            <pre><code class="language-yaml"># En Settings > Secrets and variables > Actions > Variables:
+#   AZURE_CLIENT_ID       = $APP_ID
+#   AZURE_TENANT_ID       = $TENANT_ID
+#   AZURE_SUBSCRIPTION_ID = $SUBSCRIPTION_ID
+#
+# Van en "Variables", NO en "Secrets": no son secretos.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Crea el workflow y comprueba el login:</strong>
+            <div class="code-file">.github/workflows/oidc-check.yml</div>
+            <pre><code class="language-yaml">name: oidc-check
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Quien soy
+        run: az account show --query "{cuenta:name, usuario:user.name}" -o table
+</code></pre>
+            <p><strong>Resultado esperado:</strong> el paso «Quien soy» muestra la suscripción y la identidad del service principal. Si el login falla, revisa (en este orden): el permiso <code>id-token: write</code>, que el <code>subject</code> coincida con <strong>tu</strong> <code>ORG/REPO</code> y rama, y que la audiencia sea <code>api://AzureADTokenExchange</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Limpia:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az group delete --name rg-oidc-lab --yes --no-wait
+az ad app delete --id "$APP_ID"
+</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un despliegue a producción que exige aprobación humana</h3>
+          <p>Configura <strong>dos</strong> identidades federadas distintas para el mismo repositorio: una para <em>staging</em> (push a <code>develop</code>) y otra para <em>producción</em> (entorno <code>production</code>). El despliegue a producción solo debe poder ejecutarse <strong>después de una aprobación manual</strong> y nunca desde una rama distinta de <code>main</code>.</p>
+          <p>Entrega: las dos credenciales federadas (con sus <code>subject</code> respectivos), los dos roles con ámbitos separados, y el workflow con la configuración de <code>environment</code> que activa la revisión.</p>
+          <p><em>Pista: el <code>subject</code> de producción usa <code>environment:production</code> en lugar de <code>ref:refs/heads/...</code>. La aprobación no la da OIDC, la dan las <em>protection rules</em> del entorno en GitHub; OIDC solo garantiza que el token que ves viene de ese entorno concreto. Piensa en qué pasaría si alguien quita la regla de protección: ¿tu configuración de confianza seguiría permitiendo el despliegue? ¿Debería?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>OIDC sustituye los secretos de despliegue de larga vida por <strong>tokens firmados que caducan en minutos</strong>.</li>
+          <li>GitHub emite el token; el cloud lo valida contra la <strong>confianza</strong> que configuraste (issuer, audience y subject).</li>
+          <li>El <code>subject</code> es la frontera de seguridad: fija el repo, la rama o el entorno. <strong>Sin comodines.</strong></li>
+          <li>En Azure la confianza es una <em>federated identity credential</em> sobre una identidad; en AWS, la <em>trust policy</em> de un rol.</li>
+          <li>El workflow necesita <code>permissions: id-token: write</code>; los identificadores son <strong>públicos</strong> y van como variables, no como secretos.</li>
+          <li>Una identidad por entorno y aprobaciones por <code>environment</code> limitan el radio de daño del pipeline.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Confianza en GitHub</td><td>Federated identity credential</td><td>IAM OIDC provider + trust policy</td></tr>
+            <tr><td>A quién se concede</td><td><code>subject</code> de la credencial</td><td>Condición sobre el <code>sub</code> del rol</td></tr>
+            <tr><td>Token del workflow</td><td><code>azure/login</code></td><td><code>configure-aws-credentials</code></td></tr>
+            <tr><td>Audiencia</td><td><code>api://AzureADTokenExchange</code></td><td><code>sts.amazonaws.com</code></td></tr>
+            <tr><td>Permiso del workflow</td><td><code>id-token: write</code></td><td><code>id-token: write</code></td></tr>
+            <tr><td>Identificadores</td><td><code>client-id</code> (público)</td><td><code>role-to-assume</code> ARN (público)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿OIDC no sigue necesitando un secreto para «empezar»?</summary>
+            <div>
+              <p>No en el sentido clásico. El único elemento que se guarda en la nube es la <strong>confianza</strong>: emisor, audiencia y subject. Eso es configuración pública, no una credencial. El token que se usa para autenticar lo genera GitHub en el momento y caduca en minutos, así que no hay un «secreto inicial» que proteger entre despliegues.</p>
+            </div>
+          </details>
+          <details>
+            <summary>El login falla con un error de autenticación. ¿Por dónde empiezo?</summary>
+            <div>
+              <p>Por tres comprobaciones, en orden: (1) el workflow declara <code>permissions: id-token: write</code>; (2) el <code>subject</code> coincide exactamente con tu <code>ORG/REPO</code> y la rama o entorno desde el que disparas; (3) la audiencia es la correcta (<code>api://AzureADTokenExchange</code> en Azure, <code>sts.amazonaws.com</code> en AWS). La cuarta causa habitual es disparar desde un PR de un fork, que por diseño no tiene el permiso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar OIDC con GitLab, Jenkins o Terraform Cloud?</summary>
+            <div>
+              <p>Sí. OIDC es un estándar: casi todas las plataformas de CI modernas emiten tokens OIDC (GitLab CI, CircleCI, Terraform Cloud, Bitbucket…). Cambian el emisor y las claims, pero el patrón —emitir, presentar, validar contra una confianza y recibir credenciales temporales— es idéntico. Lo que aprendes aquí se traslada.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿OIDC cuesta dinero?</summary>
+            <div>
+              <p>No. Configurar la federación no tiene coste en Azure ni en AWS. Lo único que puede tener coste es el propio pipeline (minutos de CI) y lo que despliegue. Es una de esas mejoras de seguridad que además simplifica la operación: menos secretos que rotar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Con OIDC, ¿mi pipeline sigue necesitando permisos mínimos?</summary>
+            <div>
+              <p>Más que nunca. OIDC resuelve <em>cómo</em> se autentica el pipeline, no <em>cuánto</em> puede hacer. Si le das <code>Owner</code> en la suscripción, un pipeline comprometido sigue siendo catastrófico, aunque no tenga claves. Combina OIDC con el mínimo privilegio de la lección 01: identidad federada, rol pequeño, ámbito estrecho y por entorno.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

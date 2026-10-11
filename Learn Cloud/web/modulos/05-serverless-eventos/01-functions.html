@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-functions">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Funciones serverless — Módulo 5 · Curso Cloud</title>
+  <meta name="description" content="Azure Functions y AWS Lambda: modelos de disparo, planes de hosting, cold start, límites y cómo ejecutar funciones en local antes de desplegar.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Funciones serverless</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Serverless y eventos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has ejecutado la <strong>Copiloto API</strong> dentro de un contenedor: un proceso que arranca, se queda escuchando y responde. Ese modelo es perfecto para un servicio con tráfico continuo, pero es un desperdicio para el resto del sistema. ¿Por qué mantener una máquina despierta 24 h para un trabajo que solo se ejecuta cuando llega un webhook, cuando cambia un blob o cuando suena un temporizador a medianoche?</p>
+        <p>Las <strong>funciones serverless</strong> (Azure Functions en Azure, AWS Lambda en AWS) atacan exactamente ese caso: tú escribes <em>una función</em> —un trozo de código con una entrada y una salida— y la plataforma decide <em>cuándo</em> ejecutarla, la arranca, la escala y la apaga. Deja de haber un servidor «encendido»; hay una función «a la espera de un estímulo». Solo pagas por las ejecuciones y por el tiempo real de cómputo.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque serverless es la categoría más malentendida de la nube. Mucha gente la aplica a todo («serverless first» sin pensar) y se topa con <em>cold start</em>, timeouts, agotamiento de conexiones a base de datos y facturas sorprendentes. Aquí vas a entender <strong>qué es una función por dentro</strong>, <strong>qué modelos de disparo tiene</strong>, <strong>qué límites no se pueden negociar</strong> y <strong>cómo probarla en local</strong>: las piezas sin las que no puedes decidir con criterio en la última lección del módulo.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Idea clave:</strong> una función es un <strong>unidad de despliegue atada a un disparador</strong>. No es «una app pequeña». En el momento en que necesitas estado persistente en memoria, conexiones largas o procesos de más de unos minutos, estás fuera de la zona cómoda de serverless (y lo verás de cerca en la lección 4).</p>
+        </div>
+        <p>Errores típicos que verás corregidos aquí: tratar la función como un mini backend con estado, dejar credenciales en la configuración, elegir el plan equivocado y culpar al <em>cold start</em> de todo, o creer que «serverless» significa «sin coste».</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El último escalón del espectro de cómputo</h3>
+        <p>En el módulo 1 viste el espectro VM → contenedor → serverless. Las funciones ocupan el extremo más gestionado: ya no das ni una imagen; das <strong>código y un disparador</strong>. La plataforma gestiona el runtime, el sistema operativo, la red y el escalado.</p>
+        <pre class="diagram">
+MÁS CONTROL  &lt;--------------------------------------------&gt;  MENOS CONTROL
+MÁS TRABAJO                                              MENOS TRABAJO
+                              MENOS TRABAJO
+
+  VM            Contenedor        Contenedor            FUNCIÓN
+  (SO)          (orquestador)     gestionado            (tú: una función
+                                 (Container Apps)        + su disparador)
+  +----------+  +-------------+  +----------------+  +----------------------+
+  | systemd  |  | Deployment  |  | imagen, puerto |  | "cuando llegue X,     |
+  | patch OS |  | Service/HPA |  | HTTPS, escalado|  |  ejecuta esto y calla"|
+  +----------+  +-------------+  +----------------+  +----------------------+
+  siempre on    siempre on        puede escalar a 0    SOLO corre cuando pasa algo
+        </pre>
+        <p>La diferencia esencial no es «no tener servidores» (los hay), sino cuándo se ejecuta el código. Una Container App con <code>min_replicas = 0</code> también escala a cero, pero sigue siendo <strong>un servicio a la escucha</strong>. Una función, en cambio, casi siempre es <strong>reactiva a un evento</strong>. Esa naturaleza reactiva es la que trae tanto la eficiencia como la mayoría de los problemas.</p>
+
+        <h3>Anatomía de una función: disparador, enlace y código</h3>
+        <p>Toda función serverless se compone de cuatro piezas. Confundirlas es la causa número uno de malos diseños:</p>
+        <table>
+          <thead><tr><th>Pieza</th><th>Qué es</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Trigger (disparador)</strong></td><td>El <em>porqué</em> arranca la función. Exactamente <strong>uno</strong> por función; define el contrato de entrada.</td><td>Una petición HTTP, un mensaje en cola, un fichero nuevo en un blob.</td></tr>
+            <tr><td><strong>Input binding</strong></td><td>Datos adicionales que la plataforma inyecta al arrancar, sin que tú abras conexiones a mano.</td><td>Leer una fila de Cosmos DB / DynamoDB a partir del ID del evento.</td></tr>
+            <tr><td><strong>Output binding</strong></td><td>Destino al que escribir el resultado sin gestionar el cliente.</td><td>Escribir en una cola o en una tabla tras procesar.</td></tr>
+            <tr><td><strong>Code + host</strong></td><td>Tu lógica y el fichero de configuración del runtime (p. ej. <code>host.json</code>/<code>function.json</code>).</td><td>La función en Python que manda un correo.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una función es un <strong>timbre de una casa</strong>. El botón (trigger) es lo único que la hace sonar; los cables de entrada (input bindings) le llevan la corriente de otros sitios; el altavoz conectado (output binding) es donde sale el sonido; y la canción que suena es tu código. Si el timbre hiciera demasiadas cosas a la vez —sonar, encender luces, abrir la puerta y hablar— dejaría de ser un timbre y sería una instalación entera.</p>
+        </div>
+
+        <h3>Modelos de disparo: no todo evento es igual</h3>
+        <p>Los disparadores se agrupan en familias, y cada familia define cómo se comporta la función ante el error:</p>
+        <ul>
+          <li><strong>HTTP</strong> (síncrono): alguien llama y espera respuesta. Típico para webhooks y endpoints ligeros. Si tarda, el cliente espera; hay timeout.</li>
+          <li><strong>Temporizador</strong> (<em>timer/Cron</em>): se ejecuta según una programación. Ideal para tareas de mantenimiento. No hay «quien llama».</li>
+          <li><strong>Cola / mensajería</strong> (<em>poll-based</em>): la plataforma lee mensajes de una cola y llama a la función por lotes. Es el patrón del desacoplamiento (lección 2).</li>
+          <li><strong>Evento</strong> (<em>push</em>): un servicio publica un evento y la plataforma <em>empuja</em> la llamada. Reactivo y de baja latencia.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Regla de oro de la entrega:</strong> casi toda mensajería serverless es <strong>at-least-once</strong> (al menos una vez). Eso significa que tu función <strong>puede ejecutarse más de una vez con el mismo evento</strong>. Diseña siempre <em>idempotente</em>: procesar dos veces el mismo mensaje no debe duplicar un cobro ni un correo. Volveremos a esto en la lección 2.</p>
+        </div>
+
+        <h3>Planes de hosting en Azure: el frío, lo precalentado y lo fijo</h3>
+        <p>En Azure Functions el «plan de hosting» decide precio, escalado, cold start y red. Es la decisión más importante al crear una función:</p>
+        <table>
+          <thead><tr><th>Plan</th><th>Escala a 0</th><th>Cold start</th><th>Timeout máx.</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Consumption</strong></td><td>Sí</td><td>Sí (notable)</td><td>5 min por defecto, 10 min configurable</td><td>Cargas esporádicas o impredecibles; coste mínimo base.</td></tr>
+            <tr><td><strong>Flex Consumption</strong></td><td>Sí</td><td>Reducible con <em>always-ready</em></td><td>Configurable, más alto</td><td>Consumption moderno: instancias siempre listas, VNet, escala más fina.</td></tr>
+            <tr><td><strong>Premium</strong></td><td>No (mín. 1)</td><td>No (instancias precalentadas)</td><td>Sin límite práctico</td><td>Latencia crítica, VNet, más memoria/CPU por instancia.</td></tr>
+            <tr><td><strong>Dedicated</strong> (App Service)</td><td>No</td><td>Ninguno (<em>always on</em>)</td><td>Sin límite</td><td>Cuando ya pagas un App Service plan y quieres reutilizarlo.</td></tr>
+          </tbody>
+        </table>
+        <p>En AWS el equivalente se reparte entre dos ejes: Lambda (que siempre es «consumption», escala a cero y tiene cold start) y el <strong>provisioned concurrency</strong> o <strong>reserved concurrency</strong> como forma de pagar por instancias precalentadas o por aislar un cupo.</p>
+
+        <h3>Cold start: qué es de verdad</h3>
+        <p>Cuando una función no tiene instancia lista, la plataforma debe <strong>crear una</strong> antes de ejecutar tu código. Ese tiempo de arranque es el <em>cold start</em> y tiene dos fases:</p>
+        <pre class="diagram">
+   Llega el evento
+        │
+        ▼
+  ┌───────────────┐   ┌──────────────────┐   ┌───────────────┐
+  │ FASE "INIT"   │   │ CARGA RUNTIME +  │   │ EJECUCIÓN     │
+  │ asigna host,  │──►│ tus dependencias │──►│ tu handler    │
+  │ baja contenedor│  │ (imports, SQL…)  │   │ (lo que mides)│
+  └───────────────┘   └──────────────────┘   └───────────────┘
+      (fuera de facturación en Azure)         (esto sí se factura)
+
+  Instancia caliente recibiendo más eventos -&gt; NO hay cold start
+        </pre>
+        <p>Que el <em>init</em> sea lento depende del runtime (Java y .NET tradicional suelen arrancar más lento que Node o Python), del tamaño de las dependencias y del idioma. Un cold start de 1–3 s es habitual; con muchas dependencias o stacks pesados, más.</p>
+        <p>Cómo mitigarlo, de menos a más coste:</p>
+        <ol class="steps">
+          <li><strong>Reducir el paquete:</strong> menos dependencias, imports perezosos. Gratis y siempre buena idea.</li>
+          <li><strong>Instancias precalentadas / provisioned concurrency:</strong> pagas por tener instancias listas. Elimina el cold start casi por completo.</li>
+          <li><strong>Mantener al menos una instancia (Premium/min 1):</strong> pagas aunque no haya tráfico, pero prácticamente no hay frío.</li>
+          <li><strong>SnapStart</strong> (AWS, algunos runtimes): restaura una instantánea de memoria ya inicializada.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>No pelees contra el cold start <em>antes</em> de medirlo. Instrumenta la duración y la frecuencia de arranques en frío (Application Insights / CloudWatch) y decide con datos. Optimizar un cold start que ocurre dos veces al día es tiempo perdido; ignorar uno que golpea a cada usuario sí es un problema.</p>
+        </div>
+
+        <h3>Límites que no se negocian</h3>
+        <table>
+          <thead><tr><th>Límite</th><th>Azure Functions (Consumption)</th><th>AWS Lambda</th></tr></thead>
+          <tbody>
+            <tr><td>Duración máxima</td><td>10 min (configurable)</td><td>15 min (900 s)</td></tr>
+            <tr><td>Memoria</td><td>1,5 GB por instancia (Consumption)</td><td>128 MB – 10 240 MB (ajustable)</td></tr>
+            <tr><td>Almacenamiento temporal</td><td>En disco del host, efímero</td><td><code>/tmp</code> de 512 MB a 10 GB</td></tr>
+            <tr><td>Tamaño de payload HTTP</td><td>~100 MB configurable por host</td><td>6 MB síncrono</td></tr>
+            <tr><td>Estado entre invocaciones</td><td>No garantizado (puede reutilizarse, no lo asumas)</td><td>Igual: reutiliza la instancia, pero no garantiza memoria</td></tr>
+            <tr><td>Escalado</td><td>Automático por eventos (hasta un tope por plan)</td><td>Automático por concurrencia (reservable)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>La trampa clásica: la base de datos.</strong> Una función puede escalar a 200 instancias en segundos. Si cada instancia abre su propia conexión al PostgreSQL gestionado, lo tumbas («<em>too many connections</em>»). Por eso serverless + base de datos relacional exige un <strong>pooler</strong> (como PgBouncer) o un driver serverless. Este es el motivo práctico número uno por el que parte del Copiloto no es serverless (lección 4).</p>
+        </div>
+
+        <h3>Equivalencias Azure ↔ AWS</h3>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Servicio de funciones</td><td>Azure Functions</td><td>AWS Lambda</td></tr>
+            <tr><td>Unidad de despliegue</td><td>Function App (agrupa funciones)</td><td>Función Lambda (una por unidad)</td></tr>
+            <tr><td>Disparo por cola</td><td>Queue/Service Bus trigger</td><td>Event source mapping (SQS/Kinesis)</td></tr>
+            <tr><td>Instancias precalentadas</td><td>Premium / always-ready (Flex)</td><td>Provisioned concurrency</td></tr>
+            <tr><td>Configuración del runtime</td><td><code>host.json</code> + <code>function.json</code></td><td><code>aws_lambda_function</code> (runtime, handler, memory)</td></tr>
+            <tr><td>Recurso Terraform</td><td><code>azurerm_linux_function_app</code></td><td><code>aws_lambda_function</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Lo más pequeño que se puede desplegar: un <em>plan</em> (que decide el modelo de hosting) y una <em>function app</em> con una función HTTP. En Azure, una misma Function App aloja varias funciones y comparte configuración.</p>
+        <div class="code-file">main.tf — Function App mínima (Consumption, Linux)</div>
+        <pre><code class="language-hcl"># 1) El plan decide el modelo de hosting. "Y1" + Linux = Consumption (escala a 0).
+resource "azurerm_service_plan" "func" {
+  name                = "asp-copiloto-func"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  os_type             = "Linux"
+  sku_name            = "Y1"    # Y1 = Consumption; EP1.. = Premium
+}
+
+# 2) La Function App: runtime, almacenamiento interno y el plan de arriba.
+resource "azurerm_linux_function_app" "min" {
+  name                = "func-copiloto-min"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+
+  service_plan_id            = azurerm_service_plan.func.id
+  storage_account_name       = azurerm_storage_account.func.name
+  storage_account_access_key = azurerm_storage_account.func.primary_access_key
+
+  site_config {
+    application_stack {
+      python_version = "3.11"     # el runtime que ejecutará tu código
+    }
+  }
+
+  # Configuración de la app: variables de entorno que tu función lee.
+  app_settings = {
+    "FUNCTIONS_WORKER_RUNTIME" = "python"   # obligatorio: lenguaje del worker
+    "APPINSIGHTS_INSTRUMENTATIONKEY" = azurerm_application_insights.main.instrumentation_key
+  }
+}
+</code></pre>
+        <p>Qué acaba de pasar, pieza a pieza:</p>
+        <ol class="steps">
+          <li><strong><code>azurerm_service_plan</code>:</strong> es el <em>modelo de hosting</em>. Cambiar <code>sku_name</code> de <code>"Y1"</code> a un Premium cambia por completo el cold start, el timeout y la red. No es un detalle de rendimiento: es la decisión de arquitectura.</li>
+          <li><strong><code>storage_account_*</code>:</strong> toda Function App necesita una cuenta de almacenamiento de apoyo (guarda el código, los checkpoints de los triggers y la coordinación del escalado). No es opcional.</li>
+          <li><strong><code>application_stack</code>:</strong> fija el <strong>runtime</strong>. Aquí un <code>python_version</code>; en Node <code>node_version</code>; en .NET <code>dotnet_version</code>. Debe coincidir con lo que empaquetas.</li>
+          <li><strong><code>app_settings</code>:</strong> variables de entorno y, muy importante, la cadena de <strong>Application Insights</strong> para ver logs y trazas.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Con la CLI, el atajo es <code>az functionapp create</code>, pero recuerda la regla del curso: <strong>lo que vayas a mantener, como código</strong>. La CLI sirve para explorar, no para reproducir entornos.</p>
+        </div>
+
+        <h3>El contrato de la función: <code>host.json</code></h3>
+        <p>El runtime se configura con <code>host.json</code> en la raíz del proyecto. Es donde vive, por ejemplo, el timeout de las funciones de Consumption:</p>
+        <div class="code-file">host.json — límites del runtime</div>
+        <pre><code class="language-json">{
+  "version": "2.0",
+  "functionTimeout": "00:05:00",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 20
+      }
+    }
+  },
+  "extensions": {
+    "queues": {
+      "batchSize": 16,
+      "maxDequeueCount": 5
+    }
+  }
+}
+</code></pre>
+        <p><code>functionTimeout</code> limita cuánto puede correr cada invocación (en Consumption, hasta <code>00:10:00</code>). <code>maxDequeueCount</code> es el número de reintentos antes de mover un mensaje a la cola de mensajes fallidos (<em>poison queue</em>): un detalle pequeño con consecuencias grandes en la lección 2.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Escenario del curso: la <strong>Copiloto API</strong> necesita generar un informe nocturno y preparar un resumen. Es una tarea de minutos, impredecible y no interactiva: un candidato perfecto a función. Aquí el detalle que cambia todo — <strong>nada de secretos en la configuración</strong>; la función usa su <strong>identidad gestionada</strong> para leer de Key Vault y escribir en Blob.</p>
+        <pre class="diagram">
+   Timer (00:00 UTC)                      Managed Identity
+        │                                      │
+        ▼                                      ▼
+  ┌───────────────┐   lee secreto    ┌───────────────┐   escribe   ┌──────────┐
+  │  Function     │─────────────────►│  Key Vault    │             │  Blob    │
+  │  informe-diario│                  └───────────────┘             │ informe/ │
+  └───────┬───────┘                                                 └──────────┘
+          │ usa identity para el storage (sin claves)
+          ▼
+  Application Insights  ← logs, duración, fallos
+        </pre>
+        <div class="code-file">copiloto-informe.tf — función con identity y Key Vault</div>
+        <pre><code class="language-hcl"># Plan Premium: sin cold start en una tarea con SLA y acceso a VNet.
+resource "azurerm_service_plan" "copiloto" {
+  name                = "asp-copiloto-jobs"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  os_type             = "Linux"
+  sku_name            = "EP1"   # Premium: instancias precalentadas, sin cold start
+}
+
+resource "azurerm_linux_function_app" "informe" {
+  name                = "func-copiloto-informe"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+
+  service_plan_id = azurerm_service_plan.copiloto.id
+
+  # Sin claves de storage en el repo: la app usa SU identidad.
+  storage_account_name       = azurerm_storage_account.func.name
+  storage_uses_managed_identity = true
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  site_config {
+    application_stack {
+      python_version = "3.11"
+    }
+  }
+
+  app_settings = {
+    "FUNCTIONS_WORKER_RUNTIME" = "python"
+
+    # Key Vault se lee por REFERENCIA: el valor nunca aparece en Terraform.
+    "DB_CONNECTION" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.db.id})"
+
+    # Enviar trazas a Application Insights.
+    "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.main.connection_string
+  }
+}
+
+# La identidad de la función necesita permiso explícito para leer secretos (mínimo privilegio).
+resource "azurerm_role_assignment" "kv_reader" {
+  scope                = azurerm_key_vault.main.id
+  role_definition_name = "Key Vault Secrets User"
+  principal_id         = azurerm_linux_function_app.informe.identity[0].principal_id
+}
+</code></pre>
+        <p>Lo que has ganado frente a escribir esto en el propio contenedor de la API:</p>
+        <ul>
+          <li><strong>Aislamiento de carga:</strong> el informe nocturno ya no compite por CPU/memoria con las peticiones de usuario. Si tarda, no degrada la API.</li>
+          <li><strong>Coste proporcional:</strong> en Premium pagas por instancia, pero solo dimensionas lo que el job necesita; no engordas la API para que quepa este pico.</li>
+          <li><strong>Sin credenciales:</strong> <code>storage_uses_managed_identity</code> y las referencias de Key Vault eliminan los secretos del repositorio (regla del curso). La identidad se autoriza con un rol explícito.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Si eligieras <strong>Consumption</strong> (sku <code>"Y1"</code>) ahorrarías base a cambio de asumir cold start y un timeout más corto. Para un job con ventana amplia y tolerancia al arranque en frío, Consumption es totalmente razonable. La elección es una <em>decisión informada</em>, no una moda.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Una función = una responsabilidad (un trigger, una tarea)</td>
+              <td>Una «macro-función» que lo hace todo</td>
+              <td>El escalado es por función; si mezclas cargas, escalas cosas que no lo necesitan y el fallo de una arrastra las demás</td>
+            </tr>
+            <tr>
+              <td>Idempotencia en todo handler de cola/evento</td>
+              <td>Asumir «se ejecuta exactamente una vez»</td>
+              <td>La entrega es de <em>al menos una vez</em>: habrá reintentos y duplicados</td>
+            </tr>
+            <tr>
+              <td>Identidad gestionada + referencias a Key Vault</td>
+              <td>Secretos en <code>app_settings</code></td>
+              <td>Nada de credenciales de larga vida en el repo o en el state (módulo 2)</td>
+            </tr>
+            <tr>
+              <td>Elegir el plan según latencia y red reales</td>
+              <td>Ir siempre a Consumption «porque es barato»</td>
+              <td>El cold start y el timeout de Consumption pueden romper un flujo crítico</td>
+            </tr>
+            <tr>
+              <td>Pooler de conexiones (PgBouncer / driver serverless) ante base de datos</td>
+              <td>Conexión directa por instancia</td>
+              <td>El escalado masivo agota las conexiones del motor y tumba el servicio</td>
+            </tr>
+            <tr>
+              <td>Instrumentar desde el día uno (Application Insights)</td>
+              <td>Desplegar «a ciegas» y descubrir el frío en la factura</td>
+              <td>Sin datos no puedes decidir plan, memoria ni umbrales (módulo 6)</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Guardar la cadena de conexión en <code>app_settings</code></h3>
+        <span class="code-label code-label--wrong">Incorrecto — secreto en claro en Terraform y en el state</span>
+        <pre class="code-wrong"><code class="language-hcl">app_settings = {
+  # ❌ Esto acaba en el repositorio y en el archivo de state
+  "DATABASE_URL" = "postgresql://user:p@ss@copiloto-db.postgres.database.azure.com/app"
+}
+</code></pre>
+        <span class="code-label code-label--right">Correcto — referencia a Key Vault + identidad</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ El valor vive en Key Vault; Terraform solo guarda la REFERENCIA
+identity { type = "SystemAssigned" }
+
+app_settings = {
+  "DATABASE_URL" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.db.id})"
+}
+# Y se concede "Key Vault Secrets User" a la identidad de la función.
+</code></pre>
+
+        <h3>2. Creer que la instancia se reutiliza siempre</h3>
+        <span class="code-label code-label--wrong">Incorrecto — guardar estado en memoria global</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ Un contador en memoria "de módulo" NO es fiable:
+#   la plataforma puede reciclar la instancia (o crear otra) en cualquier momento.
+contador_de_peticiones = 0   # global
+
+def procesar(evento):
+    global contador_de_peticiones
+    contador_de_peticiones += 1   # puede "resetearse" sin avisar
+</code></pre>
+        <span class="code-label code-label--right">Correcto — el estado vive fuera de la función</span>
+        <pre class="code-right"><code class="language-text"># ✅ El estado persistente va a un servicio externo (Redis, tabla, blob).
+# En la función solo se mantienen CACHES reconstruibles (p. ej. un cliente
+# de conexión reutilizable), nunca la verdad del sistema.
+def procesar(evento):
+    redis_client.incr("peticiones")   # la verdad está en Redis
+</code></pre>
+
+        <h3>3. Elegir Consumption para una API interactiva con latencia crítica</h3>
+        <span class="code-label code-label--wrong">Incorrecto — todo a Consumption por coste</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ Un endpoint que el usuario espera de forma síncrona,
+#    servido por Consumption, con cold start de varios segundos.
+sku_name = "Y1"    # frío en cada arranque de instancia
+</code></pre>
+        <span class="code-label code-label--right">Correcto — Premium (o provisioned concurrency en AWS)</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ Si la latencia de arranque importa, paga por tener instancias listas.
+sku_name = "EP1"   # Premium: instancias precalentadas, sin cold start
+# AWS equivalente: provisioned concurrency en la función Lambda.
+</code></pre>
+
+        <h3>4. Ignorar el límite de tiempo y confiar en trabajos largos</h3>
+        <pre><code class="language-text"># ❌ Una función que procesa un vídeo de 40 minutos en Lambda
+#    =&gt; se agota a los 15 min (900 s) y el trabajo se pierde a medias.
+# ❌ Lo mismo en Azure Consumption con functionTimeout de 5 min.
+
+# ✅ Si el trabajo es largo: pártelo, muévelo a un contenedor/Job
+#    (módulo 4) o usa un orquestador (Durable Functions / Step Functions).
+</code></pre>
+        <p>Los límites de duración son de los más costosos de descubrir en producción. La pregunta correcta no es «¿cuánto tarda mi código?», sino «¿cuánto tarda en el percentil 99 con datos reales?».</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear una función HTTP mínima, ejecutarla <strong>en local</strong> antes de desplegarla, y luego desplegarla comprobando que responde.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — prepara el entorno local.</strong> Instala las Azure Functions Core Tools y crea el proyecto:
+            <pre><code class="language-bash">func --version            # comprueba que están las Core Tools
+func init copiloto-func --worker-runtime python   # andamiaje del proyecto
+cd copiloto-func
+func new --name hello --template "HTTP trigger" --authlevel anonymous
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — arráncala en local.</strong> El runtime levanta un host HTTP local; no necesitas nube para probar:
+            <pre><code class="language-bash">func start
+# Esperado: escucha en http://localhost:7071
+#   hello: [GET,POST] http://localhost:7071/api/hello
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — invócala y observa el contrato.</strong> En otra terminal:
+            <pre><code class="language-bash">curl -s "http://localhost:7071/api/hello?name=Copiloto"
+# Esperado: un JSON/texto con el saludo que devuelve tu función.
+curl -s -X POST "http://localhost:7071/api/hello" -d '{"name":"Copiloto"}'
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — despliega con Terraform.</strong> Reutiliza el bloque mínimo de la sección 3 y publica el código:
+            <pre><code class="language-bash">az login
+terraform init && terraform apply        # crea plan + function app
+
+# Publica tu código en la app (zip deploy):
+func azure functionapp publish func-copiloto-min --python
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación) — llama a la función en la nube.</strong> Obtén la URL y comprueba la respuesta:
+            <pre><code class="language-bash">HOST=$(az functionapp show \
+  --name func-copiloto-min --resource-group copiloto-lab-rg \
+  --query defaultHostName --output tsv)
+curl -s "https://$HOST/api/hello?name=Copiloto"
+# Esperado: la MISMA respuesta que en local. Si da 404/500, revisa
+# que el runtime y las dependencias subieron bien (mira los logs).
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — limpia (control de coste).</strong>
+            <pre><code class="language-bash">az group delete --name copiloto-lab-rg --yes --no-wait
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Resultado esperado:</strong> la misma función responde idénticamente en local y en la nube. Este ida y vuelta —<em>el mismo código, dos entornos</em>— es lo que te permite iterar sin desplegar cada vez, y es la razón por la que las Core Tools existen.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Medir el cold start y decidir con datos</h3>
+          <p>Despliega la misma función en dos planes distintos (Consumption <code>Y1</code> y Premium <code>EP1</code>) y mide el tiempo de respuesta en frío y en caliente <em>por separado</em>.</p>
+          <p>Diseña un experimento que fuerce arranques en frío (por ejemplo, dejando la función inactiva y volviendo a llamarla tras varios minutos) y registra: latencia del primer <em>hit</em> tras el reposo, latencia con instancia caliente, y cuántos arranques en frío ocurren en una hora de tráfico realista.</p>
+          <p>Con esos datos, decide y <strong>documenta</strong>: ¿qué función de la Copiloto merece Premium? ¿Cuál puede quedarse en Consumption? ¿Cuál es el sobrecoste mensual de eliminar el frío y qué gana el usuario a cambio?</p>
+          <p><em>Pista: mira métricas como <code>FunctionExecutionCount</code> y la duración en Application Insights; el cold start aparece como un salto de latencia tras un periodo sin ejecuciones. No busques un «número mágico» de segundos: busca tu distribución.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>función serverless</strong> es una unidad reactiva: <strong>un trigger, un handler</strong>, código y configuración. No es «una app pequeña».</li>
+          <li>Las piezas son <strong>trigger</strong>, <strong>input/output bindings</strong> y <strong>código + host</strong>. El trigger define el contrato de entrada; solo hay uno.</li>
+          <li>Los modelos de disparo (HTTP, temporizador, cola, evento) definen el comportamiento ante errores. Asume siempre <strong>entrega al menos una vez</strong> e implementa <strong>idempotencia</strong>.</li>
+          <li>El <strong>plan de hosting</strong> decide coste, escalado, cold start y red: <em>Consumption</em> (barato, frío), <em>Premium</em> (precalentado), <em>Dedicated</em> (always on).</li>
+          <li>El <strong>cold start</strong> es el arranque de una instancia nueva; se mitiga reduciendo dependencias, con instancias precalentadas o con <em>provisioned concurrency</em>.</li>
+          <li>Hay <strong>límites duros</strong> de duración, memoria, payload y — el más traicionero — de <strong>conexiones a base de datos</strong>.</li>
+          <li>La función se prueba <strong>en local</strong> (Core Tools) y se despliega como código; los secretos van por <strong>identidad gestionada + Key Vault</strong>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Servicio</td><td>Azure Functions</td><td>AWS Lambda</td></tr>
+            <tr><td>Basado en eventos</td><td>Triggers + bindings (o Event Grid)</td><td>Event source mapping / EventBridge</td></tr>
+            <tr><td>Sin cold start</td><td>Premium / always-ready (Flex)</td><td>Provisioned concurrency</td></tr>
+            <tr><td>Recurso Terraform</td><td><code>azurerm_linux_function_app</code> + <code>azurerm_service_plan</code></td><td><code>aws_lambda_function</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿«Serverless» significa que no hay servidores en ninguna parte?</summary>
+            <div>
+              <p>No. Significa que <strong>tú no los gestionas</strong>: no eliges SO, no parcheas, no dimensionas instancias. Hay servidores, pero son del proveedor, se crean y destruyen bajo demanda, y tú solo ves funciones y métricas. El valor no es «que no existan», sino <strong>que no tienes trabajo operativo sobre ellos</strong>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar la misma función para HTTP y para cola a la vez?</summary>
+            <div>
+              <p>En Azure, una Function App aloja varias funciones, cada una con su trigger; pero una función concreta tiene <strong>un solo trigger</strong>. Si necesitas responder a HTTP <em>y</em> a una cola, casi siempre lo correcto no es unificar, sino <strong>desacoplar</strong>: un endpoint HTTP que publica un mensaje, y otra función con disparador de cola que lo procesa (justo lo del módulo 5, lección 2). Intentar que un handler haga de todo va contra el modelo de escalado por función.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi función a veces tarda mucho aunque el código sea trivial?</summary>
+            <div>
+              <p>Casi siempre es <strong>cold start</strong>: la plataforma creó una instancia nueva y tuvo que cargar el runtime y tus dependencias antes de ejecutar tu handler. Diagnóstico: mira la duración por invocación en Application Insights / CloudWatch y busca picos tras periodos de silencio. Mitigación: reducir dependencias, subir a Premium o usar <em>provisioned concurrency</em>. Verifica que no sea otra cosa antes de culpar al frío.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo conecto la función a un PostgreSQL gestionado sin tumbar la base?</summary>
+            <div>
+              <p>Con un <strong>pooler</strong> (p. ej. PgBouncer) entre la función y la base, o con un driver diseñado para entornos serverless. El problema es que cada instancia de la función abre conexiones propias y el escalado multiplica ese número; el motor tiene un límite de conexiones y lo agotas rápido. Es una de las razones técnicas por las que el Copiloto mantiene su API con estado de conexión en contenedores (lección 4).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Las funciones se pagan aunque no hagan nada?</summary>
+            <div>
+              <p>En los planes que escalan a cero (Consumption, Flex, Lambda), cuando no hay ejecuciones no hay coste de cómputo: pagas por <strong>ejecuciones y por el tiempo de facturación</strong>. Pero ojo: si eliges Premium, <code>min</code> alto o <em>provisioned concurrency</em>, sí pagas por tener instancias calientes sin tráfico. Además hay costes asociados (storage interno, Application Insights, transferencia). La factura sorpresa viene de <strong>picos y de mínimos mal dimensionados</strong>, no del modelo en sí: míralo en el módulo 6.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

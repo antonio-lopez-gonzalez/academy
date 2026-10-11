@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-bases-de-datos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bases de datos gestionadas — Módulo 3 · Curso Cloud</title>
+  <meta name="description" content="Bases de datos gestionadas (Azure Database for PostgreSQL, RDS): backups automáticos, escalado, réplicas de lectura y todo lo que el proveedor te quita de encima.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Bases de datos gestionadas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Almacenamiento y datos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El Copiloto tiene usuarios, conversaciones, mensajes y cuentas de uso. Eso es <strong>dato estructurado con relaciones y transacciones</strong>, y su sitio es una base de datos relacional. La pregunta no es «¿PostgreSQL o MySQL?», sino <strong>«¿quién la opera?»</strong>.</p>
+        <p>Puedes instalar PostgreSQL en una máquina virtual y encargarte de todo: parchear el sistema operativo, configurar la replicación, montar los backups, vigilar el disco que se llena. O puedes usar una <strong>base de datos gestionada</strong> —Azure Database for PostgreSQL, Amazon RDS— y dejar que el proveedor haga ese trabajo mientras tú te centras en el esquema y las consultas. Esta lección trata exactamente de eso: <strong>qué te quitan de encima</strong>, qué sigues siendo responsable de hacer, y cómo se materializa todo en Terraform.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque el error más caro de un desarrollador en la nube es tratar la base de datos como un detalle de infraestructura y desplegar una que no se puede escalar, ni respaldar, ni recuperar. Aquí aprendes a elegir el tamaño, la alta disponibilidad y la retención con criterio, no por copiar-pegar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Gestionado frente a autogestionado: dónde está la frontera</h3>
+        <p>«Gestionado» no significa «no haces nada». Significa que el proveedor opera una capa y tú operas otra. La frontera es muy concreta:</p>
+        <table>
+          <thead><tr><th>Tarea</th><th>En una VM tuya</th><th>En una base gestionada</th></tr></thead>
+          <tbody>
+            <tr><td>Parchear el sistema operativo</td><td>Tú</td><td>El proveedor</td></tr>
+            <tr><td>Instalar y actualizar el motor (PostgreSQL…)</td><td>Tú</td><td>El proveedor (eliges la versión mayor)</td></tr>
+            <tr><td>Backups automáticos</td><td>Tú (scripts + almacenamiento)</td><td>El proveedor (incluidos, retención configurable)</td></tr>
+            <tr><td>Alta disponibilidad y <em>failover</em></td><td>Tú (replicación manual)</td><td>El proveedor (se activa con una opción)</td></tr>
+            <tr><td>Reemplazar un disco que falla</td><td>Tú</td><td>El proveedor</td></tr>
+            <tr><td>Esquema, índices, consultas, migraciones</td><td>Tú</td><td>Tú</td></tr>
+            <tr><td>Elegir tamaño, retención y HA</td><td>Tú (con más esfuerzo)</td><td>Tú (con parámetros)</td></tr>
+          </tbody>
+        </table>
+        <p>La frase para recordar: <strong>el proveedor se ocupa de la máquina; tú te ocupas del dato</strong>. Diseñar tablas, índices y migraciones sigue siendo tu trabajo, y es donde de verdad se gana o se pierde rendimiento.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una base gestionada es un coche con mantenimiento incluido. No conduces igual de mal por ello, pero ya no cambias el aceite ni te preocupa la correa de distribución. Sigues siendo responsable de no estrellarte (tu esquema y tus consultas).</p>
+        </div>
+
+        <h3>El modelo mental: servidor, base de datos y conexión</h3>
+        <pre class="diagram">
+                  SERVICIO GESTIONADO (el proveedor lo opera)
+  +-----------------------------------------------------------+
+  |  SERVIDOR  (SKU, vCPU, RAM, almacenamiento, HA, backups)  |
+  |                                                           |
+  |   +----------------+    +----------------+               |
+  |   |  database:     |    |  database:     |               |
+  |   |  copiloto      |    |  copiloto_test |               |
+  |   +----------------+    +----------------+               |
+  |                                                           |
+  |   conexiones  &lt;-- apps se conectan por una cadena o,      |
+  |                   mejor, por identidad gestionada          |
+  +-----------------------------------------------------------+
+        </pre>
+        <p>Cuando creas el recurso, eliges tres cosas que determinan coste y comportamiento: el <strong>tamaño</strong> (SKU), el <strong>almacenamiento</strong> y la <strong>alta disponibilidad</strong>. El resto (backups, conexión) se configura con parámetros.</p>
+
+        <h3>Escalado: vertical, horizontal y el cuello de botella de conexiones</h3>
+        <ul>
+          <li><strong>Escalado vertical (<em>scale up</em>):</strong> darle al servidor más CPU y RAM (subir de SKU). Es la palanca principal en bases gestionadas y normalmente implica un reinicio breve.</li>
+          <li><strong>Escalado horizontal (<em>read replicas</em>):</strong> añadir servidores de solo lectura que replican el principal. Sirve para repartir lecturas (informes, analítica), <em>no</em> para las escrituras, que siguen yendo al primario.</li>
+          <li><strong>Conexiones:</strong> cada conexión a PostgreSQL consume memoria. Con muchos <em>workers</em> el límite de conexiones salta antes que la CPU. La solución es un <strong>pooler</strong> (PgBouncer) que multiplexa cientos de clientes sobre unas pocas conexiones reales.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Dato clave:</strong> el almacenamiento suele <em>crecer automáticamente</em> cuando se llena (<em>autogrow</em>), pero la CPU y la RAM <strong>no</strong>. Una base que escala en disco y no en cómputo acabará lenta. Y ojo: los SKU <em>Burstable</em> son baratos pero <strong>no soportan alta disponibilidad</strong>; no los uses para producción crítica.</p>
+        </div>
+
+        <h3>Alta disponibilidad: qué pasa cuando cae la zona</h3>
+        <p>La HA gestionada funciona con un <strong>servidor de reserva</strong> (<em>standby</em>) que recibe las mismas escrituras de forma síncrona. Si el primario falla, el proveedor conmuta al reserva automáticamente:</p>
+        <ul>
+          <li><strong>SameZone:</strong> el reserva está en la misma zona de disponibilidad. Más barato, protege contra el fallo de una máquina, no contra la caída de una zona.</li>
+          <li><strong>ZoneRedundant:</strong> el reserva está en otra zona. Protege contra la caída de una zona entera; es lo recomendable para producción.</li>
+        </ul>
+        <p>La conmutación tiene un coste real: unos segundos de indisponibilidad y un <em>blip</em> en las conexiones. Ese tiempo forma parte de tus objetivos de <strong>RTO</strong> (lección 04).</p>
+
+        <h3>Backups y PITR: el detalle importa</h3>
+        <p>Toda base gestionada toma <strong>copias automáticas</strong> y un registro continuo de transacciones (WAL en PostgreSQL, binlog en MySQL). Eso permite la <strong>restauración a un punto en el tiempo</strong> (PITR): «devuélveme la base tal como estaba a las 10:42 de anteayer». Los parámetros típicos:</p>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Valor habitual</th><th>Qué implica</th></tr></thead>
+          <tbody>
+            <tr><td>Retención de backup</td><td>7 a 35 días (PostgreSQL Flexible Server)</td><td>Cuánto atrás puedes viajar; más días = más coste</td></tr>
+            <tr><td>Backup geo-redundante</td><td>Activado / desactivado</td><td>Permite restaurar incluso si la región entera cae</td></tr>
+            <tr><td>Ventana de mantenimiento</td><td>Franja elegible</td><td>Cuándo el proveedor aplica parches</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>La copia automática no es «tu» backup.</strong> La retención máxima suele ser de semanas, y el backup vive en la misma cuenta. Para requisitos legales o de largo plazo (años), exporta copias a un contenedor de objetos con retención propia. Lo montamos en la lección 04.</p>
+        </div>
+
+        <h3>Elegir SKU sin equivocarse</h3>
+        <table>
+          <thead><tr><th>Familia</th><th>Cuándo</th><th>Aviso</th></tr></thead>
+          <tbody>
+            <tr><td>Burstable (B_)</td><td>Desarrollo, pruebas, cargas esporádicas</td><td>CPU «prestada»; no soporta HA; no para producción seria</td></tr>
+            <tr><td>General Purpose (GP_)</td><td>Producción equilibrada (el caso por defecto)</td><td>Buena relación vCPU/RAM/precio</td></tr>
+            <tr><td>Memory Optimized (MO_)</td><td>Consultas con gran caché o muchas conexiones</td><td>Más caro; no sobredimensiones sin medir</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El servidor más pequeño posible: un PostgreSQL gestionado con el SKU más modesto, backups de una semana y sin acceso público. Con la CLI de Azure:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Flexible Server: la oferta actual de PostgreSQL gestionado en Azure.
+# B_Standard_B1ms = Burstable, el SKU más barato. Solo para practicar.
+az postgres flexible-server create \
+  --resource-group rg-copiloto \
+  --name copiloto-pg-lab \
+  --location westeurope \
+  --tier Burstable \
+  --sku-name Standard_B1ms \
+  --version 16 \
+  --storage-size 32 \
+  --admin-user copiloto \
+  --admin-password "$(openssl rand -base64 24)" \
+  --backup-retention 7 \
+  --public-access None      # sin exposición a Internet
+
+# Una base de datos dentro del servidor.
+az postgres flexible-server db create \
+  --resource-group rg-copiloto \
+  --server-name copiloto-pg-lab \
+  --database-name copiloto
+</code></pre>
+        <p>Qué hace cada decisión, línea a línea:</p>
+        <ol class="steps">
+          <li><strong><code>--tier Burstable</code> y <code>--sku-name Standard_B1ms</code>:</strong> el tamaño. Barato, útil para aprender; <em>no</em> para producción con HA.</li>
+          <li><strong><code>--backup-retention 7</code>:</strong> puedes restaurar a cualquier instante de los últimos 7 días (PITR).</li>
+          <li><strong><code>--public-access None</code>:</strong> el servidor nace sin IP pública. Se accede por red privada (módulo 2).</li>
+          <li><strong><code>--admin-password</code>:</strong> aquí generamos uno al vuelo, pero en producción <strong>nunca</strong> va en el comando: se usa identidad gestionada o Azure Key Vault.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La base del Copiloto en producción, en Terraform: <strong>General Purpose</strong>, <strong>alta disponibilidad por zonas</strong>, <strong>backup geo-redundante</strong> con 35 días de retención y <strong>red privada</strong>. Este es el recurso que de verdad importa proteger.</p>
+        <div class="code-file">database.tf</div>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "copiloto" {
+  name                = "copiloto-pg-prod"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  version             = "16"
+
+  # Producción: equilibrado y con HA. Nunca Burstable aquí.
+  sku_name   = "GP_Standard_D2s_v3"
+  storage_mb = 65536          # 64 GB; el disco crece solo si se llena
+
+  # Credenciales por variables; en el repo no hay secretos (módulo 2).
+  administrator_login    = "copiloto"
+  administrator_password = var.postgres_admin_password
+
+  # Alta disponibilidad: reserva en otra zona -> sobrevive a la caída de una zona.
+  high_availability {
+    mode                      = "ZoneRedundant"
+    standby_availability_zone = "2"
+  }
+
+  # Copia automática GEO-redundante y 35 días de retención (el máximo):
+  # permite restaurar a un instante concreto incluso si cae la región.
+  backup_retention_days        = 35
+  geo_redundant_backup_enabled = true
+
+  # Sin IP pública: se accede por red privada y punto de conexión privado.
+  public_network_access_enabled = false
+
+  # El servidor solo es accesible desde la subred delegada del Copiloto.
+  delegated_subnet_id = azurerm_subnet.postgres.id
+  private_dns_zone_id = azurerm_private_dns_zone.postgres.id
+
+  # Ventana de mantenimiento: parcheamos de madrugada, en hora valle.
+  maintenance_window {
+    day_of_week  = 0   # domingo
+    start_hour   = 3
+    start_minute = 0
+  }
+
+  tags = { project = "copiloto", env = "prod" }
+}
+
+# La base de datos que usa la API del Copiloto.
+resource "azurerm_postgresql_flexible_server_database" "copiloto" {
+  name      = "copiloto"
+  server_id = azurerm_postgresql_flexible_server.copiloto.id
+  charset   = "UTF8"
+  collation = "en_US.utf8"
+}
+</code></pre>
+        <p>Y cuando la carga de lecturas crece (informes, métricas), añadimos una <strong>réplica de lectura</strong> sin tocar el primario:</p>
+        <div class="code-file">replica.tf</div>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "replica" {
+  name                = "copiloto-pg-replica"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  version             = "16"
+
+  # create_mode = Replica convierte este servidor en copia de solo lectura.
+  create_mode      = "Replica"
+  source_server_id = azurerm_postgresql_flexible_server.copiloto.id
+
+  sku_name   = "GP_Standard_D2s_v3"
+  storage_mb = 65536
+}
+</code></pre>
+        <p>Lo que hay que entender de este ejemplo:</p>
+        <ul>
+          <li><strong>ZoneRedundant</strong> es lo que te permite dormir: si cae una zona, el proveedor conmuta al reserva en otra.</li>
+          <li><strong>35 días + geo-redundante</strong> define tu ventana de recuperación. Es un parámetro de negocio, no técnico: ¿cuánto pasado necesitas poder recuperar?</li>
+          <li><strong>La réplica no es HA.</strong> La HA te protege de un fallo; la réplica reparte lecturas. Son cosas distintas que a veces se confunden.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Azure ↔ AWS:</strong> el equivalente es <strong>Amazon RDS</strong> (con <code>MultiAZ = true</code> para HA), <strong>Aurora</strong> para cargas exigentes, y <em>read replicas</em> creadas con <code>aws_db_instance</code> o <code>aws_rds_cluster</code>. La retención se controla con <code>backup_retention_period</code> y el PITR viene del mismo registro de transacciones. El vocabulario cambia; las ideas son idénticas.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Red privada + punto de conexión privado</td>
+              <td>IP pública con regla <code>0.0.0.0</code> abierta</td>
+              <td>Una base con acceso público es el objetivo preferido de los escáneres; la red privada elimina esa superficie</td>
+            </tr>
+            <tr>
+              <td>Credenciales en Key Vault o identidad gestionada</td>
+              <td>Password en el código, la imagen o la variable de CI</td>
+              <td>Un secreto versionado se filtra pronto o tarde; la identidad gestionada no caduca ni se copia</td>
+            </tr>
+            <tr>
+              <td>HA <strong>ZoneRedundant</strong> en producción</td>
+              <td>Confiar en <em>Burstable</em> para producción crítica</td>
+              <td>Burstable no soporta HA y compartes CPU; un pico te deja sin base y sin failover</td>
+            </tr>
+            <tr>
+              <td>Retención de backup alineada con la política de datos</td>
+              <td>Dejar los 7 días por defecto en un sistema crítico</td>
+              <td>7 días puede no cubrir un fallo detectado tarde; 35 días es barato comparado con perder datos</td>
+            </tr>
+            <tr>
+              <td>Usar un <strong>pooler</strong> (PgBouncer) con muchos workers</td>
+              <td>Abrir una conexión nueva por petición y por worker</td>
+              <td>Las conexiones consumen RAM; sin pooler agotas el límite antes que la CPU</td>
+            </tr>
+            <tr>
+              <td>Migraciones versionadas como parte del despliegue</td>
+              <td>Cambiar el esquema a mano desde la consola</td>
+              <td>El esquema es código: si no está versionado, cada entorno diverge y aparecen bugs indepurables</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Error 1: abrir la base al mundo para «probar la conexión»</h3>
+        <p>Permitir todas las IPs es cómodo durante cinco minutos y un agujero permanente si se queda.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — firewall abierto</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server_firewall_rule" "abierto" {
+  name             = "temporal"
+  server_id        = azurerm_postgresql_flexible_server.copiloto.id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "255.255.255.255"   # TODO INTERNET puede intentar conectar
+}
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — sin IP pública + red privada</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "copiloto" {
+  # ...
+  public_network_access_enabled = false        # ni siquiera hay IP pública
+  delegated_subnet_id           = azurerm_subnet.postgres.id
+  private_dns_zone_id           = azurerm_private_dns_zone.postgres.id
+}
+</code></pre>
+
+        <h3>Error 2: la contraseña del administrador en el repositorio</h3>
+        <p>El error que más veces he visto en revisiones. Un valor por defecto en <code>variables.tf</code> parece inofensivo hasta que llega a un repositorio público.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — secreto versionado</span>
+        <pre><code class="language-hcl">variable "postgres_admin_password" {
+  type    = string
+  default = "Copiloto1234!"   # en el repo. Visible para siempre en el historial.
+}
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — secreto sin valor por defecto</span>
+        <pre><code class="language-hcl">variable "postgres_admin_password" {
+  type      = string
+  sensitive = true
+  # Sin default: se inyecta desde Key Vault o desde el entorno de CI (módulo 2).
+}
+</code></pre>
+
+        <h3>Error 3: elegir Burstable para producción</h3>
+        <p>Es tentador por precio, pero esos SKU comparten CPU, no admiten alta disponibilidad y su rendimiento es impredecible bajo carga.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — barato pero frágil</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "copiloto" {
+  sku_name = "B_Standard_B1ms"   # producción sobre CPU "prestada": no.
+  high_availability { mode = "ZoneRedundant" }
+  # Este bloque FALLA: Burstable no soporta alta disponibilidad.
+}
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — General Purpose + HA</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "copiloto" {
+  sku_name = "GP_Standard_D2s_v3"      # CPU dedicada y predecible
+  high_availability {
+    mode = "ZoneRedundant"             # conmutación automática entre zonas
+  }
+}
+</code></pre>
+
+        <h3>Error 4: confundir réplica de lectura con alta disponibilidad</h3>
+        <p>Una réplica <em>no</em> conmuta sola. Si el primario cae, la réplica sigue ahí pero sin promover automáticamente: sigues caído.</p>
+        <span class="code-label code-label--wrong">✗ Incorrecto — "ya tengo réplica, tengo HA"</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "replica" {
+  # create_mode = Replica sirve para REPARTIR LECTURAS, no para failover.
+  create_mode      = "Replica"
+  source_server_id = azurerm_postgresql_flexible_server.copiloto.id
+  # Sin bloque high_availability: no hay conmutación automática.
+}
+</code></pre>
+        <span class="code-label code-label--right">✓ Correcto — HA en el primario, réplica aparte</span>
+        <pre><code class="language-hcl">resource "azurerm_postgresql_flexible_server" "copiloto" {
+  sku_name = "GP_Standard_D2s_v3"
+  high_availability {
+    mode = "ZoneRedundant"   # ESTO da continuidad ante un fallo
+  }
+}
+# La réplica es un recurso adicional SOLO para repartir lecturas.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un PostgreSQL gestionado, conectarte, comprobar la retención de backup y ver las opciones de restauración a un punto en el tiempo (PITR). Resultado esperado: ves la lista de backups disponibles con sus ventanas de tiempo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea el servidor (SKU barato, retención 7 días) y permite el acceso desde tu IP temporalmente:
+            <pre><code class="language-bash">az group create --name rg-cloud-db --location westeurope
+
+az postgres flexible-server create \
+  --resource-group rg-cloud-db \
+  --name copiloto-pg-lab \
+  --location westeurope \
+  --tier Burstable --sku-name Standard_B1ms \
+  --version 16 --storage-size 32 \
+  --admin-user copiloto \
+  --admin-password "$(openssl rand -base64 24)" \
+  --backup-retention 7 --public-access "$(curl -s ifconfig.me)"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea una base y una tabla, e inserta una fila:
+            <pre><code class="language-sql">-- Conéctate con: psql "host=copiloto-pg-lab.postgres.database.azure.com
+--                   port=5432 dbname=postgres user=copiloto sslmode=require"
+CREATE DATABASE copiloto;
+\c copiloto
+CREATE TABLE conversaciones (
+  id         bigserial PRIMARY KEY,
+  usuario    text        NOT NULL,
+  creada_en  timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO conversaciones (usuario) VALUES ('ana'), ('luis');
+SELECT count(*) FROM conversaciones;   -- esperado: 2
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> comprueba la configuración de backup del servidor:
+            <pre><code class="language-bash">az postgres flexible-server show \
+  --resource-group rg-cloud-db --name copiloto-pg-lab \
+  --query "{retencion:backup.backupRetentionDays, geo:backup.geoRedundantBackup}"
+# Esperado: retencion = 7, geo = "Disabled" (no lo activamos para no gastar)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> lista los backups y las horas a las que podrías restaurar:
+            <pre><code class="language-bash">az postgres flexible-server backup list \
+  --resource-group rg-cloud-db --server-name copiloto-pg-lab
+
+az postgres flexible-server restore \
+  --resource-group rg-cloud-db --name copiloto-pg-restored \
+  --source-server copiloto-pg-lab \
+  --restore-time "2026-10-11T10:00:00Z"   # PITR: un instante concreto
+</code></pre>
+            <p>La restauración crea un <strong>servidor nuevo</strong> con el estado de ese instante. No sobreescribe el original: por eso el PITR es seguro.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (limpieza):</strong> borra el grupo completo. Las bases gestionadas se facturan mientras existen:
+            <pre><code class="language-bash">az group delete --name rg-cloud-db --yes --no-wait
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Fíjate en lo que NO has hecho:</strong> en ningún momento has instalado PostgreSQL, configurado replicación ni escrito un script de backup. Solo has tomado decisiones de tamaño, red y retención. Eso es exactamente lo que compras con una base gestionada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 La base del Copiloto que aguanta una auditoría de carga</h3>
+          <p>El Copiloto moverá dos tipos de tráfico a la vez: <strong>escrituras cortas y constantes</strong> (guardar cada mensaje) y <strong>consultas pesadas y esporádicas</strong> (generar el informe mensual de un usuario). Diseña en Terraform una configuración que sirva bien a ambos sin sobredimensionar la máquina principal, y explica dónde va cada tipo de consulta.</p>
+          <p>Define además, sobre el papel, qué harías si a las 09:00 de un lunes descubres que un <em>script</em> erróneo borró la tabla <code>conversaciones</code> a las 23:00 del domingo: ¿qué tipo de restauración usas, a qué hora restauras y dónde compruebas el resultado antes de tocar producción? <em>Pista: piensa en una réplica de lectura para los informes, y en PITR + un servidor de verificación separado antes de promover nada. El reto queda abierto en esta página.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una base gestionada deja al proveedor la <strong>máquina</strong>; tú sigues siendo dueño del <strong>dato</strong> (esquema, índices, migraciones).</li>
+          <li>Tres decisiones definen coste y fiabilidad: <strong>tamaño (SKU)</strong>, <strong>almacenamiento</strong> y <strong>alta disponibilidad</strong>.</li>
+          <li>El <strong>escalado vertical</strong> (más vCPU/RAM) es la palanca principal; las <strong>réplicas</strong> reparten lecturas, no escrituras.</li>
+          <li>La <strong>HA ZoneRedundant</strong> conmuta automáticamente ante un fallo; una réplica <em>no</em>.</li>
+          <li>Los <strong>backups automáticos</strong> dan <strong>PITR</strong> (restauración a un instante) dentro de la retención configurada (7–35 días).</li>
+          <li>El backup vive en la misma cuenta y caduca: para retenciones largas o legales, exporta a almacenamiento de objetos (lección 04).</li>
+          <li>Reglas de oro: <strong>red privada</strong>, <strong>sin secretos</strong> (Key Vault / identidad gestionada), y <strong>pooler</strong> cuando hay muchos workers.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>PostgreSQL gestionado</td><td>Azure Database for PostgreSQL (Flexible Server)</td><td>Amazon RDS for PostgreSQL / Aurora</td></tr>
+            <tr><td>Alta disponibilidad</td><td><code>high_availability</code> (SameZone/ZoneRedundant)</td><td><code>MultiAZ = true</code></td></tr>
+            <tr><td>Réplica de lectura</td><td><code>create_mode = "Replica"</code></td><td><em>Read replica</em></td></tr>
+            <tr><td>Retención de backup</td><td><code>backup_retention_days</code> (7–35)</td><td><code>backup_retention_period</code></td></tr>
+            <tr><td>Restauración a un instante</td><td>Point-in-time restore (PITR)</td><td>Point-in-time recovery (PITR)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Gestionado sale más caro que una VM con PostgreSQL instalado?</summary>
+            <div>
+              <p>El precio de la máquina puede ser mayor, pero el coste total casi nunca. La VM te exige tiempo de ingeniería (parcheo, backups, replicación, guardias) que no aparece en la factura de cloud pero sí en tu nómina. Salvo cargas muy concretas, gestionado gana.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si tengo alta disponibilidad, ¿ya no necesito backups?</summary>
+            <div>
+              <p>No. La HA protege contra el fallo de la <em>máquina</em>; los backups te protegen contra el fallo <em>humano</em> y el <em>lógico</em>: borrar una tabla por error, un <em>deploy</em> con una migración destructiva o un <em>ransomware</em>. Se replican esos errores al reserva al instante. Necesitas las dos cosas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo elijo una réplica de lectura y cuándo subo de SKU?</summary>
+            <div>
+              <p>Si el problema es <strong>volumen de lecturas</strong> (informes, dashboards) y el primario va sobrado en CPU, añade réplica. Si el problema es que <strong>todas</strong> las operaciones (lecturas y escrituras) van lentas, el primario necesita más recursos: sube de SKU.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar de versión mayor del motor (16 → 17) sin recrear el servidor?</summary>
+            <div>
+              <p>Normalmente no de forma directa: los proveedores ofrecen un proceso de <em>upgrade</em> de versión mayor, o bien restauras un backup en un servidor nuevo de la versión destino. Las versiones menores sí se aplican de forma transparente. Planifica el salto como un proyecto, no como un parámetro.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué me hablas de un <em>pooler</em> si la base tiene un límite de conexiones alto?</summary>
+            <div>
+              <p>Porque el límite «alto» no es infinito y cada conexión cuesta memoria. Con decenas de <em>workers</em> o <em>serverless</em> que escalan a cientos de instancias, el número de conexiones estalla. PgBouncer multiplexa muchas conexiones de cliente sobre unas pocas reales y evita el error «too many connections» en el peor momento.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

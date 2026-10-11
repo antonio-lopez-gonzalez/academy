@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-arquitectura-cloud">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura en la nube — Módulo 7 · Curso Cloud</title>
+  <meta name="description" content="La arquitectura final del Copiloto en Azure: red, cómputo, datos, identidad, secretos y observabilidad, con la comparación AWS y las decisiones por qué.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura en la nube</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: Copiloto en la nube</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Has recorrido el curso entero pieza a pieza: la red (módulo 1), la identidad y los secretos (módulo 2), los datos (módulo 3), los contenedores gestionados (módulo 4), el serverless (módulo 5) y la operación (módulo 6). Ahora toca lo más parecido al trabajo real: <strong>dibujar la arquitectura completa del Copiloto y justificar cada decisión</strong> antes de escribir una línea de Terraform.</p>
+        <p>Una arquitectura no es una lista de servicios bonitos. Es la respuesta razonada a cinco preguntas:</p>
+        <ol class="steps">
+          <li><strong>¿Qué cómputo ejecuta el código?</strong> La Copiloto API, un contenedor. ¿Gestionamos un clúster o no?</li>
+          <li><strong>¿Dónde viven los datos?</strong> PostgreSQL para lo relacional, Blob para lo que no lo es.</li>
+          <li><strong>¿Cómo se autentica todo entre sí?</strong> Identidades gestionadas y OIDC, nunca claves de larga vida.</li>
+          <li><strong>¿Dónde están los secretos?</strong> En Key Vault, no en el repositorio ni en la imagen.</li>
+          <li><strong>¿Cómo nos enteramos de qué pasa?</strong> Logs, métricas y trazas en Azure Monitor.</li>
+        </ol>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque escribir Terraform sin una arquitectura es dibujar un plano a la vez que levantas las paredes. Esta lección fija el <strong>plano</strong>: el mismo que en las lecciones 02, 03 y 04 se convertirá en HCL, se desplegará con CI/CD y se observará en producción. Y —igual de importante— fija también la <strong>alternativa AWS</strong>, porque un ingeniero de cloud elige con criterio, no por dogma.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La nube como un edificio con plantas</h3>
+        <p>Para no perderte entre nombres, piensa en la nube como un <strong>edificio</strong>. La <em>región</em> es la ciudad; las <em>zonas de disponibilidad</em> son naves distintas del mismo recinto (si una se inunda, la otra sigue); la <strong>VNet</strong> es el edificio; cada <strong>subred</strong> es una planta con su normativa; y cada <strong>recurso</strong> es una habitación con un candado (<em>grupo de seguridad</em>) y un portero (<em>identidad</em>). Todo lo que construyamos vive dentro de esa jerarquía:</p>
+        <pre class="diagram">
+  Región (westeurope)
+  └── Grupo de recursos (rg-copiloto-prod)   &lt;-- unidad de coste, permisos y borrado
+      └── VNet 10.20.0.0/16
+          ├── Subred app       10.20.1.0/24   &lt;-- Container Apps se integra aquí
+          ├── Subred datos     10.20.2.0/24   &lt;-- PostgreSQL (delegada)
+          └── Subred privada   10.20.3.0/24   &lt;-- endpoints privados (ACR, KV, Blob)
+      └── Recursos PaaS con nombre propio: ACR, Key Vault, Log Analytics, Monitor
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía del conserje:</strong> la <em>identidad gestionada</em> es un conserje del edificio con una tarjeta que abre <em>solo</em> su habitación. No lleva las llaves de todo el edificio encima ni las pierde por la calle: cuando necesita entrar, el propio edificio le emite un pase temporal. Por eso preferimos identidades a contraseñas: una contraseña es una llave física que se copia, se pierde y no se rota sola.</p>
+        </div>
+
+        <h3>Las cinco capas de la arquitectura del Copiloto</h3>
+        <p>Esta es la arquitectura objetivo. Cada caja la has conocido en un módulo anterior; aquí se ensamblan:</p>
+        <pre class="diagram">
+                         Internet
+                            |
+                     HTTPS (TLS gestionado)
+                            v
+            +--------------------------------------+
+            |  Azure Container Apps (ingress)      |
+            |  copiloto-api  (min 1 / max 5)       |  &lt;-- cómputo (módulo 4)
+            |  identidad gestionada                |
+            +---------+----------------+-----------+
+                      |                |
+          AcrPull     |                | DATABASE_URL (secret)
+          (identidad) |                v
+                      |     +--------------------------+
+                      v     |  PostgreSQL Flexible      |  &lt;-- datos (módulo 3)
+        +-------------------+  (subred delegada, privada)|      zona redundante
+        |  Azure Container  |  +--------------------------+
+        |  Registry (ACR)   |                ^
+        |  imágenes         |                | secretos en apply
+        +-------------------+     +--------------------------+
+                                  |  Key Vault (RBAC)        |  &lt;-- secretos (módulo 2)
+                                  +--------------------------+
+            todo lo anterior emite logs/métricas
+                            |
+                            v
+            +--------------------------------------+
+            |  Log Analytics + Azure Monitor       |  &lt;-- observabilidad (módulo 6)
+            |  logs, métricas, alertas, budget     |
+            +--------------------------------------+
+        </pre>
+        <p>Léelo capa a capa:</p>
+        <table>
+          <thead><tr><th>Capa</th><th>Servicio Azure</th><th>Decisión y por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Red</strong></td>
+              <td>VNet + subredes + endpoints privados</td>
+              <td>Los recursos PaaS no se exponen a Internet: se alcanzan por la red privada. Exposición mínima = superficie de ataque mínima.</td>
+            </tr>
+            <tr>
+              <td><strong>Cómputo</strong></td>
+              <td>Container Apps + ACR</td>
+              <td>Contenedor gestionado sin clúster: escalado a cero, TLS gestionado, revisiones. No necesitamos Kubernetes (módulo 4).</td>
+            </tr>
+            <tr>
+              <td><strong>Datos</strong></td>
+              <td>PostgreSQL Flexible Server + Blob Storage</td>
+              <td>PostgreSQL gestionado para lo relacional; Blob para documentos/adjuntos. Backups automáticos y zona redundante.</td>
+            </tr>
+            <tr>
+              <td><strong>Identidad</strong></td>
+              <td>Entra ID + identidades gestionadas</td>
+              <td>Cada componente tiene su propia identidad con el rol mínimo (AcrPull, secrets read). Sin claves compartidas.</td>
+            </tr>
+            <tr>
+              <td><strong>Secretos</strong></td>
+              <td>Azure Key Vault</td>
+              <td>La cadena de conexión y demás secretos viven aquí; la app los lee con su identidad. Nada en el repo.</td>
+            </tr>
+            <tr>
+              <td><strong>Observabilidad</strong></td>
+              <td>Log Analytics + Azure Monitor (+ App Insights)</td>
+              <td>Sin telemetría no hay operación: logs, métricas, trazas y alertas, todo en un mismo sitio.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>El coste es una capa transversal, no un módulo aparte.</strong> Todas las cajas llevan <code>tags</code> (curso, entorno, propietario, centro de coste) y el conjunto entero tiene un <strong>presupuesto con alertas</strong> (lección 04). Sin etiquetas no puedes atribuir gasto; sin límites, el proyecto final se convierte en una sorpresa de facturación.</p>
+        </div>
+
+        <h3>Las decisiones, una a una (y qué elegiría un equipo senior)</h3>
+        <p>Una arquitectura se juzga por sus decisiones, no por el catálogo. Estas son las tres que más discuten los equipos:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Elegimos…</th><th>Descartamos…</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Cómputo</td>
+              <td><strong>Container Apps</strong></td>
+              <td>A App Service o a AKS</td>
+              <td>Ya tenemos el contenedor; Container Apps da HTTPS, escalado y revisiones sin operar un clúster. AKS es potencia que no vamos a necesitar (y se paga aunque esté parado).</td>
+            </tr>
+            <tr>
+              <td>Base de datos</td>
+              <td><strong>PostgreSQL Flexible Server</strong></td>
+              <td>SQL Server o una VM con Postgres</td>
+              <td>Es el motor que ya usa el Copiloto; gestionado significa backups, parches y alta disponibilidad sin que los hagamos nosotros.</td>
+            </tr>
+            <tr>
+              <td>Exposición de la BD</td>
+              <td><strong>Subred delegada + endpoint privado</strong></td>
+              <td>Regla de firewall «allow 0.0.0.0/0»</td>
+              <td>El error más grave en producción: una base de datos en Internet. La BD solo escucha dentro de la VNet.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>¿Y el serverless (módulo 5)?</strong> Bien planteado: la Copiloto API es un servicio con estado de conexión a base de datos y tráfico continuo, así que un contenedor caliente encaja mejor que una función con <em>cold start</em>. Reservaríamos Functions para tareas puntuales (por ejemplo, consumir una cola de eventos en segundo plano), no para el servicio principal. Esa es la elección informada que pide la lección <code>04-cuando-serverless</code>.</p>
+        </div>
+
+        <h3>La misma arquitectura en AWS</h3>
+        <p>El discurso del curso es <em>provider-neutral</em>: cambian los nombres, no las ideas. Este es el mapa mental que debes poder recitar de memoria:</p>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Red aislada</td><td>VNet</td><td>VPC</td></tr>
+            <tr><td>Subredes</td><td>Subnets (+ delegación)</td><td>Subnets (+ route tables)</td></tr>
+            <tr><td>Registro de imágenes</td><td>Azure Container Registry (ACR)</td><td>Elastic Container Registry (ECR)</td></tr>
+            <tr><td>Cómputo sin clúster</td><td>Container Apps</td><td>App Runner (o ECS Fargate)</td></tr>
+            <tr><td>Base de datos relacional</td><td>Azure Database for PostgreSQL</td><td>RDS for PostgreSQL / Aurora</td></tr>
+            <tr><td>Secretos</td><td>Azure Key Vault</td><td>AWS Secrets Manager</td></tr>
+            <tr><td>Identidad</td><td>Entra ID + identidad gestionada</td><td>IAM Roles (+ IRSA / task role)</td></tr>
+            <tr><td>Observabilidad</td><td>Azure Monitor + Log Analytics</td><td>CloudWatch</td></tr>
+            <tr><td>SDK/CLI</td><td><code>az</code> + provider <code>azurerm</code></td><td><code>aws</code> + provider <code>aws</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p><strong>Por qué insistimos en las dos:</strong> las diferencias reales están en los detalles (App Runner no tiene el modelo de revisiones con pesos de Container Apps; Secrets Manager cobra por secreto y rotación, Key Vault por operación). Conocer ambas evita el «en Azure esto es imposible» — casi nunca lo es, solo se llama distinto.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Antes de la arquitectura completa, el <strong>esqueleto de red</strong>: una VNet y las subredes donde luego encajarán los recursos. Es lo primero que se escribe de cualquier arquitectura, porque todo lo demás cuelga de aquí.</p>
+        <div class="code-file">infra/red-minima.tf — la VNet y sus subredes</div>
+        <pre><code class="language-hcl">variable "location" {
+  type    = string
+  default = "westeurope"
+}
+
+# El edificio: la red virtual. El rango 10.20.0.0/16 da 65 536 direcciones,
+# de sobra para repartir en subredes pequeñas y no solaparse con otras VNets.
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-copiloto"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  address_space       = ["10.20.0.0/16"]
+}
+
+# Planta de la app: aquí se integra el entorno de Container Apps.
+resource "azurerm_subnet" "app" {
+  name                 = "snet-app"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.1.0/24"]
+}
+</code></pre>
+        <p>Dos líneas que importan:</p>
+        <ul>
+          <li><strong><code>address_space</code> planificado.</strong> Se elige <em>antes</em> de crear recursos: cambiar el rango de una VNet en uso es caro. Reserva espacio para crecer (subredes de datos, de endpoints, de integración).</li>
+          <li><strong>Subred por propósito.</strong> No metemos todo en una sola subred. La subred de datos se <em>delega</em> a PostgreSQL y la de endpoints privados alojará los <code>private endpoint</code>. Separarlas es lo que permite aplicar reglas de red distintas a cada cosa.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La arquitectura completa del Copiloto, escrita como el <strong>inventario de recursos</strong> del proyecto <code>infra-cloud</code>. No es aún el Terraform completo (eso es la lección 02): es el plano con los recursos, sus etiquetas de coste y las conexiones entre ellos.</p>
+        <div class="code-file">infra/main.tf — inventario de la arquitectura (extracto)</div>
+        <pre><code class="language-hcl"># Etiquetas comunes a TODOS los recursos: coste rastreable desde el minuto uno.
+locals {
+  tags = {
+    course      = "cloud"
+    project     = "copiloto"
+    environment = var.environment        # dev | prod
+    owner       = var.owner              # responsable
+    cost_center = var.cost_center        # centro de coste
+  }
+}
+
+# ---------------------------------------------------------------- RED
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-copiloto-${var.environment}"
+  address_space       = ["10.20.0.0/16"]
+  location            = var.location
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = local.tags
+}
+
+resource "azurerm_subnet" "app" {
+  name                 = "snet-app"       # integración de Container Apps
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.1.0/24"]
+}
+
+resource "azurerm_subnet" "data" {
+  name                 = "snet-data"      # delegada a PostgreSQL
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.2.0/24"]
+
+  delegation {
+    name = "postgres"
+    service_delegation {
+      name = "Microsoft.DBforPostgreSQL/flexibleServers"
+    }
+  }
+}
+
+resource "azurerm_subnet" "private" {
+  name                 = "snet-private"   # endpoints privados (ACR, KV, Storage)
+  resource_group_name  = azurerm_resource_group.main.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.20.3.0/24"]
+}
+
+# ---------------------------------------------------------------- REGISTRO
+resource "azurerm_container_registry" "acr" {
+  name                = "copilotoacr${var.environment}"  # único, sin guiones
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.location
+  sku                 = "Standard"
+  admin_enabled       = false                            # identidad, no admin
+  tags                = local.tags
+}
+
+# ---------------------------------------------------------------- CÓMPUTO
+resource "azurerm_container_app_environment" "env" {
+  name                       = "cae-copiloto-${var.environment}"
+  resource_group_name        = azurerm_resource_group.main.name
+  location                   = var.location
+  infrastructure_subnet_id   = azurerm_subnet.app.id     # entra en la VNet
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.law.id
+  tags                       = local.tags
+}
+
+resource "azurerm_container_app" "api" {
+  name                         = "copiloto-api"
+  container_app_environment_id = azurerm_container_app_environment.env.id
+  resource_group_name          = azurerm_resource_group.main.name
+  revision_mode                = "Single"
+  tags                         = local.tags
+  # ... template, ingress, probes e identidad (ver módulo 4 y lección 02)
+}
+
+# ---------------------------------------------------------------- DATOS
+resource "azurerm_postgresql_flexible_server" "db" {
+  name                   = "psql-copiloto-${var.environment}"
+  resource_group_name    = azurerm_resource_group.main.name
+  location               = var.location
+  version                = "16"
+  zone                   = "1"            # zona primaria; la HA cubre el failover
+  delegated_subnet_id    = azurerm_subnet.data.id
+  private_dns_zone_id    = azurerm_private_dns_zone.postgres.id
+  administrator_login    = "copiloto"
+  administrator_password = var.db_admin_password   # variable SENSIBLE, en apply
+  storage_mb             = 32768
+  sku_name               = "B_Standard_B1ms"       # barato para el laboratorio
+  backup_retention_days  = 7
+  tags                   = local.tags
+}
+
+resource "azurerm_storage_account" "blob" {
+  name                     = "stcopiloto${var.environment}001"
+  resource_group_name      = azurerm_resource_group.main.name
+  location                 = var.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"        # laboratorio; GRS en producción seria
+  min_tls_version          = "TLS1_2"
+  tags                     = local.tags
+}
+
+# ---------------------------------------------------------------- SECRETOS
+resource "azurerm_key_vault" "kv" {
+  name                       = "kv-copiloto-${var.environment}"
+  resource_group_name        = azurerm_resource_group.main.name
+  location                   = var.location
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "standard"
+  rbac_authorization_enabled = true       # RBAC, no access policies
+  purge_protection_enabled   = true
+  tags                       = local.tags
+}
+
+# ---------------------------------------------------------------- OBSERVABILIDAD
+resource "azurerm_log_analytics_workspace" "law" {
+  name                = "log-copiloto-${var.environment}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.location
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+  tags                = local.tags
+}
+</code></pre>
+        <p>Qué acabas de dibujar, en orden de dependencias:</p>
+        <ul>
+          <li><strong>Red primero:</strong> VNet y subredes. La subred <code>data</code> se <em>delega</em> a PostgreSQL, y la <code>private</code> alojará los endpoints privados. Sin esto, la base de datos tendría que exponerse a Internet.</li>
+          <li><strong>Registro con <code>admin_enabled = false</code>:</strong> obliga a la identidad gestionada (módulo 4). El nombre del ACR no admite guiones y debe ser único globalmente.</li>
+          <li><strong>Entorno de Container Apps atado a la VNet y al workspace:</strong> <code>infrastructure_subnet_id</code> lo mete en la red privada y <code>log_analytics_workspace_id</code> hace que todo lo que ocurra aquí aparezca en Azure Monitor.</li>
+          <li><strong>PostgreSQL con subred delegada y DNS privado:</strong> la base solo habla dentro de la VNet. La contraseña del administrador entra como <strong>variable sensible</strong> en el <code>apply</code>, nunca en el archivo.</li>
+          <li><strong>Key Vault con RBAC y purge protection:</strong> control de acceso por roles y protección frente a borrados accidentales. El Copiloto leerá de aquí sus secretos con su identidad.</li>
+          <li><strong>Todo etiquetado:</strong> <code>tags = local.tags</code> en cada recurso. Es lo que hace posible, en la lección 04, filtrar el gasto por entorno y proyecto.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Orden de trabajo:</strong> primero el <em>grafo de dependencias</em> (red → datos/secretos → cómputo), luego el código. Terraform deduce el orden de las referencias (<code>azurerm_subnet.app.id</code> implica que la subred existe antes), pero tú debes tenerlo claro en la cabeza para no crear dependencias circulares.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Diseñar la red y el rango de direcciones antes de crear recursos</td>
+              <td>Cambiar el CIDR de una VNet en uso</td>
+              <td>Recrear red = recrear todo lo que cuelga de ella; es una de las operaciones más caras</td>
+            </tr>
+            <tr>
+              <td>Una subred por propósito (app, datos, endpoints)</td>
+              <td>Meter todo en la subred por defecto</td>
+              <td>Permite reglas y delegaciones distintas; aísla el impacto de cada componente</td>
+            </tr>
+            <tr>
+              <td>Etiquetar <strong>todos</strong> los recursos con <code>local.tags</code></td>
+              <td>Recursos sin <code>owner</code>/<code>environment</code></td>
+              <td>Sin etiquetas no hay atribución de gasto ni autopsia posible de un recurso huérfano</td>
+            </tr>
+            <tr>
+              <td>Identidad gestionada por componente y rol mínimo</td>
+              <td>Una identidad «compartida» con muchos permisos</td>
+              <td>El fallo se contiene: si una identidad se filtra, solo abre su puerta</td>
+            </tr>
+            <tr>
+              <td>Recursos PaaS con endpoint privado</td>
+              <td>«Firewall abierto para probar»</td>
+              <td>Un PaaS en Internet es la causa nº1 de fugas de datos</td>
+            </tr>
+            <tr>
+              <td>Zona redundante en la base de datos de producción</td>
+              <td>Una sola instancia sin HA</td>
+              <td>El failover automático convierte una caída de zona en un pequeño bache, no en un desastre</td>
+            </tr>
+            <tr>
+              <td>Observabilidad desde el diseño (<em>observability by design</em>)</td>
+              <td>Añadir monitorización «cuando falle»</td>
+              <td>Si no existían métricas antes del incidente, no tienes línea base ni historia que investigar</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Exponer la base de datos a Internet «solo para conectarse»</h3>
+        <span class="code-label code-label--wrong">Incorrecto — firewall abierto al mundo</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ Cualquier IP de Internet puede intentar autenticarse contra PostgreSQL.
+resource "azurerm_postgresql_flexible_server_firewall_rule" "open" {
+  name             = "allow-all"
+  server_id        = azurerm_postgresql_flexible_server.db.id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "255.255.255.255"
+}
+</code></pre>
+        <span class="code-label code-label--right">Correcto — subred delegada, sin endpoint público</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ La base vive dentro de la VNet: solo la alcanza quien está en la red.
+resource "azurerm_postgresql_flexible_server" "db" {
+  # ...
+  delegated_subnet_id = azurerm_subnet.data.id
+  private_dns_zone_id = azurerm_private_dns_zone.postgres.id
+  public_network_access_enabled = false   # sin IP pública
+}
+</code></pre>
+        <p>Con <code>public_network_access_enabled = false</code> y la subred delegada, la base de datos deja de tener una puerta a Internet. El acceso desde tu portátil, si lo necesitas, se hace por VPN o por un <em>jump host</em> dentro de la VNet, no abriendo el firewall a todo el planeta.</p>
+
+        <h3>2. Una única identidad gestionada para todos los componentes</h3>
+        <span class="code-label code-label--wrong">Incorrecto — identidad compartida y sobredimensionada</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ La app, el pipeline y los jobs usan la MISMA identidad con muchos roles.
+# Un permiso de más en cualquier sitio es un permiso de más en todas partes.
+resource "azurerm_role_assignment" "todo" {
+  principal_id         = azurerm_user_assigned_identity.comun.principal_id
+  role_definition_name = "Contributor"     # demasiado
+  scope                = azurerm_resource_group.main.id
+}
+</code></pre>
+        <span class="code-label code-label--right">Correcto — identidad por componente y rol mínimo</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ La identidad de la app solo puede LEER imágenes del registro.
+resource "azurerm_role_assignment" "app_acr_pull" {
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+  role_definition_name = "AcrPull"          # solo lectura, solo del ACR
+  scope                = azurerm_container_registry.acr.id
+}
+</code></pre>
+        <p>Regla del curso: cada componente tiene su identidad y su rol <em>mínimo sobre el recurso exacto</em>. El alcance no es «todo el grupo de recursos» si solo hace falta un registro.</p>
+
+        <h3>3. Arquitectura sin etiquetas ni límite de gasto</h3>
+        <pre><code class="language-hcl"># ❌ Recursos sueltos, sin etiquetas: la factura llega y nadie sabe de quién es.
+resource "azurerm_container_app" "api" {
+  name = "copiloto-api"
+  # ... sin tags, sin budget, sin alertas
+}
+
+# ✅ Todo etiquetado con un local común, y un presupuesto con alertas (lección 04).
+resource "azurerm_container_app" "api" {
+  name = "copiloto-api"
+  tags = local.tags
+}
+</code></pre>
+        <p>Sin las etiquetas <code>project</code>, <code>environment</code> y <code>cost_center</code> no puedes responder «¿cuánto cuesta el entorno de <em>dev</em>?» ni «¿quién es el dueño de este recurso?». El presupuesto sin etiquetas es una alarma sin dirección.</p>
+
+        <h3>4. Escalar en horizontal sin techo, en la arquitectura</h3>
+        <pre><code class="language-hcl"># ❌ max_replicas enorme: una subida de tráfico puede multiplicar la factura.
+template {
+  max_replicas = 1000
+}
+
+# ✅ Techo acorde al presupuesto, con alerta cuando se acerca.
+template {
+  min_replicas = 1     # sin cold start
+  max_replicas = 5     # techo de coste y de protección
+}
+</code></pre>
+        <p>El escalado automático (módulo 4) es una promesa: «si hace falta, gasto más». La arquitectura debe decidir <em>cuánto más</em>. Un <code>max_replicas</code> sin techo razonable es una factura sin techo razonable.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> materializar el plano en la nube y verificarlo con la CLI. Vamos a crear la red de la arquitectura y explorarla como lo haría un ingeniero antes de añadir los recursos PaaS.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — crea el grupo de recursos con sus etiquetas.</strong>
+            <pre><code class="language-bash">az group create \
+  --name rg-copiloto-dev \
+  --location westeurope \
+  --tags course=cloud project=copiloto environment=dev owner=tu-nombre cost_center=formacion
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — crea la VNet y las tres subredes del plano.</strong>
+            <pre><code class="language-bash">az network vnet create \
+  --resource-group rg-copiloto-dev --name vnet-copiloto-dev \
+  --address-prefixes 10.20.0.0/16 \
+  --subnet-name snet-app --subnet-prefixes 10.20.1.0/24
+
+az network vnet subnet create \
+  --resource-group rg-copiloto-dev --vnet-name vnet-copiloto-dev \
+  --name snet-private --address-prefixes 10.20.3.0/24
+
+# La subred de datos se crea aparte porque va DELEGADA a PostgreSQL:
+az network vnet subnet create \
+  --resource-group rg-copiloto-dev --vnet-name vnet-copiloto-dev \
+  --name snet-data --address-prefixes 10.20.2.0/24 \
+  --delegations Microsoft.DBforPostgreSQL/flexibleServers
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — comprueba que la delegación quedó aplicada.</strong>
+            <pre><code class="language-bash">az network vnet subnet show \
+  --resource-group rg-copiloto-dev --vnet-name vnet-copiloto-dev \
+  --name snet-data \
+  --query "{nombre:name, prefijo:addressPrefix, delegacion:delegations[0].serviceName}" \
+  --output table
+# Esperado: delegacion = Microsoft.DBforPostgreSQL/flexibleServers
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — reserva el DNS privado para PostgreSQL.</strong> Sin zona privada, el nombre de la base no resuelve dentro de la VNet:
+            <pre><code class="language-bash">az network private-dns zone create \
+  --resource-group rg-copiloto-dev \
+  --name "private.postgres.database.azure.com"
+
+az network private-dns link vnet create \
+  --resource-group rg-copiloto-dev --zone-name "private.postgres.database.azure.com" \
+  --name link-vnet --virtual-network vnet-copiloto-dev --registration-enabled false
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación) — recorre la jerarquía de arriba abajo.</strong> Comprueba que el edificio tiene las plantas que diseñaste:
+            <pre><code class="language-bash">az network vnet subnet list \
+  --resource-group rg-copiloto-dev --vnet-name vnet-copiloto-dev \
+  --query "[].{subred:name, prefijo:addressPrefix}" --output table
+# Esperado: snet-app, snet-data y snet-private con sus prefijos 10.20.x.0/24.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — limpia.</strong> El grupo entero se va, y con él la VNet y el DNS privado:
+            <pre><code class="language-bash">az group delete --name rg-copiloto-dev --yes --no-wait
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Resultado esperado:</strong> una VNet <code>10.20.0.0/16</code> con tres subredes (<code>snet-app</code>, <code>snet-data</code> delegada a PostgreSQL, <code>snet-private</code>) y una zona DNS privada enlazada. Tienes el plano de la arquitectura en pie y verificable, listo para que la lección 02 lo escriba entero en Terraform.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El Copiloto sobrevive a la caída de una región</h3>
+          <p>Rediseña la arquitectura para que el Copiloto siga sirviendo aunque <strong>una región entera de Azure se caiga</strong>. Debes elegir y justificar un modelo: <em>activo-pasivo</em> (una región caliente y otra en espera, con conmutación manual o automática) o <em>activo-activo</em> (las dos regiones sirviendo tráfico a la vez).</p>
+          <p>Como mínimo, tu diseño debe resolver: (1) dónde vive la base de datos y cómo se replica entre regiones; (2) dónde viven los secretos y si se replican; (3) cómo llega el tráfico del usuario a la región sana; (4) cuál es el <strong>RTO</strong> (tiempo máximo de caída) y el <strong>RPO</strong> (cuántos datos puedes perder) que ofreces, y (5) cuánto cuesta esa resiliencia de más, comparado con la arquitectura de una sola región.</p>
+          <p><em>Pista: piensa en el módulo 6 (<code>04-alta-disponibilidad-y-dr</code>). La base de datos gestionada suele ofrecer <strong>réplicas de lectura entre regiones</strong> y <strong>restauración geográfica</strong>; Azure Front Door o Traffic Manager reparten el tráfico entre regiones; y Key Vault puede replicarse. La clave del reto no es «duplicar todo», sino <strong>elegir el punto del compromiso coste/resiliencia</strong> que pida el negocio y saber defenderlo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La arquitectura del Copiloto tiene <strong>cinco capas</strong>: red, cómputo, datos, identidad/secretos y observabilidad; el <strong>coste es transversal</strong> (etiquetas + presupuesto).</li>
+          <li><strong>Red primero:</strong> VNet, una subred por propósito, datos <em>delegados</em> a PostgreSQL y endpoints privados para los PaaS.</li>
+          <li><strong>Cómputo:</strong> Container Apps + ACR por identidad gestionada (<code>AcrPull</code>), sin clúster que operar.</li>
+          <li><strong>Datos:</strong> PostgreSQL Flexible Server privado y con HA; Blob para lo no relacional.</li>
+          <li><strong>Secretos:</strong> Key Vault con RBAC; la app los lee con su identidad, nunca desde el repositorio.</li>
+          <li><strong>Observabilidad:</strong> todo emite a Log Analytics/Azure Monitor; se diseña antes del incidente, no después.</li>
+          <li>La misma arquitectura en AWS cambia de nombres, no de ideas.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Recurso Azure</th><th>Equivalente AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Red aislada</td><td><code>azurerm_virtual_network</code></td><td><code>aws_vpc</code></td></tr>
+            <tr><td>Subredes</td><td><code>azurerm_subnet</code> (+ delegación)</td><td><code>aws_subnet</code></td></tr>
+            <tr><td>Registro de imágenes</td><td><code>azurerm_container_registry</code></td><td><code>aws_ecr_repository</code></td></tr>
+            <tr><td>Cómputo sin clúster</td><td><code>azurerm_container_app</code></td><td><code>aws_apprunner_service</code></td></tr>
+            <tr><td>Base de datos</td><td><code>azurerm_postgresql_flexible_server</code></td><td><code>aws_db_instance</code></td></tr>
+            <tr><td>Almacenamiento de objetos</td><td><code>azurerm_storage_account</code> (Blob)</td><td><code>aws_s3_bucket</code></td></tr>
+            <tr><td>Secretos</td><td><code>azurerm_key_vault</code></td><td><code>aws_secretsmanager_secret</code></td></tr>
+            <tr><td>Identidad</td><td><code>azurerm_user_assigned_identity</code></td><td>Rol de IAM</td></tr>
+            <tr><td>Observabilidad</td><td><code>azurerm_log_analytics_workspace</code></td><td><code>aws_cloudwatch_log_group</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué Container Apps y no directamente AKS?</summary>
+            <div>
+              <p>Porque AKS es un <strong>clúster</strong> que tú operas (o al menos pagas) aunque no lo uses: nodos, actualizaciones, ingress, certificados. Container Apps te da lo que necesitas —contenedor, HTTPS, escalado y revisiones— sin clúster. La regla es sencilla: usa Container Apps salvo que necesites control fino de Kubernetes (CRDs, operadores, red avanzada). En ese caso, AKS, pero sabiendo que no es gratis en operación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito realmente una VNet para un proyecto pequeño?</summary>
+            <div>
+              <p>Para el laboratorio, no: Container Apps y PostgreSQL pueden funcionar con exposición pública. Pero el <strong>objetivo de la arquitectura final</strong> es reflejar producción, y en producción la base de datos no se expone a Internet. Diseñar la VNet ahora te obliga a elegir los rangos de direcciones antes de tener recursos —que es exactamente cuando es barato— y te ahorra una migración dolorosa después.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde debería ir la lógica de llamada al LLM del Copiloto?</summary>
+            <div>
+              <p>Dentro de la Copiloto API, en el contenedor. La llamada al modelo es lógica de aplicación con estado (prompts, contexto, límites de tokens), no un servicio de infraestructura aparte. Si en algún momento alguna tarea es lenta y puntual (resumir un documento largo), esa sí puede ir a una función serverless que consuma de una cola, pero el camino principal se queda en la API.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo separo la arquitectura en varios grupos de recursos?</summary>
+            <div>
+              <p>Cuando tengan <strong>ciclos de vida o permisos distintos</strong>. Un patrón habitual: un grupo por entorno (<code>rg-copiloto-dev</code>, <code>rg-copiloto-prod</code>) y, dentro, todo el entorno junto. Separar «red» y «app» solo tiene sentido si equipos distintos los gestionan o si la red se comparte entre aplicaciones. Para un solo Copiloto, un grupo por entorno es lo más simple y lo que mejor casa con los presupuestos y el control de coste.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La arquitectura en AWS sería mucho más barata o más cara?</summary>
+            <div>
+              <p>Depende del uso, y la respuesta honesta es «hay que medirlo». Los servicios equivalentes (App Runner/ECS, RDS, Secrets Manager, CloudWatch) tienen modelos de precio distintos: App Runner cobra por vCPU/memoria de instancia aprovisionada, Secrets Manager cobra por secreto y rotación mientras Key Vault cobra por operación, etc. Lo importante no es memorizar precios, sino saber <strong>qué partida genera el gasto</strong> en cada modelo para optimizarla. Eso lo trabajamos en la lección 04.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

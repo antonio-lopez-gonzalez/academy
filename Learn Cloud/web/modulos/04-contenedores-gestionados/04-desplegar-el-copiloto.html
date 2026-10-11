@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-desplegar-el-copiloto">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Desplegar el Copiloto — Módulo 4 · Curso Cloud</title>
+  <meta name="description" content="Del registro de imágenes a la URL pública: despliega la Copiloto API en contenedores gestionados con Terraform, identidad gestionada y health checks.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Desplegar el Copiloto</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Contenedores gestionados</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ha llegado el momento de juntar todas las piezas del módulo y hacer lo que llevas buscando desde la portada del curso: <strong>poner la Copiloto API en producción, con una URL pública que responde</strong>. No con la consola web, no a mano: con <strong>Terraform</strong>, reproducible, versionado y sin secretos en el repositorio.</p>
+        <p>El flujo que vamos a seguir es siempre el mismo, en cualquier proveedor y para cualquier servicio:</p>
+        <pre class="diagram">
+  (1) REGISTRO            (2) SERVICIO             (3) SALUD             (4) URL PUBLICA
+  -------------           ------------             ---------             ---------------
+  build imagen   ==&gt;      Container App     ==&gt;    /health responde ==&gt; https://copiloto...
+  push a ACR              + ingress                readiness ok          con TLS gestionado
+  (identidad)             (sin credenciales)       liveness ok           accesible al mundo
+        </pre>
+        <p>Cada flecha la has aprendido por separado: el registro en el módulo 1, la identidad gestionada en el módulo 2, la base de datos en el módulo 3. Aquí las unimos en un despliegue real.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «desplegar» no es subir una imagen: es encadenar <strong>registro → servicio → salud → URL pública</strong> sin secretos y con verificación. Es el momento en que el Copiloto deja de ser un proyecto local y pasa a ser una aplicación en producción. Todo lo demás del curso (observabilidad, coste, DR) se apoya en este cimiento.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El recorrido de una petición, extremo a extremo</h3>
+        <p>Antes de escribir código, ten claro el camino. Cuando un usuario abre <code>https://copiloto....azurecontainerapps.io/health</code>, esto es lo que ocurre:</p>
+        <pre class="diagram">
+  Usuario
+    |
+    | HTTPS (TLS gestionado por el ingress)
+    v
+  [ Ingress externo ]  --target_port 8000--&gt;  [ Réplica del contenedor ]
+    |                                             |
+    | balancea entre réplicas                     | ejecuta Copiloto API
+    |                                             |
+    +---- si /health no responde, la plataforma   |
+          NO manda tráfico a esa réplica ----------+
+    |
+    v
+  Imagen descargada del ACR usando IDENTIDAD GESTIONADA (sin credenciales)
+        </pre>
+        <p>Cuatro ideas clave que se deducen del dibujo:</p>
+        <ul>
+          <li><strong>El ingress termina el TLS.</strong> Tú no gestionas certificados: la plataforma los emite y renueva. Por eso <code>allow_insecure_connections = false</code> (solo HTTPS).</li>
+          <li><strong>El <code>target_port</code> es el del contenedor</strong>, no un puerto público. El ingress llega a él por la red interna del environment.</li>
+          <li><strong>La salud decide el enrutado.</strong> Mientras <code>/health</code> no responde bien, la plataforma considera la réplica «no lista» y no le manda tráfico.</li>
+          <li><strong>El registro se lee con identidad.</strong> Nada de usuario/contraseña: la identidad gestionada de la app tiene el rol <code>AcrPull</code> sobre el registro.</li>
+        </ul>
+
+        <h3>Los tres sondeos (probes) y por qué hacen falta los tres</h3>
+        <p>Aquí está el detalle que separa un despliegue amateur de uno profesional. La plataforma necesita saber tres cosas distintas sobre tu contenedor:</p>
+        <table>
+          <thead><tr><th>Sondeo</th><th>Pregunta que responde</th><th>Qué pasa si falla</th></tr></thead>
+          <tbody>
+            <tr><td><strong>startup</strong></td><td>«¿Has terminado de arrancar?»</td><td>Da tiempo a apps lentas a iniciarse sin que la plataforma las mate por «no estar listas aún».</td></tr>
+            <tr><td><strong>readiness</strong></td><td>«¿Puedo mandarte tráfico ya?»</td><td>La plataforma deja de enviar tráfico a esa réplica (pero la deja viva). Es la clave de un despliegue sin errores 5xx.</td></tr>
+            <tr><td><strong>liveness</strong></td><td>«¿Sigues vivo, o te has colgado?»</td><td>La plataforma reinicia la réplica. Detecta cuelgues que un sondeo de tráfico no vería.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un restaurante. <em>startup</em> = «¿ha abierto ya las puertas?» (no le exijas servir durante la obra). <em>readiness</em> = «¿el chef está listo para cocinar?» (si no, no le mandes clientes, pero no cierres el local). <em>liveness</em> = «¿sigue respirando el chef?» (si se ha desmayado, hay que reanimarlo). Confundir los tres es <em>la</em> causa de reinicios en bucle y 502 en producción.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Regla de oro:</strong> <code>readiness</code> y <code>liveness</code> deben apuntar a <strong>rutas distintas</strong> o, como mínimo, <code>liveness</code> a una más simple. Si <code>liveness</code> depende de la base de datos, y la base de datos cae un momento, la plataforma reiniciará <em>todas</em> tus réplicas a la vez —convirtiendo un problema pequeño en una caída total.</p>
+        </div>
+
+        <h3>Por qué identidad gestionada y no usuario/contraseña</h3>
+        <p>Podrías darle a la app el usuario y la contraseña del registro. Funciona… y es una mala idea: esas credenciales viven en el state de Terraform, en los logs, en la memoria de quien las copió. La <strong>identidad gestionada</strong> (módulo 2) resuelve esto: la app obtiene un token temporal del propio proveedor, sin secretos persistentes.</p>
+        <table>
+          <thead><tr><th></th><th>Usuario/contraseña del registro</th><th>Identidad gestionada</th></tr></thead>
+          <tbody>
+            <tr><td>Dónde vive la credencial</td><td>En variables, state, CI…</td><td>En ninguna parte: token temporal</td></tr>
+            <tr><td>Rotación</td><td>Manual y olvidada</td><td>Automática</td></tr>
+            <tr><td>Alcance</td><td>Todo lo que ese usuario puede</td><td>Solo el rol asignado (<code>AcrPull</code>)</td></tr>
+            <tr><td>Fuga de la imagen/repo</td><td>Credencial expuesta</td><td>Sin credencial que exponer</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p>El rol que necesita una Container App para <strong>leer</strong> imágenes de un ACR se llama <code>AcrPull</code>. Es solo lectura del registro: exactamente el mínimo privilegio. En AWS, el equivalente es dar permiso de lectura de ECR a la identidad que usa el servicio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El despliegue mínimo, sin identidad ni probes, para ver el esqueleto: un registro, un environment y una app que tira de una imagen pública. Es el «hola mundo» del registro a la URL.</p>
+        <div class="code-file">minimo.tf — registro + environment + app pública</div>
+        <pre><code class="language-hcl"># 1) El registro donde vivirán las imágenes (módulo 1).
+resource "azurerm_container_registry" "acr" {
+  name                = "copilotolabacr"   # nombre único, solo minúsculas/números
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  sku                 = "Basic"            # Basic basta para el laboratorio
+  admin_enabled       = false              # sin usuario admin: usaremos identidad
+}
+
+# 2) El entorno que aloja la app.
+resource "azurerm_container_app_environment" "env" {
+  name                = "cae-copiloto"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+}
+
+# 3) La app. Aquí usamos una imagen pública; con el ACR propio añadiríamos
+#    el bloque registry + identity (lo verás en el ejemplo real).
+resource "azurerm_container_app" "min" {
+  name                         = "copiloto-min"
+  container_app_environment_id = azurerm_container_app_environment.env.id
+  resource_group_name          = var.resource_group_name
+  revision_mode                = "Single"
+
+  template {
+    container {
+      name   = "api"
+      image  = "mcr.microsoft.com/k8se/quickstart:latest"
+      cpu    = 0.5
+      memory = "1Gi"
+    }
+  }
+
+  ingress {
+    external_enabled           = true
+    target_port                = 80
+    allow_insecure_connections = false   # solo HTTPS
+  }
+}
+</code></pre>
+        <p>Qué acaba de pasar:</p>
+        <ol class="steps">
+          <li><strong><code>admin_enabled = false</code>:</strong> desactiva el usuario administrador del registro para <em>obligarnos</em> a usar identidad gestionada. Es una decisión de seguridad, no un descuido.</li>
+          <li><strong>El environment:</strong> la frontera donde vive la app; agrupa logs y red interna.</li>
+          <li><strong>La app con ingress externo:</strong> al aplicar, Terraform te da un FQDN en <code>azurerm_container_app.min.ingress[0].fqdn</code>. Esa URL responde por HTTPS en segundos.</li>
+          <li><strong>Falta la salud y la identidad:</strong> por eso es el «mínimo». En el ejemplo real añadimos ambos para que sea apto para producción.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El despliegue completo de la Copiloto API, tal como lo usarías en producción: registro → servicio → salud → URL pública, con <strong>identidad gestionada</strong> y <strong>probes</strong>, y con la configuración sensible (la cadena de conexión a la base de datos) como <strong>secreto</strong>, nunca en el código.</p>
+        <div class="code-file">copiloto.tf — despliegue completo</div>
+        <pre><code class="language-hcl"># ------------------------- REGISTRO -------------------------
+resource "azurerm_container_registry" "acr" {
+  name                = "copilotoacr"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  sku                 = "Standard"      # Standard para el entorno de producción
+  admin_enabled       = false
+  tags                = { course = "cloud" }
+}
+
+# ------------------------- IDENTIDAD -------------------------
+# Identidad gestionada POR LA APP, no compartida con nada más.
+resource "azurerm_user_assigned_identity" "app" {
+  name                = "id-copiloto-api"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+}
+
+# Permiso de SOLO LECTURA de imágenes sobre el registro (mínimo privilegio).
+resource "azurerm_role_assignment" "acr_pull" {
+  scope                = azurerm_container_registry.acr.id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+}
+
+# ------------------------- SERVICIO -------------------------
+resource "azurerm_container_app" "copiloto" {
+  name                         = "copiloto-api"
+  container_app_environment_id = azurerm_container_app_environment.main.id
+  resource_group_name          = var.resource_group_name
+  revision_mode                = "Single"
+
+  # La app usa su identidad para autenticarse contra el ACR.
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.app.id]
+  }
+
+  # Y el registro se declara con esa identidad: sin usuario ni contraseña.
+  registry {
+    server   = azurerm_container_registry.acr.login_server
+    identity = azurerm_user_assigned_identity.app.id
+  }
+
+  # La cadena de conexión a la BD vive como SECRETO en la app.
+  # Su valor se pasa en tiempo de apply (nunca en el repositorio).
+  secret {
+    name  = "database-url"
+    value = var.database_url
+  }
+
+  template {
+    container {
+      name   = "api"
+      image  = "${azurerm_container_registry.acr.login_server}/copiloto-api:2.0.0"
+      cpu    = 0.5
+      memory = "1Gi"
+
+      # El secreto se inyecta como variable de entorno: la app lee DATABASE_URL.
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+
+      # (3) SALUD: startup da tiempo a arrancar; readiness decide el tráfico.
+      startup_probe {
+        transport               = "HTTP"
+        port                    = 8000
+        path                    = "/health"
+        initial_delay           = 5
+        interval_seconds        = 5
+        failure_count_threshold = 12   # ~1 min de margen para arrancar
+      }
+      readiness_probe {
+        transport        = "HTTP"
+        port             = 8000
+        path             = "/health"
+        interval_seconds = 10
+      }
+      # liveness a la MISMA ruta en este caso, pero con umbrales laxos:
+      # reinicia solo si realmente se ha colgado, no por un pico puntual.
+      liveness_probe {
+        transport               = "HTTP"
+        port                    = 8000
+        path                    = "/health"
+        interval_seconds        = 30
+        failure_count_threshold = 3
+      }
+    }
+
+    min_replicas = 1     # una réplica caliente: sin cold start
+    max_replicas = 5     # techo de coste (lección 03)
+  }
+
+  # ------------------------- URL PUBLICA -------------------------
+  ingress {
+    external_enabled           = true       # accesible desde Internet
+    target_port                = 8000       # el puerto que escucha la app
+    allow_insecure_connections = false      # solo HTTPS, TLS gestionado
+  }
+
+  tags = { course = "cloud", environment = "lab" }
+}
+</code></pre>
+        <div class="code-file">outputs.tf — la URL pública como salida</div>
+        <pre><code class="language-hcl">output "copiloto_url" {
+  description = "URL publica HTTPS de la Copiloto API"
+  value       = "https://${azurerm_container_app.copiloto.ingress[0].fqdn}"
+}
+
+output "health_url" {
+  description = "Endpoint de salud para comprobar el despliegue"
+  value       = "https://${azurerm_container_app.copiloto.ingress[0].fqdn}/health"
+}
+</code></pre>
+        <p>Ahora la parte que sube la imagen al registro. Puedes construir dentro de Azure con <code>az acr build</code>, que compila en la nube y evita depender de tu Docker local:</p>
+        <div class="code-file">terminal — construir y publicar la imagen</div>
+        <pre><code class="language-bash"># Construye la imagen usando el ACR (no hace falta Docker local) y la publica
+# con el tag 2.0.0, que es el que referencia el Terraform de arriba.
+az acr build \
+  --registry copilotoacr \
+  --image copiloto-api:2.0.0 \
+  --file Dockerfile \
+  .
+
+# Y ahora, el despliegue de la infraestructura:
+terraform init
+terraform apply -var="database_url=$DATABASE_URL"
+
+# Obtén la URL y comprueba la salud:
+terraform output copiloto_url
+curl -s "$(terraform output -raw health_url)"
+# Esperado: un JSON de estado {"status":"ok"} o similar desde /health.
+</code></pre>
+        <p>Lee las decisiones importantes en voz alta:</p>
+        <ul>
+          <li><strong>Registro → servicio con identidad:</strong> la app nunca guarda credenciales del registro. La identidad <code>UserAssigned</code> tiene solo <code>AcrPull</code>.</li>
+          <li><strong>La base de datos entra como secreto:</strong> <code>DATABASE_URL</code> se pasa en el <code>apply</code> y queda como <code>secret</code> en la app. Ni en el código, ni en la imagen, ni en el repositorio. En producción real, el secreto se leería de Key Vault con identidad (módulo 2), pero el principio se ve aquí con claridad.</li>
+          <li><strong>Los tres probes:</strong> startup tolera un arranque lento, readiness evita mandar tráfico antes de tiempo, liveness reinicia solo si de verdad se cuelga.</li>
+          <li><strong>La URL pública es una salida del código:</strong> <code>terraform output copiloto_url</code>. Nada de buscar la URL a mano en la consola.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>En el proyecto final (módulo 7) este mismo Terraform se orquesta con GitHub Actions + OIDC: el pipeline hace <code>az acr build</code> y <code>terraform apply</code> sin ninguna clave almacenada, cerrando el círculo del despliegue «todo como código» del curso.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Autenticar el registro con identidad gestionada + <code>AcrPull</code></td>
+              <td>Usuario y contraseña del registro en variables</td>
+              <td>Sin credenciales de larga vida que rotar, filtrar o perder</td>
+            </tr>
+            <tr>
+              <td>Declarar los tres probes (<code>/health</code>)</td>
+              <td>Ingress sin sondeos</td>
+              <td>Sin readiness, el tráfico llega antes de que la app esté lista: errores 5xx al desplegar</td>
+            </tr>
+            <tr>
+              <td>Pasar la configuración sensible como <code>secret</code></td>
+              <td>Meter la URL de base de datos en el código</td>
+              <td>Regla del curso: nada de secretos en el repositorio ni en la imagen</td>
+            </tr>
+            <tr>
+              <td>Etiquetar la imagen con versión inmutable (<code>2.0.0</code>)</td>
+              <td>Desplegar <code>:latest</code></td>
+              <td>Reproducibilidad y vuelta atrás segura: sabes qué corre en producción</td>
+            </tr>
+            <tr>
+              <td>Fijar <code>allow_insecure_connections = false</code></td>
+              <td>Dejar HTTP abierto «para probar»</td>
+              <td>TLS gestionado y sin tráfico en claro; el HTTP redirige a HTTPS</td>
+            </tr>
+            <tr>
+              <td>Escuchar en <code>0.0.0.0</code> dentro del contenedor</td>
+              <td>Escuchar solo en <code>127.0.0.1</code></td>
+              <td>El ingress necesita alcanzar el puerto; en localhost no lo encuentra (502)</td>
+            </tr>
+            <tr>
+              <td>Sacar la URL por <code>output</code> de Terraform</td>
+              <td>Buscar la URL a mano en la consola</td>
+              <td>Todo como código: la app sabe su propia dirección desde el estado</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Desplegar una imagen del ACR sin permiso <code>AcrPull</code></h3>
+        <span class="code-label code-label--wrong">Incorrecto — falta la asignación de rol</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ La app apunta al ACR pero su identidad no puede leer del registro.
+# Resultado: la revisión falla con un error al bajar la imagen y no arranca.
+registry { server = azurerm_container_registry.acr.login_server }
+# ...pero nunca se creó el azurerm_role_assignment con rol AcrPull
+</code></pre>
+        <span class="code-label code-label--right">Correcto — identidad + rol explícitos</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ La identidad tiene AcrPull, y el registry la usa.
+resource "azurerm_role_assignment" "acr_pull" {
+  scope                = azurerm_container_registry.acr.id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.app.principal_id
+}
+
+registry {
+  server   = azurerm_container_registry.acr.login_server
+  identity = azurerm_user_assigned_identity.app.id
+}
+</code></pre>
+
+        <h3>2. Guardar la cadena de conexión a la base de datos en el código</h3>
+        <span class="code-label code-label--wrong">Incorrecto — secreto en el repositorio</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ Credenciales en claro: quedan en git, en el state y en los logs.
+env {
+  name  = "DATABASE_URL"
+  value = "postgres://copiloto:pa55word@db.postgres.database.azure.com:5432/copiloto"
+}
+</code></pre>
+        <span class="code-label code-label--right">Correcto — secreto declarado, valor en apply</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ El código declara el secreto; el valor entra en tiempo de apply.
+secret {
+  name  = "database-url"
+  value = var.database_url   # variable sensible, marcada como sensitive
+}
+env {
+  name        = "DATABASE_URL"
+  secret_name = "database-url"
+}
+</code></pre>
+
+        <h3>3. Apuntar <code>liveness</code> a algo que depende de otro servicio</h3>
+        <pre><code class="language-hcl"># ❌ Si /health-db comprueba la base de datos, y la BD cae un segundo,
+# la plataforma reiniciará TODAS las réplicas a la vez.
+liveness_probe {
+  path = "/health-db"   # depende de un servicio externo
+}
+
+# ✅ liveness a una ruta local y barata: solo comprueba que el proceso responde.
+#    La comprobación de dependencias va en readiness o en métricas/alarmas.
+liveness_probe {
+  path = "/health"      # sin salir de la app
+}
+</code></pre>
+        <p>Este error convierte una degradación pequeña (la BD responde lenta) en una caída total (todas las réplicas reiniciándose). El liveness debe responder a la pregunta «¿mi proceso está vivo?», no «¿está todo el sistema perfecto?».</p>
+
+        <h3>4. Olvidar que el contenedor escucha en <code>0.0.0.0</code></h3>
+        <pre><code class="language-dockerfile"># ❌ El servidor por defecto puede escuchar solo en localhost dentro del contenedor.
+# uvicorn copiloto.main:app --host 127.0.0.1 --port 8000
+
+# ✅ Debe escuchar en todas las interfaces para que el ingress lo alcance.
+CMD ["uvicorn", "copiloto.main:app", "--host", "0.0.0.0", "--port", "8000"]
+</code></pre>
+        <p>Síntoma típico: el contenedor está «Running», no hay error en los logs, pero la URL devuelve 502. El <code>target_port</code> coincide, pero el proceso solo atiende en <code>127.0.0.1</code>. Es de los fallos más frecuentes y más difíciles de ver sin saberlo.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> recorrer el ciclo completo (registro → servicio → salud → URL pública) desplegando la Copiloto API y verificando que la URL responde por HTTPS.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — grupo de recursos y registro.</strong>
+            <pre><code class="language-bash">az group create --name copiloto-rg --location westeurope --tags course=cloud
+az acr create \
+  --name copilotoacr --resource-group copiloto-rg \
+  --sku Standard --admin-enabled false
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — construye y publica la imagen en el registro.</strong> Si no tienes el código a mano, usa una etiqueta de ejemplo:
+            <pre><code class="language-bash">az acr build \
+  --registry copilotoacr \
+  --image copiloto-api:2.0.0 \
+  --file Dockerfile .
+# Verifica que la imagen está en el registro:
+az acr repository show-tags --name copilotoacr --repository copiloto-api --output table
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — crea el entorno y la app con ingress externo.</strong>
+            <pre><code class="language-bash">az containerapp env create \
+  --name cae-copiloto --resource-group copiloto-rg --location westeurope
+
+az containerapp create \
+  --name copiloto-api \
+  --resource-group copiloto-rg \
+  --environment cae-copiloto \
+  --image copilotoacr.azurecr.io/copiloto-api:2.0.0 \
+  --registry-server copilotoacr.azurecr.io \
+  --target-port 8000 \
+  --ingress external \
+  --min-replicas 1 --max-replicas 5
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — configura los health checks.</strong> La ruta <code>/health</code> debe existir en la app:
+            <pre><code class="language-bash">az containerapp update \
+  --name copiloto-api --resource-group copiloto-rg \
+  --set-env-vars "DATABASE_URL=secretref:database-url"
+</code></pre>
+            <p>En producción, los probes se declaran igual que en el ejemplo real (startup/readiness/liveness hacia <code>/health</code>); por CLI también se pueden ajustar, pero recuerda: <strong>el objetivo es que quede en Terraform</strong>, no solo aplicado.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación) — obtén la URL y comprueba la salud.</strong>
+            <pre><code class="language-bash">FQDN=$(az containerapp show \
+  --name copiloto-api --resource-group copiloto-rg \
+  --query properties.configuration.ingress.fqdn --output tsv)
+
+echo "URL:    https://$FQDN"
+echo "Health: https://$FQDN/health"
+curl -s "https://$FQDN/health"
+# Esperado: HTTP 200 con un estado de salud de la app.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — comprueba que hay una réplica lista.</strong>
+            <pre><code class="language-bash">az containerapp replica list \
+  --name copiloto-api --resource-group copiloto-rg \
+  --query "[].{name:name, runningState:properties.runningState, health:properties.healthState}" \
+  --output table
+# Esperado: al menos una réplica con estado Healthy y Running.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 7 — limpia todo (control de coste).</strong>
+            <pre><code class="language-bash">az group delete --name copiloto-rg --yes --no-wait
+# El registro y el entorno también se borran con el grupo: no queda nada facturando.
+</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>Resultado esperado:</strong> una URL <code>https://.../health</code> que responde 200, con la imagen servida desde tu registro y una réplica en estado <em>Healthy</em>. Has completado el ciclo <strong>registro → servicio → salud → URL pública</strong> de punta a punta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Despliegue continuo sin claves: del commit a la URL</h3>
+          <p>Automatiza el ciclo completo en un pipeline de GitHub Actions que, al hacer push a <code>main</code>, haga exactamente esto: (1) construya y publique la imagen en el ACR con un tag basado en el <em>SHA</em> del commit; (2) aplique el Terraform que actualiza la Container App a esa imagen nueva; (3) compruebe <code>/health</code> contra la URL pública y <strong>falle el pipeline</strong> si no responde 200.</p>
+          <p>La condición dura del reto: <strong>ninguna credencial de larga vida</strong>. La autenticación contra Azure debe ser por <strong>OIDC federado</strong> (módulo 2), sin secretos guardados en GitHub. Documenta cómo el pipeline obtiene la identidad, cómo construye la imagen y cómo verifica la salud al final.</p>
+          <p><em>Pista: el rol de la identidad federada necesita permiso para hacer <code>az acr build</code> (contributor sobre el registro) y para aplicar Terraform sobre el grupo de recursos; y el paso de verificación es simplemente un <code>curl --fail</code> contra el <code>health_url</code> que expone tu <code>outputs.tf</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Desplegar = encadenar <strong>registro → servicio → salud → URL pública</strong>, todo como código.</li>
+          <li>La imagen se lee del registro con <strong>identidad gestionada + rol <code>AcrPull</code></strong>: nunca usuario/contraseña.</li>
+          <li>Los <strong>tres probes</strong> tienen fines distintos: <em>startup</em> (arranque), <em>readiness</em> (recibir tráfico), <em>liveness</em> (reiniciar si se cuelga).</li>
+          <li>La configuración sensible va como <strong><code>secret</code></strong> y como variable de entorno <code>secretref</code>, nunca en el código ni en la imagen.</li>
+          <li>El <strong>ingress externo</strong> da HTTPS con TLS gestionado; <code>allow_insecure_connections = false</code> fuerza solo HTTPS.</li>
+          <li>La <strong>URL pública es una salida de Terraform</strong> (<code>output</code>), no algo que se busca a mano.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Paso</th><th>Recurso / comando Azure</th><th>Equivalente AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Registro</td><td><code>azurerm_container_registry</code> / <code>az acr build</code></td><td>ECR / <code>aws ecr</code></td></tr>
+            <tr><td>Servicio</td><td><code>azurerm_container_app</code></td><td><code>aws_apprunner_service</code></td></tr>
+            <tr><td>Identidad de registro</td><td><code>azurerm_role_assignment</code> con <code>AcrPull</code></td><td>Rol de lectura de ECR</td></tr>
+            <tr><td>Salud</td><td><code>startup_probe</code> / <code>readiness_probe</code> / <code>liveness_probe</code></td><td>Health check configurado en el servicio</td></tr>
+            <tr><td>URL pública</td><td><code>ingress</code> externo + <code>output</code></td><td>Endpoint HTTPS del servicio</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Dónde debe vivir la ruta <code>/health</code>? ¿Qué debe comprobar?</summary>
+            <div>
+              <p>En la propia aplicación, y debe responder rápido. Para <em>readiness</em> y <em>liveness</em>, comprueba que <strong>el proceso</strong> puede atender peticiones (por ejemplo, que el servidor HTTP responde). Para comprobar dependencias como la base de datos, hazlo en una ruta distinta (<code>/health/ready</code>) o mejor en métricas y alertas, <strong>no</strong> en <code>liveness</code>: si el liveness depende de un servicio externo, una caída momentánea de ese servicio reiniciará todas tus réplicas a la vez.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo actualizo la app a una versión nueva sin dejar de servir?</summary>
+            <div>
+              <p>Construyes y publicas la imagen nueva con un tag distinto (por ejemplo el SHA del commit), actualizas el <code>image</code> en Terraform y aplicas. En modo <code>Single</code>, la plataforma crea una revisión nueva y retira la vieja cuando la nueva pasa su <em>readiness</em>. Si quieres máxima seguridad, usa <code>Multiple</code> con <em>traffic weights</em> (lección 01): la versión nueva recibe un porcentaje pequeño de tráfico antes del cambio total.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el despliegue tarda o se queda «atascado» al principio?</summary>
+            <div>
+              <p>Las causas más comunes son: el <code>target_port</code> no coincide con el puerto del contenedor; el contenedor escucha en <code>127.0.0.1</code> en vez de <code>0.0.0.0</code>; el <em>startup_probe</em> es demasiado estricto para lo que tarda tu app en arrancar; o la imagen no se puede descargar del registro por falta de permiso (<code>AcrPull</code>). Revisa esos cuatro puntos en ese orden y casi siempre encontrarás la causa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo paso los secretos sin ponerlos en el repositorio?</summary>
+            <div>
+              <p>El <strong>código</strong> declara el <code>secret</code> y las variables, pero los <strong>valores</strong> entran en tiempo de <code>apply</code>: mediante una variable marcada como <code>sensitive</code>, o —mejor— leyéndolos de <strong>Azure Key Vault</strong> con la identidad gestionada de la app (módulo 2). En el proyecto final se añade además GitHub OIDC para que el propio pipeline no guarde ninguna credencial. El repositorio nunca contiene secretos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si trabajo sobre AWS? ¿Cambia el flujo?</summary>
+            <div>
+              <p>El flujo es idéntico; cambian los nombres. El registro es ECR, el servicio es <code>aws_apprunner_service</code> (o ECS Fargate si necesitas más control), la identidad se sustituye por un rol de IAM con permiso de lectura de ECR, y el endpoint HTTPS lo da el propio servicio. La salud se configura con los parámetros de health check del servicio. La gran diferencia a recordar: App Runner no tiene el modelo de revisiones con pesos de Container Apps.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

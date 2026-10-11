@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-red-segura">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Red segura y exposición mínima — Módulo 2 · Curso Cloud</title>
+  <meta name="description" content="Endpoints de servicio, Private Link, grupos de seguridad y firewall: cómo dejar el Copiloto accesible solo desde donde debe y cerrar todo lo demás por defecto.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('cloud-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Red segura y exposición mínima</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Identidad y seguridad</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Por defecto, casi todo servicio PaaS en la nube nace <strong>con una dirección pública en internet</strong>. Tu base de datos responde en <code>algo.postgres.database.azure.com</code> y tu Key Vault en <code>algo.vault.azure.net</code>: cualquiera puede intentar conectarse, y lo único que te separa de un ataque es una contraseña o un token. Eso se llama tener <strong>superficie de exposición</strong>, y cada servicio público es una puerta que hay que vigilar.</p>
+        <p>Esta lección trata de reducir esa superficie al mínimo: que los recursos hablen entre sí por la <strong>red privada</strong>, que lo que no necesita ser público no lo sea, y que las reglas de firewall y grupos de seguridad <strong>nieguen por defecto</strong> y permitan solo lo explícitamente necesario.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué importa tanto en la nube?</strong> Porque la red es el último muro que no depende de que un secreto se filtre. Aunque alguien robe una credencial, si el servicio no es alcanzable desde fuera de tu red, la credencial le sirve de poco. La defensa en profundidad consiste en que <em>cada</em> capa (identidad, secreto, red) tenga que fallar para que haya brecha.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Errores típicos:</strong> abrir el puerto 5432 (PostgreSQL) o 3389 (escritorio remoto) a <code>0.0.0.0/0</code>, dejar un Key Vault con firewall en «Allow all», confiar en una IP de origen que un atacante puede falsificar, y usar endpoints públicos «porque la red privada es complicada».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tres formas de llegar a un servicio</h3>
+        <p>Cuando un recurso A (tu API) quiere hablar con un recurso B (tu Key Vault o tu base de datos), hay tres maneras de que el tráfico llegue:</p>
+        <table>
+          <thead><tr><th>Camino</th><th>¿El recurso B tiene IP pública?</th><th>Cómo lo consigues</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Endpoint público</strong></td>
+              <td>Sí, expuesto a todo internet</td>
+              <td>Es lo que viene por defecto. Solo válido para lo que debe ser público de verdad.</td>
+            </tr>
+            <tr>
+              <td><strong>Service endpoint</strong></td>
+              <td>Sí, pero el firewall lo limita a tu VNet</td>
+              <td>Extiende tu VNet hasta el servicio: el tráfico sale por la red de Azure y puedes permitir solo esa subred.</td>
+            </tr>
+            <tr>
+              <td><strong>Private endpoint (Private Link)</strong></td>
+              <td>No: el recurso solo existe con IP privada</td>
+              <td>Crea una tarjeta de red con IP privada <em>dentro de tu subred</em> que apunta al servicio. Nadie fuera lo ve.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el endpoint público es una tienda con la puerta a la calle. El service endpoint es una ventanilla que solo atiende a vecinos del mismo barrio (tu VNet). El private endpoint es una <em>puerta interior que trae la tienda a tu propia casa</em>: ni siquiera hay dirección en la calle para esa tienda, porque solo existe dentro de tu red.</p>
+        </div>
+        <div class="callout callout--note">
+          <p>En AWS los mismos conceptos se llaman: <strong>VPC endpoint de tipo Gateway</strong> (para S3 y DynamoDB, por tabla de rutas) y <strong>VPC endpoint de tipo Interface</strong> (una tarjeta de red con IP privada en tu subred, para el resto de servicios). El private endpoint de Azure equivale al Interface endpoint con PrivateLink.</p>
+        </div>
+
+        <h3>Cómo funciona el private endpoint por dentro</h3>
+        <pre class="diagram">
+   Tunel IPv4 / VNet copiloto-vnet
+   +-------------------------------------------------------------+
+   |  Subred api              |  Subred private-endpoints         |
+   |  +-----------------+     |  +-----------------------------+  |
+   |  | copiloto-api    |-----|--| pe-kv (IP 10.0.2.4)          |  |
+   |  | 10.0.1.4        |     |  |   apunta a Key Vault          |  |
+   |  +-----------------+     |  +-----------------------------+  |
+   |                          |         ^                         |
+   +--------------------------|---------|-------------------------+
+                              |  Azure Private Link (fibra de Azure)
+                              v
+                     kv-copiloto.vault.azure.net
+                     (sin IP publica: solo alcanzable desde tu red)
+        </pre>
+        <p>El detalle que hace que «funcione como siempre» es el <strong>DNS privado</strong>. Cuando tu app resuelve <code>kv-copiloto.vault.azure.net</code>, el servicio de DNS de la VNet responde con la IP privada del endpoint (<code>10.0.2.4</code>) en lugar de la IP pública. Tu código no cambia ni una línea: sigue usando el mismo nombre; solo cambia lo que ese nombre resuelve.</p>
+
+        <h3>Firewall y grupos de seguridad: negar por defecto</h3>
+        <p>Un <strong>grupo de seguridad de red</strong> (NSG en Azure, <em>security group</em> en AWS) es una lista de reglas que decide qué tráfico entra y sale. La regla de oro es <strong>deny by default</strong>: todo se bloquea salvo lo que permites explícitamente. Y se aplica en dos planos:</p>
+        <ul>
+          <li><strong>A nivel de red</strong>: NSG/subred para el tráfico de tus máquinas.</li>
+          <li><strong>A nivel de servicio</strong>: el propio Key Vault, la base de datos o el almacenamiento tienen su firewall y su opción de «red pública activada o no».</li>
+        </ul>
+        <table>
+          <thead><tr><th>Capa</th><th>Qué controla</th><th>Ejemplo de configuración segura</th></tr></thead>
+          <tbody>
+            <tr><td>NSG de subred</td><td>Tráfico entre subredes e internet</td><td>Permitir 443 desde la VNet; denegar todo lo demás</td></tr>
+            <tr><td>Firewall del servicio</td><td>Quién llega al recurso por su endpoint</td><td>Key Vault: <code>default_action = Deny</code></td></tr>
+            <tr><td>Acceso a red pública</td><td>Si el recurso tiene endpoint público</td><td><code>public_network_access_enabled = false</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Orden de preferencia:</strong> primero intenta <em>que el recurso no sea público</em> (private endpoint), y solo después limita con firewall. Un firewall perfecto sobre un endpoint público sigue siendo una superficie que vigilar; un recurso sin endpoint público no tiene nada que vigilar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El firewall más pequeño que tiene sentido: un grupo de seguridad que permite HTTPS <em>solo desde tu propia red</em> y deja el resto bloqueado por la regla implícita «deny all» que ya trae el NSG.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># 1) Crea el grupo de seguridad (aun sin reglas).
+az network nsg create --resource-group rg-net-lab --name nsg-copiloto
+
+# 2) Permite SOLO HTTPS entrante desde dentro de la red virtual.
+#    --source-address-prefixes VirtualNetwork = "trafico de mi propia VNet".
+az network nsg rule create \
+  --resource-group rg-net-lab --nsg-name nsg-copiloto \
+  --name allow-https-internal --priority 100 \
+  --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes VirtualNetwork \
+  --source-port-ranges '*' \
+  --destination-address-prefixes '*' \
+  --destination-port-ranges 443
+
+# 3) Comprueba las reglas efectivas: la primera permite 443;
+#    las siguientes son las reglas por defecto de Azure (DenyAll).
+az network nsg rule list --resource-group rg-net-lab --nsg-name nsg-copiloto \
+  --query "sort_by([].{nombre:name, prio:priority, dir:direction, acc:access, puertos:destinationPortRanges}, &amp;prio)" \
+  -o table
+</code></pre>
+        <p>Qué acaba de pasar:</p>
+        <ol class="steps">
+          <li><strong><code>nsg create</code></strong>: crea una lista vacía. Vacía significa «solo reglas por defecto», que ya deniegan la entrada desde internet.</li>
+          <li><strong><code>nsg rule create</code></strong>: añade una excepción concreta. El <code>--priority 100</code> es bajo a propósito: las reglas se evalúan de menor a mayor número, así que lo que quieres permitir va primero.</li>
+          <li><strong><code>nsg rule list</code></strong>: el <code>--query</code> ordena por prioridad para que veas primero lo que permite y, abajo, lo que Azure deniega siempre. Esa parte «denegar siempre» es la que te protege de olvidos.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Fíjate en el <code>&amp;</code> escapado de la consulta: en los ejemplos de Azure CLI se usa <code>&amp;</code> para ordenar, y dentro de HTML hay que escribirlo como <code>&amp;amp;</code>. Si copias el comando desde el portal, ajusta ese carácter.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el Copiloto, el objetivo es que la API lea sus secretos del Key Vault <strong>sin pasar por internet</strong>: el vault no tendrá endpoint público y se accederá a él por un private endpoint dentro de la VNet.</p>
+        <div class="code-file">proyectos/infra-cloud/network-private-endpoint.tf</div>
+        <pre><code class="language-hcl"># ---------------------------------------------------------------------------
+# 1) Zona DNS privada. Sin esto, el nombre del vault seguiria resolviendo
+#    a la IP publica y el private endpoint no serviria de nada.
+# ---------------------------------------------------------------------------
+resource "azurerm_private_dns_zone" "kv" {
+  name                = "privatelink.vaultcore.azure.net"
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+# Enlaza la zona con la VNet: los recursos de la VNet usan este DNS.
+resource "azurerm_private_dns_zone_virtual_network_link" "kv" {
+  name                  = "kv-dns-link"
+  resource_group_name   = azurerm_resource_group.rg.name
+  private_dns_zone_name = azurerm_private_dns_zone.kv.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
+
+# ---------------------------------------------------------------------------
+# 2) El private endpoint: una tarjeta de red con IP privada en TU subred
+#    que apunta al Key Vault. Aqui no hay IP publica que atacar.
+# ---------------------------------------------------------------------------
+resource "azurerm_private_endpoint" "kv" {
+  name                = "pe-kv-copiloto"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  subnet_id           = azurerm_subnet.private_endpoints.id
+
+  private_service_connection {
+    name                           = "psc-kv-copiloto"
+    private_connection_resource_id = azurerm_key_vault.kv.id
+    # "vault" es el tipo de conexion para un Key Vault (subresource).
+    subresource_names              = ["vault"]
+    is_manual_connection           = false
+  }
+
+  private_dns_zone_group {
+    name                 = "kv-dns-group"
+    private_dns_zone_ids = [azurerm_private_dns_zone.kv.id]
+  }
+}
+</code></pre>
+        <div class="code-file">proyectos/infra-cloud/keyvault-hardening.tf (fragmento)</div>
+        <pre><code class="language-hcl">resource "azurerm_key_vault" "kv" {
+  name                        = "kv-copiloto-${var.suffix}"
+  location                    = azurerm_resource_group.rg.location
+  resource_group_name         = azurerm_resource_group.rg.name
+  tenant_id                   = data.azurerm_client_config.current.tenant_id
+  sku_name                    = "standard"
+  rbac_authorization_enabled  = true
+  purge_protection_enabled    = true
+
+  # 3a) Nada de endpoint publico: solo se llega por el private endpoint.
+  public_network_access_enabled = false
+
+  # 3b) Aunque el endpoint publico existiera, se niega por defecto.
+  #     "AzureServices" deja que servicios de confianza (backup, monitor)
+  #     puedan seguir operando sin abrir la puerta a internet.
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+  }
+}
+</code></pre>
+        <p>Cuatro decisiones que merecen explicación:</p>
+        <ol class="steps">
+          <li><strong>Zona DNS privada primero.</strong> Es el error número uno: crear el private endpoint y preguntarse por qué sigue resolviendo a la IP pública. El enlace DNS es lo que cambia la resolución.</li>
+          <li><strong><code>public_network_access_enabled = false</code></strong>: apaga el endpoint público del vault. Sin esto, el firewall sigue existiendo pero el servicio es alcanzable desde internet.</li>
+          <li><strong><code>default_action = "Deny"</code></strong>: si por algún motivo el endpoint público se reactivara, la postura por defecto seguiría siendo denegar. Es defensa en profundidad.</li>
+          <li><strong>La subred de endpoints es propia.</strong> Aislarla de las subredes de aplicación facilita aplicar reglas de NSG distintas y no mezclar tráfico de datos con el de gestión.</li>
+        </ol>
+        <div class="callout callout--analogy">
+          <p><strong>Coste:</strong> los private endpoints se facturan por hora y por transferencia de datos, además de la zona DNS privada. No es caro, pero <em>no es gratis</em>: merece la pena en producción y sobra en un laboratorio de pruebas. Elige con criterio, no por reflejo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Private endpoint para bases de datos, Key Vault y almacenamiento</td>
+              <td>Dejar los datos accesibles por endpoint público</td>
+              <td>Sin endpoint público no hay superficie que escanear ni que parchear con urgencia</td>
+            </tr>
+            <tr>
+              <td>Firewall con <code>default_action = Deny</code> en todos los servicios que lo permitan</td>
+              <td>«Allow all» y confiar en la contraseña</td>
+              <td>Un firewall que permite todo es una capa que no existe</td>
+            </tr>
+            <tr>
+              <td>Reglas de NSG por subred, con la subred más específica posible</td>
+              <td>Un NSG gigante a nivel de VNet con reglas contradictorias</td>
+              <td>Reglas locales se entienden, se revisan y no se pisan entre sí</td>
+            </tr>
+            <tr>
+              <td>Permitir administración (SSH/RDP) solo por Bastion o VPN</td>
+              <td>Abrir el 22/3389 a <code>0.0.0.0/0</code> «solo un rato»</td>
+              <td>Un puerto de administración abierto es minutos u horas de exposición, siempre</td>
+            </tr>
+            <tr>
+              <td>Subred dedicada para private endpoints</td>
+              <td>Poner los endpoints en la subred de la aplicación</td>
+              <td>Separa el tráfico de datos del de gestión y permite reglas distintas</td>
+            </tr>
+            <tr>
+              <td>Documentar en Terraform el <em>porqué</em> de cada regla permitida</td>
+              <td>Añadir reglas «temporales» que se quedan años</td>
+              <td>Una regla sin dueño ni motivo es una regla que nadie se atreve a borrar</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>La pregunta que desbloquea todo:</strong> «¿este recurso necesita de verdad ser alcanzable desde internet?». Casi siempre la respuesta es no. Si empiezas por ahí, la mitad de las decisiones de red se toman solas.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Abrir la base de datos a todo internet</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-bash"># PostgreSQL alcanzable desde cualquier IP del mundo.
+# Escaneres automatizados encuentran esto en minutos.
+az postgres flexible-server firewall-rule create \
+  --resource-group rg-copiloto --name srvs --rule-name allow-all \
+  --start-ip-address 0.0.0.0 --end-ip-address 255.255.255.255
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-bash"># La base de datos NO tiene regla de firewall para internet:
+# se llega a ella por un private endpoint dentro de la VNet.
+# (El firewall global, si existe, queda en Deny por defecto.)
+az postgres flexible-server show \
+  --resource-group rg-copiloto --name srvs-copiloto \
+  --query "{publico:network.publicNetworkAccess}" -o table
+</code></pre>
+        <p>Abrir el rango completo es tentador «para que funcione desde casa», pero deja la base de datos expuesta permanentemente. La alternativa correcta es un private endpoint, o en su defecto una IP concreta y temporal.</p>
+
+        <h3>Creer que service endpoint basta para ocultar el servicio</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-hcl"># Activo el service endpoint y me relajo: el servicio SIGUE teniendo
+# IP publica y su firewall podria estar permitiendo mas de lo que creo.
+resource "azurerm_subnet" "app" {
+  name                 = "subnet-app"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
+  service_endpoints    = ["Microsoft.KeyVault"]
+}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-hcl"># El private endpoint SI crea una IP privada en mi red y me permite
+# apagar por completo el acceso publico del recurso.
+resource "azurerm_private_endpoint" "kv" {
+  name                = "pe-kv-copiloto"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  subnet_id           = azurerm_subnet.private_endpoints.id
+
+  private_service_connection {
+    name                           = "psc-kv-copiloto"
+    private_connection_resource_id = azurerm_key_vault.kv.id
+    subresource_names              = ["vault"]
+    is_manual_connection           = false
+  }
+}
+</code></pre>
+        <p>El service endpoint es útil y más barato, pero no elimina la IP pública del servicio: solo filtra quién llega. Si el objetivo es <em>no tener nada público</em>, la pieza correcta es el private endpoint.</p>
+
+        <h3>Permitir por IP de origen sin entender qué IP es</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-bash"># "Permito la IP de mi oficina" sin fijarse en que la IP de salida
+# de la oficina puede cambiar o compartirse con muchos inquilinos.
+az keyvault network-rule add --name kv-copiloto --ip-address 203.0.113.10
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-bash"># En su lugar, acceso por red privada: no dependes de IPs externas
+# ni de que la IP de origen sea de quien crees que es.
+az keyvault network-rule list --name kv-copiloto \
+  --query "{publico:properties.publicNetworkAccess, reglas:properties.networkAcls.ipRules}" -o json
+</code></pre>
+        <p>Una IP de origen no identifica a un usuario: puede cambiar, compartirse tras un NAT o falsificarse en ciertos escenarios. Si necesitas restringir por IP, hazlo como mal menor y nunca como única defensa.</p>
+
+        <h3>Fijar el NSG a la tarjeta de red y no a la subred</h3>
+        <span class="code-label code-label--wrong">❌ Incorrecto</span>
+        <pre class="code-wrong"><code class="language-hcl"># Reglas distintas en cada NIC: cuando escala, cada maquina
+# nueva hay que recordar aplicarle las reglas a mano. Error garantizado.
+resource "azurerm_network_interface_security_group_association" "vm" {
+  network_interface_id      = azurerm_network_interface.vm.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
+}
+</code></pre>
+        <span class="code-label code-label--right">✅ Correcto</span>
+        <pre class="code-right"><code class="language-hcl"># El NSG se asocia a la SUBNET: toda maquina que entre hereda las reglas.
+resource "azurerm_subnet_network_security_group_association" "app" {
+  subnet_id                 = azurerm_subnet.app.id
+  network_security_group_id = azurerm_network_security_group.nsg.id
+}
+</code></pre>
+        <p>Aplicar el NSG a la subred hace que la política sea estructural: no depende de que alguien recuerde configurar cada máquina. Con autoscaling, una NIC sin reglas es solo cuestión de tiempo.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear una red con una subred de aplicación y un NSG que solo permita HTTPS interno, y comprobar las reglas efectivas.</p>
+        <div class="callout callout--warning">
+          <p><strong>Coste:</strong> las redes virtuales, subredes y NSG <strong>no tienen coste</strong> por sí mismos. Solo pagas cuando algo consume (una máquina, un balanceador, un private endpoint). Este laboratorio puro de red es gratis, aun así borra el grupo al terminar.</p>
+        </div>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea grupo de recursos, VNet y subred:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az group create --name rg-net-lab --location westeurope --tags curso=cloud
+az network vnet create --resource-group rg-net-lab --name vnet-copiloto \
+  --address-prefixes 10.10.0.0/16 \
+  --subnet-name snet-app --subnet-prefixes 10.10.1.0/24
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Crea el NSG y la regla de HTTPS interno:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az network nsg create --resource-group rg-net-lab --name nsg-app
+az network nsg rule create --resource-group rg-net-lab --nsg-name nsg-app \
+  --name allow-https-internal --priority 100 \
+  --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes VirtualNetwork \
+  --destination-port-ranges 443
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Asocia el NSG a la subred:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az network vnet subnet update --resource-group rg-net-lab \
+  --vnet-name vnet-copiloto --name snet-app \
+  --network-security-group nsg-app
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Verifica las reglas efectivas:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az network nsg rule list --resource-group rg-net-lab --nsg-name nsg-app \
+  --query "sort_by([].{nombre:name, prio:priority, accion:access, puertos:destinationPortRanges}, &amp;prio)" \
+  -o table
+</code></pre>
+            <p><strong>Resultado esperado:</strong> tu regla <code>allow-https-internal</code> aparece primero (prioridad 100). Debajo siguen las reglas por defecto de Azure (<code>AllowVnetInBound</code>, <code>DenyAllInBound</code>…). Lo importante es que <strong>no existe ninguna regla que permita entrar desde Internet</strong>: solo lo que tú autorizaste.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Limpia:</strong>
+            <div class="code-file">terminal</div>
+            <pre><code class="language-bash">az group delete --name rg-net-lab --yes --no-wait
+</code></pre>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un Key Vault invisible desde internet</h3>
+          <p>Monta un Key Vault que <strong>solo sea alcanzable por un private endpoint</strong> dentro de una VNet (endpoint público desactivado y firewall en <code>Deny</code>). Después demuestra con un comando que, desde fuera de ese DNS privado, <code>az keyvault secret show</code> falla o resuelve a una dirección pública que ya no responde.</p>
+          <p>Entrega: los recursos (VNet, subred de endpoints, zona DNS privada, enlace, private endpoint, vault endurecido), el comando que prueba el aislamiento y una frase explicando por qué falla desde fuera.</p>
+          <p><em>Pista: recuerda crear y enlazar la zona <code>privatelink.vaultcore.azure.net</code> antes de crear el endpoint. Si el nombre sigue resolviendo a una IP pública, el problema casi siempre está en el DNS, no en el endpoint. Piensa también en qué rol necesita tu identidad para leer el secreto incluso por red privada (lección 02): la red no sustituye a los permisos, los complementa.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Por defecto, los servicios PaaS nacen con <strong>endpoint público</strong>. Reducir esa exposición es la mejor inversión de seguridad.</li>
+          <li><strong>Service endpoint</strong> filtra por red pero mantiene la IP pública; <strong>private endpoint (Private Link)</strong> crea una IP privada y permite apagar el acceso público.</li>
+          <li>El private endpoint solo funciona «como siempre» si el <strong>DNS privado</strong> resuelve el nombre a la IP del endpoint.</li>
+          <li>Firewalls y grupos de seguridad deben <strong>negar por defecto</strong> y permitir solo lo explícito.</li>
+          <li>Los NSG se asocian a la <strong>subred</strong>, no a cada máquina: la política es así estructural.</li>
+          <li>Ni una sola regla a <code>0.0.0.0/0</code> en puertos de datos o administración.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Azure</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td>Red privada</td><td>VNet + subredes</td><td>VPC + subredes</td></tr>
+            <tr><td>Firewall de red</td><td>Network Security Group</td><td>Security Group / NACL</td></tr>
+            <tr><td>Acceso privado a un PaaS</td><td>Private Endpoint (Private Link)</td><td>VPC Endpoint (Interface)</td></tr>
+            <tr><td>Acceso privado a almacenamiento</td><td>Private Endpoint</td><td>VPC Endpoint (Gateway)</td></tr>
+            <tr><td>DNS privado</td><td>Private DNS Zone</td><td>Route 53 Resolver (Private Hosted Zone)</td></tr>
+            <tr><td>Apagar endpoint público</td><td><code>public_network_access_enabled = false</code></td><td>Recurso en subred privada / policy de endpoint</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Private endpoint o service endpoint? ¿Cuándo uso cada uno?</summary>
+            <div>
+              <p>Private endpoint cuando quieras que el recurso <strong>no tenga endpoint público</strong> (lo normal para datos y secretos) o cuando necesites conectar servicios que no soportan service endpoints. Service endpoint cuando busques algo más barato y ligero y aceptes que el servicio siga teniendo IP pública, protegida por su firewall. En un proyecto serio, los datos van por private endpoint.</p>
+            </div>
+          </details>
+          <details>
+            <summary>He creado el private endpoint y sigue resolviendo a la IP pública. ¿Qué me falta?</summary>
+            <div>
+              <p>Casi siempre la <strong>zona DNS privada</strong>: hay que crearla con el nombre correcto (<code>privatelink.&lt;servicio&gt;.azure.net</code> o equivalente) y enlazarla a la VNet. Sin esa resolución, tu máquina pregunta al DNS público, que no conoce tu endpoint y devuelve la IP pública.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La red privada sustituye a los permisos?</summary>
+            <div>
+              <p>No: la <strong>complementa</strong>. Reducir la exposición evita que un atacante remoto llegue al servicio, pero quien esté dentro de la red sigue necesitando permisos para hacer cosas. Defensa en profundidad es que ambas capas existan; quitar una porque tienes la otra es bajar la guardia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto cuesta todo esto?</summary>
+            <div>
+              <p>VNet, subredes y NSG son gratis. Los <strong>private endpoints</strong> y las <strong>zonas DNS privadas</strong> tienen un coste por hora más transferencia, bajo pero real. En un laboratorio de pruebas puedes ahorrártelos; en producción, el coste de exponer una base de datos a internet es bastante mayor que el de un endpoint privado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si mi aplicación debe ser accesible desde internet?</summary>
+            <div>
+              <p>Entonces <em>esa</em> puerta sí es pública, pero solo una: expón la web o el API Gateway y deja que todo lo de dentro (base de datos, secretos, almacenamiento) hable por red privada. El objetivo no es «cero internet», sino <strong>una única entrada controlada</strong> en lugar de diez puertas abiertas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
