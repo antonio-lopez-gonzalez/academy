@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="04-seguridad-supply-chain">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Seguridad de la cadena de suministro — Módulo 7 · Curso DevOps</title>
+  <meta name="description" content="Blindar el pipeline del Copiloto: pinning de actions por SHA, permisos mínimos del GITHUB_TOKEN, escaneo de vulnerabilidades y secretos, y atestaciones de procedencia (SBOM y SLSA) para que el artefacto desplegado sea verificable.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Seguridad de la cadena de suministro</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: el pipeline del Copiloto</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tu pipeline es, sin querer, <strong>el eslabón más poderoso de todo el sistema</strong>. Tiene acceso a los secretos, puede escribir en el registry, puede desplegar a producción. Si un atacante controla el pipeline, controla todo. Y no hace falta que te comprometan el repositorio: basta con que una <em>action</em> de terceros que usas o una dependencia transitiva que descargas resulten maliciosas.</p>
+        <p>Eso es la <strong>cadena de suministro</strong> de software: todo lo que <em>entra</em> en tu build —actions, dependencias, imágenes base, binarios— y todo lo que <em>sale</em> —tu imagen, con su procedencia—. Esta lección blinda el pipeline del Copiloto con cuatro medidas concretas: <strong>pinning por SHA</strong>, <strong>permisos mínimos</strong>, <strong>escaneo</strong> y <strong>atestaciones</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque ha habido ataques reales y sonados: actores que toman el control de una action popular y añaden código que exfiltra secretos, o que publican una versión maliciosa de una librería muy usada. El pipeline es el punto donde el código se convierte en producción; asegurarlo es el mayor retorno de seguridad por esfuerzo que hay en DevOps.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>La regla que lo resume todo:</strong> <em>nada</em> entra en tu build sin estar fijado a un contenido inmutable y verificado. Una action referida por etiqueta (<code>@v4</code>) o por rama (<code>@main</code>) puede cambiar bajo tus pies sin que tú hagas nada. Un SHA, no.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La superficie de ataque de un pipeline</h3>
+        <p>Antes de defenderse, hay que ver por dónde entran. Un pipeline típico del Copiloto tiene cuatro puertas:</p>
+        <table>
+          <thead><tr><th>Puerta</th><th>Qué entra</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Actions</strong></td><td>Código de terceros que corre dentro de tu job</td><td>Una action comprometida ve secretos y el <code>GITHUB_TOKEN</code></td></tr>
+            <tr><td><strong>Dependencias</strong></td><td>Librerías que instala tu app (y sus dependencias)</td><td>Una versión maliciosa ejecuta código en tests/build</td></tr>
+            <tr><td><strong>Imágenes base</strong></td><td>El <code>FROM</code> de tu Dockerfile</td><td>Imagen envenenada o con vulnerabilidades conocidas</td></tr>
+            <tr><td><strong>Secretos</strong></td><td>Credenciales que el pipeline usa</td><td>Si se filtran (log, PR de fork), acceso total</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una cocina de restaurante. Da igual lo buenos que sean tus chefs: si un proveedor entrega un ingrediente en mal estado, el plato sale mal y el cliente enferma. La cadena de suministro no es solo tu código; es todo lo que compras.</p>
+        </div>
+
+        <h3>1) Pinning de actions por SHA</h3>
+        <p>Referir una action por etiqueta (<code>@v4</code>) o por rama (<code>@main</code>) es cómodo, pero una etiqueta <strong>se puede mover</strong>: el autor (o quien comprometa su cuenta) publica una versión nueva de esa etiqueta y tu pipeline, sin cambiar una línea, empieza a ejecutar código distinto. Fijar la action a un <strong>SHA de commit completo</strong> la convierte en inmutable:</p>
+        <div class="code-file">.github/workflows/ejemplo.yml</div>
+        <pre><code class="language-yaml"># ❌ La etiqueta puede moverse: hoy apunta a un codigo, manana a otro.
+- uses: actions/checkout@v5
+
+# ✅ SHA completo: ese commit concreto no puede cambiar. El comentario documenta la version.
+- uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+</code></pre>
+        <p>Pinned por SHA, una versión maliciosa publicada por el autor <strong>no te afecta</strong> hasta que tú decidas subir el SHA. Esa decisión —y su revisión— es justamente el control que quieres tener.</p>
+        <div class="callout callout--tip">
+          <p><strong>No lo hagas a mano.</strong> Herramientas como <code>pinact</code>, <code>ratchet</code> o Dependabot pueden fijar y <em>actualizar</em> los SHA por ti, y la política de GitHub permite <em>exigir</em> que todas las actions estén pinneadas. Pinnea y automatiza las actualizaciones; no escribas hashes a mano y los olvides.</p>
+        </div>
+
+        <h3>2) Permisos mínimos del <code>GITHUB_TOKEN</code></h3>
+        <p>Cada job recibe un token que GitHub genera y revoca automáticamente. Por defecto, según la configuración del repositorio, ese token puede tener permisos amplios. Las reglas de oro:</p>
+        <ul>
+          <li><strong>Pon el token en lectura por defecto</strong> a nivel de repositorio (<em>Settings → Actions → Workflow permissions → Read repository contents</em>).</li>
+          <li><strong>Declara <code>permissions</code> en el workflow o por job</strong>, concediendo solo lo imprescindible: <code>contents: read</code> para el CI; <code>packages: write</code> solo para publicar; <code>attestations</code> e <code>id-token</code> para las atestaciones; <code>security-events: write</code> para subir resultados de escaneo.</li>
+          <li><strong>Nunca</strong> <code>permissions: write-all</code>. Si algo se compromete, el daño es proporcional a lo que el token podía hacer.</li>
+        </ul>
+        <div class="code-file">.github/workflows/ejemplo.yml</div>
+        <pre><code class="language-yaml"># ✅ Solo lo que el job necesita, declarado donde se necesita.
+permissions:
+  contents: read          # leer el repo
+  packages: write         # publicar en GHCR (solo en el job de build)
+  attestations: write     # emitir atestaciones
+  id-token: write         # OIDC para atestaciones y fed. de identidad
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Cuidado con <code>pull_request_target</code>.</strong> Ese evento da acceso a los secretos del repositorio a workflows que corren en el contexto base, mientras ejecutan código que puede venir de un fork. Si mezclas ambos, un PR externo puede ejecutar código con tus secretos. Para PRs de forks, usa <code>pull_request</code> (sin secretos) y sé explícito sobre qué código se ejecuta y con qué permisos.</p>
+        </div>
+
+        <h3>3) Escaneo: dependencias, imágenes y secretos</h3>
+        <p>No basta con atacar; también hay que <em>detectar</em>. Cuatro escaneos cubren lo esencial:</p>
+        <table>
+          <thead><tr><th>Escaneo</th><th>Busca</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Dependencias</strong></td><td>CVEs en las librerías que usas</td><td>Dependabot, <code>actions/dependency-review-action</code>, OSV/Trivy</td></tr>
+            <tr><td><strong>Imágenes</strong></td><td>CVEs en la imagen y en su base</td><td>Trivy, Grype, <code>docker scout</code></td></tr>
+            <tr><td><strong>Secretos</strong></td><td>Credenciales commiteadas o logueadas</td><td>Secret scanning + push protection, <code>gitleaks</code></td></tr>
+            <tr><td><strong>Código (SAST)</strong></td><td>Patrones vulnerables en tu propio código</td><td>CodeQL (<code>github/codeql-action</code>)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Empieza por el más barato: el escaneo de secretos.</strong> GitHub tiene <em>secret scanning</em> y <em>push protection</em>: en cuanto detecta algo parecido a una credencial, bloquea el push. Actívalo en el repositorio hoy; cuesta un clic y evita el incidente más común de todos. Después, <em>dependency review</em> en las PRs, y luego el escaneo de imágenes en el build.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Un escaneo que bloquea es un escaneo útil.</strong> Un informe que nadie mira no para nada. Decide los umbrales: por ejemplo, <em>fallar</em> ante vulnerabilidades <code>HIGH</code>/<code>CRITICAL</code> con arreglo disponible, y <em>solo avisar</em> del resto. Pero el gate debe existir; si no, el escaneo es decorativo.</p>
+        </div>
+
+        <h3>4) Atestaciones: procedencia y SBOM</h3>
+        <p>Todo lo anterior protege <em>tu</em> build. Las atestaciones protegen a <em>quien consume</em> tu imagen: le permiten <strong>verificar dónde y cómo se construyó</strong>. Una atestación es una afirmación criptográficamente firmada, ligada al <code>digest</code> de la imagen, que dice «este artefacto lo produjo <em>este</em> workflow, en <em>este</em> commit, en <em>este</em> repositorio».</p>
+        <ul>
+          <li><strong>Procedencia</strong> (<em>build provenance</em>): quién construyó qué, desde qué commit. Es el corazón de SLSA (niveles de madurez de la cadena de suministro).</li>
+          <li><strong>SBOM</strong> (<em>Software Bill of Materials</em>): la lista de todos los componentes de tu imagen. Como la etiqueta de ingredientes: permite responder «¿me afecta esta CVE?» en segundos.</li>
+        </ul>
+        <p>Ambas se generan en el mismo pipeline y se <strong>adjuntan al digest en el registry</strong>. Quien despliegue puede verificarlas antes de confiar en la imagen:</p>
+        <div class="code-file">verificación por el consumidor</div>
+        <pre><code class="language-bash">git clone https://github.com/academy/copiloto-api &amp;&amp; cd copiloto-api
+gh attestation verify oci://ghcr.io/academy/copiloto-api@sha256:9b1c… \
+  --repo academy/copiloto-api
+</code></pre>
+        <p>Si la imagen no fue construida por el workflow esperado, la verificación falla. Esa es la diferencia entre «confío porque lo dice el README» y «confío porque puedo comprobarlo».</p>
+        <div class="callout callout--note">
+          <p>Las atestaciones y el SBOM exigen <code>push: true</code> en el build (viajan adjuntas al digest en el registry) y los permisos <code>attestations: write</code> e <code>id-token: write</code>. Se generan <em>después</em> del push, usando el <code>digest</code> que devolvió el propio build. Esto empalma con el Módulo 3 (SBOM y procedencia).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La unidad de seguridad más pequeña y más eficaz: una action pinneada por SHA y permisos mínimos declarados. Nada más hace falta para empezar a defenderse.</p>
+        <div class="code-file">.github/workflows/seguro-minimo.yml</div>
+        <pre><code class="language-yaml">name: Seguro minimo
+on: [pull_request]
+
+# El token solo puede LEER. Menos daño si algo se compromete.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Action fijada a un SHA inmutable, con la version como comentario.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36acb17f2 # v6.4.0
+        with:
+          enable-cache: true
+      - run: uv run ruff check .
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>permissions: contents: read</code></strong>: el job solo puede leer el repositorio. No puede escribir issues, ni packages, ni nada más. Es el <em>default</em> que deberías tener siempre.</li>
+          <li><strong><code>uses: …@08c6903c…</code></strong>: SHA completo (40 caracteres). Aunque la etiqueta <code>v5.0.0</code> se mueva, este commit es el mismo para siempre.</li>
+          <li><strong><code># v5.0.0</code></strong>: el comentario no es decorativo: documenta a qué versión corresponde el SHA y facilita revisar actualizaciones (y que un bot pueda actualizarlo).</li>
+          <li><strong><code>setup-uv</code> también pinneada</strong>: la regla vale para <em>todas</em> las actions de terceros, no solo para las oficiales.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Parece un detalle pequeño; no lo es. La mayoría de compromisos de pipelines empiezan exactamente aquí: una action de terceros referida por etiqueta que su autor (o un atacante) cambia por código malicioso. El pinning cierra esa puerta entera.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El pipeline del Copiloto, blindado: escaneo en cada PR, publicacion con permisos mínimos, SBOM y atestación. Empecemos por la PR.</p>
+
+        <h3>Escaneo en cada pull request</h3>
+        <div class="code-file">.github/workflows/security.yml</div>
+        <pre><code class="language-yaml">name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - name: Buscar secretos en el historial del PR
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Revisar dependencias nuevas del PR
+        uses: actions/dependency-review-action@da24556b548a50705dd671f47852072ea4c105d9 # v4.7.1
+        with:
+          fail-on-severity: high
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write     # subir hallazgos a Code scanning
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3
+</code></pre>
+        <p>Qué hace cada job y por qué:</p>
+        <ul>
+          <li><strong><code>secret-scan</code></strong>: busca credenciales en el historial del PR. Complementa la <em>push protection</em> de GitHub (que bloquea el push); aquí se comprueba además que no haya nada colado por otras vías.</li>
+          <li><strong><code>dependency-review</code></strong>: en cada PR, compara las dependencias nuevas con la base de vulnerabilidades y <strong>falla si introduce algo HIGH</strong>. Es el gate que evita que entre una dependencia CVE-liente sin querer.</li>
+          <li><strong><code>codeql</code></strong>: análisis estático del código Python. Declara <code>security-events: write</code> <em>solo</em> en ese job, porque necesita subir resultados; el resto del workflow se queda con <code>contents: read</code>.</li>
+          <li><strong>Todas las actions pinneadas por SHA</strong>: <code>gitleaks</code>, <code>dependency-review</code>, <code>checkout</code> con comentario de versión.</li>
+        </ul>
+
+        <h3>El build que publica con SBOM y atestación</h3>
+        <div class="code-file">.github/workflows/publish.yml (job build)</div>
+        <pre><code class="language-yaml">  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    # Permisos MINIMOS para este job: leer, publicar, atestiguar. Nada mas.
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build y push (con procedencia detallada)
+        id: push
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Escanear la imagen por vulnerabilidades
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          format: sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"            # FALLA el build si hay HIGH/CRITICAL
+
+      - name: Atestacion de procedencia (build provenance)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Atestacion del SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>permissions</code> al nivel del job</strong>: el build necesita publicar y atestiguar; el job <code>ci</code> no. Así, si el CI se ve comprometido, no puede tocar el registry.</li>
+          <li><strong><code>provenance: mode=max</code> y <code>sbom: true</code></strong>: la imagen sale con su procedencia detallada y su lista de componentes, generadas por Buildx.</li>
+          <li><strong><code>trivy</code> con <code>exit-code: "1"</code></strong>: el escaneo <em>bloquea</em>. Se escanea <code>IMAGE@digest</code> (la imagen exacta, no la etiqueta) y, si hay <code>HIGH</code>/<code>CRITICAL</code>, el build falla y no hay release.</li>
+          <li><strong>Atestaciones sobre el digest</strong>: <code>subject-digest</code> es el digest que devolvió el push. La atestación queda ligada al artefacto exacto, en el registry.</li>
+          <li><strong>Todo pinneado</strong>: <code>checkout</code>, <code>setup-buildx</code>, <code>login</code>, <code>build-push</code> por SHA. Las de Docker son de confianza, pero la disciplina es del pipeline entero, no de una allow-list.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>El escaneo tarda: no lo pongas en cada PR si no quieres ralentizar.</strong> Un patrón sano: <em>dependency review</em> y <em>gitleaks</em> en cada PR (rápidos); escaneo de imagen completo en el build de release (menos frecuente, ya estás construyendo). Así el control existe sin convertir el CI en un cuello de botella.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Fijar toda action a un SHA completo, con comentario de versión</td>
+              <td><code>uses: …@v4</code> o <code>uses: …@main</code></td>
+              <td>Etiquetas y ramas pueden cambiar; un SHA es inmutable</td>
+            </tr>
+            <tr>
+              <td><code>permissions: contents: read</code> por defecto, ampliar por job</td>
+              <td><code>permissions: write-all</code> o el default amplio del repo</td>
+              <td>El token define el alcance del daño si algo se compromete</td>
+            </tr>
+            <tr>
+              <td>Activar secret scanning + push protection</td>
+              <td>Confiar en que nadie commitea una clave «por descuido»</td>
+              <td>Es el incidente más común y el más barato de prevenir</td>
+            </tr>
+            <tr>
+              <td>Dependency review en las PRs, con <code>fail-on-severity</code></td>
+              <td>Escaneos que solo informan y nunca bloquean</td>
+              <td>Un gate que no bloquea no protege nada</td>
+            </tr>
+            <tr>
+              <td>Escaneo de la imagen <em>por digest</em> y con <code>exit-code: 1</code></td>
+              <td>Escanear la etiqueta o ignorar el resultado</td>
+              <td>Se escanea y se bloquea sobre el artefacto exacto</td>
+            </tr>
+            <tr>
+              <td>Generar procedencia y SBOM ligados al digest</td>
+              <td>Publicar la imagen «a secas», sin rastro verificable</td>
+              <td>Permite a quien consume verificar el origen (SLSA)</td>
+            </tr>
+            <tr>
+              <td>Usar OIDC en vez de claves de larga vida</td>
+              <td>Guardar <code>AWS_SECRET_ACCESS_KEY</code> como secreto</td>
+              <td>Credenciales efímeras: nada que robar si se filtra</td>
+            </tr>
+            <tr>
+              <td>Proteger <code>.github/workflows/**</code> con CODEOWNERS</td>
+              <td>Cualquiera puede cambiar el pipeline sin revisión</td>
+              <td>Quien controla el workflow, controla los secretos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Actions referidas por etiqueta o rama</h3>
+        <span class="code-label code-label--wrong">Mal — mutable</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ "@v4" puede moverse; "@main" cambia en cada commit del autor.
+- uses: actions/checkout@v4
+- uses: some-org/some-action@main
+</code></pre>
+        <span class="code-label code-label--right">Bien — SHA inmutable</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Commit fijo; la version queda como comentario para el mantenimiento.
+- uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+- uses: some-org/some-action@a1b2c3d4e5f6… # v2.1.0
+</code></pre>
+
+        <h3>Token con permisos de más</h3>
+        <span class="code-label code-label--wrong">Mal — todo permitido</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Un CI que solo lee el repo, con permiso para escribir en todo.
+permissions: write-all
+</code></pre>
+        <span class="code-label code-label--right">Bien — mínimo privilegio</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El CI lee; solo el job de build obtiene packages/attestations.
+permissions:
+  contents: read
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+</code></pre>
+
+        <h3>Escaneo que solo avisa</h3>
+        <span class="code-label code-label--wrong">Mal — informe decorativo</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Detecta vulnerabilidades CRITICAL y... deja seguir. El gate no existe.
+- uses: aquasecurity/trivy-action@0.28.0
+  with:
+    image-ref: ${{ env.IMAGE }}:latest
+    severity: CRITICAL
+</code></pre>
+        <span class="code-label code-label--right">Bien — bloquea y por digest</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Falla el build ante HIGH/CRITICAL y escanea el artefacto exacto.
+- uses: aquasecurity/trivy-action@0.28.0
+  with:
+    image-ref: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+    severity: HIGH,CRITICAL
+    exit-code: "1"
+</code></pre>
+
+        <h3>Secretos que acaban en los logs</h3>
+        <span class="code-label code-label--wrong">Mal — imprimir y pasarlos por <code>echo</code></span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ El token aparece en el log del run (mascara parcial, pero queda el rastro).
+echo "token=${{ secrets.REGISTRY_TOKEN }}"
+curl -H "Authorization: Bearer $TOKEN" ...
+</code></pre>
+        <span class="code-label code-label--right">Bien — por entorno y sin imprimir</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El secreto entra como variable de entorno y nunca se imprime.
+- run: ./scripts/login.sh
+  env:
+    REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+# Mejor aun: OIDC, para no tener tokens de larga vida.
+</code></pre>
+
+        <h3>Confiar en una imagen externa sin verificar</h3>
+        <span class="code-label code-label--wrong">Mal — descargar y ejecutar</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Bajar un binario y ejecutarlo sin comprobar su integridad.
+curl -sSL https://example.com/tool.sh | bash
+docker pull someuser/mytool:latest   # base sin pin ni escaneo
+</code></pre>
+        <span class="code-label code-label--right">Bien — verificar y fijar</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Base fijada por digest, descarga verificada contra su checksum.
+FROM python:3.12-slim@sha256:9b1c…    # en el Dockerfile
+curl -sSLo tool.tar.gz https://example.com/tool-1.2.3.tar.gz
+echo "3f7a… tool.tar.gz" | sha256sum -c -
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> pinnear las actions del pipeline del Copiloto, endurecer los permisos, activar el escaneo de secretos y verificar una atestación de la imagen publicada.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> audita cuántas actions de tu repositorio están referidas por etiqueta o rama (es decir, sin pinnear):
+            <pre><code class="language-bash">grep -rn "uses:" .github/workflows/ | grep -vE "@[0-9a-f]{40}"
+</code></pre>
+            <p>Resultado esperado: la lista de <code>uses:</code> que <em>no</em> están fijadas por SHA. Cada línea es una puerta abierta. Anótalas; son tu lista de trabajo.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> pinea automáticamente con una herramienta en vez de a mano. Con <code>pinact</code> (o el <code>ratchet</code> de <em>step-security</em>):
+            <pre><code class="language-bash">go install github.com/suzuki-shunsuke/pinact/cmd/pinact@latest
+pinact run            # reescribe @v4 como @sha # v4.x.y en todos los workflows
+git diff -- .github/workflows/
+</code></pre>
+            <p>Resultado esperado: el <code>diff</code> muestra cada <code>@v4</code> convertido en <code>@&lt;sha40&gt; # v4.x.y</code>. Si no tienes Go, Dependabot también puede «fijar» las actions de GitHub. Revisa el cambio antes de commitear: es un cambio de seguridad, merece una PR.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> endurece los permisos. Añade <code>permissions: contents: read</code> a nivel de workflow y amplía solo en los jobs que lo necesiten:
+            <pre><code class="language-yaml">permissions:
+  contents: read           # default para todo el workflow
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+</code></pre>
+            <p>Resultado esperado: el resto de jobs no pueden escribir nada. Verifica en <em>Settings → Actions → Workflow permissions</em> que el default del repositorio es <em>Read</em>.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> activa el escaneo de secretos y comprueba que la <em>push protection</em> bloquea una credencial de mentira:
+            <pre><code class="language-bash"># Activar (si no lo esta) el secret scanning y la push protection.
+gh api -X PATCH repos/academy/copiloto-api \
+  -f security_and_analysis[secret_scanning][status]=enabled \
+  -f security_and_analysis[secret_scanning_push_protection][status]=enabled
+git checkout -b prueba-secreto
+echo 'AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE' &gt; .env.prueba
+git add .env.prueba &amp;&amp; git commit -m "test: credencial de mentira"
+git push -u origin prueba-secreto   # la push protection debe rechazarlo
+</code></pre>
+            <p>Resultado esperado: el push es <strong>rechazado</strong> con un aviso de push protection. Borra la rama de prueba; no se subió nada. Y comprueba que el <code>grep</code> del paso 1 no encuentra nada sin pinnear: ese es el control que evita el incidente más común.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (verificar una atestación):</strong> comprueba que la imagen publicada por tu build tiene procedencia válida:
+            <pre><code class="language-bash"># Digest del ultimo build (del resumen del run o del registry).
+DIGEST=$(gh run view --workflow publish.yml --limit 1 --json ... )
+gh attestation verify oci://ghcr.io/academy/copiloto-api@$DIGEST \
+  --repo academy/copiloto-api
+</code></pre>
+            <p>Resultado esperado: el comando lista la afirmación de procedencia (workflow, commit, repositorio) y termina con éxito. Si modificas un byte del digest, la verificación <strong>falla</strong>: eso es la garantía de integridad.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un pipeline que se defiende solo (y se audita)</h3>
+          <p>Blinda el pipeline del Copiloto de extremo a extremo y demuéstralo: (1) haz que una <strong>política del repositorio exija el pinning por SHA</strong> de todas las actions, de modo que un PR con <code>@v4</code> no pueda mergearse; (2) genera procedencia con <strong>nivel SLSA Build 3</strong> (construcción en un workflow reutilizable aislado, atestación ligada al digest); y (3) añade un <strong>job que pruebe que las defensas funcionan</strong> —por ejemplo, un test que intente ejecutar una action sin pinnear y deba fallar, y una comprobación de que el token por defecto es de solo lectura—. Todo como código y versionado.</p>
+          <p><em>Pista: la política de pinning se configura en <em>Settings → Actions → General</em> («Require actions to be pinned to a full-length commit SHA») o a nivel de organización; un workflow puede leer su propia configuración con <code>gh api</code>. Para SLSA 3, separa el build en un workflow reutilizable con permisos mínimos y atestaciones (<code>actions/attest-build-provenance</code>) y evita ejecutar código no confiable en el mismo job que firma. Para el «test de las defensas», lanza un job con una action sin pinnear contra una rama de prueba y verifica que el check falla; y consulta <code>gh api repos/:owner/:repo/actions/permissions</code> para confirmar el default de solo lectura. Reflexiona: ¿por qué <em>probar</em> las defensas es distinto de <em>tener</em> defensas, y por qué la construcción aislada es lo que eleva el nivel de SLSA?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La <strong>cadena de suministro</strong> es todo lo que entra en tu build (actions, dependencias, imágenes base) y todo lo que sale (tu imagen con su procedencia).</li>
+          <li><strong>Pinning por SHA</strong>: ninguna action por etiqueta o rama; un SHA es inmutable. Automatiza las actualizaciones con <code>pinact</code>/Dependabot.</li>
+          <li><strong>Permisos mínimos del <code>GITHUB_TOKEN</code></strong>: lectura por defecto, ampliar por job, nunca <code>write-all</code>. Cuidado con <code>pull_request_target</code>.</li>
+          <li><strong>Escaneo</strong>: secretos (push protection + gitleaks), dependencias (dependency review), imágenes (Trivy por digest, con <code>exit-code: 1</code>), código (CodeQL).</li>
+          <li><strong>Atestaciones</strong>: procedencia y SBOM firmadas y ligadas al <code>digest</code>; el consumidor puede <em>verificar</em> con <code>gh attestation verify</code>.</li>
+          <li><strong>OIDC</strong> en vez de claves de larga vida; <strong>CODEOWNERS</strong> protegiendo <code>.github/workflows/**</code>.</li>
+          <li>Los defensas se <em>prueban</em>, no se suponen: un gate que no bloquea no protege.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Riesgo</th><th>Medida</th><th>YAML / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Action comprometida</td><td>Pinning por SHA</td><td><code>uses: …@&lt;sha40&gt; # vX.Y.Z</code></td></tr>
+            <tr><td>Token demasiado poderoso</td><td>Permisos mínimos</td><td><code>permissions: contents: read</code></td></tr>
+            <tr><td>Secreto commiteado</td><td>Push protection + gitleaks</td><td><code>gitleaks/gitleaks-action@&lt;sha&gt;</code></td></tr>
+            <tr><td>Dependencia con CVE</td><td>Dependency review (bloquea)</td><td><code>fail-on-severity: high</code></td></tr>
+            <tr><td>Imagen vulnerable</td><td>Trivy por digest</td><td><code>exit-code: "1"</code></td></tr>
+            <tr><td>Origen no verificable</td><td>Atestación de procedencia</td><td><code>actions/attest-build-provenance@v2</code></td></tr>
+            <tr><td>Claves de larga vida</td><td>OIDC</td><td><code>id-token: write</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si pinneo por SHA, ¿cómo actualizo las actions sin quedarme atrás?</summary>
+            <div>
+              <p>Con automatización. Dependabot (o Renovate) abre PRs periódicas que suben el SHA y el comentario de versión; tú revisas el <em>changelog</em> y mergeas. Así tienes lo mejor de ambos mundos: inmutabilidad <em>durante</em> el uso y actualizaciones <em>deliberadas</em>. Actualizar a ciegas es un riesgo; no actualizar nunca también lo es (vulnerabilidades sin parchear). El pinning convierte una decisión invisible en una decisión revisable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo confiar entonces en las actions oficiales de GitHub sin pinnear?</summary>
+            <div>
+              <p>Mejor no. GitHub también recomienda el pinning para <em>todas</em> las actions, incluidas las suyas, y ofrece políticas que lo exigen a nivel de repositorio u organización. Confiar en el <em>nombre</em> de la action no te protege de que su etiqueta se mueva o de que su repositorio se vea comprometido. La regla uniforme («todo por SHA») además es más simple de auditar que una lista de excepciones.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué nivel de SLSA debería intentar alcanzar?</summary>
+            <div>
+              <p>SLSA es una escala; no hace falta el nivel máximo para todos. Un objetivo realista y muy valioso es <strong>Build Level 3</strong>: la construcción ocurre en un servicio alojado (como GitHub Actions) con un workflow reutilizable aislado, y se emite una procedencia no falsificable ligada al artefacto. Eso ya responde a «¿lo construyó el pipeline esperado, sin manipulación humana?». Los niveles superiores añaden garantías más fuertes y cuestan más. Plan SLSA como un <em>camino</em>, no como un interruptor.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Atestación y firma de imagen son lo mismo?</summary>
+            <div>
+              <p>Están relacionados pero no son idénticos. Una <strong>firma</strong> (por ejemplo, con Cosign) dice «yo, con esta clave, afirmo que este digest es mío». Una <strong>atestación</strong> añade <em>hechos</em> firmados: procedencia (quién/cómo se construyó), SBOM (qué contiene), resultados de escaneo. Podrías firmar una imagen sin atestación, y podrías atestiguar sin que un consumidor confíe en tu clave. Lo potente es combinar ambas: la atestación de procedencia de GitHub usa OIDC para firmar, sin que gestiones claves. En la práctica, para el Copiloto basta con las atestaciones nativas (<code>attest-build-provenance</code> y <code>attest-sbom</code>).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El SBOM hay que generarlo siempre, o solo al publicar?</summary>
+            <div>
+              <p>Para <em>consumidores</em> de tu artefacto, al publicar: el SBOM debe ir con la imagen que se despliega. Generarlo también en CI sirve para detectar dependencias problemáticas antes. Un buen reparto: <em>dependency review</em> en cada PR (barato) y SBOM completo + atestación en el build de release (donde ya construyes la imagen). Lo que <strong>no</strong> sirve es generar un SBOM que nadie consulta: úsalo en la respuesta a incidentes («¿esta CVE afecta a la 1.4.2?») y en la verificación de quien despliega tu imagen.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

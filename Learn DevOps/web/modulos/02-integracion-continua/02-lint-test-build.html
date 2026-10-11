@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-lint-test-build">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lint, tests y build en CI: rápido y fiable — Módulo 2 · Curso DevOps</title>
+  <meta name="description" content="Rellena el pipeline de CI del Copiloto con ruff, mypy, pytest y el build del paquete: orden de ejecución, fallar pronto, determinismo con uv y qué pasos se cachean.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Lint, tests y build en CI: rápido y fiable</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Integración continua</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior montamos el <em>esqueleto</em> del CI: eventos, jobs y dependencias. Ahora toca llenarlo. Un pipeline de CI que solo hace <code>echo</code> da una falsa sensación de seguridad: la verdadera pregunta es <strong>¿qué comprobaciones ejecuta y en qué orden?</strong></p>
+        <p>En esta lección le pondremos cuerpo a los tres jobs del Copiloto: <strong>lint</strong> (analizar el código sin ejecutarlo), <strong>tests</strong> (ejecutarlo y verificar su comportamiento) y <strong>build</strong> (producir el paquete real que se probará y, más adelante, se desplegará). El hilo conductor serán dos ideas: <strong>fallar pronto</strong> —que lo barato y rápido corra primero— y <strong>ser reproducible</strong> —que el mismo commit produzca siempre el mismo resultado.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué «rápido y fiable» y no solo «que pase»?</strong> Porque un CI lento deja de usarse: la gente empieza a fusionar sin esperarlo, a ignorar los rojos y a decir «ya lo arreglo luego». Y un CI poco fiable (que falla a veces sin motivo, los llamados <em>flaky tests</em>) es peor que no tener CI, porque enseña al equipo a desconfiar de la señal. Velocidad y determinismo son, literalmente, lo que hace que la CI se use.</p>
+        </div>
+        <p>Errores típicos: poner los tests antes del lint (esperar 8 minutos para un error de formato), ocultar fallos con <code>|| true</code>, depender de estado global que existe en tu máquina pero no en el runner, usar <code>pip install -r</code> sin fijar versiones, o crear el paquete con herramientas distintas a las de producción.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Las tres preguntas: formato, comportamiento, empaquetado</h3>
+        <p>Lint, tests y build no son tres maneras de decir lo mismo: responden a tres preguntas distintas y <strong>por eso son tres jobs</strong>.</p>
+        <table>
+          <thead><tr><th>Estación</th><th>Pregunta</th><th>Herramienta (Copiloto)</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td><strong>lint</strong></td><td>¿El código es correcto y consistente sin ejecutarlo?</td><td><code>ruff check</code>, <code>ruff format --check</code>, <code>mypy</code></td><td>Segundos</td></tr>
+            <tr><td><strong>test</strong></td><td>¿Se comporta como esperamos al ejecutarlo?</td><td><code>pytest</code> (+ cobertura, lección 04)</td><td>Segundos–minutos</td></tr>
+            <tr><td><strong>build</strong></td><td>¿Podemos empaquetarlo de forma instalable/desplegable?</td><td><code>uv build</code> (wheel + sdist)</td><td>Minutos</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — la línea de control de calidad:</strong> el <em>lint</em> es el inspector que mira la pieza a contraluz antes de montarla (no la prueba, solo la observa); el <em>test</em> es el banco de pruebas que la hace funcionar bajo carga; el <em>build</em> es la fábrica que empaqueta la pieza en su caja para enviarla. Si la pieza tiene una rebaba, el inspector la ve en dos segundos y no hace falta arrancar el banco de pruebas: ese es el «fallar pronto».</p>
+        </div>
+
+        <h3>Fallar pronto: el orden importa (y el paralelismo, más)</h3>
+        <p>«Fallar pronto» (<em>fail fast</em>) significa que el pipeline te devuelva el veredicto negativo lo antes posible. Hay dos formas de conseguirlo y se combinan:</p>
+        <ul>
+          <li><strong>Por orden</strong>: dentro de un job, pon lo más rápido y más probable de fallar primero (lint antes de tests).</li>
+          <li><strong>Por paralelismo</strong>: pon cada categoría en su propio job. El lint no espera a los tests: si el lint revienta, el PR ya está rojo aunque los tests sigan corriendo.</li>
+        </ul>
+        <div class="diagram">
+Serie (malo)                       Paralelo (bueno)
+-------------                      -----------------
+lint 3 min ──► test 5 min          lint  ──┐  (rojo a los 2 min
+        ──► build 4 min              test  ──┤   si el lint falla)
+VERDE/ROJO a los 12 min            build* ─┘  (*needs de ambos)
+                                   ROJO en 2 min, VERDE en ~7 min
+        </div>
+        <p>Como ya sabes, un error de lint puede tumbarlo todo a los pocos segundos sin malgastar ni un segundo de tests. El objetivo no es que <em>todo</em> sea instantáneo, sino que el <strong>primer rojo</strong> llegue cuanto antes.</p>
+
+        <h3>Determinismo: el enemigo silencioso</h3>
+        <p>Un CI es fiable cuando es <strong>determinista</strong>: el mismo commit produce siempre el mismo resultado. Las tres causas de no-determinismo que más rompen CI son:</p>
+        <ol>
+          <li><strong>Versiones flotantes de dependencias</strong>. <code>fastapi&gt;=0.115</code> permite que mañana se instale una versión distinta. La solución es un <strong>lockfile</strong> (<code>uv.lock</code>) y una instalación con <code>--frozen</code> que falla si el lock no casa con <code>pyproject.toml</code>.</li>
+          <li><strong>Estado global</strong> (variables de entorno, archivos, bases de datos en memoria) que existe en tu máquina y no en el runner limpio.</li>
+          <li><strong>Dependencias externas</strong> (una API de terceros, la red, la hora del sistema) que no controlas. Se aíslan con <em>fixtures</em>, datos de prueba y simulaciones.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p><strong>El lockfile es infraestructura, no un detalle.</strong> Genera <code>uv.lock</code> una vez en local (<code>uv lock</code>), commitéalo, y en CI instala con <code>uv sync --frozen</code>. <code>--frozen</code> no actualiza nada: instala exactamente lo que dice el lock, y falla si el lock está desincronizado. Es la diferencia entre «en mi máquina funciona» y «funciona igual en el runner, la semana que viene y el mes que viene».</p>
+        </div>
+
+        <h3>Qué pasos se cachean (y por qué)</h3>
+        <p>La regla para saber qué merece caché es sencilla: cachea lo que es <strong>caro de obtener</strong> y <strong>determinista</strong> a partir de un archivo que cambia poco.</p>
+        <table>
+          <thead><tr><th>Se cachea</th><th>Clave típica</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Descarga de dependencias (<code>~/.cache/uv</code>)</td><td>hash de <code>uv.lock</code></td><td>Evita bajar e instalar lo mismo en cada run. Es el mayor ahorro.</td></tr>
+            <tr><td>Intérprete/toolchain</td><td>versión de Python</td><td>No volver a descargar el mismo Python.</td></tr>
+            <tr><td>Resultados de build (capas de Docker)</td><td>hash del Dockerfile y contexto</td><td>Lo verás en el Módulo 3 con Buildx.</td></tr>
+          </tbody>
+        </table>
+        <p>Lo que <strong>no</strong> debe ir a caché: código fuente (cambia en cada commit, no hay nada que reutilizar), informes de tests (eso es un <strong>artefacto</strong>, lección 04) y secretos (jamás). La caché y los artefactos son cosas distintas: la caché es un atajo de rendimiento que puede fallar; el artefacto es un resultado que debes poder recuperar. Esta lección deja la caché preparada (con <code>enable-cache: true</code>) y la lección 03 la estudia a fondo.</p>
+        <div class="callout callout--tip">
+          <p><strong>Truco: los pasos deben ser idempotentes.</strong> Diseña cada step para que ejecutarlo dos veces dé el mismo resultado. Así, si un runner muere y reintentas el job, no se rompe nada. Es también la propiedad que hace que la caché sea segura: acertarla o fallarla no cambia el resultado, solo la velocidad.</p>
+        </div>
+
+        <h3>Bash y PowerShell en el runner</h3>
+        <p>Los runners Linux usan <code>bash</code>. El bloque <code>run: |</code> ejecuta cada línea con <code>bash -e</code>: el primer comando que falla corta el step (ese <code>-e</code> es tu amigo, no lo desactives). Si algún día ejecutas en un runner Windows, el shell por defecto es PowerShell; puedes forzar el shell del bloque:</p>
+        <div class="code-file">.github/workflows/ci.yml (fragmento)</div>
+        <pre><code class="language-yaml">- name: Comando en Windows
+  shell: pwsh          # PowerShell Core (o "bash" si hay bash disponible)
+  run: |
+    $ErrorActionPreference = 'Stop'   # equivalente a bash -e
+    python --version
+        </code></pre>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El CI más pequeño que ya atrapa algo útil: instala <code>ruff</code> y lo pasa por el código. Si hay un import sin usar o una línea demasiado larga, el job falla.</p>
+        <div class="code-file">.github/workflows/lint.yml</div>
+        <pre><code class="language-yaml">name: Lint mínimo
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) Traer el código.
+      - uses: actions/checkout@v6
+
+      # 2) Fijar la versión de Python del runner.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 3) Instalar ruff fijando su versión (un linter que hace ping-pong
+      #    de reglas según su versión rompe el CI sin tocar tu código).
+      - name: Instalar ruff
+        run: python -m pip install 'ruff==0.6.9'
+
+      # 4) Ejecutar el lint. Código de salida != 0 ⇒ job rojo.
+      - name: Comprobar el estilo y los errores comunes
+        run: ruff check .
+        </code></pre>
+        <p>Puntos clave línea a línea:</p>
+        <ul>
+          <li><code>actions/setup-python@v5</code> deja <code>python</code> apuntando a la versión pedida en todo el job.</li>
+          <li>Fijar <code>ruff==0.6.9</code> evita que una actualización del linter ponga el CI rojo sin que hayas tocado código. «Fiable» empieza por versiones fijas.</li>
+          <li><code>ruff check .</code> devuelve 0 si todo está bien y 1 si hay hallazgos. Ese es todo el contrato de un linter en CI.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>¿Por qué no arreglar el formato automáticamente en CI?</strong> Porque el CI <em>verifica</em>, no <em>modifica</em>: es una comprobación de solo lectura. El formateo se hace en local (o con <code>ruff format</code> en un <em>pre-commit hook</em>); el CI solo comprueba que ya está hecho. Un CI que reescribe código es un CI que miente sobre lo que se fusiona.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El CI del Copiloto, ahora completo. Usa <strong>uv</strong> (el gestor del proyecto de <em>Learn FastAPI</em>), con caché activada, y sus tres jobs: <code>lint</code>, <code>test</code> y <code>build</code>.</p>
+        <div class="code-file">proyectos/pipeline/.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml">name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # 1) LINT — rápida: ruff (errores + formato) y mypy (tipos).
+  #    Sin dependencia de los tests: corre en paralelo.
+  # ============================================================
+  lint:
+    name: Lint y tipos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Instalar uv
+        # setup-uv instala uv y, con enable-cache, cachea el almacén
+        # de paquetes usando pyproject.toml/uv.lock como clave.
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Instalar dependencias con el lock fijo
+        # --frozen: instala EXACTAMENTE uv.lock (no resuelve ni actualiza).
+        # --all-extras: incluye el grupo dev (ruff, mypy, pytest).
+        run: uv sync --frozen --all-extras
+
+      - name: ruff check (errores comunes e imports)
+        run: uv run --frozen ruff check .
+
+      - name: ruff format --check (formato)
+        # --check: avisa si habría que reescribir; no modifica archivos.
+        run: uv run --frozen ruff format --check .
+
+      - name: mypy (tipado estático)
+        run: uv run --frozen mypy app
+
+  # ============================================================
+  # 2) TEST — ejecuta el código y verifica su comportamiento.
+  # ============================================================
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Instalar dependencias
+        run: uv sync --frozen --all-extras
+
+      - name: Ejecutar los tests
+        # La cobertura y su umbral llegan en la lección 04.
+        run: uv run --frozen pytest -q
+
+  # ============================================================
+  # 3) BUILD — empaqueta el producto. Solo si lint y test pasan.
+  # ============================================================
+  build:
+    name: Build del paquete
+    needs: [lint, test]     # dependencia REAL: no empaquetes sin verificar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Construir wheel y sdist
+        # uv build produce dist/*.whl y dist/*.tar.gz reproducibles.
+        run: uv build
+
+      - name: Comprobar que el paquete se instaló e importa
+        # "Prueba de humo" del artefacto: ¿de verdad es instalable?
+        run: |
+          uv run --isolated --no-project --with dist/*.whl \
+            python -c "import app; print(app.__version__)"
+        </code></pre>
+        <p>Lo que merece la pena destacar:</p>
+        <ul>
+          <li><strong><code>lint</code> y <code>test</code> en paralelo</strong>: el PR se pone rojo en segundos si el lint falla. <code>build</code> espera a ambos con <code>needs</code>.</li>
+          <li><strong><code>uv sync --frozen --all-extras</code></strong> en cada job hace lo mismo que haría un desarrollador, con las versiones del lock. Reproducible y rápido gracias a la caché de <code>setup-uv</code>.</li>
+          <li><strong>La prueba de humo del build</strong> (instalar el wheel en un entorno aislado e importar <code>app</code>) es la comprobación que atrapa el error clásico de empaquetado: el código pasa los tests <em>desde el repo</em> pero el paquete no incluye algún módulo. Verificar el artefacto, no el código, es el primer paso del «el artefacto que se prueba es el que se despliega».</li>
+          <li><strong><code>uv run --isolated --no-project</code></strong> construye un entorno temporal sin usar el <code>pyproject.toml</code> del proyecto: así se prueba el wheel <em>tal cual</em>, como lo haría quien lo instala desde un registry.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>Windows / PowerShell — ejecutar el pipeline en local:</strong> <code>act</code> funciona, pero los pasos con <code>uv</code> pueden necesitar red. Si ejecutas los comandos equivalentes en tu máquina, recuerda que en PowerShell las variables de entorno se leen con <code>$env:NOMBRE</code> y que <code>uv run</code> es el mismo comando. El shell del runner Linux es bash; este curso usa bash como canónico.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Lint y tests en <strong>jobs separados</strong> (paralelo)</td>
+              <td>Un único job con todo en serie</td>
+              <td>El rojo llega antes y no malgastas minutos de test si el lint falla.</td>
+            </tr>
+            <tr>
+              <td>Fija versiones de las herramientas (<code>ruff==0.6.9</code>)</td>
+              <td>Instalar «lo último» sin fijar</td>
+              <td>Una versión nueva del linter puede poner el CI rojo sin cambios tuyos. El CI debe cambiar solo cuando cambias tú.</td>
+            </tr>
+            <tr>
+              <td><code>uv sync --frozen</code> con <code>uv.lock</code> commiteado</td>
+              <td><code>pip install -r requirements.txt</code> sin lock</td>
+              <td>Determinismo: el mismo commit instala exactamente lo mismo siempre.</td>
+            </tr>
+            <tr>
+              <td>Haz que el step falle con código ≠ 0</td>
+              <td><code>comando || true</code> o <code>continue-on-error</code> para «dejarlo verde»</td>
+              <td>Silenciar el fallo convierte el check en decoración. Si algo no debe bloquear, sepáralo en un job informativo.</td>
+            </tr>
+            <tr>
+              <td>Verifica el <strong>artefacto</strong> (instala el wheel e impórtalo)</td>
+              <td>Dar por bueno el paquete solo porque los tests pasan desde el repo</td>
+              <td>El error de empaquetado (falta un módulo, mal <code>packages</code>) solo aparece al instalar el artefacto real.</td>
+            </tr>
+            <tr>
+              <td>Cachea dependencias con una clave basada en el lock</td>
+              <td>Cachear <code>.venv</code> entero o el código</td>
+              <td>La caché acelera sin cambiar el resultado; cachear el entorno puede «envenenarse» con un resultado obsoleto.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Ocultar el fallo para que el check salga verde</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-yaml">- name: Tests
+  # ❌ El step "termina bien" aunque los tests fallen: el check miente.
+  run: pytest || true
+
+- name: Lint
+  # ❌ Lo mismo con continue-on-error: el job se marca exitoso siempre.
+  continue-on-error: true
+  run: ruff check .
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-yaml">- name: Tests
+  run: pytest -q          # ✅ código de salida real ⇒ check fiable
+
+# Si de verdad algo es informativo, sepáralo y NO lo hagas obligatorio:
+- name: Cobertura (informativo, no bloquea)
+  run: pytest --cov=app
+        </code></pre>
+
+        <h3>Confiar en el estado de tu máquina</h3>
+        <pre><code class="language-bash"># ❌ Pasa en local y falla en CI: la BD existe en tu máquina, no en el runner.
+uv run pytest
+#   E   ConnectionError: could not connect to localhost:5432
+
+# ✅ El test debe crear su propio estado efímero (fixtures, SQLite/tmp,
+#    contenedores de servicio). En Learn FastAPI se ve con TestClient y la
+#    base en memoria; el CI arranca en un runner LIMPIO, sin tu entorno.
+        </code></pre>
+
+        <h3>Instalar sin lock y «un día dejó de funcionar»</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-bash"># ❌ Sin lock: cada run instala lo que hoy haya en el índice.
+python -m pip install -r requirements.txt
+# Semana 1: verde. Semana 2: una dependencia sacó una versión con un cambio
+# incompatible y el CI empezó a fallar SIN que tú tocaras código.
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-bash"># ✅ Lock commiteado + instalación congelada: reproducible por definición.
+uv sync --frozen --all-extras
+# Si el lock no casa con pyproject.toml, --frozen FALLA y te obliga a
+# regenerarlo a conciencia (uv lock) y commitearlo.
+        </code></pre>
+
+        <h3>Correr los tests antes que el lint</h3>
+        <pre><code class="language-yaml"># ❌ Un error de formato tumba el job a los 8 minutos.
+steps:
+  - run: pytest -q          # 5 minutos
+  - run: ruff check .       # "import sin usar" ← falla aquí, tarde
+  - run: mypy app
+
+# ✅ Lo barato y rápido primero (o, mejor, en un job propio en paralelo).
+steps:
+  - run: ruff check .       # segundos
+  - run: ruff format --check .
+  - run: mypy app
+  - run: pytest -q          # el caro, al final dentro del job
+        </code></pre>
+
+        <h3>Tests «flaky» que fallan a veces</h3>
+        <pre><code class="language-python"># ❌ Depende del reloj: puede pasar a las 23:59 y fallar a las 00:00.
+assert respuesta.json()["creado"] == datetime.now().isoformat()
+
+# ✅ Fija el tiempo con una fixture o compara de forma tolerante.
+#    Un test que falla 1 de cada 20 veces se llama "flaky" y envenena
+#    la confianza en el CI: se arregla aislando el no-determinismo,
+#    nunca reintentando hasta que salga verde.
+        </code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir <code>ruff</code>, <code>mypy</code> y <code>pytest</code> al Copiloto en local, cometer un error a propósito, ver el CI fallar en rojo y arreglarlo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Prepara el proyecto con lock.</strong>
+            <pre><code class="language-bash">cd ~/proyectos/copiloto-api
+# Genera el lock una sola vez y commitéalo:
+uv lock
+git add pyproject.toml uv.lock &amp;&amp; git commit -m "chore: fijar dependencias con uv.lock"
+
+# Comprueba en local lo mismo que hará el CI:
+uv sync --frozen --all-extras
+uv run --frozen ruff check .
+uv run --frozen mypy app
+uv run --frozen pytest -q
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Copia el workflow.</strong> Crea <code>.github/workflows/ci.yml</code> con el ejemplo real de la sección 4 y súbelo en una rama corta.
+            <pre><code class="language-bash">git checkout -b ci/lint-test-build
+git add .github/workflows/ci.yml
+git commit -m "ci: lint, tests y build"
+git push -u origin ci/lint-test-build
+gh pr create --fill
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Introduce un error de lint.</strong> Un import sin usar es perfecto.
+            <pre><code class="language-bash"># Añade al principio de app/main.py:
+#   import os
+git commit -am "chore: import sin usar (a propósito)"
+git push
+gh pr checks --watch
+# Esperado: "Lint y tipos" ❌ en pocos segundos; "Tests" puede seguir ✅;
+#           "Build del paquete" ⏭ skipped por needs.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Arréglalo y observa el verde.</strong>
+            <pre><code class="language-bash"># Quita el import y sube el arreglo:
+git commit -am "fix: quitar import sin usar"
+git push
+gh pr checks --watch
+# Esperado: lint ✅ · test ✅ · build ✅
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Rompe un test y comprueba que el build se salta.</strong>
+            <pre><code class="language-bash"># En tests/test_health.py, cambia la aserción:
+#   assert response.json()["status"] == "ok"
+# por:
+#   assert response.json()["status"] == "mal"
+git commit -am "test: romper health a propósito"
+git push
+gh pr checks
+# Esperado: test ❌ · build ⏭ skipped. El lint sigue ✅.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Revierté y verifica el build.</strong> Deja el test correcto y observa que el job <code>build</code> ahora sí corre y termina en verde.
+            <pre><code class="language-bash">git checkout -- tests/test_health.py
+git commit -am "fix: restaurar health"
+git push
+gh pr checks
+# Esperado: lint ✅ · test ✅ · build ✅ (con "Construir wheel y sdist"
+# y la "prueba de humo" en verde). Fusiona con:
+gh pr merge --squash
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación conceptual:</strong> en el paso 5, el build quedó en <em>skipped</em> por <code>needs</code>; eso es exactamente el «fallar pronto ahorrando trabajo». Si el build hubiera corrido igualmente, revisa que <code>needs: [lint, test]</code> esté a nivel de job y no dentro de <code>steps</code>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un CI que distingue «rápido» de «completo»</h3>
+          <p>Haz que el pipeline del Copiloto dé una señal útil en menos de un minuto, sin renunciar a la verificación completa:</p>
+          <ul>
+            <li>Divide los tests en dos conjuntos: <strong>smoke</strong> (los pocos que cubren lo esencial: <code>/health</code>, <code>/modules</code>, <code>/ask</code> sin auth ⇒ 401) y <strong>full</strong> (el resto). El conjunto smoke debe ser un job que corre <em>siempre</em> y en paralelo; el full solo tras el smoke.</li>
+            <li>El <code>build</code> no debe depender del full si el smoke ya pasó, pero el PR solo debe poder fusionarse cuando <strong>todo</strong> esté verde. Piensa cómo combinar jobs obligatorios y no obligatorios.</li>
+            <li>Añade una comprobación de que <code>uv.lock</code> está <strong>sincronizado</strong> con <code>pyproject.toml</code> como primer paso (rápido): una instalación con <code>--frozen</code> que no toque nada, o <code>uv lock --check</code>, debe fallar si el lock está viejo.</li>
+          </ul>
+          <p><em>Pistas:</em> <code>pytest -m smoke</code> con <em>markers</em> (<code>@pytest.mark.smoke</code>) separa conjuntos sin duplicar tests; <code>needs</code> encadena y <code>if</code> decide; y recuerda que un check obligatorio que aparece como <em>skipped</em> no siempre cuenta como éxito: revisa la configuración de protección de rama antes de dar por bueno un diseño que podría bloquear PRs.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Lint, tests y build responden a <strong>tres preguntas distintas</strong>: por eso son tres jobs.</li>
+          <li><strong>Fallar pronto</strong> = lo rápido y probable de fallar primero, y categorías en paralelo.</li>
+          <li><strong>Fiabilidad</strong> = determinismo: <code>uv.lock</code> + <code>uv sync --frozen</code>, sin estado global ni dependencias externas sin aislar.</li>
+          <li>Los <strong>steps</strong> deben ser idempotentes: reintentar un job no debe romper nada.</li>
+          <li>Cachea <strong>dependencias</strong> (clave = hash del lock), nunca el código; los informes son artefactos, no caché.</li>
+          <li>Verifica el <strong>artefacto</strong> (instala el wheel e impórtalo), no solo el código del repo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Objetivo</th><th>YAML / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Instalar entorno reproducible</td><td><code>uv sync --frozen --all-extras</code></td></tr>
+            <tr><td>Lint + formato</td><td><code>uv run --frozen ruff check . &amp;&amp; uv run --frozen ruff format --check .</code></td></tr>
+            <tr><td>Tipos</td><td><code>uv run --frozen mypy app</code></td></tr>
+            <tr><td>Tests</td><td><code>uv run --frozen pytest -q</code></td></tr>
+            <tr><td>Empaquetar</td><td><code>uv build</code></td></tr>
+            <tr><td>Caché de dependencias</td><td><code>uses: astral-sh/setup-uv@v10</code> + <code>enable-cache: true</code></td></tr>
+            <tr><td>Encadenar jobs</td><td><code>needs: [lint, test]</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Corrijo un detalle tipográfico del glosario mental:</strong> no existe «el CI» como una tarea única; existe un <strong>conjunto de comprobaciones</strong> que se agregan en un check. «El CI está verde» = todos los jobs obligatorios terminaron con éxito.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No es redundante correr <code>ruff</code> si ya tengo un hook de pre-commit?</summary>
+            <div>
+              <p>No. Un hook de pre-commit es local y <strong>opcional</strong>: se puede saltar con <code>--no-verify</code>, no existe hasta que cada persona lo instala y no corre en el servidor. El CI es la única comprobación <strong>no evitable</strong>. Los hooks aceleran tu bucle local; el CI es la garantía del repositorio. Se complementan, no se sustituyen.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>uv</code> y no <code>pip</code> + <code>requirements.txt</code>?</summary>
+            <div>
+              <p>Porque <code>uv</code> resuelve, instala y genera un <strong>lock</strong> de forma determinista y muy rápida, y su action de CI cachea las dependencias con una clave basada en <code>uv.lock</code>. Es el gestor que usa el proyecto del Copiloto en <em>Learn FastAPI</em>. Si ya usas <code>pip</code>, el principio no cambia: fija versiones y commitea el lock (con <code>pip-tools</code>, <code>poetry</code> o <code>uv</code>).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo correr el CI también en ramas de feature, o basta con el PR?</summary>
+            <div>
+              <p>Con <code>pull_request</code> ya cubres cada actualización del PR, que es cuando quieres la señal. Configurar además <code>push</code> en todas las ramas multiplica runs y cancela y relanza sin aportar mucho. La receta habitual: <code>pull_request</code> sin filtro de ramas y <code>push</code> solo a <code>main</code> (y a tags, cuando llegue el release). Si un workflow se equivoca, lo pruebas en una rama con <code>workflow_dispatch</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto debería tardar mi CI?</summary>
+            <div>
+              <p>Como regla práctica, el <strong>primer rojo</strong> (lint/probado) por debajo de los dos minutos y el verde completo por debajo de los diez. Por encima de eso, la gente deja de esperar y empieza a fusionar a ciegas. Si tu CI tarda más, el cuello de botella suele ser la instalación de dependencias (solucionable con caché) o una matriz innecesaria (lección 03).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago con un test «flaky» que falla de vez en cuando?</summary>
+            <div>
+              <p><strong>Arreglarlo, nunca reintentarlo en silencio.</strong> Un <em>retry</em> automático oculta un bug real de no-determinismo (una carrera, una hora, un orden de tests). Marca el test como <em>quarantined</em> solo como medida temporal, con una tarea asignada para aislar la causa. La regla de oro: si un test puede fallar sin que nadie cambie el código, el problema es del test o del código, no del CI.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

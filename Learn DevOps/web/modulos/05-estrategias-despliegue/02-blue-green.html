@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-blue-green">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Blue/green — Módulo 5 · Curso DevOps</title>
+  <meta name="description" content="Despliegue blue/green: dos entornos idénticos, cambio de tráfico sin downtime, smoke tests sobre el entorno nuevo, limpieza y rollback instantáneo.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Blue/green: cambiar tráfico sin downtime</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Estrategias de despliegue</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El despliegue rolling es gradual: reemplaza instancias mientras el servicio sigue vivo. Eso lo hace barato y seguro, pero tiene una limitación de fondo: <strong>no puedes probar la versión nueva con calma</strong>. En cuanto la primera instancia está lista, ya hay usuarios reales encima, y volver atrás significa rodar en sentido inverso, instancia a instancia.</p>
+        <p>El despliegue <strong>blue/green</strong> (azul/verde) ataca justo eso. En vez de reemplazar instancias dentro de un único grupo, mantienes <strong>dos entornos completos e idénticos</strong>: <em>blue</em> (el que sirve el tráfico hoy) y <em>green</em> (el que acabas de desplegar). La versión nueva se despliega <em>entera</em> en green, se prueba allí sin usuarios, y solo cuando está verificada se <strong>cambia el tráfico</strong> de blue a green —un cambio de interruptor. Si algo va mal, se vuelve a mover el interruptor: <strong>rollback instantáneo</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque hay despliegues que no puedes permitirte «a medias»: un cambio de esquema de base de datos, una migración de modelo de IA, una versión que cambia contratos de API. En esos casos quieres <strong>una decisión binaria y reversible</strong> —todo el tráfico a la versión nueva, o todo a la vieja— en lugar de un proceso que se arrastra durante minutos y donde el estado es ambiguo. Blue/green te da esa palanca.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>No es gratis.</strong> Blue/green necesita el <strong>doble de recursos</strong> durante la ventana de cambio: dos entornos completos funcionando a la vez. Y exige que la base de datos sea <strong>compatible con ambas versiones</strong> (lo vimos en la lección de migraciones en CD). Sin esas dos condiciones, el azul y el verde no pueden convivir.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos entornos idénticos, un interruptor</h3>
+        <p>La idea central: en lugar de tener un clúster que se transforma, tienes <strong>dos clústeres (o dos despliegues) gemelos</strong> que comparten las dependencias (base de datos, caché, colas) y un componente que decide hacia cuál va el tráfico —un balanceador, un <em>ingress</em>, un selector de servicio—. El ciclo es siempre el mismo:</p>
+        <pre class="diagram">
+   estado inicial                       despliegue sobre el inactivo
+   trafico ──▶ ┌─────────┐              trafico ──▶ ┌─────────┐
+               │  BLUE   │                          │  BLUE   │  (sirve)
+               │  v1.4.1 │                          │  v1.4.1 │
+               └─────────┘                          └─────────┘
+               ┌─────────┐                          ┌─────────┐
+               │  GREEN  │  (dormido)               │  GREEN  │  ◀── aqui se
+               │  v1.4.2 │                          │  v1.4.2 │      despliega y
+               └─────────┘                          └─────────┘      se prueba
+
+   cambio de trafico                     si algo va mal
+   trafico ──▶ ┌─────────┐              trafico ──▶ ┌─────────┐
+               │  BLUE   │  (dormido)               │  BLUE   │  (vuelve)
+               └─────────┘                          └─────────┘
+               ┌─────────┐                          ┌─────────┐
+   trafico ──▶ │  GREEN  │  (sirve)                 │  GREEN  │  (se apaga)
+               └─────────┘                          └─────────┘
+        </pre>
+        <p>Fíjate en la simetría: <em>blue</em> y <em>green</em> no son «viejo» y «nuevo», son <strong>posiciones</strong>. En el siguiente despliegue, green pasa a ser el que sirve y blue se convierte en el inactivo. El papel va rotando.</p>
+
+        <h3>El momento crítico: promover (cambiar el tráfico)</h3>
+        <p>Todo el valor de blue/green está en la separación entre <strong>desplegar</strong> y <strong>promover</strong>:</p>
+        <ul>
+          <li><strong>Desplegar</strong>: subir la versión nueva al entorno inactivo y <em>esperar</em> a que esté sana. Nadie lo usa todavía.</li>
+          <li><strong>Probar</strong>: ejecutar <em>smoke tests</em> contra el entorno inactivo, directamente (por su dirección interna). Aquí puedes ser agresivo: si algo falla, no afecta a nadie.</li>
+          <li><strong>Promover</strong>: apuntar el tráfico al entorno nuevo. Idealmente atómico (un <code>selector</code> que cambia, un <em>ingress</em> que se reescribe).</li>
+          <li><strong>Observar</strong>: durante una ventana, confirmar que las métricas siguen bien con tráfico real.</li>
+          <li><strong>Limpiar</strong>: apagar (o mantener en frío) el entorno anterior. Ese es tu botón de rollback hasta que lo apagues.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> es como mudarse de casa sin cargar los muebles el día del traslado. Preparas la casa nueva entera y amueblada (despliegas en green), la revisas puerta por puerta (smoke tests) y, cuando está lista, cambias la dirección que das al cartero (el selector). Si algo se rompe, vuelves a dar la dirección antigua (rollback): la casa vieja sigue en pie hasta que decidas desmontarla.</p>
+        </div>
+
+        <h3>El problema compartido: la base de datos</h3>
+        <p>Aquí es donde blue/green se complica. Durante la ventana de cambio, <strong>las dos versiones escriben en la misma base de datos</strong>. Si la versión nueva espera una columna que la vieja no conoce, o al revés, el entorno viejo se rompe —y entonces «cambiar el interruptor» para volver atrás tampoco funciona, porque el daño ya está en los datos.</p>
+        <p>La regla es la que ya conoces: aplica el patrón <strong>expand/contract</strong> de la lección de migraciones, de modo que el esquema sea compatible con <em>ambas</em> versiones durante la convivencia. Blue/green no sustituye a unas migraciones bien hechas: <strong>depende</strong> de ellas.</p>
+        <div class="callout callout--note">
+          <p>Otra arista es el <strong>estado en el servidor</strong>: sesiones en memoria, ficheros subidos al disco local, tareas programadas que corren en todas las réplicas. Si el entorno inactivo tiene su propio disco y su propia memoria, el cambio de tráfico puede hacer «desaparecer» ese estado. La solución habitual es sacar el estado a un sitio compartido (BD, Redis, almacenamiento de objetos) —justo lo que un servicio decente ya hace para poder correr N réplicas.</p>
+        </div>
+
+        <h3>Blue/green frente a rolling y canary</h3>
+        <table>
+          <thead><tr><th>Criterio</th><th>Rolling</th><th>Blue/green</th><th>Canary</th></tr></thead>
+          <tbody>
+            <tr><td>Coste de infraestructura</td><td>Bajo</td><td>Alto (2×)</td><td>Bajo</td></tr>
+            <tr><td>Prueba con tráfico real antes de exponer a todos</td><td>No</td><td>No (pero pruebas el entorno entero)</td><td>Sí (con un %)</td></tr>
+            <tr><td>Velocidad del rollback</td><td>Lenta (rodar al revés)</td><td>Instantánea (interruptor)</td><td>Instantánea (0 %)</td></tr>
+            <tr><td>Estado durante el cambio</td><td>Mezcla de versiones</td><td>Dos entornos completos</td><td>Mezcla controlada</td></tr>
+            <tr><td>Complejidad</td><td>Baja</td><td>Media</td><td>Alta (análisis)</td></tr>
+            <tr><td>Exige esquema compatible con dos versiones</td><td>Sí</td><td>Sí (obligatorio)</td><td>Sí</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Cuándo elegir blue/green:</strong> cuando el despliegue debe ser una <em>decisión atómica y reversible</em> —cambios de contrato, migraciones de datos sensibles, versiones de modelo— y tienes presupuesto para el doble de infraestructura durante la ventana. Si lo que quieres es «probar con un poquito de tráfico real antes de ir a todos», la siguiente lección (canary) encaja mejor.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El átomo de blue/green en Kubernetes es un <code>Service</code> cuyo <code>selector</code> apunta a un color. Cambiar el tráfico es <strong>reescribir el selector</strong>: un solo objeto, una sola operación.</p>
+        <div class="code-file">k8s/service.yaml</div>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: copiloto-api          # esta es la puerta de entrada estable
+spec:
+  selector:
+    app: copiloto-api
+    color: blue               # ◀── aqui vive el interruptor: blue | green
+  ports:
+    - port: 80
+      targetPort: 8000
+</code></pre>
+        <p>Y el cambio de tráfico, en una línea:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Mover TODO el trafico a green, de golpe.
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"app":"copiloto-api","color":"green"}}}'
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>selector</code></strong>: el Service reenvía a los pods que llevan esa etiqueta. Los pods <code>blue</code> y <code>green</code> conviven en el clúster; el selector decide cuáles reciben tráfico.</li>
+          <li><strong><code>color: blue</code></strong>: la etiqueta «viva» hoy. Los pod <code>green</code> existen pero no reciben nada porque no coinciden con el selector.</li>
+          <li><strong><code>kubectl patch … color: green</code></strong>: la operación de <em>promoción</em>. El Service deja de enrutar a blue y empieza a enrutar a green. Todo o nada, en un instante.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Nada de esto reinicia pods ni corta procesos: los dos colores siguen corriendo. Solo cambia <strong>a quién mira la puerta de entrada</strong>. Por eso el rollback es tan rápido: repites el <code>patch</code> invirtiendo el color.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Montamos blue/green completo para el Copiloto: dos despliegues gemelos, un servicio con selector, un workflow que despliega en el color inactivo, ejecuta <em>smoke tests</em> y promueve. Y una ventana de gracia antes de apagar el color viejo.</p>
+
+        <h3>Los dos despliegues gemelos</h3>
+        <p>Solo se diferencian en la etiqueta <code>color</code>:</p>
+        <div class="code-file">k8s/copiloto-blue.yaml</div>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copiloto-api-blue
+  labels:
+    app: copiloto-api
+    color: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: copiloto-api
+      color: blue          # blue solo gestiona pods blue
+  template:
+    metadata:
+      labels:
+        app: copiloto-api
+        color: blue
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/academy/copiloto-api:1.4.1
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+</code></pre>
+        <p>El gemelo <code>copiloto-api-green</code> es idéntico con <code>color: green</code> y la versión nueva. Como el Service selecciona por <code>color</code>, apuntar a uno u otro es cambiar una sola etiqueta.</p>
+
+        <h3>El workflow: desplegar en el inactivo, probar, promover</h3>
+        <div class="code-file">.github/workflows/blue-green.yml</div>
+        <pre><code class="language-yaml">jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descubrir el color activo y elegir el inactivo
+        id: colors
+        run: |
+          ACTIVE=$(kubectl get service copiloto-api \
+            -o jsonpath='{.spec.selector.color}')
+          if [ "$ACTIVE" = "blue" ]; then
+            echo "target=green" &gt;&gt; "$GITHUB_OUTPUT"
+            echo "previous=blue" &gt;&gt; "$GITHUB_OUTPUT"
+          else
+            echo "target=blue"  &gt;&gt; "$GITHUB_OUTPUT"
+            echo "previous=green" &gt;&gt; "$GITHUB_OUTPUT"
+          fi
+          echo "Activo: $ACTIVE  ->  desplegaremos en el inactivo"
+
+      - name: Desplegar la version nueva en el color inactivo
+        run: |
+          kubectl set image deployment/copiloto-api-${{ steps.colors.outputs.target }} \
+            api="$IMAGE"
+          kubectl rollout status \
+            deployment/copiloto-api-${{ steps.colors.outputs.target }} --timeout=180s
+        env:
+          IMAGE: ghcr.io/academy/copiloto-api@${{ steps.digest.outputs.digest }}
+
+      - name: Smoke tests CONTRA el entorno inactivo (sin usuarios)
+        run: ./scripts/smoke-test.sh \
+          --url "http://copiloto-api-${{ steps.colors.outputs.target }}"
+
+      - name: Promover: mover el trafico al color nuevo
+        if: success()
+        run: |
+          kubectl patch service copiloto-api -p \
+            '{"spec":{"selector":{"app":"copiloto-api","color":"${{ steps.colors.outputs.target }}"}}}'
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Descubrir el activo, no asumirlo</strong>: el color que sirve va rotando; el workflow lo lee del propio Service. Así el mismo pipeline sirve para el despliegue de hoy y el de mañana sin editar nada.</li>
+          <li><strong>Desplegar en el inactivo</strong>: la versión nueva arranca y pasa su readiness <em>sin recibir ni una petición de usuario</em>. El tráfico sigue en el color viejo, intacto.</li>
+          <li><strong>Smoke tests contra el inactivo</strong>: se ataca directamente al despliegue por su dirección interna. Aquí puedes probar el flujo de chat, el endpoint de salud, una consulta representativa. Un fallo aquí <strong>aborta antes de tocar el tráfico</strong>, que es el mejor sitio donde puede fallar algo.</li>
+          <li><strong><code>kubectl patch</code> como promoción</strong>: el cambio de tráfico es una operación única sobre un objeto. No hay ventana de ambigüedad: o va a blue o a green.</li>
+        </ul>
+
+        <h3>La ventana de gracia y la limpieza</h3>
+        <p>Tras promover, el color viejo <strong>sigue en pie</strong>: es tu rollback instantáneo. Se apaga cuando la versión nueva ha demostrado estar bien:</p>
+        <div class="code-file">.github/workflows/blue-green.yml (continuación)</div>
+        <pre><code class="language-yaml">      - name: Ventana de observacion tras promover
+        run: |
+          # Espera y comprueba salud con trafico real antes de limpiar.
+          sleep 300
+          ./scripts/check-health.sh --window 5m
+
+      - name: Apagar el color anterior (ya es el rollback no longer needed)
+        if: success()
+        run: |
+          kubectl scale deployment/copiloto-api-${{ steps.colors.outputs.previous }} \
+            --replicas=0
+</code></pre>
+        <div class="callout callout--tip">
+          <p>El orden importa: <strong>promover → observar → limpiar</strong>. Si limpias (escalas a cero el color viejo) antes de estar seguro, has tirado tu botón de rollback. Y si el rollback es «volver a mover el selector», el color viejo debe seguir <em>arrancado y listo</em> para recibir el tráfico al instante.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p>Recuerda la base de datos: durante toda esta secuencia, <strong>blue y green comparten el esquema</strong>. Si el pipeline mete una migración incompatible con la versión antigua, el rollback «instantáneo» no funcionará —el color viejo no sabrá leer los datos que el nuevo ya escribió—. Por eso la migración va en su job, en fase <em>expand</em>, y es compatible con ambas versiones.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Smoke tests contra el entorno inactivo antes de promover</td>
+              <td>Cambiar el tráfico «a ver qué pasa»</td>
+              <td>El mejor fallo es el que ocurre sin usuarios delante</td>
+            </tr>
+            <tr>
+              <td>Promover con un cambio atómico (selector/ingress)</td>
+              <td>Ir moviendo tráfico poco a poco sin control</td>
+              <td>Quieres una decisión binaria y reversible, no un estado ambiguo</td>
+            </tr>
+            <tr>
+              <td>Mantener el color viejo listo como rollback</td>
+              <td>Apagarlo justo al promover</td>
+              <td>Sin él, «volver» deja de ser instantáneo</td>
+            </tr>
+            <tr>
+              <td>Migraciones compatibles con ambos colores (expand)</td>
+              <td>Un cambio de esquema incompatible</td>
+              <td>Los dos entornos escriben en la misma BD durante la ventana</td>
+            </tr>
+            <tr>
+              <td>Descubrir el color activo en tiempo de ejecución</td>
+              <td>Codificar «blue» o «green» a mano en el pipeline</td>
+              <td>Los colores rotan; el pipeline debe adaptarse</td>
+            </tr>
+            <tr>
+              <td>Externalizar el estado (sesiones, ficheros)</td>
+              <td>Guardar estado en el disco local de cada color</td>
+              <td>Al cambiar de entorno, el estado «desaparecería»</td>
+            </tr>
+            <tr>
+              <td>Presupuestar el doble de recursos en la ventana</td>
+              <td>Asumir que el coste es el mismo que un rolling</td>
+              <td>Durante el cambio coexisten dos entornos completos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Promover sin probar el entorno nuevo</h3>
+        <span class="code-label code-label--wrong">Mal — cambiar el tráfico directamente</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Solo porque los pods estan "Running" no significa que la app responda bien.
+kubectl set image deployment/copiloto-api-green api="$IMAGE"
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"color":"green"}}}'
+</code></pre>
+        <span class="code-label code-label--right">Bien — esperar readiness y pasar smoke tests</span>
+        <pre class="code-right"><code class="language-bash"># ✅ 1) esperar a que el entorno nuevo converja y este sano.
+kubectl rollout status deployment/copiloto-api-green --timeout=180s
+# ✅ 2) atacar directamente al inactivo: si falla, nadie lo nota.
+./scripts/smoke-test.sh --url http://copiloto-api-green
+# ✅ 3) solo entonces, promover.
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"color":"green"}}}'
+</code></pre>
+
+        <h3>Apagar el color viejo en cuanto se promueve</h3>
+        <span class="code-label code-label--wrong">Mal — quedarse sin rollback</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Promover y limpiar de golpe: si la version nueva falla con usuarios,
+#    ya no tienes a donde volver rapido.
+kubectl scale deployment/copiloto-api-blue --replicas=0
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"color":"green"}}}'
+</code></pre>
+        <span class="code-label code-label--right">Bien — observar antes de limpiar</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Primero promover y observar con trafico real.
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"color":"green"}}}'
+./scripts/check-health.sh --window 5m
+# ✅ Solo despues, apagar el color anterior.
+kubectl scale deployment/copiloto-api-blue --replicas=0
+</code></pre>
+
+        <h3>Migración incompatible: el rollback deja de funcionar</h3>
+        <span class="code-label code-label--wrong">Mal — esquema que solo entiende la versión nueva</span>
+        <pre class="code-wrong"><code class="language-sql">-- ❌ Se aplica antes de promover. La version vieja (que aun sirve) no sabe
+--    leer esto; al intentar volver atras, el color viejo falla.
+ALTER TABLE messages RENAME COLUMN body TO content;
+</code></pre>
+        <span class="code-label code-label--right">Bien — cambio aditivo, compatible con ambos</span>
+        <pre class="code-right"><code class="language-sql">-- ✅ Fase expand: anade lo nuevo; la version vieja lo ignora.
+ALTER TABLE messages ADD COLUMN content TEXT;
+-- (el backfill y el DROP van en releases posteriores)
+</code></pre>
+
+        <h3>Estado en el disco local de cada color</h3>
+        <span class="code-label code-label--wrong">Mal — estado pegado al entorno</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Los ficheros subidos van al disco del pod. Al promover, ese disco
+#    no sigue al trafico: los usuarios "pierden" sus ficheros.
+volumeMounts:
+  - name: uploads
+    mountPath: /data/uploads
+</code></pre>
+        <span class="code-label code-label--right">Bien — estado externo y compartido</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El estado vive fuera del entorno: al cambiar de color, sigue ahi.
+env:
+  - name: STORAGE_URL
+    value: s3://academy-copiloto-uploads
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar dos entornos gemelos, desplegar la versión nueva en el inactivo, promover con un <code>patch</code> y comprobar con tus ojos que el cambio de tráfico es instantáneo y revertible.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un clúster local:
+            <pre><code class="language-bash">kind create cluster --name bg-lab
+</code></pre>
+            <p>Resultado esperado: clúster listo con un nodo.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> aplica los dos despliegues gemelos y el Service con <code>color: blue</code>. Asegúrate de que ambos existen:
+            <pre><code class="language-bash">kubectl apply -f k8s/copiloto-blue.yaml
+kubectl apply -f k8s/copiloto-green.yaml
+kubectl apply -f k8s/service.yaml
+kubectl get deployments -l app=copiloto-api
+</code></pre>
+            <p>Resultado esperado: dos deployments (<code>-blue</code>, <code>-green</code>) corriendo, aunque solo blue recibe tráfico.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> confirma quién recibe tráfico consultando los <em>endpoints</em> del Service:
+            <pre><code class="language-bash">kubectl get endpoints copiloto-api
+kubectl get service copiloto-api -o jsonpath='{.spec.selector.color}'
+</code></pre>
+            <p>Resultado esperado: <code>blue</code>; y los endpoints listan solo las IPs de los pods blue. Los pods green existen pero no aparecen.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> «despliega» una versión nueva en green y <strong>promueve</strong> con el cambio de selector:
+            <pre><code class="language-bash">kubectl set image deployment/copiloto-api-green \
+  api=ghcr.io/academy/copiloto-api:1.4.2
+kubectl rollout status deployment/copiloto-api-green
+
+# Promocion: mover el trafico.
+kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"app":"copiloto-api","color":"green"}}}'
+kubectl get endpoints copiloto-api
+</code></pre>
+            <p>Resultado esperado: los endpoints cambian de las IPs de blue a las de green <strong>sin reiniciar nada</strong>. Ese salto es la promoción.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (rollback instantáneo):</strong> vuelve el tráfico a blue —tu color viejo sigue vivo— y comprueba el tiempo del cambio:
+            <pre><code class="language-bash">time kubectl patch service copiloto-api \
+  -p '{"spec":{"selector":{"app":"copiloto-api","color":"blue"}}}'
+kubectl get endpoints copiloto-api
+kind delete cluster --name bg-lab
+</code></pre>
+            <p>Resultado esperado: el «rollback» es una operación de milisegundos: el selector vuelve a blue y los usuarios ya están en la versión anterior. Compáralo mentalmente con un rolling al revés, que tardaría minutos. <strong>Esa</strong> es la promesa de blue/green.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Blue/green de un comando, con verificación y guardia de esquema</h3>
+          <p>Construye un script <code>deploy.sh</code> que haga <strong>todo</strong> el ciclo blue/green en una sola orden: descubra el color activo, despliegue el nuevo en el inactivo, espere su readiness, ejecute los <em>smoke tests</em>, promueva solo si pasan, observe durante una ventana y, si las métricas se degradan, <strong>revierta solo</strong> volviendo el selector. Añade además una <strong>guardia de compatibilidad de esquema</strong>: antes de promover, el script debe comprobar que la base de datos sigue siendo legible por el color antiguo (por ejemplo, que no se ha aplicado una migración destructiva). Y documenta en el propio script qué hace si el color inactivo <em>no</em> está sano: ¿promueve igual, aborta o deja el sistema como estaba?</p>
+          <p><em>Pista: el descubrimiento del color activo es el mismo <code>jsonpath</code> del ejemplo real. Los smoke tests pueden ser un <code>curl</code> a los endpoints clave con código de salida distinto de cero si alguno falla. Para la guardia de esquema, compara la revisión de migración aplicada con la mínima que requiere el color antiguo, o comprueba que existen las columnas que la versión vieja usa. Reflexiona: ¿qué pasa si el rollback deja a los dos colores con datos escritos por la versión nueva —cómo lo evita expand/contract y por qué es <em>obligatorio</em> en blue/green y no solo recomendable?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Blue/green mantiene <strong>dos entornos idénticos</strong>: uno sirve (<em>blue</em>) y el otro se despliega y se prueba (<em>green</em>).</li>
+          <li>El valor está en separar <strong>desplegar</strong> (subir y probar sin usuarios) de <strong>promover</strong> (cambiar el tráfico de golpe).</li>
+          <li>La promoción es un cambio <strong>atómico</strong> (selector/ingress); el rollback es igual de instantáneo mientras el color viejo siga vivo.</li>
+          <li>Orden correcto: <strong>desplegar → probar (smoke) → promover → observar → limpiar</strong>. Nunca limpiar antes de observar.</li>
+          <li>Exige el <strong>doble de recursos</strong> en la ventana y un <strong>esquema compatible con ambas versiones</strong> (expand/contract).</li>
+          <li>El estado (sesiones, ficheros) debe ser <strong>externo y compartido</strong>, o «desaparecerá» al cambiar de color.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece</th></tr></thead>
+          <tbody>
+            <tr><td>Entorno inactivo</td><td>El color que no sirve, donde se despliega</td><td>Deployment <code>-green</code></td></tr>
+            <tr><td>Promoción</td><td>Mover el tráfico al color nuevo</td><td><code>kubectl patch service … color: green</code></td></tr>
+            <tr><td>Smoke tests</td><td>Probar el color nuevo sin usuarios</td><td><code>./scripts/smoke-test.sh --url …</code></td></tr>
+            <tr><td>Rollback instantáneo</td><td>Volver el selector al color viejo</td><td><code>kubectl patch … color: blue</code></td></tr>
+            <tr><td>Limpieza</td><td>Apagar el color anterior tras observar</td><td><code>kubectl scale … --replicas=0</code></td></tr>
+            <tr><td>Guardia de esquema</td><td>Compatibilidad con ambos colores</td><td>Migraciones en fase <em>expand</em></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Blue/green es mejor que rolling?</summary>
+            <div>
+              <p>No es «mejor», es distinto. El rolling es más barato (no duplica la infraestructura) y ya evita el downtime. Blue/green brilla cuando necesitas <strong>probar el entorno entero sin usuarios</strong> y poder <strong>revertir de forma atómica e instantánea</strong>. A cambio, cuesta el doble durante la ventana y obliga a que la base de datos sea compatible con las dos versiones. Elige según lo que más te importe: coste y sencillez (rolling) o control y reversibilidad totales (blue/green).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo el entorno nuevo si todavía no recibe tráfico del balanceador?</summary>
+            <div>
+              <p>Atacándolo <strong>directamente</strong>. En Kubernetes, cada Deployment tiene un Service propio o puedes usar el DNS interno del pod/Service del color inactivo (<code>http://copiloto-api-green</code>) desde dentro del clúster. El balanceador público sigue apuntando a blue; tú pruebas green por su puerta trasera. Eso te permite verificar sin exponer a nadie.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo mantengo el color viejo encendido?</summary>
+            <div>
+              <p>El que tardes en confiar en el nuevo: normalmente una ventana de observación (minutos u horas) tras la promoción. Mientras siga encendido, tienes rollback instantáneo. El coste de tenerlo un rato de más es pequeño; el de apagarlo demasiado pronto es quedarte sin paracaídas justo cuando aparece el problema difícil de detectar. Puedes degradar el ahorro apagándolo durante la noche si tu tráfico lo permite.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si la base de datos cambia?</summary>
+            <div>
+              <p>Entonces blue/green <strong>depende</strong> de expand/contract. Como los dos colores escriben en la misma base de datos, el esquema debe ser legible y escribible por ambos durante toda la convivencia. Nunca apliques un cambio destructivo (renombrar, borrar, <code>NOT NULL</code>) mientras los dos colores estén vivos: rompería el color viejo y con él tu rollback. Los pasos destructivos van al final, cuando ya solo queda un color.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Blue/green sirve para cambiar la infraestructura, no solo la app?</summary>
+            <div>
+              <p>Sí, y es uno de sus mejores usos: migrar de una versión de runtime, de un tipo de instancia o de una configuración de red. Despliegas toda la infraestructura nueva (el «green») al lado de la vieja, validas, cambias el tráfico y retiras la antigua. Es el mismo patrón aplicado un nivel más abajo. Donde no encaja bien es en recursos con estado único y no duplicable (por ejemplo, una base de datos primaria): esos siguen su propio camino con migraciones compatibles.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

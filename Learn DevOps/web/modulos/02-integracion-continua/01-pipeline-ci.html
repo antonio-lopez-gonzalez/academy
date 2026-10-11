@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="01-pipeline-ci">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>El pipeline de CI: eventos, jobs y dependencias — Módulo 2 · Curso DevOps</title>
+  <meta name="description" content="Diseña el pipeline de integración continua del Copiloto: eventos push y pull_request, jobs con needs, paralelismo, concurrencia y cancelación de runs obsoletos en GitHub Actions.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>El pipeline de CI: eventos, jobs y dependencias</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Integración continua</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La integración continua (CI) responde a una pregunta muy concreta: <strong>¿este commit deja el proyecto mejor que como estaba?</strong> Hasta ahora esa pregunta la contestabas tú, a mano, en tu máquina, con tu entorno y tus dependencias ya instaladas. El pipeline de CI la contesta por ti en un <strong>runner limpio</strong> cada vez que subes código, y devuelve un veredicto binario: verde o rojo.</p>
+        <p>En esta lección vas a diseñar la <em>espina dorsal</em> de ese pipeline para el <strong>Copiloto API</strong>: qué <strong>eventos</strong> lo disparan (<code>push</code> y <code>pull_request</code>), cómo se organiza el trabajo en <strong>jobs</strong> que se ejecutan en paralelo (lint, test, build), cómo se declaran sus <strong>dependencias</strong> con <code>needs</code>, y cómo se evita que dos ejecuciones de la misma rama se pisen entre sí usando <strong>concurrency</strong> para <strong>cancelar runs obsoletos</strong>. En las tres lecciones siguientes iremos rellenando el contenido de cada job.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué importa el «esqueleto» antes que el contenido?</strong> Porque un pipeline mal estructurado es lento y caro aunque los tests sean perfectos: convierte todo en una cadena serie donde nada empieza hasta que termina lo anterior, desperdicia minutos de runner y te obliga a esperar diez minutos por un error que el lint habría detectado en ocho segundos. Empezar por los eventos, los jobs y sus dependencias es empezar por la arquitectura del pipeline.</p>
+        </div>
+        <p>Errores típicos que verás y que esta lección ayuda a evitar: disparar el pipeline en cada rama y cada tag sin criterio, encadenar jobs cuando podían ir en paralelo, dejar que un run viejo siga consumiendo minutos después de que ya subiste un commit nuevo, o confundir «el workflow ha terminado» con «el check ha pasado» en un pull request.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El pipeline como cadena de montaje</h3>
+        <p>Imagina una fábrica. La <strong>materia prima</strong> es tu commit; el <strong>producto terminado</strong> es un artefacto desplegable; y las <strong>estaciones de trabajo</strong> son los jobs del pipeline. Cada estación recibe algo, le hace una comprobación y pasa el resultado a la siguiente. Ninguna estación «confía» en la anterior por fe: cada una deja su propio certificado (el check en verde).</p>
+        <div class="diagram">
+git push  /  abrir PR
+      │
+      ▼
+┌──────────────────────────────────────────────┐
+│              GitHub Actions (workflow)        │
+│                                               │
+│   ┌─────────┐        ┌─────────┐             │
+│   │  lint   │  ──►   │  test   │  ──►  build │
+│   └─────────┘        └─────────┘       │      │
+│        (needs)            (needs)      ▼      │
+│                                    artefacto  │
+│                                    (lección 04)│
+└──────────────────────────────────────────────┘
+      │
+      ▼
+ check ✅ / ❌  visible en el Pull Request
+        </div>
+        <p>Cada caja es un <strong>job</strong>: se ejecuta en su propio runner, con su propio sistema de archivos y su propio contenedor limpio. Por eso un job <em>no</em> comparte nada con el anterior salvo lo que le pases explícitamente (por artefactos, como verás en la lección 04). Esta es la razón por la que el pipeline es la fuente de verdad: nadie puede «arreglar» el resultado a mano.</p>
+
+        <h3>Eventos: cuándo se dispara el workflow</h3>
+        <p>La clave <code>on:</code> declara qué <strong>eventos</strong> arrancan el workflow. Los dos que sostienen toda estrategia de CI son:</p>
+        <table>
+          <thead><tr><th>Evento</th><th>Cuándo se dispara</th><th>Para qué sirve en CI</th></tr></thead>
+          <tbody>
+            <tr><td><code>push</code></td><td>Al subir commits a una rama (o crear/actualizar un tag).</td><td>CI de la rama de integración (<code>main</code>): valida que lo que entra está sano.</td></tr>
+            <tr><td><code>pull_request</code></td><td>Al abrir, actualizar o reabrir un PR.</td><td>CI del <em>merge result</em>: valida lo que entraría en <code>main</code> antes de fusionar.</td></tr>
+            <tr><td><code>workflow_dispatch</code></td><td>A mano desde la pestaña Actions o con <code>gh workflow run</code>.</td><td>Relanzar un CI fallido o probar cambios del propio workflow.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong><code>pull_request</code> no es «lo mismo» que <code>push</code>.</strong> En un PR, GitHub construye una <strong>rama de merge virtual</strong> (tu rama fusionada con la base) y ejecuta el CI sobre ese resultado. Así detectas conflictos de integración que un CI solo de tu rama no vería. Por eso quieres <em>ambos</em>: <code>pull_request</code> protege la fusión y <code>push</code> protege <code>main</code>.</p>
+        </div>
+        <p>Puedes acotar los eventos con filtros. Los más útiles:</p>
+        <ul>
+          <li><code>branches:</code> limita a las ramas que te importan (<code>main</code>, <code>releases/**</code>) y evita gastar minutos en ramas de prueba.</li>
+          <li><code>paths:</code> dispara solo si cambian ciertos archivos. Ojo: <strong>si lo pones en <code>pull_request</code>, el check puede no ejecutarse nunca</strong> y bloquear el PR si es obligatorio. Úsalo con prudencia y nunca para los checks requeridos.</li>
+        </ul>
+
+        <h3>Jobs: unidades de trabajo en paralelo</h3>
+        <p>Un <strong>job</strong> es una unidad que se asigna a un <strong>runner</strong> (una máquina virtual limpia). Las propiedades que definen su comportamiento:</p>
+        <ul>
+          <li><code>runs-on</code>: el runner. En CI el estándar es <code>ubuntu-latest</code>.</li>
+          <li><code>steps</code>: los pasos, en orden, dentro del job. Los pasos <strong>sí</strong> comparten el sistema de archivos del job (aquí sí hay estado entre pasos).</li>
+          <li><code>needs</code>: de qué jobs depende; sin él, todos los jobs arrancan <strong>en paralelo</strong>.</li>
+          <li><code>if</code>: condición para ejecutarlo o saltarlo.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — la cocina con varios cocineros:</strong> cada job es un cocinero con su propia estación y sus propios ingredientes. Si no les dices nada, todos empiezan a la vez y cada uno hace su parte (paralelismo). Con <code>needs: [lint]</code> le dices al de <em>test</em>: «no empieces hasta que el de <em>lint</em> termine». Lo que no puedes hacer es pasarle la salsa a medias de una estación a otra sin un recipiente: ese recipiente es el <strong>artefacto</strong>.</p>
+        </div>
+
+        <h3>Dependencias con needs: el grafo del pipeline</h3>
+        <p>Sin <code>needs</code>, los jobs son independientes y corren a la vez. Con <code>needs</code> construyes un <strong>grafo dirigido acíclico</strong>:</p>
+        <div class="diagram">
+jobs sin needs                jobs con needs
+-------------                 ---------------
+lint ─┐                       lint ──► test ──► build
+test ─┼──► (todos a la vez)             │
+build ┘                       (cada uno espera al anterior)
+
+El objetivo no es "encadenar todo": es encadenar NADIE.
+Solo se encadena cuando un job NECESITA el resultado del anterior.
+        </div>
+        <p>La regla de diseño: <strong>paraleliza por defecto, encadena solo por necesidad real</strong>. Lint, tests y comprobación de tipos no dependen unos de otros: pueden correr los tres a la vez. El <code>build</code> del artefacto sí depende de que los tests pasen (no quieres construir lo que no funciona). Y el despliegue dependerá del build.</p>
+        <div class="callout callout--tip">
+          <p><strong>Truco de velocidad: separa lo barato y ruidoso.</strong> El <code>lint</code> tarda segundos y atrapa errores tontos (imports sin usar, formato). Ponlo como job propio, en paralelo, con <code>fail-fast</code> natural. Así, cuando el lint falla, el PR se pone rojo casi al instante aunque los tests aún estén corriendo. Ese es el «fallar pronto» que verás a fondo en la lección 02.</p>
+        </div>
+
+        <h3>Concurrency: que dos runs no se pisen</h3>
+        <p>Si subes tres commits seguidos a la misma rama, se lanzan <strong>tres runs</strong>. El segundo y el tercero son más nuevos que el primero; cuando el primero termine, su resultado ya no le importa a nadie. Aquí entra <code>concurrency</code>:</p>
+        <div class="code-file">.github/workflows/ci.yml (fragmento)</div>
+        <pre><code class="language-yaml"># Un "grupo de concurrencia" agrupa runs que compiten por el mismo recurso.
+concurrency:
+  # El grupo se nombra con el contexto; aquí, una clave por rama/PR.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Si un run nuevo entra en el mismo grupo, CANCELA al que esté corriendo.
+  # El run cancelado se marca "cancelled", no "failed".
+  cancel-in-progress: true
+        </code></pre>
+        <p>El <strong>grupo</strong> define la unidad de exclusión mutua: dos runs en el mismo grupo no se solapan. El <strong>nombre</strong> debe identificar la rama (o el PR) para no cancelar runs de ramas distintas entre sí. Con <code>github.ref</code> obtienes algo como <code>refs/heads/main</code> o <code>refs/pull/42/merge</code>.</p>
+        <div class="callout callout--warning">
+          <p><strong>Nunca pongas <code>cancel-in-progress: true</code> en un despliegue.</strong> Cancelar un deploy a medias puede dejar el entorno en un estado inconsistente. En CI (lint/tests/build) cancelar el run viejo es exactamente lo que quieres; en CD (Módulo 4) usarás el mismo mecanismo <em>sin</em> cancelación, o con un grupo distinto por entorno, para serializar despliegues.</p>
+        </div>
+
+        <h3>Contextos: de dónde salen los valores</h3>
+        <p>Dentro del YAML dispones de <strong>contextos</strong> que Actions rellena en cada run:</p>
+        <table>
+          <thead><tr><th>Contexto</th><th>Qué es</th><th>Ejemplo</th></tr></thead>
+          <tbody>
+            <tr><td><code>github.ref</code></td><td>Referencia Git del run.</td><td><code>refs/heads/main</code></td></tr>
+            <tr><td><code>github.sha</code></td><td>El commit exacto que se está probando.</td><td><code>a1b2c3d…</code></td></tr>
+            <tr><td><code>github.event_name</code></td><td>El evento que lo disparó.</td><td><code>push</code>, <code>pull_request</code></td></tr>
+            <tr><td><code>runner.os</code></td><td>Sistema del runner.</td><td><code>Linux</code></td></tr>
+            <tr><td><code>job.status</code></td><td>Estado del job en curso.</td><td><code>success</code>, <code>failure</code></td></tr>
+          </tbody>
+        </table>
+        <p>Un <strong>check</strong> en el PR no es más que la exposición del resultado del run para ese commit. GitHub agrega todos los jobs; el PR queda «verde» cuando todos pasan. Proteger la rama <code>main</code> para exigir esos checks es la lección 02 del Módulo 1.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El workflow más pequeño que ya es un CI de verdad: se dispara en <code>push</code> y <code>pull_request</code>, tiene un job y comprueba que el runner está vivo y ve tu código.</p>
+        <div class="code-file">.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml"># Nombre visible en la pestaña Actions del repositorio.
+name: CI
+
+# on: define los EVENTOS. Aquí, cada push y cada PR.
+on:
+  push:
+  pull_request:
+
+# Concurrency: un run por rama/PR; el nuevo cancela al viejo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # El identificador del job es una clave YAML; el nombre visible va aparte.
+  checks:
+    name: Checks básicos
+    # El runner es una máquina virtual efímera y limpia.
+    runs-on: ubuntu-latest
+    steps:
+      # 1) Descarga tu código en el runner (sin esto, el runner está vacío).
+      - name: Checkout del repositorio
+        uses: actions/checkout@v6
+
+      # 2) Un comando cualquiera. Si devuelve un código ≠ 0, el job falla.
+      - name: Saludar y listar el repo
+        run: |
+          echo "Evento: ${{ github.event_name }}"
+          echo "Commit: ${{ github.sha }}"
+          ls -la
+        </code></pre>
+        <p>Léelo línea a línea:</p>
+        <ul>
+          <li><code>name: CI</code> es solo la etiqueta humana; el archivo puede llamarse como quieras, pero la carpeta <strong>debe</strong> ser <code>.github/workflows/</code>.</li>
+          <li><code>on:</code> con los dos eventos sin filtros significa «cualquier push» y «cualquier PR». Para empezar vale; en el ejemplo real lo acotamos a <code>main</code>.</li>
+          <li><code>actions/checkout@v6</code> trae tu repositorio al runner en el commit del evento. Es, con diferencia, el step más común de cualquier workflow.</li>
+          <li>El <code>|</code> introduce un bloque multilínea de shell. Cada línea se ejecuta en bash (en <code>ubuntu-latest</code>).</li>
+          <li>Cualquier comando que termine con código distinto de cero <strong>tumba el job</strong> y con él el check del PR. Ese es todo el mecanismo de «fallar».</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Pruébalo en local con <code>act</code>.</strong> Si tienes el runner local <code>act</code> instalado (Módulo 0, lección 03), puedes ejecutar este workflow sin subir nada: <code>act push</code>. Es la forma más rápida de iterar en el propio pipeline.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Ahora el CI real de <strong>Publicar el Copiloto</strong>: tres jobs que se reparten el trabajo. <code>lint</code>, <code>test</code> y <code>build</code> están conectados con <code>needs</code> de modo que el build solo se hace si el resto pasa, y todo el workflow se cancela solo cuando llega un commit más nuevo a la misma rama.</p>
+        <div class="code-file">proyectos/pipeline/.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml"># ============================================================
+# CI del Copiloto API — lint + test + build
+# Fase 1: solo el esqueleto y dependencias entre jobs.
+# Las secciones internas de cada job llegan en la lección 02.
+# ============================================================
+name: CI
+
+on:
+  # push: protege la rama de integración.
+  push:
+    branches: [main]
+  # pull_request: protege la fusión (merge result) antes de entrar a main.
+  pull_request:
+    branches: [main]
+
+# Un run por rama; el commit nuevo cancela el run viejo de esa misma rama.
+# En PR, github.ref es refs/pull/&lt;n&gt;/merge, así que cada PR tiene su grupo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permisos mínimos del GITHUB_TOKEN: el CI solo necesita LEER el repo.
+permissions:
+  contents: read
+
+jobs:
+  # ---------- 1) Lint: rápido, en paralelo con todo ----------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ver versión del runner
+        run: python3 --version
+
+  # ---------- 2) Tests: no dependen del lint (paralelo) ----------
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Placeholder de tests
+        run: echo "Aquí irán los tests del Copiloto (lección 02)"
+
+  # ---------- 3) Build: SOLO si lint y test pasan ----------
+  build:
+    name: Build del paquete
+    # needs espera a que AMBOS terminen con éxito.
+    # Si cualquiera falla, este job se SALTA (no se ejecuta).
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Placeholder del build
+        run: echo "Aquí se construirá el artefacto (lecciones 02-04)"
+        </code></pre>
+        <p>Decisiones que merece la pena destacar:</p>
+        <ul>
+          <li><strong><code>lint</code> y <code>test</code> corren en paralelo</strong>: no hay <code>needs</code> entre ellos porque ninguno necesita el resultado del otro. El PR se pone rojo en cuanto lo más rápido acaba.</li>
+          <li><strong><code>build</code> depende de los dos</strong> (<code>needs: [lint, test]</code>). Es la dependencia real: no construyes el artefacto si el código no está probado.</li>
+          <li><strong>El grupo de concurrencia usa <code>github.ref</code></strong>, no un nombre fijo. Con un grupo fijo (<code>group: ci</code>) un push a <code>main</code> cancelaría los CI de <em>todas</em> las ramas y PRs a la vez: caos.</li>
+          <li><strong><code>permissions: contents: read</code></strong> sigue el principio de privilegio mínimo: el CI no necesita escribir nada. Los secretos y permisos de escritura llegan con CD (Módulo 4).</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>¿Cuándo es obligatorio <code>needs</code> y cuándo es solo higiene?</strong> Solo es <em>obligatorio</em> cuando necesitas el <strong>resultado</strong> del job anterior (su artefacto, su output). Si lo único que quieres es «no malgastar el build cuando los tests fallan», <code>needs</code> también cumple ese papel: el build se salta y ahorras minutos de runner.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Dispara <code>pull_request</code> <em>y</em> <code>push</code> a <code>main</code></td>
+              <td>Solo <code>push</code>, o solo en <code>pull_request</code></td>
+              <td>El PR valida el <em>merge result</em> (detecta conflictos de integración); el push a <code>main</code> valida lo que de verdad quedó integrado.</td>
+            </tr>
+            <tr>
+              <td>Paraleliza por defecto; usa <code>needs</code> solo con motivo</td>
+              <td>Encadenar todo en serie «por si acaso»</td>
+              <td>Cada <code>needs</code> que no hacía falta añade minutos de espera sin ganar nada. El PR debe estar verde lo antes posible.</td>
+            </tr>
+            <tr>
+              <td>Un grupo de concurrencia <strong>por rama/PR</strong></td>
+              <td><code>group: ci</code> (nombre fijo)</td>
+              <td>Un grupo global hace que un push cancele el CI de todas las demás ramas y PRs abiertos.</td>
+            </tr>
+            <tr>
+              <td><code>cancel-in-progress: true</code> en CI</td>
+              <td>Usarlo también en CD/deploy</td>
+              <td>Cancelar un run viejo de CI ahorra minutos; cancelar un despliegue a medias deja el entorno inconsistente.</td>
+            </tr>
+            <tr>
+              <td><code>permissions: contents: read</code> como base</td>
+              <td>Dejar los permisos por defecto sin pensarlos</td>
+              <td>Menos superficie de ataque: un CI no necesita escribir en el repo ni en Packages.</td>
+            </tr>
+            <tr>
+              <td>Fallar el job con código ≠ 0</td>
+              <td><code>continue-on-error: true</code> «para que salga verde»</td>
+              <td>Un check que no puede fallar no es un check. Si algo es informativo, ponlo como job <code>continue-on-error</code> separado y no lo hagas obligatorio.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>El workflow no aparece / no se ejecuta</h3>
+        <p>Casi siempre es la ubicación del archivo o el nombre de la carpeta.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-text"># Mal: el archivo no está donde GitHub lo busca
+.github/workflows/ci.yaml          &lt;-- bien... pero:
+workflows/ci.yml                   &lt;-- fuera de .github/  ❌
+.github/workflow/ci.yml            &lt;-- "workflow" en singular ❌
+ci.yml                             &lt;-- en la raíz ❌
+
+# YAML con TABS en vez de espacios (el parser lo rechaza)
+on:
+&#9;push:            &lt;-- tab  ❌
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-text">.github/workflows/ci.yml           &lt;-- ✅ ruta exacta
+on:
+  push:                            &lt;-- ✅ dos espacios, nunca tab
+        </code></pre>
+
+        <h3>El check no se ejecuta en el PR porque filtraste paths</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-yaml">on:
+  pull_request:
+    paths:
+      - 'app/**'      # si el PR solo toca docs/, el check NUNCA corre...
+                      # ...y si es obligatorio, el PR queda bloqueado sin salida
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-yaml">on:
+  pull_request:       # sin paths en el check obligatorio: SIEMPRE corre
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'      # el filtro de paths, si lo quieres, en el push
+        </code></pre>
+        <p>Si necesitas ahorrar minutos en PRs de solo documentación, usa el filtro en un workflow <em>no obligatorio</em>, o un job <code>if</code> que decida en tiempo de ejecución (así el check obligatorio siempre aparece como exitoso o skipped de forma controlada).</p>
+
+        <h3>Concurrency cancelando lo que no debe</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-yaml"># Un único grupo global: el push a feature/x cancela el CI de main,
+# y el PR #42 cancela el PR #43. Todo compite por el mismo carril.
+concurrency:
+  group: ci
+  cancel-in-progress: true
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-yaml"># Un carril por rama/PR. Runs de ramas distintas no se ven entre sí.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+        </code></pre>
+
+        <h3>Creer que un job comparte estado con otro</h3>
+        <pre><code class="language-bash"># ❌ El job "test" NO ve lo que hizo el job "lint": son máquinas distintas.
+#    Esto falla con "no such file or directory".
+- name: (job test) usar el informe del job lint
+  run: cat lint-report.txt      # lint-report.txt está en OTRO runner
+        </code></pre>
+        <p>Para pasar datos entre jobs hay exactamente dos vías: <strong>outputs</strong> (texto pequeño, con <code>needs.&lt;job&gt;.outputs</code>) o <strong>artefactos</strong> (archivos, con <code>upload-artifact</code>/<code>download-artifact</code>, lección 04). La caché <em>no</em> sirve para esto: es un almacén de conveniencia, no un canal fiable de datos.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> poner en marcha el esqueleto del CI del Copiloto, ver el check en un PR y comprobar con tus ojos cómo <code>concurrency</code> cancela un run obsoleto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea el repositorio y el workflow.</strong> Parte del proyecto del Copiloto y crea la ruta del workflow.
+            <pre><code class="language-bash">cd ~/proyectos/copiloto-api
+mkdir -p .github/workflows
+# Crea .github/workflows/ci.yml con el ejemplo real de la sección 4.
+git checkout -b ci/pipeline       # rama corta para el PR
+git add .github/workflows/ci.yml
+git commit -m "ci: esqueleto del pipeline de CI"
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Súbela y abre un PR.</strong> Con <code>gh</code> (Módulo 0) es una línea.
+            <pre><code class="language-bash">git push -u origin ci/pipeline
+gh pr create --fill --base main
+gh pr checks --watch      # verás lint, test y build aparecer
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Observa el grafo de jobs.</strong> Abre el PR en el navegador (o <code>gh pr view --web</code>). Deberías ver: <code>lint</code> y <code>test</code> arrancando a la vez, y <code>build</code> en «Waiting» hasta que ambos terminan. Ese «Waiting» es <code>needs</code> trabajando.
+          </li>
+          <li>
+            <strong>Paso 4 — Fuerza un fallo y un salto.</strong> Haz que <code>test</code> falle a propósito y fíjate en que <code>build</code> se queda como <em>Skipped</em>.
+            <pre><code class="language-bash"># Añade un step que rompe el job test:
+#   - run: exit 1
+git commit -am "ci: probar fallo" &amp;&amp; git push
+gh pr checks          # lint ✅ · test ❌ · build ⏭ skipped
+# Revertir el fallo para dejarlo verde:
+#   quita el step "exit 1"
+git commit -am "ci: quitar fallo" &amp;&amp; git push
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Provoca la cancelación por concurrencia.</strong> Sube dos commits con segundos de diferencia y mira la lista de runs.
+            <pre><code class="language-bash">echo "# cambio A" &gt;&gt; README.md &amp;&amp; git commit -am "a" &amp;&amp; git push
+echo "# cambio B" &gt;&gt; README.md &amp;&amp; git commit -am "b" &amp;&amp; git push
+gh run list --limit 5
+# El run del commit A aparecerá como "cancelled" en cuanto entró el de B.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación final.</strong> Comprueba el estado esperado.
+            <pre><code class="language-bash">gh pr checks
+# Resultado esperado: lint ✅ · test ✅ · build ✅
+# Y en "gh run list": los runs viejos de la misma rama como "cancelled".
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación conceptual:</strong> si el run viejo apareciera como <em>failed</em> en vez de <em>cancelled</em>, revisa que <code>cancel-in-progress</code> esté en el nivel correcto (workflow, no job) y que el grupo incluya <code>github.ref</code>. Si el PR nunca se pone verde aunque todo pase, casi seguro <code>paths:</code> está filtrando el evento.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un CI que se adapta al evento</h3>
+          <p>Amplía el pipeline del Copiloto para que se comporte distinto según de dónde venga el run, manteniendo <code>lint</code> en paralelo y el grafo correcto:</p>
+          <ul>
+            <li>En <code>pull_request</code>, además de lint/test/build, un job <code>resumen</code> que dependa de los tres y solo corra si el evento es un PR, mostrando el número de PR y el SHA.</li>
+            <li>Un job <code>build</code> que, solo en <code>push</code> a <code>main</code>, haga una comprobación extra (por ejemplo, verificar que existe una etiqueta de versión), y en <code>pull_request</code> se salte ese paso con un <code>if</code>.</li>
+            <li>Que un push a <code>main</code> <strong>no</strong> cancele el CI de las ramas de feature: piensa qué debe entrar en el grupo de concurrencia para lograrlo.</li>
+          </ul>
+          <p><em>Pistas:</em> <code>github.event_name</code> distingue <code>push</code> de <code>pull_request</code>; <code>github.ref</code> ya distingue ramas entre sí, así que la clave está en no <em>colapsar</em> el grupo cuando no toca; y <code>needs.&lt;job&gt;.result</code> te permite razonar sobre qué pasó con un job anterior sin volver a ejecutarlo.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La CI convierte «¿este commit está sano?» en un <strong>veredicto binario</strong> calculado en un runner limpio.</li>
+          <li><code>on:</code> declara los <strong>eventos</strong>: <code>push</code> (protege <code>main</code>) y <code>pull_request</code> (protege la fusión / <em>merge result</em>) son la base.</li>
+          <li>Cada <strong>job</strong> corre en su propio runner: no comparte archivos con los demás. Los datos viajan por <strong>outputs</strong> o <strong>artefactos</strong>.</li>
+          <li>Sin <code>needs</code> los jobs corren <strong>en paralelo</strong>; con <code>needs</code> impones dependencias reales. Paraleliza por defecto.</li>
+          <li><code>concurrency</code> + <code>cancel-in-progress: true</code> cancela runs obsoletos; el grupo debe incluir la rama/PR (<code>github.ref</code>).</li>
+          <li>El <strong>check</strong> del PR es el resultado agregado de los jobs; proteger la rama para exigirlo cierra el círculo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>YAML</th></tr></thead>
+          <tbody>
+            <tr><td>Eventos</td><td><code>on: { push: { branches: [main] }, pull_request: {} }</code></td></tr>
+            <tr><td>Job</td><td><code>jobs.&lt;id&gt;.runs-on: ubuntu-latest</code></td></tr>
+            <tr><td>Pasos</td><td><code>jobs.&lt;id&gt;.steps: [...]</code></td></tr>
+            <tr><td>Dependencia</td><td><code>jobs.&lt;id&gt;.needs: [lint, test]</code></td></tr>
+            <tr><td>Concurrencia</td><td><code>concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }</code></td></tr>
+            <tr><td>Condición</td><td><code>jobs.&lt;id&gt;.if: github.event_name == 'pull_request'</code></td></tr>
+            <tr><td>Permisos mínimos</td><td><code>permissions: { contents: read }</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué el CI también corre en <code>push</code> a <code>main</code> si ya ha pasado en el PR?</summary>
+            <div>
+              <p>Porque el <em>merge</em> puede no ser idéntico al resultado que probaste: alguien pudo fusionar otra cosa antes, el merge pudo resolver un conflicto de forma distinta, o alguien pudo hacer push directo a <code>main</code> (bypass). El run de <code>push</code> es la última red de seguridad y también el punto donde, más adelante, engancharás el <em>build</em> y el <em>deploy</em> (Módulos 3 y 4).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los jobs de un workflow se ejecutan siempre en máquinas distintas?</summary>
+            <div>
+              <p>Sí, cada job obtiene un runner propio y efímero. Eso es una garantía de <strong>aislamiento</strong>: nadie hereda un <code>node_modules</code> o un <code>.venv</code> sucio del job anterior, y por tanto cada resultado es reproducible. El precio es que compartir datos entre jobs exige artefactos u outputs explícitos. Esta propiedad es una ventaja, no una limitación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre un run «cancelled» y uno «failed»?</summary>
+            <div>
+              <p><em>Cancelled</em> significa que algo lo interrumpió a propósito (normalmente <code>cancel-in-progress</code> cuando entró un run más nuevo, o una cancelación manual). <em>Failed</em> significa que un step devolvió un código de error. Si un check obligatorio aparece como <em>cancelled</em>, el PR no se considerará aprobado: por eso la cancelación es buena en CI, pero debes evitar que un run necesario quede cancelado por accidente (por ejemplo, con un grupo de concurrencia demasiado amplio).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo condicionar un job entero con <code>if</code>?</summary>
+            <div>
+              <p>Sí: <code>if:</code> a nivel de job decide si se ejecuta o se salta. Un job saltado cuenta como «skipped» y, para un <code>needs</code> posterior, no es un éxito. Si quieres que un job dependiente corra <em>aunque</em> el anterior falle o se salte, usa <code>if: always()</code> junto con <code>needs: [...]</code>; y si quieres razonar sobre el resultado, <code>needs.&lt;job&gt;.result</code> te da <code>success</code>, <code>failure</code>, <code>cancelled</code> o <code>skipped</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo usar <code>ubuntu-latest</code> o fijar una versión concreta?</summary>
+            <div>
+              <p><code>ubuntu-latest</code> es cómodo y suele ser lo correcto para CI, pero «latest» cambia con el tiempo y puede romper un día sin que tú toques nada. Si buscas máxima reproducibilidad (y es lo que se recomienda en pipelines maduros), fija la imagen (<code>ubuntu-24.04</code>) y actualízala a propósito. Con las <em>actions</em> ocurre lo mismo: en el Módulo 7 verás el <em>pin</em> por SHA de commit, que es el nivel más fuerte.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

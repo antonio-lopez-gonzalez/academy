@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-canary-y-feature-flags">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Canary y feature flags — Módulo 5 · Curso DevOps</title>
+  <meta name="description" content="Despliegue canary por porcentaje de tráfico con métricas para decidir, y feature flags para separar desplegar de publicar (deploy ≠ release).">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Canary y feature flags</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Estrategias de despliegue</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Blue/green decide <em>todo o nada</em>: o el 100 % del tráfico va al entorno nuevo, o va al viejo. Es una palanca potente y reversible, pero binaria. ¿Y si pudieras exponer la versión nueva solo al <strong>1 % de los usuarios</strong>, mirar cómo se comporta con tráfico real, y subir ese porcentaje poco a poco solo si las métricas acompañan? Eso es un despliegue <strong>canary</strong> (canario).</p>
+        <p>El nombre viene de las minas de carbón: los mineros llevaban un canario porque es más sensible a los gases tóxicos; si el canario enfermaba, había que salir <em>antes</em> de que el gas llegara a los humanos. En software, el «canario» es ese pequeño porcentaje de tráfico que recibe la versión nueva. Si las métricas empeoran, retiras el canario y el resto de usuarios no se entera.</p>
+        <p>Hay una segunda idea, complementaria y muy potente: las <strong>feature flags</strong> (banderas de funcionalidad). Permiten desplegar código que ya está en producción pero <strong>desactivado</strong>, y activarlo después a voluntad. Con ellas, <strong>desplegar deja de ser publicar</strong>: el código llega al servidor sin que nadie lo vea, y se enciende cuando tú decides.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque el canary y las flags son la respuesta moderna a una pregunta incómoda: «¿cómo sé que este cambio es seguro <em>antes</em> de que lo sufra todo el mundo?». El rolling y el blue/green te protegen de caídas visibles; el canary y las flags te protegen de <strong>cambios sutiles</strong> —una latencia que sube un 20 %, una tasa de error que pasa de 0,1 % a 0,5 %— que no tumban el servicio pero arruinan la experiencia.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Un canary sin métricas no es un canary: es una ruleta.</strong> Si mandas el 5 % del tráfico a la versión nueva «para ver qué pasa» pero no comparas sus métricas contra las de la versión estable, no estás haciendo un despliegue controlado: estás exponiendo a usuarios sin aprender nada. La decisión de subir o revertir <strong>depende</strong> de los números.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Canary: exponer poco a poco, decidir con datos</h3>
+        <p>Un canary mantiene las dos versiones <strong>vivas y enrutadas a la vez</strong>, pero con pesos distintos. El tráfico se reparte de forma controlada entre la versión <em>stable</em> (la que ya funcionaba) y la <em>canary</em> (la nueva):</p>
+        <pre class="diagram">
+   usuarios                     pesos de trafico (controlados)
+      │                    ┌──────────────────────────────┐
+      ▼                    │  95%  ─▶  [ stable  v1.4.1 ]  │
+   [ ingress / mesh ] ─────┤  5%   ─▶  [ canary  v1.4.2 ]  │ ◀── "el canario"
+                           └──────────────────────────────┘
+   paso a paso:  5% ──▶ 25% ──▶ 50% ──▶ 100%      (solo si las metricas aguantan)
+                 └── si algo empeora: 0%, y ya esta ──┘
+        </pre>
+        <p>La diferencia con blue/green es de <strong>granularidad</strong>: blue/green mueve el interruptor del 0 % al 100 %; el canary mueve una <em>rueda</em> que pasa por porcentajes intermedios, y en cada parada <strong>mira las métricas antes de seguir girando</strong>.</p>
+
+        <h3>Cómo se reparte el tráfico, en la práctica</h3>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Cómo reparte</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Ingress con pesos</strong></td><td>El balanceador HTTP reparte por porcentaje entre dos servicios</td><td>Lo más simple; no hace falta malla de servicios</td></tr>
+            <tr><td><strong>Service mesh</strong></td><td>El <em>proxy</em> lateral reparte por pesos o por cabeceras</td><td>Control fino, además de telemetría por versión</td></tr>
+            <tr><td><strong>Controlador de rollouts</strong></td><td>El propio objeto de despliegue pasos por peso y pausas</td><td>Quieres el ciclo canary declarado como código</td></tr>
+            <tr><td><strong>Feature flags</strong></td><td>No reparte tráfico: enciende el código ya desplegado para un % de usuarios</td><td>Separar desplegar de publicar; kill switch</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Las métricas que deciden (y por qué se comparan)</h3>
+        <p>Un canary no mira «¿va bien?», mira «¿va <em>igual de bien</em> que la versión estable?». La comparación es la clave: siempre se contrastan las métricas de la canary contra el <strong>baseline</strong> de la stable, en la misma ventana de tiempo y con el mismo tipo de tráfico. Las señales típicas:</p>
+        <table>
+          <thead><tr><th>Señal</th><th>Qué revela</th><th>Umbral de ejemplo (canary vs stable)</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Tasa de error</strong> (5xx)</td><td>Fallos funcionales</td><td>+0,5 puntos absolutos → revertir</td></tr>
+            <tr><td><strong>Latencia p95 / p99</strong></td><td>Regresiones de rendimiento</td><td>+20 % → revertir</td></tr>
+            <tr><td><strong>Throughput</strong></td><td>El canary no aguanta la carga</td><td>Caída notable → revertir</td></tr>
+            <tr><td><strong>Saturación</strong> (CPU/memoria)</td><td>Fugas o consumo desproporcionado</td><td>Tendencia al alza → revisar</td></tr>
+            <tr><td><strong>Métricas de negocio</strong></td><td>El cambio «funciona» pero empeora el producto</td><td>Conversión, embeddings fallidos… → revertir</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p><strong>Suficiente tráfico.</strong> Con un 1 % de un servicio con poco volumen, en diez minutos no has visto ni cien peticiones: cualquier diferencia es ruido. El porcentaje inicial y el tiempo de observación deben dar una muestra estadísticamente útil. Si tu servicio tiene poco tráfico, el canary por porcentaje sirve de poco: usa feature flags (que separan por usuario, no por volumen) o pruebas funcionales sobre el entorno inactivo.</p>
+        </div>
+
+        <h3>Automatizar la decisión</h3>
+        <p>La versión manual —un humano mira el panel y decide— es un buen punto de partida, pero el estándar actual es <strong>declarar el análisis como código</strong>: el controlador de despliegue consulta tus métricas (Prometheus, Datadog…) contra los umbrales y sube o revierte solo. El ciclo queda así:</p>
+        <ol class="steps">
+          <li><strong>Desplegar</strong> la canary (por ejemplo, al 5 %) sin tocar la stable.</li>
+          <li><strong>Observar</strong> durante una ventana mínima, comparando contra el baseline.</li>
+          <li><strong>Promocionar</strong> el peso (25 % → 50 % → 100 %) si aguanta.</li>
+          <li><strong>Revertir</strong> a 0 % en cuanto un umbral se incumple, sin intervención humana.</li>
+        </ol>
+
+        <h3>Feature flags: desplegar ≠ publicar</h3>
+        <p>Una feature flag es un <strong>interruptor en tiempo de ejecución</strong> que decide qué código se ejecuta para qué usuario, sin re-desplegar. El código nuevo ya está en el servidor; la flag decide si se enciende.</p>
+        <pre class="diagram">
+   DEPLOY (codigo llega a produccion)          RELEASE (los usuarios lo ven)
+   ┌───────────────────────────────┐           ┌───────────────────────────┐
+   │  v1.4.2 ya corre en el cluster │  ───flag──▶│  if flag ON: nuevo flujo   │
+   │  pero la via nueva esta OFF    │   "off"    │  else:     flujo clasico   │
+   └───────────────────────────────┘           └───────────────────────────┘
+        desplegar es tecnico            publicar es una decision de producto
+        </pre>
+        <p>Tipos de flags según su vida útil:</p>
+        <ul>
+          <li><strong>Release flag</strong>: oculta una funcionalidad que aún no está lista. Corta vida: se retira tras publicar.</li>
+          <li><strong>Ops flag / kill switch</strong>: apaga una función problemática <em>sin desplegar</em>. Es el botón de pánico del producto.</li>
+          <li><strong>Experiment flag</strong>: divide el tráfico entre variantes (A/B testing).</li>
+          <li><strong>Permission flag</strong>: habilita funciones por plan o por cliente. Larga vida, gestión de producto.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el despliegue es <em>traer</em> el mueble nuevo a casa; la flag es <em>abrirlo</em>. Puedes tener el mueble guardado en el salón sin que nadie lo use (código desplegado con la flag apagada) y estrenarlo el día que quieras. Si resulta que ocupa demasiado, lo devuelves a la caja sin mover el resto de la casa (apagas la flag sin desplegar).</p>
+        </div>
+        <div class="callout callout--tip">
+          <p><strong>Canary y flags se complementan.</strong> Puedes desplegar la versión nueva con la funcionalidad <em>apagada</em> (sin riesgo) y, una vez el artefacto está en producción, encenderla para un porcentaje de usuarios con la flag. El canary controla <em>qué versión del código</em> ve la gente; la flag controla <em>qué comportamiento</em> dentro de esa versión.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Las flags también son deuda técnica.</strong> Cada flag sin retirar es una rama más de código que hay que probar y razonar. Una release flag olvidada durante meses es una bomba de relojería: nadie recuerda si está segura, y la mitad del código se vuelve condicional. Pon dueño y fecha a cada flag, y retírala en cuanto cumpla su función (y con ella la rama que ya no se usa).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El átomo del canary con Ingress de NGINX: un segundo recurso de entrada marcado como <em>canary</em> con un <strong>peso</strong>. El 100 % del tráfico iría al Ingress principal; el canary le roba el porcentaje que indiques.</p>
+        <div class="code-file">k8s/ingress-canary.yaml</div>
+        <pre><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: copiloto-api-canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "5"   # ◀── 5% del trafico
+spec:
+  rules:
+    - host: copiloto.academy.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: copiloto-api-canary    # el Service de la version nueva
+                port:
+                  number: 80
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>canary: "true"</code></strong>: le dice al Ingress Controller que este recurso <em>no</em> reemplaza al principal, sino que compite con él por el tráfico.</li>
+          <li><strong><code>canary-weight: "5"</code></strong>: el 5 % de las peticiones van a este backend. El 95 % restante sigue yendo al Ingress principal (el Service <code>stable</code>). Es una rueda, no un interruptor.</li>
+          <li><strong><code>backend … copiloto-api-canary</code></strong>: apunta al Service de la versión nueva. El tráfico se reparte <em>entre dos Servicios</em>, cada uno con sus pods.</li>
+        </ol>
+        <p>Subir el peso es tan simple como cambiar el número —y es adonde engancha la automatización con métricas:</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Subir el canary al 25% (si las metricas van bien).
+kubectl annotate ingress copiloto-api-canary \
+  nginx.ingress.kubernetes.io/canary-weight=25 --overwrite
+</code></pre>
+        <div class="callout callout--note">
+          <p>Para volver a la versión estable, basta con poner el peso a <code>0</code> (o borrar el Ingress canary). El 100 % del tráfico vuelve a la stable <strong>al instante</strong>, igual que en blue/green. Ese «0 %» es el rollback del canary.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Llevemos el Copiloto a un canary <strong>automatizado</strong>: pasos por peso declarados como código, análisis de métricas contra el baseline, y una feature flag para separar desplegar de publicar en la funcionalidad más arriesgada.</p>
+
+        <h3>El canary declarado como pasos, con análisis</h3>
+        <p>Con Argo Rollouts, el propio objeto <code>Rollout</code> describe la escalera de pesos y qué consultar en cada pausa:</p>
+        <div class="code-file">k8s/rollout.yaml</div>
+        <pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: copiloto-api
+spec:
+  replicas: 4
+  strategy:
+    canary:
+      canaryService: copiloto-api-canary    # recibe el % de trafico
+      stableService: copiloto-api-stable    # recibe el resto
+      trafficRouting:
+        nginx:
+          stableIngress: copiloto-api
+      analysis:
+        templates:
+          - templateName: salud-canary
+        startingStep: 1                     # analiza ya en el primer paso
+      steps:
+        - setWeight: 5                      # 5% del trafico al canary
+        - pause: { duration: 5m }           # observa 5 minutos
+        - setWeight: 25
+        - pause: { duration: 5m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+        - setWeight: 100                    # promocion completa
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: salud-canary
+spec:
+  metrics:
+    - name: tasa-errores
+      interval: 1m
+      successCondition: result[0] &lt; 0.01     # menos del 1% de 5xx
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(http_requests_total{job="copiloto-canary", status=~"5.."}[2m]))
+            /
+            sum(rate(http_requests_total{job="copiloto-canary"}[2m]))
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Pasos explícitos por peso</strong>: la escalera (5 → 25 → 50 → 100) está versionada en el repositorio, no en la cabeza de quien despliega. Cualquiera la revisa en un pull request.</li>
+          <li><strong><code>analysis</code> con <code>startingStep: 1</code></strong>: el análisis arranca ya en el primer peso, para no exponer ni siquiera el 5 % sin medición.</li>
+          <li><strong>Umbral sobre la canary</strong>: la consulta mide la tasa de 5xx <em>de los pods canary</em>. Si supera el 1 %, <code>failureLimit</code> se agota y el rollout <strong>revierte solo</strong> a la stable (peso 0 %).</li>
+          <li><strong>Pausas largas en pesos altos</strong>: cuanto más tráfico recibe la canary, más se parece al lanzamiento completo; conviene observar más antes de ir al 100 %.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Compáralo con la <strong>comparación contra el baseline</strong>: una versión sana puede tener, por su propia naturaleza, un 0,6 % de errores. Un umbral fijo del 1 % funcionaría, pero lo robusto es medir la <em>diferencia</em> canary − stable: si el canary no empeora respecto a la stable, promociona. Es la diferencia entre «¿funciona?» y «¿funciona <em>tan bien como antes</em>?».</p>
+        </div>
+
+        <h3>Feature flag: desplegar el flujo nuevo apagado</h3>
+        <p>La funcionalidad estrella de esta release —respuestas con <strong>búsqueda web</strong>— es arriesgada: puede tardar, fallar en fuentes externas, encarecer el coste por token. No queremos que la decisión «desplegar» implique «publicar». La desplegamos <strong>apagada</strong> y la encendemos después:</p>
+        <div class="code-file">app/flags.py</div>
+        <pre><code class="language-python"># La app consulta la flag en tiempo de ejecucion: el mismo binario
+# puede comportarse de dos maneras sin re-desplegar.
+def build_answer(question: str, user_id: str) -> Answer:
+    if flags.enabled("web_search_answer", user_id):
+        return answer_with_web_search(question)   # via nueva
+    return answer_from_knowledge(question)        # via clasica
+</code></pre>
+        <p>Y el despliegue separa <strong>deploy</strong> de <strong>release</strong>:</p>
+        <div class="code-file">.github/workflows/cd.yml</div>
+        <pre><code class="language-yaml">jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Desplegar la version nueva (flujo nuevo APAGADO)
+        run: |
+          # La flag viaja OFF en el despliegue: nadie ve el flujo nuevo todavia.
+          ./scripts/deploy.sh --image "$IMAGE" --flag web_search_answer=off
+
+      - name: Canary automatico (pesos + analisis)
+        run: |
+          # El Rollout sube por pesos y revierte solo si las metricas empeoran.
+          kubectl argo rollouts status copiloto-api --timeout 40m
+
+      - name: Publicar el flujo nuevo: encender la flag para un 10%
+        if: success()
+        run: ./scripts/flags.sh set web_search_answer rollout=10
+
+      - name: Publicar para todos
+        run: ./scripts/flags.sh set web_search_answer rollout=100
+        env:
+          IMAGE: ghcr.io/academy/copiloto-api@${{ steps.digest.outputs.digest }}
+</code></pre>
+        <div class="callout callout--note">
+          <p>Fíjate en que el <strong>kill switch</strong> ya existe: si dentro de una semana la búsqueda web empieza a fallar en producción, la apagas con <code>flags.sh set web_search_answer off</code> —sin desplegar, sin pipeline, en segundos—. Ese botón es, muchas veces, el mejor rollback posible: revierte un <em>comportamiento</em> sin tocar el artefacto.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Comparar la canary contra el baseline de la stable</td>
+              <td>Un umbral absoluto sin referencia</td>
+              <td>«Igual de bien que antes» es la pregunta útil</td>
+            </tr>
+            <tr>
+              <td>Empezar con poco peso y subir por pasos observados</td>
+              <td>Saltar del 0 % al 100 %</td>
+              <td>Expones menos usuarios y ganas datos para decidir</td>
+            </tr>
+            <tr>
+              <td>Declarar el análisis (umbrales, ventanas) como código</td>
+              <td>Decidir «a ojo» mirando un panel</td>
+              <td>Es reproducible, revisable y automatizable</td>
+            </tr>
+            <tr>
+              <td>Separar desplegar (deploy) de publicar (release)</td>
+              <td>Que cada deploy sea un lanzamiento a todos</td>
+              <td>Reduce el riesgo del cambio y habilita el kill switch</td>
+            </tr>
+            <tr>
+              <td>Dueño y fecha de expiración para cada feature flag</td>
+              <td>Flags que viven para siempre</td>
+              <td>El código condicional sin dueño es deuda y riesgo</td>
+            </tr>
+            <tr>
+              <td>Un kill switch para las funciones arriesgadas</td>
+              <td>Depender de un re-despliegue para apagar</td>
+              <td>Apagar en segundos vale más que desplegar en minutos</td>
+            </tr>
+            <tr>
+              <td>Tráfico suficiente antes de concluir</td>
+              <td>Canary con pocas peticiones para sacar conclusiones</td>
+              <td>Sin muestra, la diferencia es ruido</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Canary sin métricas: la ruleta</h3>
+        <span class="code-label code-label--wrong">Mal — exponer sin mirar</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Manda el 50% a la version nueva "y ya veremos". Si algo va mal,
+#    la mitad de tus usuarios lo sufre antes de que nadie reaccione.
+annotations:
+  nginx.ingress.kubernetes.io/canary: "true"
+  nginx.ingress.kubernetes.io/canary-weight: "50"
+</code></pre>
+        <span class="code-label code-label--right">Bien — peso bajo + análisis automático</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Empieza bajo, deja que el análisis vigile el error rate.
+annotations:
+  nginx.ingress.kubernetes.io/canary: "true"
+  nginx.ingress.kubernetes.io/canary-weight: "5"
+# ...y un AnalysisTemplate que revierte si la tasa de 5xx supera el umbral.
+</code></pre>
+
+        <h3>Feature flag que se queda para siempre</h3>
+        <span class="code-label code-label--wrong">Mal — código condicional sin dueño</span>
+        <pre class="code-wrong"><code class="language-python"># ❌ La funcionalidad se publico hace dos anos y la flag sigue ahi:
+#    nadie sabe si es segura apagarla; el codigo tiene dos caminos eternos.
+if flags.enabled("nueva_ui_2024"):
+    render_new_ui()
+else:
+    render_old_ui()
+</code></pre>
+        <span class="code-label code-label--right">Bien — retirar la flag tras publicar</span>
+        <pre class="code-right"><code class="language-python"># ✅ La flag guio el lanzamiento y luego se retiro con la rama antigua.
+#    Queda una sola via, sin condicionales muertos:
+render_new_ui()
+</code></pre>
+
+        <h3>Evaluar la flag sin versionarla ni cachear bien</h3>
+        <span class="code-label code-label--wrong">Mal — config a mano y sin trazas</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Cambiar variables a mano en el servidor: no queda historial, no es
+#    reproducible, y un reinicio puede perder el cambio.
+kubectl set env deployment/copiloto-api WEB_SEARCH=on
+</code></pre>
+        <span class="code-label code-label--right">Bien — flags gestionadas y auditables</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Las flags se cambian por su API/CLI, quedan registradas y son
+#    reversibles; el codigo las lee en tiempo de ejecucion.
+./scripts/flags.sh set web_search_answer rollout=10
+./scripts/flags.sh set web_search_answer off     # kill switch
+</code></pre>
+
+        <h3>Sacar conclusiones con poco tráfico</h3>
+        <span class="code-label code-label--wrong">Mal — canary sin muestra significativa</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Con un servicio de 200 peticiones/hora, un peso del 1% son 2 peticiones:
+#    cualquier subida de latencia es ruido, no una senal.
+steps:
+  - setWeight: 1
+  - pause: { duration: 2m }
+  - setWeight: 100
+</code></pre>
+        <span class="code-label code-label--right">Bien — peso y ventana suficientes, o flags</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Con poco trafico, sube el peso y la ventana (o separa por usuario
+#    con feature flags, que no dependen del volumen).
+steps:
+  - setWeight: 25
+  - pause: { duration: 30m }
+  - setWeight: 100
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> repartir tráfico real entre dos versiones con un Ingress canary, subir el peso por pasos y comprobar de verdad que el porcentaje cambia. Usaremos <code>kind</code> y una imagen que devuelve su versión.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> prepara el clúster con el controlador de Ingress y los dos servicios:
+            <pre><code class="language-bash">kind create cluster --name canary-lab
+kubectl apply -f https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml
+
+# Dos versiones: stable (v1.4.1) y canary (v1.4.2).
+kubectl apply -f k8s/stable.yaml
+kubectl apply -f k8s/canary.yaml
+kubectl apply -f k8s/ingress-main.yaml      # 100% al stable
+</code></pre>
+            <p>Resultado esperado: ambos deployments corriendo; solo el Ingress principal enruta a <code>copiloto-api-stable</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> añade el Ingress canary al 5 % y comprueba el reparto con un bucle de peticiones:
+            <pre><code class="language-bash">kubectl apply -f k8s/ingress-canary.yaml   # canary-weight: 5
+
+# Lanza 100 peticiones y cuenta cuantas respondio la version nueva.
+for i in $(seq 1 100); do
+  curl -s http://copiloto.local/version
+done | sort | uniq -c
+</code></pre>
+            <p>Resultado esperado: la cuenta se parece a <code>95 … v1.4.1</code> y <code>5 … v1.4.2</code>. El reparto por peso funciona.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> sube el peso por pasos y observa de nuevo:
+            <pre><code class="language-bash">kubectl annotate ingress copiloto-api-canary \
+  nginx.ingress.kubernetes.io/canary-weight=50 --overwrite
+
+for i in $(seq 1 100); do curl -s http://copiloto.local/version; done \
+  | sort | uniq -c
+</code></pre>
+            <p>Resultado esperado: ahora el reparto ronda el 50/50. En un canary real, entre este paso y el anterior <strong>habrías mirado las métricas</strong> antes de subir.</p>
+          </li>
+          <li>
+            <strong>Paso 4 (rollback del canary):</strong> devuelve el canary al 0 % y confirma que todo vuelve a la stable:
+            <pre><code class="language-bash">kubectl annotate ingress copiloto-api-canary \
+  nginx.ingress.kubernetes.io/canary-weight=0 --overwrite
+
+for i in $(seq 1 100); do curl -s http://copiloto.local/version; done \
+  | sort | uniq -c
+</code></pre>
+            <p>Resultado esperado: las 100 peticiones responden <code>v1.4.1</code>. El canary se ha retirado sin reiniciar nada, en un instante.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (feature flag en local):</strong> demuestra el concepto con una flag trivial sin tocar el clúster:
+            <pre><code class="language-bash"># La misma version del codigo, dos comportamientos, cero re-despliegues.
+FLAG_WEB_SEARCH=off python -c "import app; print(app.answer('hola'))"
+FLAG_WEB_SEARCH=on  python -c "import app; print(app.answer('hola'))"
+kind delete cluster --name canary-lab
+</code></pre>
+            <p>Resultado esperado: la misma app, dos respuestas distintas, según la flag. Eso es <strong>deploy ≠ release</strong>: el código es el mismo; lo que cambia es el interruptor.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Canary que decide solo, con kill switch de producto</h3>
+          <p>Diseña un canary <strong>totalmente automático</strong> para el Copiloto: define los umbrales de promoción y de reversión de dos señales distintas (por ejemplo, tasa de 5xx <em>y</em> latencia p95 <strong>relativas al baseline</strong>, no absolutas), declara la escalera de pesos como código y haz que la decisión de subir o revertir la tome el propio sistema tras cada ventana de observación. Añade, además, una <strong>feature flag de kill switch</strong> para la funcionalidad más arriesgada del cambio, y demuestra que apagarla revierte el comportamiento <em>sin</em> volver a desplegar ni tocar el canary.</p>
+          <p><em>Pista: las señales relativas se calculan comparando las métricas de la canary con las de la stable en la misma ventana (una consulta Prometheus que devuelva el cociente, y un umbral sobre ese cociente). Para el kill switch, el flujo es: el canary sube porque el <em>artefacto</em> es sano, pero la <em>funcionalidad</em> se controla aparte con la flag. Reflexiona: ¿en qué casos conviene revertir el artefacto (bajar el canary) y en qué casos basta con apagar una flag —y por qué «revertir el comportamiento» es a menudo la operación más rápida y menos arriesgada de todas?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>canary</strong> expone un porcentaje pequeño de tráfico a la versión nueva y sube por pasos <strong>solo si las métricas aguantan</strong>.</li>
+          <li>Un canary sin métricas es una ruleta: hay que <strong>comparar contra el baseline</strong> de la versión estable (error rate, latencia p95/p99, throughput, negocio).</li>
+          <li>Las <strong>feature flags</strong> separan <strong>desplegar</strong> de <strong>publicar</strong>: el código llega a producción apagado y se enciende a voluntad, por usuario o porcentaje.</li>
+          <li>El <strong>kill switch</strong> es un rollback de comportamiento: apagar una función en segundos, sin desplegar.</li>
+          <li>Las flags son <strong>deuda</strong>: dueño, fecha y retirada. Una release flag olvidada es un riesgo latente.</li>
+          <li>Canary y flags se combinan: canary controla <em>qué versión del código</em>; la flag, <em>qué comportamiento</em>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece</th></tr></thead>
+          <tbody>
+            <tr><td>Canary</td><td>Un % de tráfico a la versión nueva</td><td><code>canary-weight: "5"</code> / <code>setWeight</code></td></tr>
+            <tr><td>Baseline</td><td>Las métricas de la versión estable</td><td>Comparación canary vs stable</td></tr>
+            <tr><td>Análisis</td><td>Umbrales y ventanas como código</td><td><code>AnalysisTemplate</code></td></tr>
+            <tr><td>Promoción</td><td>Subir el peso si aguanta</td><td><code>setWeight: 100</code></td></tr>
+            <tr><td>Feature flag</td><td>Interruptor en tiempo de ejecución</td><td><code>flags.enabled("…")</code></td></tr>
+            <tr><td>Kill switch</td><td>Apagar un comportamiento sin desplegar</td><td><code>flags.sh set … off</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Canary y blue/green no son lo mismo?</summary>
+            <div>
+              <p>Se parecen en que ambos mantienen dos versiones vivas y permiten revertir rápido, pero se diferencian en <strong>granularidad y en el criterio de promoción</strong>. Blue/green es binario: 0 % o 100 %, y decides promoviendo el conjunto entero tras probarlo <em>sin</em> usuarios. El canary es gradual: pasas por 5 %, 25 %, 50 %… y decides con <strong>métricas de tráfico real</strong>. Blue/green prueba antes de exponer; canary expone un poco y mide. Muchas organizaciones usan los dos según el tipo de cambio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué porcentaje inicial pongo al canary?</summary>
+            <div>
+              <p>Depende del volumen y del riesgo. La regla práctica: <strong>suficiente para obtener una muestra significativa en tu ventana de observación, y lo más pequeño que puedas permitirte</strong>. Con mucho tráfico, 1 % ya da miles de peticiones en minutos. Con poco, un 1 % no dice nada y quizá necesites 25 % con ventanas largas. Y recuerda que el canary necesita <em>volumen</em>: si tu servicio es de bajo tráfico, las flags (que separan por usuario, no por cantidad) pueden ser mejor herramienta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué comparar contra el baseline y no con un umbral fijo?</summary>
+            <div>
+              <p>Porque cada servicio tiene su «normal». Una tasa de 5xx del 0,4 % puede ser excelente… o el triple de lo habitual. Un umbral absoluto no distingue «sano» de «regresión»: o es tan laxo que no detecta nada, o tan estricto que revierte versiones buenas. Comparar la canary <strong>con la stable en la misma ventana</strong> pregunta lo correcto: «¿esta versión se comporta peor que la que ya funcionaba?». Ese cociente relativo es la señal robusta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿«Desplegar ≠ publicar» no complica demasiado?</summary>
+            <div>
+              <p>Añade una pieza, sí, pero resuelve un problema real: desacopla dos decisiones con riesgos muy distintos. Desplegar es una operación técnica (que el artefacto llegue y arranque); publicar es una decisión de producto (que los usuarios lo vean). Al separarlas ganas un botón para encender y apagar comportamiento sin tocar el pipeline, expones de forma gradual y puedes revertir en segundos. La complicación se paga sola en cuanto un incidente se resuelve apagando una flag en lugar de haciendo un rollback completo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo retiro una feature flag?</summary>
+            <div>
+              <p>Cuando ha cumplido su función. Una <strong>release flag</strong> debe retirarse en cuanto la funcionalidad está publicada para todos y es estable: se elimina el condicional, se borra la rama muerta y se quita la propia flag. Las <strong>ops flags</strong> (kill switches) y las <strong>permission flags</strong> sí viven mucho tiempo, pero deben tener dueño y sentido permanente. La prueba: si nadie sabría decir si es seguro apagar esa flag, es deuda urgente, no una herramienta.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

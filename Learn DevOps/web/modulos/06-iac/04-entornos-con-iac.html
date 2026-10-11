@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-entornos-con-iac">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Entornos con IaC — Módulo 6 · Curso DevOps</title>
+  <meta name="description" content="Entornos con infraestructura como código: workspaces frente a var-files, promoción entre entornos y CI para IaC con terraform plan en la pull request y apply en main.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Entornos con IaC</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Infraestructura como código</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya sabemos describir la infraestructura (lección 2) y repartir su estado en módulos aislados (lección 3). Falta la pieza que une todo con el pipeline: <strong>cómo modelar entornos</strong> —staging y producción— sobre el mismo código, y <strong>cómo automatizar la IaC con CI</strong> para que nadie aplique «desde su portátil».</p>
+        <p>La meta es la misma que en el módulo 4: que <em>staging</em> valide antes que producción, que el cambio se revise en una pull request y que el <code>apply</code> de producción esté detrás de una aprobación. La diferencia es qué se promueve: aquí no promocionamos una imagen, promocionamos <strong>un commit de infraestructura</strong>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque la IaC sin CI es solo «infra escrita en archivos». El valor real aparece cuando el <code>plan</code> se revisa en cada pull request y el <code>apply</code> lo ejecuta un pipeline con permisos controlados. Eso cierra el círculo que abrimos en la lección 1.</p>
+        </div>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el <code>plan</code> es el presupuesto que el fontanero te enseña <em>antes</em> de tocar la obra; el <code>apply</code> es la obra. Nadie contrata una reforma para que el fontanero decida el precio al final. La aprobación del entorno de producción es tu firma en ese presupuesto.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tres formas de modelar entornos</h3>
+        <p>Todas comparten la idea «mismo código, distintos valores y distinto estado». Cambia dónde vive esa diferencia.</p>
+        <table>
+          <thead><tr><th></th><th>Workspaces</th><th>Un directorio por entorno (var-files)</th><th>Un repositorio por entorno</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Estado</strong></td><td>Uno por workspace, mismo backend</td><td>Uno por entorno, backend propio</td><td>Uno por repo</td></tr>
+            <tr><td><strong>Valores</strong></td><td>Un <code>.tfvars</code> por workspace</td><td><code>envs/staging</code>, <code>envs/prod</code></td><td>Separados por completo</td></tr>
+            <tr><td><strong>Aislamiento</strong></td><td>Medio (fácil equivocarse de workspace)</td><td><strong>Alto</strong> y explícito</td><td>Máximo</td></tr>
+            <tr><td><strong>Coste de mantenimiento</strong></td><td>Bajo</td><td>Medio</td><td>Alto (duplicación)</td></tr>
+            <tr><td><strong>Recomendado para</strong></td><td>Entornos efímeros y de prueba</td><td>Staging y producción del Copiloto</td><td>Organizaciones con equipos muy separados</td></tr>
+          </tbody>
+        </table>
+        <p>En este curso usamos <strong>un directorio por entorno</strong>, que es lo que recomienda la propia documentación de Terraform: cada módulo raíz tiene su backend y su estado, y llama al mismo módulo hijo con distintos valores. Es la opción más legible y la que hace dificilísimo tocar producción por accidente.</p>
+        <div class="code-file">infra/envs/ (un módulo raíz por entorno)</div>
+        <pre><code class="language-text">envs/
+├── staging/
+│   ├── main.tf          module "service" { replicas = 1 }
+│   ├── backend.hcl      key = "copiloto/staging/terraform.tfstate"
+│   └── staging.tfvars   environment = "staging"
+└── prod/
+    ├── main.tf          module "service" { replicas = 4 }
+    ├── backend.hcl      key = "copiloto/prod/terraform.tfstate"
+    └── prod.tfvars      environment = "prod"
+</code></pre>
+
+        <h3>Workspaces: cuándo sí</h3>
+        <p>Un <em>workspace</em> es un estado independiente bajo el mismo backend. Con <code>terraform workspace select staging</code> cambias de contexto, y <code>terraform.workspace</code> te da el nombre para condicionar valores.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">terraform workspace list           # default, staging, prod
+terraform workspace new staging
+terraform workspace select prod
+TF_WORKSPACE=prod terraform plan   # en CI: fija el workspace sin comandos interactivos
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>El peligro de los workspaces:</strong> es fácil olvidar cuál está seleccionado y aplicar en el equivocado. Un <code>environment: ${{ matrix.env }}</code> mal resuelto en el CI puede hacer lo mismo. Para entornos de larga vida como producción, preferimos directorios separados: el estado y el backend están escritos en el código, no en un estado de sesión que hay que recordar.</p>
+        </div>
+
+        <h3>Promoción: qué se promueve en IaC</h3>
+        <p>En el módulo 4 promocionábamos <strong>la misma imagen</strong> por los entornos. En IaC promocionamos <strong>el mismo commit</strong>: el que pasó <code>fmt</code>, <code>validate</code> y <code>plan</code> en <em>staging</em> es el que se aplica en producción, con otro archivo de variables.</p>
+        <pre class="diagram">
+   PR: commit de infra ──▶ plan (staging) ──▶ revision + aprobacion
+                                   │
+                                   ▼  merge a main
+                          apply (staging) ──▶ OK
+                                   │
+                                   ▼  misma revision, otro backend/tfvars
+                          apply (prod) ──▶ aprobacion de entorno ──▶ OK
+        </pre>
+        <p>Lo que <em>nunca</em> se promueve en IaC es un «plan» exportado entre entornos: un plan está atado a un estado y a una revisión concretos. El plan de <em>staging</em> no es válido contra el estado de producción. Se revisa un plan por entorno; se aplica el plan que se acaba de generar <em>en ese mismo entorno</em>.</p>
+
+        <h3>CI para IaC: plan en la PR, apply en main</h3>
+        <p>El patrón es el mismo que en el módulo 2, aplicado a la infraestructura:</p>
+        <ol class="steps">
+          <li><strong>En la pull request</strong> (<code>paths: infra/**</code>): <code>fmt -check</code>, <code>init</code>, <code>validate</code> y <code>plan</code>. El plan se publica como comentario para que el revisor vea el diff exacto.</li>
+          <li><strong>En merge a <code>main</code></strong>: se regenera el plan y se aplica, con el entorno <code>production</code> protegido por aprobación. El <code>apply</code> usa un rol con permisos de escritura; el de la PR, solo lectura.</li>
+          <li><strong>Siempre</strong>: <strong>OIDC</strong> en vez de claves de larga vida, y un grupo de <code>concurrency</code> que serialice los <code>apply</code> para no corromper el estado.</li>
+        </ol>
+        <table>
+          <thead><tr><th>Riesgo</th><th>Control en el CI</th></tr></thead>
+          <tbody>
+            <tr><td>Aplicar un cambio no revisado</td><td><code>apply</code> solo en <code>main</code>, nunca en la PR</td></tr>
+            <tr><td>Dos <code>apply</code> simultáneos corrompen el estado</td><td><code>concurrency</code> + <code>-lock-timeout</code> (el backend bloquea)</td></tr>
+            <tr><td>Credenciales filtradas de larga vida</td><td>OIDC: token efímero, <code>id-token: write</code>, sin secrets estáticos</td></tr>
+            <tr><td>Aplicar en producción sin querer</td><td><code>environment: production</code> con revisores obligatorios</td></tr>
+            <tr><td>Estilo y errores detectados tarde</td><td><code>fmt -check</code> y <code>validate</code> antes del <code>plan</code></td></tr>
+            <tr><td>Deriva silenciosa en la infra</td><td><code>plan</code> programado (cron) que abre un issue si hay diferencias</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>El plan es el artefacto de revisión.</strong> Publícalo en la PR con <code>-no-color</code> y truncado (<code>%0A</code> es tu amigo), guarda también el archivo <code>tfplan</code> como <em>artifact</em> por si hace falta el detalle completo, y adjunta el resultado de <code>fmt</code> y <code>validate</code> para que el revisor no tenga que adivinar nada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El workflow más pequeño que aporta valor real: <strong>validar y planificar</strong> cada pull request que toque <code>infra/</code>. Sin <code>apply</code>: nada toca la infraestructura todavía.</p>
+        <div class="code-file">.github/workflows/iac.yml</div>
+        <pre><code class="language-yaml">name: iac
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/envs/staging
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false -backend-config=backend.hcl
+      - run: terraform validate
+      - run: terraform plan -input=false -lock-timeout=5m
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>on.pull_request.paths: infra/**</code></strong>: el workflow solo se dispara si el PR toca infraestructura. Un cambio en la API no necesita planificar Terraform.</li>
+          <li><strong><code>permissions: contents: read</code></strong>: aquí no necesitamos escribir nada ni autenticar en la nube. El mínimo privilegio empieza por pedir solo lo que se usa.</li>
+          <li><strong><code>TF_IN_AUTOMATION: "true"</code></strong>: ajusta los mensajes de Terraform para el log (quita las sugerencias interactivas).</li>
+          <li><strong><code>working-directory: infra/envs/staging</code></strong>: cada step corre dentro del módulo raíz del entorno.</li>
+          <li><strong><code>hashicorp/setup-terraform@v4</code></strong>: instala el binario. Fija su versión en el <code>with</code> (<code>terraform_version</code>) para reproducibilidad; aquí usamos la que traiga por defecto.</li>
+          <li><strong><code>fmt -check -recursive</code></strong>: falla si el formato no es el canónico. Es el <code>lint</code> de la infraestructura.</li>
+          <li><strong><code>init -backend-config=backend.hcl</code></strong>: descarga providers y conecta con el backend del entorno sin meter el bucket en el <code>.tf</code>.</li>
+          <li><strong><code>validate</code> + <code>plan -lock-timeout=5m</code></strong>: coherencia y previsualización. El <code>-lock-timeout</code> espera si el estado está bloqueado en lugar de fallar de inmediato.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Fíjate en que <strong>no hay <code>apply</code></strong>. Este workflow responde a la pregunta «¿qué pasaría si aplicara?» sin cambiar nada. Es la mitad segura y la que primero debe existir.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El pipeline de IaC del Copiloto: <code>plan</code> en cada PR con el resultado publicado como comentario, y <code>apply</code> en <code>main</code> detrás de la aprobación del entorno <code>production</code>. Autenticación por OIDC y serialización con <code>concurrency</code>.</p>
+        <div class="code-file">.github/workflows/iac.yml</div>
+        <pre><code class="language-yaml">name: iac
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write      # necesario para OIDC
+  pull-requests: write # necesario para comentar el plan en la PR
+
+# Serializa los runs: nunca dos apply a la vez sobre el mismo estado.
+concurrency:
+  group: iac-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.9.5"
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Formato
+        run: terraform fmt -check -recursive
+
+      # Token efimero por OIDC: rol de SOLO LECTURA para planificar.
+      - name: Credenciales
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/terraform-plan
+          aws-region: eu-west-1
+
+      - name: Init
+        run: terraform -chdir=infra/envs/staging init -input=false -backend-config=backend.hcl
+
+      - name: Validate
+        run: terraform -chdir=infra/envs/staging validate
+
+      - name: Plan
+        run: |
+          terraform -chdir=infra/envs/staging plan \
+            -input=false -no-color -lock-timeout=5m -out=tfplan | tee plan.txt
+
+      - name: Guardar el plan como artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan
+          path: infra/envs/staging/tfplan
+          retention-days: 5
+
+      - name: Publicar el plan en la PR
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8').slice(0, 60000);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '### Terraform plan\n\n```\n' + plan + '\n```'
+            });
+
+  apply:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.copiloto.com
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Rol de ESCRITURA, solo disponible para este job protegido.
+      - name: Credenciales
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/terraform-apply
+          aws-region: eu-west-1
+
+      - name: Init
+        run: terraform -chdir=infra/envs/prod init -input=false -backend-config=backend.hcl
+
+      - name: Validate
+        run: terraform -chdir=infra/envs/prod validate
+
+      - name: Plan y apply en el mismo run
+        run: |
+          terraform -chdir=infra/envs/prod plan \
+            -input=false -lock-timeout=5m -out=tfplan
+          terraform -chdir=infra/envs/prod apply \
+            -input=false -lock-timeout=5m tfplan
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>if: github.event_name == 'pull_request'</code></strong> frente a <code>!= 'pull_request'</code>: dos caminos bien separados. La PR <em>nunca</em> aplica; <code>main</code> aplica, y lo hace pasando por el entorno protegido.</li>
+          <li><strong><code>environment: production</code></strong>: activa las reglas que configuraste en el módulo 4, lección 3 (revisores obligatorios). El job se queda esperando la aprobación humana antes de tocar producción.</li>
+          <li><strong>Dos roles, dos permisos</strong>: <code>terraform-plan</code> es de solo lectura; <code>terraform-apply</code> escribe. Si el código de la PR es malicioso, no puede más que leer.</li>
+          <li><strong>OIDC</strong> (<code>id-token: write</code>): GitHub emite un token de corta vida que asume el rol; no hay claves AWS guardadas en el repositorio. Es la práctica actual recomendada.</li>
+          <li><strong><code>concurrency</code></strong>: si dos runs del mismo <em>ref</em> coinciden, el segundo espera. Con <code>cancel-in-progress: false</code>, jamás se mata un <code>apply</code> a medias.</li>
+          <li><strong><code>-out=tfplan</code> + <code>apply tfplan</code></strong>: el plan se genera y se aplica <em>en el mismo run</em>. Es la forma robusta: un plan de otro contexto o de otra revisión no es válido.</li>
+          <li><strong><code>upload-artifact</code> del <code>tfplan</code></strong>: deja el plan completo descargable para quien revise, aunque el comentario se trunca.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Para el <code>apply</code> de <em>staging</em> (sin aprobación) basta con el mismo job cambiando <code>environment: staging</code> y la ruta a <code>infra/envs/staging</code>. Muchos equipos despliegan staging automáticamente al mergear y dejan producción como único punto con aprobación: así el cambio llega a producción «ya probado por el pipeline».</p>
+        </div>
+        <div class="callout callout--warning">
+          <p>Las versiones de las actions (<code>checkout@v7</code>, <code>setup-terraform@v4</code>, <code>configure-aws-credentials@v4</code>) cambian con el tiempo. Fija siempre una versión mayor explícita y revísalas de forma periódica; nunca dejes una action sin versión. Si usas OpenTofu, cambia <code>hashicorp/setup-terraform</code> por <code>opentofu/setup-opentofu</code> y los comandos <code>tofu</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>plan</code> en la PR y <code>apply</code> en <code>main</code></td>
+              <td><code>apply</code> en cada pull request</td>
+              <td>Nadie debe poder cambiar producción desde una rama sin revisión</td>
+            </tr>
+            <tr>
+              <td>Un directorio por entorno con su backend</td>
+              <td>Un único estado y un <em>workspace</em> «que hay que recordar»</td>
+              <td>El aislamiento queda escrito en el código, no en la sesión</td>
+            </tr>
+            <tr>
+              <td>OIDC con roles de mínimo privilegio</td>
+              <td>Claves cloud de larga vida en <em>secrets</em></td>
+              <td>Menos superficie de fuga y rotación innecesaria</td>
+            </tr>
+            <tr>
+              <td><code>concurrency</code> + locking del backend</td>
+              <td>Dejar que dos <code>apply</code> corran a la vez</td>
+              <td>Escrituras concurrentes corrompen el estado</td>
+            </tr>
+            <tr>
+              <td>Plan guardado y aplicado en el mismo run</td>
+              <td>Promocionar un <code>tfplan</code> entre entornos</td>
+              <td>El plan está atado a un estado y a una revisión concretos</td>
+            </tr>
+            <tr>
+              <td>Entorno <code>production</code> con revisores</td>
+              <td>Aprobar pulsando «merge» sin más</td>
+              <td>La aprobación explícita es tu control de cambio</td>
+            </tr>
+            <tr>
+              <td><code>plan</code> programado para detectar deriva</td>
+              <td>Confiar en que la infra «se queda quieta»</td>
+              <td>Otros equipos y humanos cambian cosas; el drift hay que verlo</td>
+            </tr>
+            <tr>
+              <td>Fijar versiones de Terraform y de las actions</td>
+              <td>Dejar que «coja la última»</td>
+              <td>Reproducibilidad: lo que ayer funcionó debe funcionar mañana</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Aplicar desde la pull request</h3>
+        <span class="code-label code-label--wrong">Mal — la PR toca producción</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Cualquier rama puede aplicar sin revision ni aprobacion.
+on:
+  pull_request:
+    paths: ["infra/**"]
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - run: terraform -chdir=infra/envs/prod apply -auto-approve -input=false
+</code></pre>
+        <span class="code-label code-label--right">Bien — plan en PR, apply en main</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ La PR solo planifica; el apply vive en main y pasa por el entorno protegido.
+on:
+  pull_request:
+    paths: ["infra/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: terraform -chdir=infra/envs/staging plan -input=false
+  apply:
+    if: github.event_name == 'push'
+    environment: production
+    steps:
+      - run: terraform -chdir=infra/envs/prod apply -input=false tfplan
+</code></pre>
+
+        <h3>Claves cloud de larga vida en los secretos</h3>
+        <span class="code-label code-label--wrong">Mal — credenciales estáticas</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Dos claves con permisos amplios, guardadas para siempre en el repositorio.
+- run: terraform apply -auto-approve
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+</code></pre>
+        <span class="code-label code-label--right">Bien — OIDC con token efímero</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ No hay claves guardadas: GitHub emite un token de corta vida para asumir el rol.
+permissions:
+  id-token: write
+  contents: read
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/terraform-apply
+      aws-region: eu-west-1
+</code></pre>
+
+        <h3>Sin <code>concurrency</code>: dos <code>apply</code> a la vez</h3>
+        <span class="code-label code-label--wrong">Mal — escrituras simultáneas</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Un merge rapido puede lanzar dos runs que escriban el estado a la vez.
+on:
+  push:
+    branches: [main]
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+</code></pre>
+        <span class="code-label code-label--right">Bien — serializar por ref</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El grupo de concurrencia pone en cola el segundo run; no lo cancela.
+concurrency:
+  group: iac-${{ github.ref }}
+  cancel-in-progress: false
+</code></pre>
+
+        <h3>Secretos en los <code>.tfvars</code> versionados</h3>
+        <span class="code-label code-label--wrong">Mal — la contraseña en el repositorio</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ prod.tfvars va a Git con la contrasena de la base de datos en claro.
+db_password = "copiloto-2026"
+</code></pre>
+        <span class="code-label code-label--right">Bien — el valor entra desde el entorno del CI</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El .tfvars solo lleva lo no secreto; el secreto entra como TF_VAR_ desde el CI.
+- name: Plan
+  run: terraform -chdir=infra/envs/prod plan -input=false -out=tfplan
+  env:
+    TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+</code></pre>
+
+        <h3>Un único estado para todos los entornos</h3>
+        <span class="code-label code-label--wrong">Mal — un plan que todo lo ve</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ El plan de staging lista tambien los cambios de produccion, y un typo
+# en el entorno puede aplicar sobre los recursos equivocados.
+terraform -chdir=infra plan -var-file=terraform.tfvars -out=tfplan
+</code></pre>
+        <span class="code-label code-label--right">Bien — un estado por entorno</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Cada entorno tiene su backend y su estado: el plan solo ve lo suyo.
+terraform -chdir=infra/envs/staging plan -backend-config=backend.hcl -out=tfplan
+terraform -chdir=infra/envs/prod    plan -backend-config=backend.hcl -out=tfplan
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir el workflow de IaC al repositorio del Copiloto, ver el <code>plan</code> publicado en una pull request, y comprobar que el <code>apply</code> solo ocurre en <code>main</code> y con aprobación.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> prepara la estructura y un cambio pequeño que planificar.
+            <pre><code class="language-bash">mkdir -p infra/envs/staging infra/envs/prod
+# copia main.tf, backend.hcl y el .tfvars del ejemplo real en cada entorno
+git checkout -b infra/add-iac-pipeline
+</code></pre>
+            <p>Resultado esperado: los dos módulos raíz con su <code>backend.hcl</code> y el módulo <code>infra/modules/service</code> común.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea <code>.github/workflows/iac.yml</code> con el ejemplo real (jobs <code>plan</code> y <code>apply</code>, <code>concurrency</code>, <code>permissions</code>).
+          </li>
+          <li>
+            <strong>Paso 3:</strong> abre la pull request y mira los checks.
+            <pre><code class="language-bash">git add infra .github/workflows/iac.yml
+git commit -m "ci(infra): plan en PR"
+git push -u origin infra/add-iac-pipeline
+gh pr create --fill
+gh pr checks --watch
+</code></pre>
+            <p>Resultado esperado: el job <code>plan</code> corre, pasa <code>fmt</code> y <code>validate</code>, y publica un <strong>comentario con el plan</strong> en la PR. El job <code>apply</code> ni aparece (está condicionado a <code>push</code> en <code>main</code>).</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> provoca un cambio y observa que el plan lo anticipa. Cambia <code>replicas</code> de <code>1</code> a <code>2</code> en <code>infra/envs/staging/main.tf</code>, haz commit y push.
+            <pre><code class="language-bash">git commit -am "infra: subir replicas a 2"
+git push
+</code></pre>
+            <p>Resultado esperado: un nuevo comentario con <code>~ update in-place</code> y <code>Plan: 0 to add, 1 to change, 0 to destroy</code>. Ese es el diff que el revisor aprueba.</p>
+          </li>
+          <li>
+            <strong>Paso 5:</strong> mergea a <code>main</code> y comprueba la aprobación.
+            <pre><code class="language-bash">gh pr merge --squash --delete-branch
+gh run list --workflow=iac.yml
+gh run watch
+</code></pre>
+            <p>Resultado esperado: el job <code>apply</code> entra en el entorno <code>production</code> y queda <strong>esperando aprobación</strong>. Apruébalo en <em>Actions → el run → Review deployments</em> y verás el <code>apply</code> completarse.</p>
+          </li>
+          <li>
+            <strong>Paso 6 (verificación):</strong> reproduce el plan en local para comprobar que el CI no hace magia.
+            <pre><code class="language-bash">cd infra/envs/staging
+terraform fmt -check -recursive
+terraform init -input=false -backend-config=backend.hcl
+terraform validate
+terraform plan -input=false -lock-timeout=5m
+</code></pre>
+            <p>Resultado esperado: los mismos mensajes que en el log del job. Si local y CI coinciden, el pipeline es reproducible; si difieren, casi siempre es por una variable que no está en el <code>.tfvars</code> o por credenciales distintas.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Puedes probar el workflow sin abrir una PR de verdad con <code>act pull_request</code> en local para ver la resolución de <code>paths</code> y <code>if</code>. El <code>apply</code> real necesita credenciales, así que en local limítate a <code>fmt</code>, <code>validate</code> y <code>plan</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Política como código y vigilancia de deriva</h3>
+          <p>Amplía el pipeline de IaC con dos controles: <strong>política</strong> y <strong>vigilancia</strong>.</p>
+          <p>Por un lado, añade una comprobación de políticas al job <code>plan</code> que <strong>falle la PR</strong> si el plan intenta destruir más de un recurso, si algún recurso no tiene etiqueta <code>env</code>, o si se aplica sobre producción sin el archivo de variables de producción. Puedes usar <code>conftest</code>/OPA o un script propio que interprete la salida de <code>terraform show -json tfplan</code>.</p>
+          <p>Por otro, añade un workflow programado que, cada mañana, ejecute <code>terraform plan -detailed-exitcode</code> en cada entorno y <strong>abra un issue</strong> si detecta deriva (código de salida 2). El issue debe decir qué entorno, qué recursos y desde cuándo.</p>
+          <p><em>Pista: <code>terraform plan -out=tfplan -detailed-exitcode</code> devuelve 0 sin cambios, 2 con cambios y 1 con error; captúralo con <code>set +e</code>. Para la política, <code>terraform show -json tfplan &gt; plan.json</code> y examina <code>.resource_changes[].change.actions</code> en busca de <code>"delete"</code>. Para el issue usa <code>actions/github-script@v9</code> con <code>issues.create</code>, y evita duplicados buscando antes un issue abierto con la misma etiqueta. Un <code>schedule: cron: "0 6 * * 1-5"</code> con <code>workflow_dispatch</code> te permite probarlo a mano.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Tres formas de modelar entornos: <strong>workspaces</strong> (estado por workspace), <strong>un directorio por entorno</strong> (recomendado: backend y estado explícitos) y <strong>un repo por entorno</strong> (aislamiento máximo, coste alto).</li>
+          <li>En IaC la promoción es <strong>el mismo commit</strong> con otro backend y otro <code>.tfvars</code>; <em>nunca</em> se promociona un <code>tfplan</code> entre entornos.</li>
+          <li>El patrón de CI es <strong><code>plan</code> en la pull request</strong> (publicado como comentario) y <strong><code>apply</code> en <code>main</code></strong> detrás de un entorno protegido.</li>
+          <li><strong>OIDC</strong> con roles de mínimo privilegio sustituye a las claves de larga vida.</li>
+          <li><strong><code>concurrency</code></strong> más el locking del backend evitan que dos <code>apply</code> corrompan el estado.</li>
+          <li>El plan se genera y se aplica <strong>en el mismo run</strong>; separar <code>staging</code> y <code>prod</code> en dos jobs con distinto rol da el control.</li>
+          <li>Un <code>plan</code> programado convierte la <strong>deriva</strong> en algo visible y accionable.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece en YAML</th></tr></thead>
+          <tbody>
+            <tr><td>Entorno (destino)</td><td>Staging o producción, con su estado</td><td><code>environment: production</code></td></tr>
+            <tr><td>Plan en la PR</td><td>Previsualización revisable</td><td><code>if: github.event_name == 'pull_request'</code></td></tr>
+            <tr><td>Apply en main</td><td>Aplicar tras aprobación</td><td><code>if: github.event_name == 'push'</code></td></tr>
+            <tr><td>OIDC</td><td>Credenciales efímeras</td><td><code>permissions: { id-token: write }</code></td></tr>
+            <tr><td>Serialización</td><td>Un run a la vez</td><td><code>concurrency.group</code></td></tr>
+            <tr><td>Entorno por directorio</td><td>Aislamiento por estado</td><td><code>infra/envs/staging</code>, <code>infra/envs/prod</code></td></tr>
+            <tr><td>Deriva</td><td>Diferencia real ↔ código</td><td><code>plan -detailed-exitcode</code> en un cron</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Workspaces o un directorio por entorno?</summary>
+            <div>
+              <p>Para entornos de larga vida como producción, un <strong>directorio por entorno</strong>: el backend y el estado quedan escritos en el código y el aislamiento no depende de recordar qué workspace está activo. Los <em>workspaces</em> brillan en entornos efímeros (una preview por PR, pruebas temporales) donde el coste de crear un directorio por caso sería absurdo. Si dudas, empieza por directorios.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo seguir aplicando Terraform desde mi portátil?</summary>
+            <div>
+              <p>Puedes, pero no deberías en entornos compartidos. Si el CI es el único que aplica, se cumplen tres cosas: nadie aplica algo no revisado, las credenciales de escritura no viven en portátiles, y queda un registro de cada cambio. Para experimentar usa un entorno local (o un workspace efímero) y deja el pipeline como única vía hacia staging y producción.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo paso un secreto a Terraform sin ponerlo en el <code>.tfvars</code>?</summary>
+            <div>
+              <p>Marcando la variable como <code>sensitive = true</code> y alimentándola desde el CI con <code>TF_VAR_nombre</code> (desde <em>Secrets</em> del repositorio o del entorno) o, mejor, sin que exista: usa OIDC para que Terraform asuma un rol y lea el secreto de un gestor (Vault, Secrets Manager). El <code>.tfvars</code> versionado solo lleva valores no secretos y compartibles.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si el plan de la PR y el apply ven estados distintos?</summary>
+            <div>
+              <p>Puede pasar: entre la revisión y el merge, otro cambio pudo mover el estado. Por eso el <code>apply</code> <strong>regenera</strong> el plan en <code>main</code> antes de aplicarlo, en vez de reutilizar el de la PR. Si quieres garantía total de que se aplica exactamente lo revisado, mira HCP Terraform, que ata el plan a una revisión y detecta si el estado cambió desde entonces.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo detecto si alguien ha cambiado la infraestructura a mano?</summary>
+            <div>
+              <p>Con un <code>plan</code> programado: si hay diferencias entre el código y la realidad, <code>terraform plan -detailed-exitcode</code> devuelve 2 y creas un issue. Es exactamente el reto de esta lección. Detectar la deriva a diario convierte «¿por qué hay 7 réplicas?» en un aviso a tiempo, antes de que cause un incidente.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

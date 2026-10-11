@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-pipeline-completo">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipeline completo — Módulo 7 · Curso DevOps</title>
+  <meta name="description" content="El pipeline end-to-end del Copiloto: CI en cada push y PR, build que publica un artefacto inmutable y CD que despliega. Cómo encadenar ci.yml, publish.yml y deploy.yml y cómo reutilizar workflows con workflow_call en vez de duplicar YAML.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Pipeline completo</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: el pipeline del Copiloto</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Durante seis módulos has construido las piezas por separado: un CI que prueba, un build que publíca una imagen, un CD que despliega. En este módulo final las ensamblamos en <strong>un solo pipeline</strong> que va del <code>git push</code> a la aplicación corriendo, sin pasos manuales y sin recompilar nada por el camino. Ese es el objetivo de <em>Publicar el Copiloto</em>.</p>
+        <p>El problema del ensamblaje no es escribir más YAML, sino <strong>no escribir YAML de más</strong>. Lo fácil es que <code>ci.yml</code> tenga su copia de «lint + test + build», y que <code>publish.yml</code> tenga otra copia parecida, y que <code>deploy.yml</code> vuelva a construir la imagen «por si acaso». El resultado es un collar de workflows que se desincronizan: arreglas un test en uno y se te olvida en el otro. Esta lección trata de <strong>reutilizar y encadenar</strong>, no de copiar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque el trabajo de un ingeniero de plataforma no es escribir pipelines largos, es escribir pipelines <em>cortos, componibles y de una sola fuente de verdad</em>. Un pipeline que se mantiene duplicado se pudre; uno que reutiliza se mantiene barato. Aquí aprendes la mecánica que hace posible el resto del módulo.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>La regla de oro que gobierna todo el módulo:</strong> el artefacto que se <em>prueba</em> es el mismo que se <em>construye</em>, es el mismo que se <em>despliega</em>. En cuanto un workflow reconstruye la imagen «para desplegarla», has roto la trazabilidad: ya no sabes si lo que corre en producción es lo que pasó los tests.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Las tres fases y sus fronteras</h3>
+        <p>Un pipeline completo tiene tres fases con <strong>fronteras claras</strong>. Cada frontera marca dónde termina algo <em>efímero</em> (el código fuente, un runner) y empieza algo <em>inmutable</em> (un artefacto).</p>
+        <table>
+          <thead><tr><th>Fase</th><th>Entrada</th><th>Salida</th><th>Cuándo corre</th></tr></thead>
+          <tbody>
+            <tr><td><strong>CI</strong> (integración continua)</td><td>Un commit en el repositorio</td><td>Un veredicto: pasa o no pasa</td><td>En cada <code>push</code> y cada <code>pull_request</code></td></tr>
+            <tr><td><strong>Build</strong> (publicar artefacto)</td><td>Un commit que <em>ya pasó</em> CI</td><td>Una imagen inmutable en un registry, identificada por <code>digest</code></td><td>Cuando se crea una release (un tag)</td></tr>
+            <tr><td><strong>CD</strong> (entrega continua)</td><td>Un artefacto por <code>digest</code></td><td>La aplicación corriendo en un entorno</td><td>Automático a <em>staging</em>; a producción tras aprobación</td></tr>
+          </tbody>
+        </table>
+        <p>El flujo completo, de izquierda a derecha, con los dos hechos inmutables marcados:</p>
+        <pre class="diagram">
+  git push                CI: lint + test           build                 CD
+  ────────▶  commit  ────────────────▶  ✔  ────────────────▶  📦 imagen  ──────────▶  entornos
+              │          (efímero)                       (inmutable: @sha256:…)
+              │                                              │
+              └─ un push nuevo cancela el run viejo           └─ el MISMO digest viaja a
+                 (el código cambia)                              staging y a producción
+                                                                 (el artefacto NO se reconstruye)
+        </pre>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una cadena de montaje con control de calidad. CI es el operario que revisa las piezas al entrar; build es la máquina que <em>estampa</em> el producto terminado con un número de serie (el digest); CD es el camión que reparte <em>ese</em> producto. Nadie vuelve a fabricar el coche en la puerta del concesionario.</p>
+        </div>
+
+        <h3>Tres archivos, no uno gigante</h3>
+        <p>¿Por qué separar <code>ci.yml</code>, <code>publish.yml</code> y <code>deploy.yml</code> en vez de meterlo todo en un archivo?</p>
+        <ul>
+          <li><strong>Disparadores distintos.</strong> CI corre en <code>pull_request</code>; el build solo cuando hay un tag de release; el deploy cuando existe un artefacto. Un solo archivo tendría un <code>on:</code> con tres ramas y <code>if:</code> por todas partes.</li>
+          <li><strong>Permisos distintos.</strong> CI no necesita escribir en el registry; el deploy «de producción» necesita un <code>environment</code> protegido. Aislar los permisos es seguridad (lo verás en la lección 4).</li>
+          <li><strong>Reutilizable.</strong> El CI debe poder <em>llamarse</em> tanto desde un PR como desde el build. Si vive en su propio archivo reusable, se llama; si está embebido, se copia.</li>
+          <li><strong>Fácil de razonar.</strong> Un archivo con una responsabilidad se depura leyéndolo; un archivo de 300 líneas con todo, no.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Ojo con un mito:</strong> un job de un workflow <em>no puede</em> depender con <code>needs</code> de un job de <em>otro</em> workflow. <code>needs</code> funciona dentro del mismo archivo. Para encadenar archivos hay tres mecanismos: <strong>workflows reutilizables</strong> (<code>workflow_call</code>, llamados con <code>uses:</code>), eventos como <code>workflow_run</code>, y <strong>compartir artefactos/artefactos del registry</strong> entre ellos.</p>
+        </div>
+
+        <h3>Reutilización: <code>workflow_call</code></h3>
+        <p>Un workflow reutilizable es un YAML normal al que se le añade <code>on: workflow_call</code> y que declara sus <code>inputs</code>, <code>outputs</code> y <code>secrets</code>. Otro workflow lo invoca como si fuera una función, a nivel de <em>job</em>:</p>
+        <pre class="diagram">
+  publish.yml                          ci.yml (reusable)
+  ───────────                          ────────────────
+  jobs:                                on:
+    ci:                                  workflow_call:
+      uses: ./.github/workflows/ci.yml     inputs:
+      with:                                  python-version: {…}
+        python-version: "3.12"               outputs:
+      secrets: inherit                         coverage: {…}
+                                           jobs:
+                                             lint: …
+                                             test: …
+        </pre>
+        <p>Ventajas concretas: <strong>una sola definición</strong> de «qué es pasar CI»; el llamador solo aporta parámetros; y los <code>outputs</code> permiten pasar datos (por ejemplo, el porcentaje de cobertura o el <code>digest</code> de la imagen) de vuelta al flujo que llamó.</p>
+
+        <h3>Encadenado: dos formas de «lo siguiente»</h3>
+        <p>¿Cómo sabe el build que el CI ha pasado? No puede usar <code>needs</code> a través de archivos. Las dos soluciones honestas:</p>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Cómo funciona</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Llamada directa</strong> (<code>uses:</code>)</td>
+              <td>El workflow que publica <em>llama</em> al CI como primer job; si el CI falla, el build no arranca</td>
+              <td>Cuando el build debe esperar al CI en el mismo run (lo más simple y trazable)</td>
+            </tr>
+            <tr>
+              <td><strong>Evento</strong> (<code>workflow_run</code> o tag)</td>
+              <td>El build se dispara cuando el CI termina o cuando se crea un tag; consulta si el CI fue verde</td>
+              <td>Cuando quieres desacoplar: builds disparados por releases, reintentos independientes</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Regla práctica:</strong> usa <strong>llamada directa</strong> para «CI → build» (mismo run, una sola verdad) y <strong>tags</strong> para «decidir qué versión publicar». En el Copiloto, un tag <code>v1.4.2</code> dispara <code>publish.yml</code>, que llama al CI reusable y, solo si es verde, construye y publica.</p>
+        </div>
+
+        <h3>Idempotencia y cancelación</h3>
+        <p>Dos detalles que hacen que un pipeline se sienta profesional:</p>
+        <ul>
+          <li><strong><code>concurrency</code></strong>: si empujas tres commits seguidos, no quieres tres CIs compitiendo por los mismos recursos. Un grupo de concurrencia con <code>cancel-in-progress: true</code> en CI deja solo el más reciente: el código viejo ya no importa.</li>
+          <li><strong>Reproducibilidad</strong>: el build no debe depender de <em>cuándo</em> corre. Fija versiones, usa caché correctamente y no «arregles» nada a mano dentro de un runner.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El átomo de la reutilización: un workflow con <code>workflow_call</code> que recibe un parámetro y devuelve un resultado, y otro que lo llama. Sin Docker, sin despliegue: solo la mecánica de «función».</p>
+        <div class="code-file">.github/workflows/greet.yml</div>
+        <pre><code class="language-yaml">name: greet
+on:
+  workflow_call:
+    inputs:
+      who:
+        description: A quien saludar
+        required: true
+        type: string
+    outputs:
+      greeting:
+        description: El saludo generado
+        value: ${{ jobs.say.outputs.message }}
+
+jobs:
+  say:
+    runs-on: ubuntu-latest
+    outputs:
+      message: ${{ steps.build.outputs.text }}
+    steps:
+      - id: build
+        run: echo "text=Hola, ${{ inputs.who }}" &gt;&gt; "$GITHUB_OUTPUT"
+      - run: echo "El reusable dice: ${{ steps.build.outputs.text }}"
+</code></pre>
+        <p>Y quien lo usa, como si fuera una función más:</p>
+        <div class="code-file">.github/workflows/caller.yml</div>
+        <pre><code class="language-yaml">name: caller
+on: [push]
+
+jobs:
+  greet:
+    uses: ./.github/workflows/greet.yml
+    with:
+      who: Copiloto
+
+  after:
+    needs: greet
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "El reusable devolvio: ${{ needs.greet.outputs.greeting }}"
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>on: workflow_call</code></strong> convierte el archivo en reutilizable. No tiene <code>push</code> ni <code>pull_request</code>: solo se ejecuta cuando alguien lo llama.</li>
+          <li><strong><code>inputs</code> con <code>type</code> y <code>required</code></strong>: el contrato de la función. El llamador debe aportar <code>who</code>; si falta, el run falla antes de gastar minutos.</li>
+          <li><strong><code>outputs.value</code></strong>: expone un valor de vuelta al llamador. Debe apuntar a un <em>output de job</em> (<code>jobs.say.outputs.message</code>), que a su vez viene de un <em>output de step</em>.</li>
+          <li><strong><code>echo "text=..." &gt;&gt; "$GITHUB_OUTPUT"</code></strong>: la forma canónica de que un step devuelva un valor. (Sin esto, <code>steps.build.outputs.text</code> estaría vacío.)</li>
+          <li><strong><code>uses: ./.github/workflows/greet.yml</code></strong>: la llamada. Con <code>./</code> se refiere a un workflow del <em>mismo</em> repositorio; con <code>owner/repo/.github/…@ref</code> se llama a uno de otro repositorio.</li>
+          <li><strong><code>needs: greet</code></strong>: el job <code>after</code> consume el output. Aquí <em>sí</em> funciona <code>needs</code>, porque ambos están en el mismo archivo llamador.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Un detalle que sorprende: los <code>env</code> definidos a nivel de workflow en el llamador <strong>no</strong> se propagan al reusable, y viceversa. La comunicación es explícita: <code>inputs</code> hacia dentro, <code>outputs</code> hacia fuera. Eso es una ventaja, no un estorbo: la función no depende de variables invisibles.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Así queda el pipeline completo del Copiloto: <code>ci.yml</code> (reusable), <code>publish.yml</code> (build) y <code>deploy.yml</code> (CD). Empieza por el CI reutilizable, que es lo que ambos llaman.</p>
+
+        <h3>1) <code>ci.yml</code> — la definición única de «pasar CI»</h3>
+        <div class="code-file">.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml">name: CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        type: string
+        default: "3.12"
+    outputs:
+      coverage:
+        description: Cobertura alcanzada por los tests
+        value: ${{ jobs.test.outputs.coverage }}
+
+# Un push nuevo sobre el mismo ref cancela el CI obsoleto.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv run ruff check .
+      - run: uv run mypy app
+
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.cov.outputs.percent }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv run pytest --cov=app --cov-report=term --cov-report=xml
+      - id: cov
+        run: |
+          PCT=$(uv run coverage report --format=total)
+          echo "percent=$PCT" &gt;&gt; "$GITHUB_OUTPUT"
+</code></pre>
+        <p>Qué mira cada decisión:</p>
+        <ul>
+          <li><strong>Es reusable</strong> (<code>workflow_call</code>): no tiene <code>push</code> propio. Lo llaman tanto un PR como el build.</li>
+          <li><strong><code>concurrency</code></strong> con <code>cancel-in-progress: true</code>: empujar cinco commits no lanza cinco CIs completos, solo el último.</li>
+          <li><strong><code>permissions: contents: read</code></strong>: el CI solo lee el repo. Nada de escribir en el registry ni en el entorno (mínimo privilegio).</li>
+          <li><strong><code>outputs.coverage</code></strong>: el llamador podrá aplicar un gate («cobertura ≥ 80 %») sin volver a ejecutar los tests.</li>
+          <li><strong>Las acciones van pinneadas por SHA</strong> (<code>actions/checkout@08c690… # v5.0.0</code>): inmutables. Lo profundizamos en la lección 4.</li>
+        </ul>
+
+        <h3>2) <code>publish.yml</code> — llama al CI y, si pasa, construye</h3>
+        <div class="code-file">.github/workflows/publish.yml</div>
+        <pre><code class="language-yaml">name: Publish
+
+on:
+  push:
+    tags: ["v*"]          # v1.4.2 despierta el build; un push normal no.
+
+env:
+  IMAGE: ghcr.io/academy/copiloto-api
+
+jobs:
+  # 1) Llama al MISMO CI que corre en los PRs. Si falla, no hay imagen.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      python-version: "3.12"
+
+  build:
+    needs: ci             # el artefacto solo existe si el CI fue verde
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write     # publicar en GHCR
+      attestations: write
+      id-token: write     # atestaciones y firma
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build y push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          provenance: mode=max
+      - name: Atestacion de procedencia
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Deja el digest a la vista
+        run: |
+          {
+            echo "### Imagen publicada"
+            echo ""
+            echo "- Imagen: ${{ env.IMAGE }}"
+            echo "- Digest: ${{ steps.push.outputs.digest }}"
+          } &gt;&gt; "$GITHUB_STEP_SUMMARY"
+</code></pre>
+        <p>Lo esencial: el tag <code>v1.4.2</code> es la señal de <em>release</em>; el job <code>ci</code> reutiliza la definición única; y el build publica una imagen con <code>provenance: mode=max</code> y una <strong>atestación</strong> que la ata al workflow. El <code>outputs.digest</code> es el identificador canónico que usará el CD.</p>
+        <div class="callout callout--tip">
+          <p><strong>Por qué <code>needs: ci</code> y no re-ejecutar tests dentro del build:</strong> porque el build es <em>publicar</em>, no <em>verificar</em>. Y por qué no confiar «en que el tag ya venía de main»: un tag puede apuntar a cualquier commit. El CI se ejecuta sobre el commit del tag; si ese commit no era verde, la imagen no se publica.</p>
+        </div>
+
+        <h3>3) <code>deploy.yml</code> — el CD, disparado por la misma release</h3>
+        <div class="code-file">.github/workflows/deploy.yml</div>
+        <pre><code class="language-yaml">name: Deploy
+
+on:
+  push:
+    tags: ["v*"]          # la misma release que dispara el build
+
+env:
+  IMAGE: ghcr.io/academy/copiloto-api
+
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.copiloto.dev
+    steps:
+      - run: ./scripts/deploy.sh --image "$IMAGE" --env staging
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}
+
+  production:
+    needs: staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production      # revisores obligatorios: el job se pausa aqui
+      url: https://copiloto.dev
+    steps:
+      - run: ./scripts/deploy.sh --image "$IMAGE" --env production
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}
+</code></pre>
+        <p>El encadenado aquí es por <strong>evento</strong> (el tag): build y deploy corren en paralelo lanzados por la misma release, cada uno con su responsabilidad. En la lección 2 afinaremos esto para promover el <em>mismo digest</em> y no una etiqueta.</p>
+        <div class="callout callout--note">
+          <p>Fíjate en que <code>deploy.yml</code> <strong>no construye nada</strong>. Solo descarga y despliega. Ese «no construir» es lo que garantiza la regla de oro. Si el deploy tuviera un <code>docker build</code>, estaríamos desplegando un artefacto distinto del que se probó.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un workflow reutilizable (<code>workflow_call</code>) para el CI</td>
+              <td>Copiar «lint + test» en cada archivo que lo necesita</td>
+              <td>Una sola definición de «pasar CI»; se arregla en un sitio</td>
+            </tr>
+            <tr>
+              <td>Separar CI, build y CD en tres archivos con disparadores claros</td>
+              <td>Un <code>workflow.yml</code> con todo y montones de <code>if</code></td>
+              <td>Cada archivo una responsabilidad, con sus propios permisos</td>
+            </tr>
+            <tr>
+              <td>Encadenar con <code>needs: ci</code> (llamada) o con tags</td>
+              <td>Asumir que <code>needs</code> cruza archivos</td>
+              <td><code>needs</code> solo existe dentro de un mismo workflow</td>
+            </tr>
+            <tr>
+              <td>Construir una sola vez y promover el artefacto</td>
+              <td>Reconstruir la imagen en CD «para asegurar»</td>
+              <td>El que corre en producción debe ser el que pasó los tests</td>
+            </tr>
+            <tr>
+              <td><code>concurrency</code> + <code>cancel-in-progress</code> en el CI</td>
+              <td>Dejar diez runs viejos consumiendo minutos</td>
+              <td>Solo importa el commit más reciente</td>
+            </tr>
+            <tr>
+              <td>Pasar datos con <code>inputs</code>/<code>outputs</code></td>
+              <td>Confiar en variables de entorno «implícitas»</td>
+              <td>El reusable no hereda <code>env</code>: la interfaz debe ser explícita</td>
+            </tr>
+            <tr>
+              <td>Registrar el <code>digest</code> en el resumen del run</td>
+              <td>Confundir la etiqueta del tag con la identidad de la imagen</td>
+              <td>El digest es el identificador inmutable; la etiqueta puede moverse</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Creer que <code>needs</code> cruza workflows</h3>
+        <span class="code-label code-label--wrong">Mal — <code>needs</code> apuntando a otro archivo</span>
+        <pre class="code-wrong"><code class="language-yaml"># deploy.yml (❌) intenta esperar al build de publish.yml
+jobs:
+  deploy:
+    needs: build     # FALLA: ese job no existe en ESTE workflow
+</code></pre>
+        <span class="code-label code-label--right">Bien — llamada directa o evento</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Opcion A: mismo archivo, se llama al CI y se espera.
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: ci
+# ✅ Opcion B: distinto archivo, encadenado por evento (tag).
+on:
+  push:
+    tags: ["v*"]
+</code></pre>
+
+        <h3>Reconstruir la imagen en el despliegue</h3>
+        <span class="code-label code-label--wrong">Mal — CD que vuelve a construir</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ deploy.yml: crea un artefacto NUEVO. Ya no es el que paso CI.
+docker build -t copiloto:prod .
+docker push copiloto:prod
+</code></pre>
+        <span class="code-label code-label--right">Bien — desplegar el artefacto ya publicado</span>
+        <pre class="code-right"><code class="language-bash"># ✅ CD solo consume lo que el build ya publico, por su digest.
+docker pull ghcr.io/academy/copiloto-api@sha256:9b1c…
+./scripts/deploy.sh --image ghcr.io/academy/copiloto-api@sha256:9b1c… --env production
+</code></pre>
+
+        <h3>Duplicar el CI en cada workflow</h3>
+        <span class="code-label code-label--wrong">Mal — dos copias que se desincronizan</span>
+        <pre class="code-wrong"><code class="language-yaml"># pr.yml                        # publish.yml (❌) otra copia de lo mismo
+jobs:                           jobs:
+  test:                           test:
+    steps:                          steps:
+      - run: pytest                   - run: pytest   # se arregla en uno y no en el otro
+</code></pre>
+        <span class="code-label code-label--right">Bien — una definición, dos llamadores</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ ci.yml define; pr.yml y publish.yml lo llaman.
+on: { workflow_call: {} }        # ci.yml
+# ---
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml   # en pr.yml y en publish.yml
+</code></pre>
+
+        <h3>No cancelar runs obsoletos</h3>
+        <span class="code-label code-label--wrong">Mal — sin concurrencia</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Cinco push seguidos = cinco CIs completos compitiendo.
+# (Sin bloque concurrency)
+</code></pre>
+        <span class="code-label code-label--right">Bien — cancela lo viejo</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El run anterior del mismo ref se cancela; solo vive el ultimo commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar el esqueleto del pipeline completo del Copiloto en un repositorio de práctica y comprobar, en local con <code>act</code>, que el build <em>se niega</em> a publicar si el CI falla.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea el repositorio y los tres archivos (vacíos de momento):
+            <pre><code class="language-bash">gh repo create academy/copiloto-api --private --clone
+cd copiloto-api
+mkdir -p .github/workflows scripts
+</code></pre>
+            <p>Resultado esperado: el repo clonado, con las carpetas creadas. (<code>gh</code> ya lo configuraste en el Módulo 0.)</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> copia el <code>ci.yml</code> reusable del ejemplo real y confirma que el YAML es válido:
+            <pre><code class="language-bash">uv run --with pyyaml python - &lt;&lt;'PY'
+import yaml, pathlib
+for f in pathlib.Path(".github/workflows").glob("*.yml"):
+    yaml.safe_load(f.read_text())
+    print("OK", f)
+PY
+</code></pre>
+            <p>Resultado esperado: <code>OK .github/workflows/ci.yml</code>. Si hay un error de indentación, el analizador lo señala con la línea.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> haz que el CI «falle» a propósito para ver la barrera. Añade temporalmente un test que falla:
+            <pre><code class="language-bash">echo 'def test_deliberadamente_roto(): assert False' &gt;&gt; tests/test_smoke.py
+git add -A &amp;&amp; git commit -m "chore(ci): test que falla a proposito"
+git push
+</code></pre>
+            <p>Resultado esperado: en la pestaña <em>Actions</em>, el run <code>Publish</code> muestra el job <code>ci</code> en rojo y el job <code>build</code> <strong>saltado</strong> (no arranca: <code>needs: ci</code> no se cumplió). Comprueba con:</p>
+            <pre><code class="language-bash">gh run list --workflow publish.yml --limit 5
+gh run view --log-failed
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> revierte el test roto y crea un tag para disparar una release real:
+            <pre><code class="language-bash">git revert --no-edit HEAD &amp;&amp; git push
+git tag v0.1.0 &amp;&amp; git push origin v0.1.0
+</code></pre>
+            <p>Resultado esperado: el CI pasa en verde; el build publica la imagen y el paso «Deja el digest a la vista» escribe el <code>sha256:…</code> en el resumen del run (míralo en la pestaña del run).</p>
+          </li>
+          <li>
+            <strong>Paso 5 (local, con <code>act</code>):</strong> simula el disparador del tag sin gastar minutos de GitHub:
+            <pre><code class="language-bash">act -W .github/workflows/publish.yml push \
+  --eventpath &lt;(echo '{"ref":"refs/tags/v0.1.0","ref_name":"v0.1.0"}') \
+  --dryrun
+</code></pre>
+            <p>Resultado esperado: <code>act</code> lista los jobs que ejecutaría (<code>ci</code> y <code>build</code>) sin ejecutarlos. Confirma que el disparador y el encadenado están bien declarados antes de gastar un run real.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Si <code>act</code> no reproduce el disparador de tags exactamente (su soporte de eventos es aproximado), apóyate en el <code>--dryrun</code> para leer el grafo de jobs y valida el resto en un repositorio de verdad. El objetivo del paso 5 es <em>entender</em> el evento, no sustituir a GitHub.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un solo llamador, tres entornos, cero duplicación</h3>
+          <p>Refactoriza el pipeline del Copiloto para que exista <strong>un único workflow “entrada”</strong> (<code>pipeline.yml</code>) que, según el evento, llame a los reutilizables necesarios: en un PR llama solo al CI; al publicar un tag llama al CI, al build y al CD. El CI no debe definirse dos veces en ningún sitio, y el build debe <strong>consumir el resultado del CI</strong> (por ejemplo, abortar si la cobertura por debajo del umbral) sin repetir los tests. Además, haz que el <code>digest</code> de la imagen viaje como <em>output</em> del build hasta el job de CD, de forma que el despliegue use el digest y nunca la etiqueta del tag.</p>
+          <p><em>Pista: encadena archivos con <code>uses:</code> y propaga datos por <code>outputs</code> (<code>jobs.build.outputs.digest</code> → <code>needs.build.outputs.digest</code> → <code>env</code> del job de CD). Para el gate de cobertura, el output del CI (<code>needs.ci.outputs.coverage</code>) se compara en un <code>if</code> o en un paso de <code>run</code> que salga con error. Pregúntate: si mañana quieres reutilizar el CI en otro repositorio, ¿qué tendría que ser configurable — la versión de Python, el umbral, la ruta de la app — y qué debería seguir siendo fijo?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un pipeline completo tiene tres fases con fronteras claras: <strong>CI</strong> (veredicto), <strong>build</strong> (artefacto inmutable) y <strong>CD</strong> (entorno).</li>
+          <li>La regla de oro: <strong>el artefacto que se prueba es el que se construye y el que se despliega</strong>. Nunca se reconstruye en CD.</li>
+          <li>Tres archivos (<code>ci.yml</code>, <code>publish.yml</code>, <code>deploy.yml</code>) con disparadores y permisos distintos; no un archivo gigante.</li>
+          <li><code>needs</code> <strong>no cruza archivos</strong>: para encadenar, workflows reutilizables (<code>workflow_call</code> + <code>uses</code>) o eventos (<code>workflow_run</code>, tags).</li>
+          <li>Un reutilizable comunica por <strong><code>inputs</code> y <code>outputs</code></strong>; el <code>env</code> no se hereda.</li>
+          <li><code>concurrency</code> con <code>cancel-in-progress: true</code> evita runs obsoletos; fija el <em>último</em> commit como el que importa.</li>
+          <li>El <strong><code>digest</code></strong> es la identidad inmutable del artefacto; la etiqueta del tag puede moverse.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>YAML</th></tr></thead>
+          <tbody>
+            <tr><td>Workflow reutilizable</td><td>Un workflow que otros llaman como función</td><td><code>on: workflow_call</code> + <code>uses: ./…</code></td></tr>
+            <tr><td>Contrato del reusable</td><td>Parámetros de entrada y valores de salida</td><td><code>inputs:</code> / <code>outputs:</code></td></tr>
+            <tr><td>Encadenado interno</td><td>Esperar a un job del mismo archivo</td><td><code>needs: ci</code></td></tr>
+            <tr><td>Encadenado por evento</td><td>Disparar otro workflow al crear un tag</td><td><code>on: push: tags: ["v*"]</code></td></tr>
+            <tr><td>Cancelar obsoletos</td><td>Un solo run por ref</td><td><code>concurrency: { group: …, cancel-in-progress: true }</code></td></tr>
+            <tr><td>Identidad del artefacto</td><td>Hash inmutable de la imagen publicada</td><td><code>steps.push.outputs.digest</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no un solo workflow con todo dentro?</summary>
+            <div>
+              <p>Porque tendría un <code>on:</code> con varios eventos y un montón de <code>if</code> para que cada job solo corriera cuando toca; además mezclaría permisos (leer para el CI, escribir en el registry para el build, entorno protegido para el deploy) y sería imposible reutilizarlo desde otro flujo. Tres archivos con una responsabilidad cada uno se leen, se depuran y se reutilizan mucho mejor. La regla es <em>responsabilidad única</em>, igual que en el código.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un workflow reutilizable puede llamar a otro?</summary>
+            <div>
+              <p>Sí. Se llama <em>anidar</em> workflows y se permiten hasta 10 niveles de profundidad, con un máximo de 50 workflows reutilizables distintos por run (contando todo el árbol de llamadas). Es potente —<code>pipeline.yml</code> → <code>ci.yml</code> → <code>lint.yml</code>— pero no lo abuses: si necesitas cinco niveles, probablemente convenga fusionar algunos. La regla práctica es que un reusable haga <em>una</em> cosa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo pasar secretos a un workflow reutilizable?</summary>
+            <div>
+              <p>Sí, de dos formas: declarándolos explícitamente bajo <code>on.workflow_call.secrets</code> y pasándolos desde el llamador, o con <code>secrets: inherit</code> para pasar todos los del repositorio. La primera es más segura y legible (el reusable solo ve lo que necesita). Recuerda que el <code>GITHUB_TOKEN</code> no hace falta pasarlo: cada job tiene el suyo, con los permisos que declare. Y nunca metas secretos en <code>inputs</code>: los inputs quedan visibles en los logs y en la definición del workflow.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo desplegar por tag o por <code>workflow_run</code>?</summary>
+            <div>
+              <p>Con tags ganas claridad: la release <code>v1.4.2</code> es el disparador, y el nombre de la imagen coincide con la versión. Con <code>workflow_run</code> ganas automatismo (build y deploy se encadenan solos sin release), pero debes <em>consultar</em> si el run del que dependes acabó en verde, con <code>github.event.workflow_run.conclusion == 'success'</code>. En el Copiloto usamos tags porque la versión es un concepto de negocio que queremos explícito. Lo importante en ambos casos: que el CD consuma un <strong>artefacto ya construido</strong>, no uno nuevo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que un build largo bloquee todo?</summary>
+            <div>
+              <p>Con dos herramientas: <code>concurrency</code> para cancelar runs obsoletos del mismo ref, y <code>needs</code> / jobs paralelos para que lint y test corran a la vez y el build espere solo a lo imprescindible. También ayuda cachear dependencias (Módulo 2) y capas de Docker (Módulo 3). Un pipeline del Copiloto sano debería resolver CI en pocos minutos; si tarda veinte, mira qué se puede paralelizar antes de optimizar el build.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

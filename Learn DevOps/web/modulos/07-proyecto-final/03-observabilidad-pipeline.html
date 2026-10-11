@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-observabilidad-pipeline">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observabilidad del pipeline — Módulo 7 · Curso DevOps</title>
+  <meta name="description" content="Medir el pipeline del Copiloto como si fuera producción: duración y tasa de fallo, las cuatro métricas DORA (lead time, frecuencia de despliegue, change failure rate y MTTR), resúmenes de run con $GITHUB_STEP_SUMMARY y avisos cuando algo va mal.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Observabilidad del pipeline</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final: el pipeline del Copiloto</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El pipeline es software, y como todo software, <strong>se degrada</strong>. Un CI que tardaba 4 minutos tarda 12 porque alguien añadió tests pesados; el build falla una de cada cuatro veces por un test inestable (<em>flaky</em>); los despliegues se atascan porque nadie mira la cola de aprobaciones. Nada de eso aparece en un panel si no lo mides. Esta lección trata de <strong>hacer visible el pipeline</strong>: cuánto tarda, cuánto falla, cuánto tardas en recuperarte.</p>
+        <p>La referencia de la industria para estas métricas son las <strong>cuatro claves DORA</strong> (del informe <em>Accelerate</em>/DORA de Google): <em>lead time</em>, frecuencia de despliegue, <em>change failure rate</em> y <em>MTTR</em>. No son métricas de vanidad: predicen el rendimiento del equipo. Y todas ellas se pueden extraer del propio GitHub, con <code>gh</code> y sus eventos.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque sin medición, «mejorar el pipeline» es opinión. Con medición, es una decisión: sabes si el cuello de botella es la duración del CI, la tasa de fallo o la espera de aprobación. Y porque un pipeline que avisa cuando algo va mal evita que el fallo llegue por sorpresa al usuario final.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Las métricas son para mejorar el sistema, no para vigilar a las personas.</strong> Si el <em>change failure rate</em> se usa para señalar a quien rompe algo, la gente deja de desplegar y las métricas se vuelven mentira. Mídelo por <em>servicio</em> y por <em>pipeline</em>, no por individuo; y úsalo para quitar fricción, no para repartir culpas.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Primero: métricas técnicas del propio pipeline</h3>
+        <p>Antes de las métricas de negocio, el pipeline tiene su propia salud. Estas cuatro te dicen casi todo:</p>
+        <table>
+          <thead><tr><th>Métrica</th><th>Qué mide</th><th>Señal de alarma</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Duración</strong></td><td>Cuánto tarda un run (o cada job) de punta a punta</td><td>Crece con el tiempo; el CI pasa de minutos a decenas de minutos</td></tr>
+            <tr><td><strong>Tasa de fallo</strong></td><td>Proporción de runs que fallan sobre el total</td><td>Sube sin que se deba a código: tests <em>flaky</em>, red, dependencias</td></tr>
+            <tr><td><strong>Tiempo en cola</strong></td><td>Espera antes de que un runner arranque</td><td>Picos por concurrencia o por límite de runners</td></tr>
+            <tr><td><strong>Tasa de reintento</strong></td><td>Cuántos runs hay que relanzar «a ver si esta vez pasa»</td><td>Alta = no te fías del pipeline (síntoma de flakiness)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Mide la duración del cambio, no solo la del run.</strong> Lo que importa de verdad es cuánto tarda un commit en estar probado y desplegado, no cuánto tarda un job. Un CI rapidísimo seguido de una aprobación que nadie mira durante horas sigue dando un pipeline lento.</p>
+        </div>
+
+        <h3>Las cuatro claves DORA</h3>
+        <p>Estas cuatro métricas, validadas por años de investigación, describen la capacidad de un equipo de entregar software. Se agrupan de dos en dos: dos de <em>ritmo</em> (velocidad) y dos de <em>estabilidad</em> (calidad).</p>
+        <table>
+          <thead><tr><th>Clave</th><th>Pregunta que responde</th><th>Cómo se calcula (aprox.)</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Lead time for changes</strong></td>
+              <td>¿Cuánto tarda un commit en llegar a producción?</td>
+              <td>Primer despliegue a producción − merge del commit</td>
+            </tr>
+            <tr>
+              <td><strong>Deployment frequency</strong></td>
+              <td>¿Con qué frecuencia desplegamos a producción?</td>
+              <td>Nº de despliegues a producción por unidad de tiempo</td>
+            </tr>
+            <tr>
+              <td><strong>Change failure rate</strong></td>
+              <td>¿Qué proporción de cambios provoca un fallo?</td>
+              <td>Despliegues que causan incidente / total de despliegues</td>
+            </tr>
+            <tr>
+              <td><strong>MTTR</strong> (time to restore)</td>
+              <td>¿Cuánto tardamos en recuperarnos de un fallo?</td>
+              <td>Tiempo desde el incidente hasta el servicio restaurado</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre class="diagram">
+   ritmo                                        estabilidad
+   ─────                                        ───────────
+   lead time  ◀──── commit ──────────▶ deploy    change failure rate
+   deployment frequency    nº de deploys / mes   MTTR (time to restore)
+
+   Leading fast and breaking things:
+     ⚡ lead time corto  +  🔥 change failure alto   = desastre con prisa
+   Slow and safe:
+     🐢 lead time largo  +  ✅ change failure bajo   = seguro pero caro
+   Lo que buscamos:
+     ⚡ lead time corto  +  ✅ change failure bajo   = entrega de élite
+        </pre>
+        <div class="callout callout--note">
+          <p><strong>Negocio y técnica no riñen.</strong> Mejorar el <em>lead time</em> casi siempre baja el <em>change failure rate</em>, porque los lotes pequeños tienen menos cambios por release y, si algo falla, es más fácil identificar qué lo causó. La velocidad <em>buena</em> es la que se consigue acortando el ciclo, no saltándose controles.</p>
+        </div>
+
+        <h3>De dónde salen los datos: los eventos de GitHub</h3>
+        <p>No necesitas una herramienta externa para empezar. GitHub guarda todo lo necesario:</p>
+        <ul>
+          <li><strong>Runs de workflows</strong>: <code>gh run list --json</code> da <code>status</code>, <code>conclusion</code>, <code>createdAt</code>, <code>updatedAt</code>, <code>headSha</code>. De ahí salen duración y tasa de fallo.</li>
+          <li><strong>Despliegues</strong>: la API de <em>Deployments</em> registra cada despliegue (entorno, ref, sha, estado). De ahí salen frecuencia de despliegue y el rastro para <em>lead time</em>.</li>
+          <li><strong>Commits</strong>: la fecha de merge de una PR frente a la fecha del despliegue da el <em>lead time</em>.</li>
+          <li><strong>Incidentes</strong>: si las releases de producción anotan cuándo hubo un rollback o un hotfix, tienes <em>change failure</em> y <em>MTTR</em>.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Empieza por lo más simple.</strong> Un job que una vez al día lee los runs de las últimas 24 h y publica duración media, tasa de fallo y número de despliegues ya es observabilidad de verdad. No necesitas un data warehouse para empezar; no lo pospongas por querer el panel perfecto.</p>
+        </div>
+
+        <h3>Dónde se publica: resúmenes, artefactos y avisos</h3>
+        <p>GitHub ofrece tres canales nativos y uno externo:</p>
+        <table>
+          <thead><tr><th>Canal</th><th>Cómo</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Resumen del run</strong></td><td><code>echo … &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></td><td>Un informe legible justo en el run que lo genera (Markdown)</td></tr>
+            <tr><td><strong>Anotaciones</strong></td><td><code>echo "::warning file=…::…"</code></td><td>Señalar un archivo/línea concreta en la interfaz</td></tr>
+            <tr><td><strong>Artefactos</strong></td><td><code>actions/upload-artifact</code></td><td>Guardar el JSON crudo de métricas para analizarlo después</td></tr>
+            <tr><td><strong>Avisos externos</strong></td><td>Un step que llama a Slack/Teams/correo</td><td>Avisar a quien está de guardia cuando algo se rompe</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Avisa de lo accionable, no de todo.</strong> Un canal que recibe cada run en verde se convierte en ruido y la gente lo silencia. Avisa cuando <em>alguien tiene que hacer algo</em>: un despliegue a producción falló, un <em>rollback</em> se disparó, la tasa de fallo superó un umbral. El resto, al resumen del run y a consultar cuando haga falta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Lo más pequeño que aporta valor: medir cuánto tarda un job y escribirlo en el resumen del run. Sin APIs, sin herramientas externas.</p>
+        <div class="code-file">.github/workflows/report-minimo.yml</div>
+        <pre><code class="language-yaml">name: Report minimo
+on:
+  workflow_dispatch:
+
+jobs:
+  timed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Marca de inicio
+        id: start
+        run: echo "t0=$(date +%s)" &gt;&gt; "$GITHUB_OUTPUT"
+
+      - name: Trabajo que medimos
+        run: |
+          sleep 3
+          echo "trabajo terminado"
+
+      - name: Escribir el resumen del run
+        if: always()
+        run: |
+          T0=${{ steps.start.outputs.t0 }}
+          T1=$(date +%s)
+          DURACION=$((T1 - T0))
+          {
+            echo "## Informe del pipeline"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "| --- | --- |"
+            echo "| Duracion del job | ${DURACION}s |"
+            echo "| Commit | ${GITHUB_SHA:0:7} |"
+          } &gt;&gt; "$GITHUB_STEP_SUMMARY"
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>t0=$(date +%s)</code></strong>: marca de tiempo al empezar, guardada como <em>output</em> del step para usarla después.</li>
+          <li><strong>El trabajo real</strong>: aquí iría el lint, los tests o el build. Lo de menos es lo que hace; lo de más, <em>medirlo</em>.</li>
+          <li><strong><code>if: always()</code></strong>: el informe se escribe pase lo que pase. Un informe que solo se genera cuando todo va bien no sirve para diagnosticar lo que va mal.</li>
+          <li><strong><code>$((T1 - T0))</code></strong>: cálculo aritmético de bash; la diferencia de segundos es la duración.</li>
+          <li><strong><code>&gt;&gt; "$GITHUB_STEP_SUMMARY"</code></strong>: escribe Markdown en el resumen del run. La interfaz lo renderiza como tabla; cualquiera lo lee sin abrir logs.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>GitHub ya muestra la duración de cada job; esto parece redundante. La diferencia es que aquí <strong>tú eliges qué se mide y cómo se presenta</strong>: puedes comparar con un umbral, contar reintentos o sumar la duración de todos los jobs. El resumen es tu informe, no el genérico de GitHub.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Un workflow que corre a diario, extrae de GitHub las métricas del Copiloto (duración, tasa de fallo y aproximaciones de DORA), publica un informe y avisa a Slack solo si algo supera el umbral. Todo con <code>gh</code> y <code>jq</code>, sin dependencias externas salvo la notificación.</p>
+
+        <h3>El workflow de métricas</h3>
+        <div class="code-file">.github/workflows/metrics.yml</div>
+        <pre><code class="language-yaml">name: Pipeline metrics
+on:
+  schedule:
+    - cron: "0 7 * * *"     # cada dia a las 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CI_WORKFLOW: ci.yml
+  MAX_CI_MINUTES: "8"
+  MIN_DEPLOYS_PER_DAY: "1"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Elegir el digest desplegado y registrar el deploy
+        id: dora
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1) Frecuencia de despliegue: releases a produccion en 7 dias.
+          DEPLOYS=$(gh api "repos/${{ github.repository }}/deployments" \
+            --paginate -q '[.[] | select(.environment=="production")] | length')
+
+          # 2) Duracion media y tasa de fallo del CI (ultimos 30 runs).
+          RUNS=$(gh run list --workflow "$CI_WORKFLOW" --limit 30 \
+            --json conclusion,createdAt,updatedAt)
+          TOTAL=$(echo "$RUNS" | jq 'length')
+          FAILED=$(echo "$RUNS" | jq '[.[] | select(.conclusion=="failure")] | length')
+          AVG_SEC=$(echo "$RUNS" | jq '
+            [ .[] | ((.updatedAt | fromdate) - (.createdAt | fromdate)) ]
+            | (add / length) | floor')
+
+          # 3) Tasa de fallo en porcentaje.
+          FAIL_RATE=$(awk -v f="$FAILED" -v t="$TOTAL" \
+            'BEGIN { printf "%.0f", (t==0?0:(f/t)*100) }')
+
+          echo "deploys=$DEPLOYS"         &gt;&gt; "$GITHUB_OUTPUT"
+          echo "total=$TOTAL"             &gt;&gt; "$GITHUB_OUTPUT"
+          echo "failed=$FAILED"           &gt;&gt; "$GITHUB_OUTPUT"
+          echo "fail_rate=$FAIL_RATE"     &gt;&gt; "$GITHUB_OUTPUT"
+          echo "avg_min=$((AVG_SEC / 60))" &gt;&gt; "$GITHUB_OUTPUT"
+
+      - name: Publicar el informe en el resumen del run
+        if: always()
+        run: |
+          {
+            echo "## Metricas del pipeline del Copiloto"
+            echo ""
+            echo "| Metrica | Valor | Umbral |"
+            echo "| --- | --- | --- |"
+            echo "| Duracion media del CI | ${{ steps.dora.outputs.avg_min }} min | &lt;= $MAX_CI_MINUTES min |"
+            echo "| Tasa de fallo del CI | ${{ steps.dora.outputs.fail_rate }}% | &lt; 15% |"
+            echo "| Runs analizados | ${{ steps.dora.outputs.total }} | - |"
+            echo "| Despliegues a produccion (7d) | ${{ steps.dora.outputs.deploys }} | &gt;= $MIN_DEPLOYS_PER_DAY/dia |"
+          } &gt;&gt; "$GITHUB_STEP_SUMMARY"
+
+      - name: Avisar si se supera un umbral
+        if: always()
+        env:
+          AVG: ${{ steps.dora.outputs.avg_min }}
+          RATE: ${{ steps.dora.outputs.fail_rate }}
+          DEPLOYS: ${{ steps.dora.outputs.deploys }}
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          MOTIVO=""
+          [ "$AVG" -gt "$MAX_CI_MINUTES" ] &amp;&amp; MOTIVO="CI lento: ${AVG} min"
+          [ "$RATE" -ge 15 ] &amp;&amp; MOTIVO="${MOTIVO:+$MOTIVO; }CI inestable: ${RATE}%"
+          [ "$DEPLOYS" -lt "$MIN_DEPLOYS_PER_DAY" ] &amp;&amp; MOTIVO="${MOTIVO:+$MOTIVO; }pocos deploys: ${DEPLOYS}"
+
+          if [ -n "$MOTIVO" ]; then
+            echo "::warning::$MOTIVO"
+            curl -sS -X POST -H "Content-Type: application/json" \
+              --data "{\"text\":\"🚨 Pipeline Copiloto: $MOTIVO\"}" "$WEBHOOK"
+          else
+            echo "Todos los umbrales en orden."
+          fi
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>schedule</code> + <code>workflow_dispatch</code></strong>: las métricas se calculan en un momento fijo y también a demanda. No quieres medir dentro del propio CI que mides (sería un ciclo).</li>
+          <li><strong><code>permissions: actions: read</code></strong>: leer los runs requiere este permiso. Mínimo privilegio otra vez: nada de <code>write</code>.</li>
+          <li><strong><code>gh run list --json conclusion,createdAt,updatedAt</code></strong>: la fuente de duración y tasa de fallo. <code>jq</code> filtra y agrega; <code>awk</code> calcula el porcentaje.</li>
+          <li><strong>Umbrales en <code>env</code></strong> (<code>MAX_CI_MINUTES</code>, <code>MIN_DEPLOYS_PER_DAY</code>): visibles y fáciles de ajustar. Un umbral escondido en medio de un <code>if</code> es una trampa.</li>
+          <li><strong>El aviso es condicional</strong>: solo se envía si se supera un umbral. Nada de «run verde → mensaje verde».</li>
+          <li><strong>El resumen se publica siempre</strong> (<code>if: always()</code>): incluso un día sin fallos deja constancia de las cifras; así ves tendencias.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Fíjate en que el informe usa el <em>mismo</em> Markdown que leerías en un dashboard. Guarda el JSON crudo como artefacto (<code>actions/upload-artifact</code>) si quieres histórico: los resúmenes de run caducan, pero los artefactos y su JSON se pueden volcar a cualquier panel.</p>
+        </div>
+
+        <h3>El aviso de un despliegue fallido, en su sitio</h3>
+        <p>Las métricas son una cosa; el aviso <em>en el momento</em>, otra. Para eso, el propio workflow de despliegue avisa cuando falla o cuando se dispara un rollback:</p>
+        <div class="code-file">.github/workflows/deploy.yml (paso final)</div>
+        <pre><code class="language-yaml">      - name: Notificar el resultado
+        if: failure() || cancelled()
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          ENT:
+            name: production
+            url: https://copiloto.dev
+        run: |
+          curl -sS -X POST -H "Content-Type: application/json" \
+            --data "{\"text\":\"❌ Despliegue a producción fallido en ${GITHUB_SHA:0:7} — revisa el run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}" \
+            "$WEBHOOK"
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>El aviso lleva a la acción.</strong> Un mensaje útil incluye el <em>qué</em> (despliegue fallido), el <em>dónde</em> (entorno) y un <em>enlace al run</em>. Un «algo ha fallado» sin más obliga a la persona de guardia a buscar: eso es tiempo de MTTR que regalas al incidente.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Medir duración y tasa de fallo del CI desde el primer día</td>
+              <td>«Ya miraremos las métricas cuando haya tiempo»</td>
+              <td>Sin línea base no sabes si mejoras o empeoras</td>
+            </tr>
+            <tr>
+              <td>Medir por servicio y por pipeline</td>
+              <td>Rankings de personas o de equipos</td>
+              <td>Las métricas como vigilancia se manipulan y dejan de ser ciertas</td>
+            </tr>
+            <tr>
+              <td>Publicar el informe en el resumen del run (Markdown)</td>
+              <td>Volcar cientos de líneas a los logs</td>
+              <td>Legible para cualquiera, sin abrir la consola</td>
+            </tr>
+            <tr>
+              <td>Avisar solo de lo accionable, con enlace al run</td>
+              <td>Notificar cada run en verde</td>
+              <td>El ruido hace que nadie lea los avisos importantes</td>
+            </tr>
+            <tr>
+              <td>Guardar los datos crudos como artefacto</td>
+              <td>Confiar solo en el resumen (caduca)</td>
+              <td>Permite histórico y volcado a un panel propio</td>
+            </tr>
+            <tr>
+              <td>Definir umbrales explícitos y revisarlos</td>
+              <td>Umbrales escondidos en <code>if</code> sin contexto</td>
+              <td>Un umbral claro se discute y se ajusta; uno oculto se ignora</td>
+            </tr>
+            <tr>
+              <td>Vigilar el <em>lead time</em>, no solo la duración del run</td>
+              <td>Optimizar el CI y dejar la aprobación esperando horas</td>
+              <td>El cuello de botella suele estar fuera del runner</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Medir el pipeline dentro del pipeline que mide</h3>
+        <span class="code-label code-label--wrong">Mal — ciclo y datos sesgados</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ El propio CI calcula sus metricas: se mide a si mismo a medias.
+jobs:
+  ci:
+    steps:
+      - run: pytest
+      - run: ./scripts/metrics.sh     # cuenta este mismo run como fallo si algo va mal
+</code></pre>
+        <span class="code-label code-label--right">Bien — medición aparte y programada</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Un workflow separado, por schedule, lee los runs ya terminados.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+jobs:
+  report:
+    steps:
+      - run: gh run list --workflow ci.yml --limit 30 --json conclusion,createdAt,updatedAt
+</code></pre>
+
+        <h3>Informe que solo se genera si todo va bien</h3>
+        <span class="code-label code-label--wrong">Mal — el informe desaparece cuando falla</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Si un paso anterior falla, esto no se ejecuta. Justo cuando lo necesitas.
+- run: echo "| Duracion | ${DURACION}s |" &gt;&gt; "$GITHUB_STEP_SUMMARY"
+</code></pre>
+        <span class="code-label code-label--right">Bien — <code>always()</code></span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El informe se publica pase lo que pase: diagnostico y tendencia.
+- if: always()
+  run: echo "| Duracion | ${DURACION}s |" &gt;&gt; "$GITHUB_STEP_SUMMARY"
+</code></pre>
+
+        <h3>Avisar de todo (fatiga de alertas)</h3>
+        <span class="code-label code-label--wrong">Mal — ruido</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Cada run, en verde o en rojo, manda un mensaje al canal.
+curl -X POST --data '{"text":"Run terminado"}' "$SLACK_WEBHOOK"
+</code></pre>
+        <span class="code-label code-label--right">Bien — solo lo accionable</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Solo cuando falla o se supera un umbral, y con enlace al run.
+if [ -n "$MOTIVO" ]; then
+  curl -X POST --data "{\"text\":\"🚨 $MOTIVO — $RUN_URL\"}" "$SLACK_WEBHOOK"
+fi
+</code></pre>
+
+        <h3>Confundir duración del CI con lead time</h3>
+        <span class="code-label code-label--wrong">Mal — métrica incompleta</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ "Nuestro CI tarda 3 minutos, somos rapidísimos."
+#    Pero entre el merge y el deploy a producción pasan 6 horas de aprobaciones.
+</code></pre>
+        <span class="code-label code-label--right">Bien — medir de commit a producción</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Lead time = tiempo del primer deploy a produccion (desde el merge).
+#    Si es grande, el cuello de botella esta FUERA del runner.
+gh api repos/$REPO/deployments --paginate -q \
+  '.[] | select(.environment=="production") | .created_at'
+</code></pre>
+
+        <h3>Ignorar los tests inestables</h3>
+        <span class="code-label code-label--wrong">Mal — relanzar «a ver si pasa»</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Un test flaky que falla 1 de cada 4 veces: todos aprenden a reintentar.
+#    La tasa de fallo del pipeline sube y el rojo deja de significar nada.
+- run: pytest -p no:randomly --reruns 3
+</code></pre>
+        <span class="code-label code-label--right">Bien — arreglar el test o retirarlo</span>
+        <pre class="code-right"><code class="language-text"># ✅ Un test flaky se arregla o se marca y se aisla, pero no se enmascara.
+#    Alertar si la tasa de fallo supera el umbral fuerza a mirarlo.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> calcular las métricas del pipeline del Copiloto con <code>gh</code>, publicarlas como informe y comprobar el aviso condicional en local.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> desde tu máquina, lista los últimos runs del CI y cuenta los fallos:
+            <pre><code class="language-bash">gh run list --workflow ci.yml --limit 30 --json conclusion,createdAt,updatedAt \
+  | jq '{total: length, fallos: ([.[] | select(.conclusion=="failure")] | length)}'
+</code></pre>
+            <p>Resultado esperado: un objeto como <code>{"total":30,"fallos":4}</code>. Ese «4 de 30» es tu tasa de fallo (~13 %). Anótala como línea base.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> calcula la duración media de esos runs (en segundos y en minutos):
+            <pre><code class="language-bash">gh run list --workflow ci.yml --limit 30 --json createdAt,updatedAt \
+  | jq '[ .[] | ((.updatedAt | fromdate) - (.createdAt | fromdate)) ] | (add/length) | floor'
+</code></pre>
+            <p>Resultado esperado: un número, p. ej. <code>245</code> (≈ 4 min). Si supera tu umbral, ya has encontrado la primera cosa a mejorar.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> cuenta los despliegues a producción de la última semana (frecuencia de despliegue):
+            <pre><code class="language-bash">gh api repos/academy/copiloto-api/deployments --paginate -q \
+  '[.[] | select(.environment=="production")] | length'
+</code></pre>
+            <p>Resultado esperado: el número de releases a producción. Divide entre 7 para tener la frecuencia diaria. Si es menor que 1, ahí está tu cuello de botella.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> estima el <em>lead time</em> de un cambio concreto: busca el merge de un PR y el despliegue que lo contiene:
+            <pre><code class="language-bash"># Fecha del merge (PR #42)
+gh pr view 42 --json mergedAt -q .mergedAt
+# Fecha del primer deploy a produccion con ese sha
+gh api repos/academy/copiloto-api/deployments --paginate \
+  -q '.[] | select(.environment=="production") | .created_at' | tail -1
+</code></pre>
+            <p>Resultado esperado: dos fechas; su diferencia (en horas) es tu <em>lead time</em> aproximado. Compara con la duración del CI del paso 2: verás cuánto de ese tiempo es «espera» y cuánto es «trabajo».</p>
+          </li>
+          <li>
+            <strong>Paso 5 (aviso condicional, en local):</strong> reproduce la lógica del workflow sin gastar un run. Simula un CI lento y comprueba que salta el aviso:
+            <pre><code class="language-bash">AVG=12; MAX=8; MOTIVO=""
+[ "$AVG" -gt "$MAX" ] &amp;&amp; MOTIVO="CI lento: ${AVG} min"
+[ -n "$MOTIVO" ] &amp;&amp; echo "::warning::$MOTIVO" || echo "Todo en orden"
+</code></pre>
+            <p>Resultado esperado: imprime <code>::warning::CI lento: 12 min</code>. Cambia <code>AVG</code> a <code>5</code> y verás <code>Todo en orden</code>: esa es la lógica que evita la fatiga de alertas. Súbela al workflow tal cual.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un panel DORA propio con histórico y tendencia</h3>
+          <p>Construye un pequeño panel (una página HTML estática, un archivo Markdown o un job que escribe en <em>GitHub Pages</em>) que muestre las cuatro claves DORA del Copiloto con su <strong>tendencia</strong>: no solo el valor de hoy, sino cómo cambió en las últimas semanas. El pipeline debe (1) extraer los datos de GitHub —runs, despliegues y commits—, (2) persistir un histórico (por ejemplo, un JSON versionado que se actualiza en cada ejecución o un artefacto que se acumula), y (3) pintar la evolución. Además, define qué considera un «despliegue fallido» para el <em>change failure rate</em> (¿un rollback? ¿un hotfix en las 24 h siguientes?) y hazlo explícito.</p>
+          <p><em>Pista: guarda cada ejecución como una fila (<code>fecha, lead_time_h, deploys, fail_rate, mttr_h</code>) en un <code>metrics.json</code> versionado; un job lo lee, añade la fila de hoy y lo reescribe. Para el «despliegue fallido», cruza los despliegues a producción con los rollbacks (el job <code>rollback</code> de la lección anterior) o con los hotfixes (<code>fix:</code>) en las 24 h siguientes al deploy. Para el MTTR, mide del primer aviso de fallo al siguiente despliegue verde. Reflexiona: ¿por qué una tabla con la tendencia semanal dice más que un número aislado, y por qué conviene mirar ritmo y estabilidad juntos y no por separado?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El pipeline es software: se degrada. <strong>Mídelo</strong> o muéstralo a ciegas.</li>
+          <li>Métricas técnicas base: <strong>duración</strong>, <strong>tasa de fallo</strong>, tiempo en cola y tasa de reintento.</li>
+          <li>Las <strong>cuatro claves DORA</strong>: <em>lead time</em>, frecuencia de despliegue, <em>change failure rate</em> y <em>MTTR</em> (dos de ritmo, dos de estabilidad).</li>
+          <li>Los datos ya están en GitHub: <code>gh run list</code>, la API de <em>Deployments</em> y los commits. No hace falta una herramienta externa para empezar.</li>
+          <li>Publica el informe en el <strong>resumen del run</strong> (<code>$GITHUB_STEP_SUMMARY</code>) y guarda el crudo como artefacto.</li>
+          <li><strong>Avisa solo de lo accionable</strong>, con enlace al run. El ruido mata los avisos.</li>
+          <li>Mide para <em>mejorar el sistema</em>, nunca para vigilar a las personas.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Métrica</th><th>Qué responde</th><th>Cómo se obtiene</th></tr></thead>
+          <tbody>
+            <tr><td>Duración del CI</td><td>¿Cuánto tarda probar un commit?</td><td><code>gh run list --json createdAt,updatedAt</code></td></tr>
+            <tr><td>Tasa de fallo</td><td>¿Qué proporción de runs falla?</td><td>Filtrar <code>conclusion=="failure"</code></td></tr>
+            <tr><td>Lead time</td><td>¿Cuánto de commit a producción?</td><td>merge date → deploy a producción</td></tr>
+            <tr><td>Deployment frequency</td><td>¿Con qué frecuencia desplegamos?</td><td>API <code>/deployments</code></td></tr>
+            <tr><td>Change failure rate</td><td>¿Qué % de cambios causa fallo?</td><td>Rollbacks/hotfixes / deploys</td></tr>
+            <tr><td>MTTR</td><td>¿Cuánto tardamos en recuperarnos?</td><td>Fallo → despliegue verde</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito una herramienta externa para medir DORA?</summary>
+            <div>
+              <p>No para empezar. <code>gh</code> y <code>jq</code> bastan para duración, tasa de fallo, frecuencia de despliegue y una aproximación de <em>lead time</em>. Herramientas como los paneles de DORA, Grafana o sistemas APM ayudan cuando quieres histórico largo, segmentación por servicio y correlación con incidentes. Pero <strong>el dato más valioso es el primero</strong>: empieza simple y añade herramientas cuando el volumen lo justifique.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre MTTR y MTTD?</summary>
+            <div>
+              <p><strong>MTTD</strong> (time to detect) es cuánto tardas en <em>enterarte</em> de que algo va mal; <strong>MTTR</strong> (time to repair/restore) es cuánto tardas en <em>arreglarlo</em>. En las claves DORA, el «time to restore» mide desde el fallo hasta la recuperación. Aquí la observabilidad del pipeline importa: si el aviso llega tarde, tu MTTD (y tu MTTR) se disparan aunque el arreglo en sí sea rápido. Avisar a tiempo es parte de la recuperación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El <code>GITHUB_STEP_SUMMARY</code> tiene límite?</summary>
+            <div>
+              <p>Sí: cada job admite un tamaño máximo (del orden de 1 MiB). Para informes de texto y tablas de métricas sobra de largo. Si necesitas datos extensos —por ejemplo, la lista completa de runs—, guárdalos como <strong>artefacto</strong> y deja en el resumen solo la síntesis. Regla práctica: al resumen, lo que una persona leería de un vistazo; al artefacto, el volcado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Con qué frecuencia conviene calcular las métricas?</summary>
+            <div>
+              <p>Una vez al día suele ser suficiente para tendencias, y cuesta cero. Si estás en plena mejora del pipeline, un par de veces al día da <em>feedback</em> más rápido. Lo que <strong>no</strong> conviene es medir en tiempo real <em>todo</em>: las métricas diarias mueven decisiones; las alertas, para lo urgente. Un buen reparto: informe diario del sistema + aviso inmediato de los fallos de despliegue accionables.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo uso estas métricas sin que se conviertan en vigilancia?</summary>
+            <div>
+              <p>Midíelas por <strong>servicio</strong> y por <strong>pipeline</strong>, nunca por persona. Preséntalas con tendencia y con el objetivo de <em>quitar fricción</em>: si el <em>lead time</em> sube, la pregunta es «¿qué nos frena?», no «¿quién va lento?». Y recuerda que las métricas son un medio: la meta es entregar valor con poco riesgo. Si una métrica se usa contra el equipo, el equipo la saboteará (desplegará menos, troceará cambios) y dejará de medir la realidad.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

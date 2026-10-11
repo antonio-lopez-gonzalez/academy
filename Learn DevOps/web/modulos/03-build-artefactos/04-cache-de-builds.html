@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-cache-de-builds">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caché de builds de Docker en CI (type=gha) — Módulo 3 · Curso DevOps</title>
+  <meta name="description" content="Por qué el runner efímero reconstruye todo y cómo resolverlo: caché de capas de Docker en CI con Buildx (type=gha y type=registry), mode=max, cache mounts y builds rápidos y reproducibles para la Copiloto API.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caché de builds de Docker en CI (type=gha)</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Build y artefactos</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Si has seguido las lecciones anteriores, te habrá llamado la atención: <strong>el build en CI tarda muchísimo más que en tu portátil</strong>. Cambias una línea del <code>app/main.py</code> y volvemos a resolver e instalar todas las dependencias, a descargar la imagen base, a recompilar… como si fuera la primera vez. Porque, de hecho, <em>lo es</em>: cada job corrió en una máquina nueva, y las capas que tenía tu Docker local <strong>no existen ahí</strong>.</p>
+        <p>La caché de builds resuelve exactamente eso: hacer que el resultado del trabajo pesado (dependencias, compilaciones, capas intermedias) <strong>sobreviva al runner</strong> y lo reutilicen los siguientes builds. Bien hecha, convierte un build de 4 minutos en uno de 20 segundos; mal hecha, puede darte un artefacto distinto cada vez. Esta lección enseña a hacerlo bien: <code>type=gha</code>, <code>mode=max</code>, orden del <code>Dockerfile</code> y <em>cache mounts</em>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué importa la velocidad del build?</strong> Porque la velocidad del pipeline es la velocidad del equipo. Un CI que tarda 20 minutos hace que la gente agrupe cambios, deje de correr el pipeline y posponga el <em>feedback</em>. Un CI de 2 minutos se usa. Y la caché es, con diferencia, la mayor palanca de tiempo en un pipeline que construye imágenes.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Dos objetivos en tensión:</strong> rapidez y reproducibilidad. La caché debe ser un <em>atajo</em>, nunca una fuente de verdad distinta. Si con-caché y sin-caché produces imágenes diferentes, no tienes una caché, tienes un <em>bug</em>. Lo abordamos en la teoría.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Cómo funciona la caché de capas</h3>
+        <p>Cada instrucción del <code>Dockerfile</code> produce una <strong>capa</strong>. Docker no decide si reutilizar una capa «a ojo»: calcula una clave a partir de la instrucción y del estado del que depende. Cuando esa clave ya existe, reutiliza la capa; cuando cambia algo, invalida esa capa <em>y todas las siguientes</em>.</p>
+        <div class="diagram">
+  #  instruccion                                clave depende de        resultado
+  1  FROM python:3.12-slim AS builder           digest de la base       HIT si la base no cambia
+  2  COPY pyproject.toml uv.lock ./             checksum de esos ficheros  HIT si deps no cambian
+  3  RUN uv sync --frozen ...                    capa 2                  HIT si la 2 hizo HIT
+  4  COPY app ./app                              checksum del codigo     MISS en cada commit
+  5  RUN uv sync --frozen --no-dev               capas 2..4              MISS si la 4 fallo
+
+  Regla de oro: coloca PRIMERO lo que cambia POCO (manifiestos) y al final
+  lo que cambia MUCHO (codigo). Asi la invalidacion se queda al fondo.
+        </div>
+        <p>Ese es el motivo real del famoso «<code>COPY package*.json</code> antes de <code>npm ci</code>»: no es una moda, es ingeniería de caché. En la Copiloto API, los <em>manifiestos</em> (<code>pyproject.toml</code>, <code>uv.lock</code>) cambian poco y el código cambia en cada commit, así que van en ese orden.</p>
+
+        <h3>BuildKit: la caché deja de ser «una cadena de pasos»</h3>
+        <p>El builder clásico invalidaba como una <em>cascada</em>: un cambio obligaba a repetir todo lo de abajo. <strong>BuildKit</strong> construye un <strong>grafo</strong> de operaciones basado en contenido: puede reutilizar piezas concretas, saltarse etapas que no hacen falta para el <code>target</code> y descargar solo lo que falta. Por eso «con BuildKit se comparte mejor»: no reutiliza pasos, reutiliza <strong>contenido</strong>.</p>
+
+        <h3>Dónde guardar la caché: <em>backends</em></h3>
+        <p>Como el runner es efímero, hay que <strong>exportar</strong> la caché a un sitio que persista y <strong>volver a importarla</strong> en el build siguiente. Eso son las entradas <code>cache-to</code> y <code>cache-from</code>, con distintos <em>backends</em>:</p>
+        <table>
+          <thead><tr><th>Backend</th><th>Dónde vive</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>type=local</code></td><td>Una carpeta del runner</td><td>Builds en la misma máquina; en CI se pierde salvo que la persistas tú.</td></tr>
+            <tr><td><code>type=gha</code></td><td>Servicio de caché de GitHub Actions</td><td><strong>El patrón en GitHub CI</strong>: sin configurar nada extra, integrado con el repo.</td></tr>
+            <tr><td><code>type=registry</code></td><td>Las propias capas en el registry</td><td>Persistente, sirve entre ramas y para multi-plataforma; añade coste de red/almacenamiento.</td></tr>
+            <tr><td><code>type=inline</code></td><td>Metadatos dentro de la etiqueta publicada</td><td>Sin infraestructura extra, pero limitada a las capas finales.</td></tr>
+          </tbody>
+        </table>
+
+        <h3><code>type=gha</code>: la caché como parte del propio GitHub</h3>
+        <p>Con <code>type=gha</code>, Buildx guarda el grafo de caché en el <strong>servicio de caché de GitHub Actions</strong> (el mismo que usa <code>actions/cache</code>) y lo recupera en el build siguiente. Detalles que conviene conocer para no llevarte sorpresas:</p>
+        <ul>
+          <li><strong>Requiere el builder <code>docker-container</code>:</strong> lo crea <code>docker/setup-buildx-action</code>. Con el builder por defecto, <code>cache-to type=gha</code> no aplica.</li>
+          <li><strong>Está acotada por rama:</strong> la caché creada en una rama está disponible para esa rama (y las que nazcan de ella); la de la rama por defecto está disponible para todas.</li>
+          <li><strong>Límite de ~10 GB por repositorio</strong> con desalojo LRU: si guardas demasiado (por ejemplo, cachés enormes o <code>mode=max</code> en muchos <em>scopes</em>), GitHub empieza a expulsar entradas antiguas y los <em>hits</em> se vuelven intermitentes.</li>
+          <li><strong><code>scope</code>:</strong> separa cachés de distintas imágenes/jobs. Sin él, dos <code>Dockerfile</code> diferentes pueden pisarse y «envenenarse» mutuamente.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — la despensa compartida:</strong> el job es una cocina que se desmonta al acabar. <code>cache-to</code> guarda los preparados en una despensa común; <code>cache-from</code> los recupera al día siguiente. Si metes <em>todo</em> en la despensa (sin <code>mode</code> ni <code>scope</code>), se llena, el portero tira lo más viejo y tú vuelves a empezar de cero. La despensa es un atajo, no el plato.</p>
+        </div>
+
+        <h3><code>mode=max</code> frente a <code>mode=min</code></h3>
+        <p>En un <strong>multi-stage</strong> como el de la Copiloto API, esto es decisivo:</p>
+        <table>
+          <thead><tr><th>Modo</th><th>Qué exporta</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td><code>mode=min</code></td><td>Solo las capas de las etapas <strong>finales</strong> (lo que queda en la imagen)</td><td>Caché pequeña y suficiente si solo reconstruyes la etapa final.</td></tr>
+            <tr><td><code>mode=max</code></td><td>También las capas de las etapas <strong>intermedias</strong> (el <code>builder</code>)</td><td>Cuando quieres que el siguiente build reutilice el <code>uv sync</code> del taller. Ocupa más.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>La trampa clásica:</strong> activar <code>cache-to: type=gha</code> con el modo por defecto (<code>min</code>) y preguntarse por qué el <code>builder</code> sigue reinstalando todo. Si tu etapa pesada es intermedia, necesitas <strong><code>mode=max</code></strong>.</p>
+        </div>
+
+        <h3>Cache mounts: la caché <em>dentro</em> del build</h3>
+        <p>Además de las capas, BuildKit ofrece <code>--mount=type=cache</code>: un directorio (por ejemplo, la caché de <code>uv</code>/<code>pip</code>/<code>npm</code>) que <strong>persiste entre builds en el mismo builder</strong> pero <em>no engorda la imagen</em>. Ojo con su alcance: los cache mounts <strong>no forman parte</strong> de lo que exporta <code>cache-to</code>; viven con el builder de ese job. Ayudan sobre todo cuando el mismo job hace varias instalaciones (varias etapas) y complementan el orden del <code>Dockerfile</code>, pero no sustituyen a <code>type=gha</code> entre ejecuciones distintas.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La caché se activa con <strong>dos líneas</strong> en el build: de dónde leerla y dónde escribirla. Este workflow tarda mucho en el primer <code>push</code> y muy poco en los siguientes.</p>
+        <div class="code-file">.github/workflows/build.yml</div>
+        <pre><code class="language-yaml">name: build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Imprescindible: el backend type=gha necesita el driver
+      # docker-container.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build con cache de GitHub
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: copiloto-api:ci
+          # De donde LEER la cache: la del build anterior...
+          cache-from: type=gha
+          # ...y donde ESCRIBIR la de este build.
+          # mode=max: guarda tambien las capas de la etapa builder.
+          cache-to: type=gha,mode=max
+        </code></pre>
+        <ul>
+          <li><strong><code>cache-from: type=gha</code>:</strong> al empezar, Buildx intenta recuperar el grafo de caché que dejó el build anterior.</li>
+          <li><strong><code>cache-to: type=gha,mode=max</code>:</strong> al terminar, exporta las capas reutilizables (incluidas las del <code>builder</code>) al servicio de caché de GitHub.</li>
+          <li><strong>Sin el builder <code>docker-container</code></strong> no funciona: por eso está el <code>setup-buildx-action</code> justo antes.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>Cómo saber si funcionó:</strong> en la salida del build verás líneas <code>CACHED</code> al lado de los pasos reutilizados (<code>RUN uv sync ... CACHED</code>). La primera ejecución no tiene <code>CACHED</code> (es lo esperado: aún no había nada que reutilizar); la segunda, sí.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el proyecto conductor aplicamos las tres palancas juntas: <strong>orden del <code>Dockerfile</code></strong> (para que la invalidación caiga al final), <strong><code>type=gha</code> con <code>mode=max</code> y <code>scope</code></strong>, y <strong>cache mounts</strong> para las descargas de <code>uv</code>.</p>
+        <div class="code-file">proyectos/pipeline/Dockerfile (orden pensado para la caché)</div>
+        <pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM python:3.12-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /bin/
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+
+# 1) SOLO los manifiestos: si no cambian de dependencias, la capa
+#    "uv sync" de abajo es un HIT y no se descarga nada.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# 2) Al final, el codigo: es lo que cambia en cada commit, asi que
+#    solo se invalida desde aqui hacia abajo.
+COPY app ./app
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+
+FROM python:3.12-slim AS runtime
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/app /app/app
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+        </code></pre>
+        <div class="code-file">proyectos/pipeline/.github/workflows/publish.yml (job de build con caché)</div>
+        <pre><code class="language-yaml">name: publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login en GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          # Cache en GitHub, con scope propio para esta imagen:
+          # evita que la cache de build se mezcle con la de otros jobs.
+          cache-from: type=gha,scope=copiloto-api
+          cache-to: type=gha,scope=copiloto-api,mode=max
+        </code></pre>
+        <p>Panel de las tres palancas y qué gana cada una:</p>
+        <table>
+          <thead><tr><th>Palanca</th><th>Qué evita repetir</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Ordenar <code>Dockerfile</code> (manifiestos primero)</td><td>Resolver/instalar dependencias en cada commit</td><td>Ninguno (disciplina).</td></tr>
+            <tr><td><code>cache-to: type=gha,mode=max</code></td><td>Reconstruir la etapa <code>builder</code> entre ejecuciones</td><td>Uso del cupo de caché (~10 GB/repo).</td></tr>
+            <tr><td><code>--mount=type=cache</code> en <code>uv sync</code></td><td>Re-descargar paquetes dentro del mismo job</td><td>Ninguno en la imagen (no la engorda).</td></tr>
+          </tbody>
+        </table>
+        <p><strong>Alternativa persistente: la caché en el registry.</strong> Si quieres que la caché sobreviva entre ramas, funcione para varios runners y no consuma el cupo de GitHub, usa <code>type=registry</code>:</p>
+        <pre><code class="language-yaml">- name: Build con cache en el registry
+  uses: docker/build-push-action@v7
+  with:
+    context: .
+    push: true
+    tags: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+    # La cache se guarda como un tag especial del propio paquete.
+    cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+    cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+        </code></pre>
+        <div class="callout callout--why">
+          <p><strong>¿<code>gha</code> o <code>registry</code>?</strong> <code>type=gha</code> es más rápido de configurar y no ensucia tu registry, pero está atado al servicio de Actions y a su cupo. <code>type=registry</code> es más lento de subir/bajar, pero es <strong>persistente y compartida</strong>: ideal para builds multi-plataforma y para calentar la caché una vez y servirla a todos los runners. No hay una «mejor»: hay una que encaja con tu escala.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Copia manifiestos antes que el código</td>
+              <td><code>COPY . .</code> al principio</td>
+              <td>El código cambia en cada commit; si va primero, invalida las dependencias y adiós caché.</td>
+            </tr>
+            <tr>
+              <td><code>mode=max</code> cuando hay etapas intermedias pesadas</td>
+              <td>Dejar el modo por defecto (<code>min</code>) en un multi-stage</td>
+              <td>El <code>builder</code> es justo la etapa más cara; <code>min</code> no la exporta y la reconstruyes siempre.</td>
+            </tr>
+            <tr>
+              <td>Fija un <code>scope</code> por imagen/job</td>
+              <td>Compartir la caché entre imágenes distintas</td>
+              <td>Dos <code>Dockerfile</code> con el mismo <code>scope</code> se «pisan» y provocan <em>hits</em> incorrectos y pérdidas.</td>
+            </tr>
+            <tr>
+              <td>Usa cache mounts para gestores de paquetes</td>
+              <td><code>rm -rf</code> de la caché dentro del mismo <code>RUN</code></td>
+              <td>El mount no engorda la imagen; el <code>rm</code> sí crea capas intermedias que ensucian todo.</td>
+            </tr>
+            <tr>
+              <td>Pon un <code>pull: true</code> si dependes de una base móvil</td>
+              <td>Confiar en la base cacheada para siempre</td>
+              <td>Una capa cacheada puede ocultar que la imagen base cambió (o trae un parche de seguridad).</td>
+            </tr>
+            <tr>
+              <td>Verifica que <code>--no-cache</code> produce la misma imagen</td>
+              <td>Confiar en la caché como si fuera la verdad</td>
+              <td>Reproducibilidad: el build limpio es la referencia; la caché solo debe acelerar, no cambiar el resultado.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Copiar el código antes de las dependencias</h3>
+        <span class="code-label code-label--wrong">Mal — un solo cambio en el código invalida la instalación</span>
+        <pre class="code-wrong"><code class="language-dockerfile">FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY . .                          # incluye app/ (cambia siempre)
+RUN uv sync --frozen --no-dev     # MISS en cada commit
+</code></pre>
+        <span class="code-label code-label--right">Bien — manifiestos primero, código al final</span>
+        <pre class="code-right"><code class="language-dockerfile">WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
+COPY app ./app
+RUN uv sync --frozen --no-dev
+</code></pre>
+
+        <h3>2. <code>type=gha</code> sin <code>mode=max</code> en un multi-stage</h3>
+        <span class="code-label code-label--wrong">Mal — el modo por defecto no exporta la etapa <code>builder</code></span>
+        <pre class="code-wrong"><code class="language-yaml">with:
+  cache-from: type=gha
+  cache-to: type=gha          # mode=min -&gt; el builder se reconstruye
+                               #            entero en cada ejecucion
+</code></pre>
+        <span class="code-label code-label--right">Bien — exporta también las capas intermedias</span>
+        <pre class="code-right"><code class="language-yaml">with:
+  cache-from: type=gha,scope=copiloto-api
+  cache-to: type=gha,scope=copiloto-api,mode=max
+</code></pre>
+
+        <h3>3. <code>cache-to</code> sin el builder <code>docker-container</code></h3>
+        <span class="code-label code-label--wrong">Mal — el builder por defecto no exporta a <code>gha</code></span>
+        <pre class="code-wrong"><code class="language-yaml">steps:
+  - uses: actions/checkout@v6
+  # Falta setup-buildx-action: el build corre en el builder "default"
+  - uses: docker/build-push-action@v7
+    with:
+      cache-from: type=gha
+      cache-to: type=gha,mode=max
+# Resultado: la cache nunca se guarda/lee; builds siempre lentos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — crea el builder de Buildx primero</span>
+        <pre class="code-right"><code class="language-yaml">steps:
+  - uses: actions/checkout@v6
+  - uses: docker/setup-buildx-action@v4
+  - uses: docker/build-push-action@v7
+    with:
+      cache-from: type=gha
+      cache-to: type=gha,mode=max
+</code></pre>
+
+        <h3>4. Creer que la caché sirve igual para todos, siempre</h3>
+        <p>Las cachés de <code>type=gha</code> están <strong>acotadas por rama</strong> y sujetas a desalojo LRU (≈10 GB por repositorio). Si tus builds alternan entre muchas ramas, o si el cupo se llena, los <em>hits</em> caen y el pipeline vuelve a ser lento «sin razón aparente». Para builds multi-plataforma o equipos grandes, la caché en el registry (<code>type=registry</code>) es más predecible.</p>
+        <div class="callout callout--warning">
+          <p><strong>Nunca metas secretos en la caché.</strong> Si un <code>RUN</code> descarga algo autenticado y eso queda en una capa o en un cache mount, el secreto puede persistir entre builds y quedar expuesto. Para credenciales de build, usa <code>secrets</code> de BuildKit, que <strong>no</strong> se cachean.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir con evidencia la diferencia entre un build <em>sin caché</em> y uno <em>con caché</em>, y comprobar que ambos producen <strong>la misma imagen</strong>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Mide el build en frío (sin caché).</strong>
+            <pre><code class="language-bash">cd copiloto-ci
+time docker buildx build --no-cache --target runtime -t copiloto-api:cold --load .
+# Anota el tiempo. Al terminar, guarda el digest de la imagen:
+docker inspect --format '{{index .RepoDigests 0}}' copiloto-api:cold
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Rebuild sin tocar nada (caché caliente local).</strong>
+            <pre><code class="language-bash">time docker buildx build --target runtime -t copiloto-api:warm --load .
+# Esperado: mucho mas rapido y con lineas "CACHED" en cada paso.
+            </code></pre>
+            <div class="callout callout--tip">
+              <p>Si <em>no</em> ves <code>CACHED</code>, revisa el orden del <code>Dockerfile</code>: seguro que un <code>COPY . .</code> o un <code>ARG</code> que cambia está invalidando las capas de arriba.</p>
+            </div>
+          </li>
+          <li>
+            <strong>Paso 3 — Reproduce el escenario de CI con <code>cache-to</code>/<code>cache-from</code> a una carpeta local.</strong>
+            <pre><code class="language-bash"># 1er build: exporta la cache al disco (simula "cache-to type=gha")
+docker buildx build --target runtime -t copiloto-api:ci1 --load \
+  --cache-to type=local,dest=./.buildcache,mode=max .
+
+# Cambia UNA linea de app/main.py (solo el codigo)
+# 2do build: importa la cache exportada (simula "cache-from type=gha")
+time docker buildx build --target runtime -t copiloto-api:ci2 --load \
+  --cache-from type=local,src=./.buildcache \
+  --cache-to   type=local,dest=./.buildcache,mode=max .
+# Esperado: los pasos de uv sync salen CACHED; solo se rehace app/.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Demuestra la reproducibilidad: mismo contenido con y sin caché.</strong>
+            <pre><code class="language-bash"># Compara el contenido del sistema de ficheros de ambas imagenes.
+docker run --rm copiloto-api:cold find /app -type f | sort &gt; /tmp/cold.txt
+docker run --rm copiloto-api:warm find /app -type f | sort &gt; /tmp/warm.txt
+diff /tmp/cold.txt /tmp/warm.txt
+# Sin diferencias =&gt; la cache SOLO acelero, no cambio el artefacto.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Llévalo al workflow con <code>type=gha</code>.</strong>
+            <div class="code-file">.github/workflows/build.yml (extracto)</div>
+            <pre><code class="language-yaml">      - uses: docker/setup-buildx-action@v4
+
+      - name: Build con cache de GitHub
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: copiloto-api:ci
+          cache-from: type=gha,scope=copiloto-api
+          cache-to: type=gha,scope=copiloto-api,mode=max
+            </code></pre>
+            <pre><code class="language-bash"># Empuja DOS veces (un commit banal entre medias) y compara la
+# duracion de los dos runs en la pestana Actions. El segundo debe
+# mostrar "CACHED" y bajar a una fraccion del tiempo.
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Resultado esperado:</strong> el build en frío tarda minutos; el segundo, segundos. Y —lo más importante— <code>diff</code> no muestra diferencias: <em>la caché aceleró sin cambiar el artefacto</em>. Esa es la definición de una caché bien puesta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Caché que cruza ramas y plataformas</h3>
+          <p>Con <code>type=gha</code> la caché está atada a la rama y al cupo de GitHub; además, cada rama de feature empieza «en frío». Tu reto: diseñar una caché que <strong>no arranque nunca de cero</strong> y que además sirva para builds multi-arquitectura.</p>
+          <pre><code class="language-yaml"># PISTAS
+# 1) Cache en el registry, compartida por todas las ramas:
+#      cache-from: type=registry,ref=ghcr.io/OWNER/REPO:buildcache
+#      cache-to:   type=registry,ref=ghcr.io/OWNER/REPO:buildcache,mode=max
+#
+# 2) "Precalienta" la cache en main: un job que construye en main deja
+#    la cache lista para que las PRs la consuman.
+#
+# 3) Para multi-arch, la cache de registry es la que mejor se comparte
+#    entre plataformas (amd64 y arm64 tienen capas distintas).
+#
+# 4) Mide: compara el primer build de una rama nueva con y sin cache
+#    precalentada, y decide si compensa el coste de almacenamiento.
+          </code></pre>
+          <p>Preguntas para decidir: ¿qué cupo de caché toleras (tamaño y coste de almacenamiento en el registry)? ¿Qué pasa si dos builds escriben el mismo tag de caché a la vez? ¿Cómo evitas que la caché de una rama experimental contamine la de <code>main</code>? <strong>No dejes la respuesta escrita aquí</strong>: impleméntala, míde y elige con números.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>El runner es efímero:</strong> sin exportar la caché, cada build empieza en frío.</li>
+          <li><strong>Clave de capa:</strong> instrucción + contenido. Coloca primero lo que cambia poco (manifiestos) y al final lo que cambia mucho (código).</li>
+          <li><strong>BuildKit:</strong> cachea <em>contenido</em>, no «pasos»; reutiliza piezas concretas y salta etapas no necesarias.</li>
+          <li><strong><code>type=gha</code>:</strong> caché en el servicio de Actions; necesita el builder <code>docker-container</code>; acotada por rama y con cupo (~10 GB/repo) y desalojo LRU.</li>
+          <li><strong><code>mode=max</code>:</strong> imprescindible en multi-stage para cachear también la etapa <code>builder</code>.</li>
+          <li><strong><code>scope</code>:</strong> separa cachés de imágenes distintas para no «pisarse».</li>
+          <li><strong>Cache mounts:</strong> aceleran descargas dentro del builder del job, sin engordar la imagen; no se exportan con <code>cache-to</code>.</li>
+          <li><strong>La caché es un atajo:</strong> con y sin caché, el artefacto debe ser el mismo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>YAML / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Leer la caché de GitHub</td><td><code>cache-from: type=gha</code></td></tr>
+            <tr><td>Escribir la caché (con etapas intermedias)</td><td><code>cache-to: type=gha,mode=max</code></td></tr>
+            <tr><td>Aislar la caché por imagen</td><td><code>type=gha,scope=copiloto-api</code></td></tr>
+            <tr><td>Caché persistente y compartida</td><td><code>type=registry,ref=…:buildcache,mode=max</code></td></tr>
+            <tr><td>Cache mount de paquetes</td><td><code>RUN --mount=type=cache,target=/root/.cache/uv …</code></td></tr>
+            <tr><td>Ignorar la caché (build de referencia)</td><td><code>docker buildx build --no-cache …</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué mi build en CI tarda 10 veces más que en local?</summary>
+            <div>
+              <p>Porque en local reutilizas capas de builds anteriores y en CI partes de una máquina vacía. No es que CI sea «lento»: es que hace el trabajo completo cada vez. La solución es exportar la caché (<code>cache-to</code>) y recuperarla en el build siguiente (<code>cache-from</code>).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>type=gha</code> o <code>type=registry</code>?</summary>
+            <div>
+              <p><code>gha</code> es más simple y rápido de configurar, pero está atado a las ramas y al cupo del servicio de caché de Actions (~10 GB por repositorio, con desalojo LRU). <code>registry</code> es más lento de transferir pero <strong>persistente y compartido</strong>, ideal para multi-plataforma o equipos con muchas ramas. Empieza con <code>gha</code>; cambia a <code>registry</code> si los <em>hits</em> se vuelven intermitentes o haces multi-arch.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La caché puede darme una imagen distinta a la del build limpio?</summary>
+            <div>
+              <p>No <em>debería</em>. Una caché correcta reproduce el mismo resultado; solo evita recomputarlo. Si obtienes diferencias, casi siempre hay un <code>RUN</code> no determinista o que depende de algo que debería invalidar la capa (una descarga con «última versión», un <code>apt-get update</code> separado del <code>install</code>…). Compara con <code>--no-cache</code> y arregla el <code>Dockerfile</code>; no culpes a la caché.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué un <code>RUN apt-get update</code> me da paquetes «viejos»?</summary>
+            <div>
+              <p>Clásico: si <code>apt-get update</code> está en una capa separada y esa capa queda <code>CACHED</code>, el índice de paquetes es el de hace semanas. La regla es agrupar <code>apt-get update &amp;&amp; apt-get install -y --no-install-recommends … &amp;&amp; rm -rf /var/lib/apt/lists/*</code> en un <strong>único</strong> <code>RUN</code>, para que ambos ocurran juntos o ninguno.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los <code>--mount=type=cache</code> se guardan entre ejecuciones de CI?</summary>
+            <div>
+              <p>No. Los cache mounts viven con el <strong>builder</strong>: en CI, el builder dura lo que dura el job, así que ayudan sobre todo cuando haces varias instalaciones dentro del mismo job (varias etapas), pero <strong>no</strong> se exportan con <code>cache-to</code>. Para persistir entre ejecuciones necesitas la caché de capas (<code>type=gha</code> o <code>type=registry</code>).</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

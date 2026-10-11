@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-estado-y-modulos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Estado y módulos — Módulo 6 · Curso DevOps</title>
+  <meta name="description" content="El archivo de estado de Terraform y por qué es crítico: estado remoto con locking, buenas prácticas, y módulos reutilizables para la infraestructura del Copiloto.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Estado y módulos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Infraestructura como código</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Terraform funciona porque sabe <strong>qué existe</strong> y <strong>dónde está</strong>. Ese conocimiento vive en un archivo: el <strong>estado</strong> (<em>state</em>). Si el código <code>.tf</code> es el plano de la casa, el estado es el inventario de muebles con su número de serie: sin él, la herramienta no sabe si un recurso ya está creado o hay que crearlo.</p>
+        <p>El estado es, con diferencia, la pieza que más duele cuando se gestiona mal: es único, es mutable, puede contener secretos y, si dos personas lo tocan a la vez, se corrompe. Esta lección explica cómo funciona, por qué debe vivir en un <strong>backend remoto con <em>locking</em></strong> y cómo los <strong>módulos</strong> te dejan reutilizar infraestructura sin copiar y pegar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque el error nº 1 de quien empieza con IaC es tratar el <code>terraform.tfstate</code> como un archivo cualquiera del proyecto. El estado no es un artefacto de salida: es la <em>memoria</em> de la herramienta. Entenderlo es la frontera entre «hago demos» y «llevo infraestructura de verdad».</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Adelanto de la lección:</strong> el estado se guarda en un backend remoto, se bloquea durante cada operación y <strong>nunca</strong> se sube a Git. Si te llevas solo eso, ya habrás entendido el 80 %.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué guarda el estado exactamente</h3>
+        <p>El estado asocia cada recurso de tu código con el objeto real que creó, y guarda los atributos que la API devolvió. Simplificando, para cada recurso hay una entrada con su <strong>dirección</strong> y sus <strong>atributos</strong>. Un extracto de un <code>terraform.tfstate</code> real:</p>
+        <div class="code-file">terraform.tfstate (fragmento, simplificado)</div>
+        <pre><code class="language-json">{
+  "version": 4,
+  "terraform_version": "1.9.5",
+  "serial": 12,
+  "lineage": "8f2c1a9e-...",
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "kubernetes_namespace_v1",
+      "name": "copiloto",
+      "provider": "provider[\"registry.terraform.io/hashicorp/kubernetes\"]",
+      "instances": [
+        {
+          "attributes": {
+            "id": "copiloto-staging",
+            "metadata": [{ "name": "copiloto-staging", "labels": { "env": "staging" } }]
+          }
+        }
+      ]
+    }
+  ]
+}
+</code></pre>
+        <p>Dos datos clave: el <strong>tipo y nombre</strong> (<code>kubernetes_namespace_v1.copiloto</code>) y el <strong><code>id</code> real</strong> en el proveedor. Con eso, Terraform puede preguntar «¿sigue existiendo? ¿cambió algo?» y decidir el diff. Además, el estado guarda metadatos como el orden de serialización (<code>serial</code>) y el <code>lineage</code>, que identifican su historia.</p>
+        <div class="callout callout--note">
+          <p><strong>El estado no es solo el <em>id</em>.</strong> También guarda los <em>outputs</em>, las dependencias y valores de atributos que la API no te deja consultar. Por eso no se puede «reconstruir» leyendo solo la nube: Terraform necesita el archivo.</p>
+        </div>
+
+        <h3>Por qué es crítico</h3>
+        <ul>
+          <li><strong>Es la fuente de verdad del <code>plan</code>.</strong> Sin estado, Terraform cree que no existe nada y propondrá <em>crear</em> recursos que ya existen (duplicados o choques de nombre) o, peor, destruir y recrear.</li>
+          <li><strong>Puede contener secretos.</strong> Los atributos sensibles que la API devuelve (contraseñas generadas, tokens) se guardan <strong>en claro</strong> en el estado. Por eso el estado es <em>tan</em> sensible como un secreto.</li>
+          <li><strong>Es un recurso compartido y mutable.</strong> Todo el equipo y el CI lo leen y lo escriben. Sin bloqueo, dos <code>apply</code> a la vez corrompen el archivo.</li>
+          <li><strong>Perderlo es caro.</strong> Recuperarlo implica <em>importar</em> recurso a recurso, a mano. Es una tarde perdida y un riesgo de incidente.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el estado es la lista de la compra <em>después</em> de haber comprado. El código dice qué quieres tener en la despensa; la lista dice qué hay ya y de qué marca. Si tiras la lista, volverás a comprar lo que ya tienes, o tirarás lo bueno por duplicado.</p>
+        </div>
+
+        <h3>Estado remoto con locking</h3>
+        <p>Por defecto el estado es un archivo local: <code>terraform.tfstate</code> en el directorio del proyecto. Eso vale para aprender, pero en equipo y en CI es inservible: cada persona tendría su copia y la del CI otra. La solución es un <strong>backend remoto</strong>: el estado vive en un almacenamiento compartido y <strong>se bloquea</strong> durante cada operación.</p>
+        <pre class="diagram">
+   tu portatil ─┐
+                ├──▶  backend remoto (S3 + lock, HCP Terraform, GCS…)
+   el CI ───────┘          │
+                           ├── guarda terraform.tfstate (compartido)
+                           └── LOCK mientras alguien hace plan/apply
+                                │
+                                └── el segundo que llega espera o falla
+        </pre>
+        <p>El backend se declara en el bloque <code>terraform</code> y se configura con <code>init</code>. Los datos sensibles (bucket, región) pueden ir por <code>-backend-config</code>, lo que permite el mismo código con distinto backend por entorno:</p>
+        <div class="code-file">infra/versions.tf</div>
+        <pre><code class="language-hcl">terraform {
+  backend "s3" {
+    bucket       = "academy-tfstate"
+    key          = "copiloto/staging/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true # bloqueo por fichero en el propio bucket (Terraform 1.10+)
+  }
+}
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># Inicializa con backend remoto y migra el estado local si ya existia:
+terraform init -migrate-state
+
+# Espera hasta 5 minutos si el estado esta bloqueado por otro run:
+terraform apply -lock-timeout=5m
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>Sobre el bloqueo (locking).</strong> En backends como S3, el bloqueo se hacía con una tabla de DynamoDB; hoy se admite <code>use_lockfile = true</code>, que usa un objeto en el propio bucket. Otros backends lo traen integrado: <strong>HCP Terraform</strong> (la nube de HashiCorp) bloquea y además da historial de runs, política y aprobaciones. Los tres backends populares —S3, GCS y Azure Blob— soportan estado remoto; elige el que ya conozcas.</p>
+        </div>
+
+        <h3>Comandos de estado que conviene conocer</h3>
+        <table>
+          <thead><tr><th>Comando</th><th>Para qué sirve</th><th>Cuidado con…</th></tr></thead>
+          <tbody>
+            <tr><td><code>terraform state list</code></td><td>Lista las direcciones gestionadas</td><td>—</td></tr>
+            <tr><td><code>terraform state show DIR</code></td><td>Muestra los atributos de un recurso</td><td>Puede revelar secretos</td></tr>
+            <tr><td><code>terraform state mv A B</code></td><td>Renombra/dirige una entrada</td><td>Mejor usar bloques <code>moved</code></td></tr>
+            <tr><td><code>terraform state rm DIR</code></td><td>Deja de gestionar un recurso <em>sin</em> destruirlo</td><td>El recurso sigue existiendo por fuera</td></tr>
+            <tr><td><code>terraform import DIR ID</code></td><td>Adopta un recurso ya existente</td><td>Hay que escribir el recurso antes</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Mejor <code>moved</code> que <code>state mv</code>.</strong> Un bloque <code>moved</code> en el código documenta el renombrado, se revisa en la PR y se aplica solo. Un <code>terraform state mv</code> a mano es un cambio invisible en el historial del repositorio, y se olvida.</p>
+        </div>
+
+        <h3>Módulos: reutilizar sin copiar y pegar</h3>
+        <p>Un <strong>módulo</strong> es un conjunto de archivos <code>.tf</code> que se llama desde otro punto. El proyecto que ejecutas es el <strong>módulo raíz</strong> (<em>root</em>); cada <code>module</code> que invocas es un <strong>módulo hijo</strong> (<em>child</em>). La interfaz es igual que la de una función: <strong>variables de entrada</strong>, <strong>outputs de salida</strong>.</p>
+        <div class="code-file">infra/envs/staging/main.tf</div>
+        <pre><code class="language-hcl">module "service" {
+  source = "../../modules/service"
+
+  environment = "staging"
+  image       = "ghcr.io/academy/copiloto-api:v1.4.0-rc.1"
+  replicas    = 1
+}
+
+output "service_name" {
+  value = module.service.service_name
+}
+</code></pre>
+        <p>El módulo define qué recibe y qué devuelve:</p>
+        <div class="code-file">infra/modules/service/variables.tf</div>
+        <pre><code class="language-hcl">variable "environment" { type = string }
+variable "image" { type = string }
+variable "replicas" {
+  type    = number
+  default = 2
+}
+</code></pre>
+        <p>Cuatro reglas que evitan sorpresas:</p>
+        <ol class="steps">
+          <li><strong>Los hijos no tienen estado propio.</strong> Todo se guarda en el estado del módulo raíz, con direcciones prefijadas por <code>module.nombre</code>.</li>
+          <li><strong>Los hijos solo se comunican por variables y outputs.</strong> No hay efectos globales; es lo que los hace testeables y reutilizables.</li>
+          <li><strong>La <code>source</code> es local o remota.</strong> Local (<code>../../modules/service</code>) para módulos del propio repo; remota (registry, repo de Git con <code>?ref=v1.2.0</code>) para compartidos. La remota se <strong>fija a una versión</strong>.</li>
+          <li><strong>Un módulo, un propósito.</strong> «Todo lo del Copiloto» no es un módulo; «un servicio desplegable» sí.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Los módulos también reducen el <strong>tamaño del estado</strong>. Un estado gigantesco hace lento cada <code>plan</code> y amplifica el riesgo de un cambio. Separa por ciclo de vida: la red cambia poco, la aplicación mucho; no deberían compartir estado.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Sin nube: el proveedor <code>local</code> escribe una nota, y nosotros <em>miramos</em> el estado que genera. El objetivo es ver la asociación entre dirección y recurso real.</p>
+        <div class="code-file">infra/main.tf</div>
+        <pre><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.6"
+  required_providers {
+    local = {
+      source  = "hashicorp/local"
+      version = "~&gt; 2.5"
+    }
+  }
+}
+
+resource "local_file" "nota" {
+  filename = "${path.module}/salida/nota.txt"
+  content  = "estado y modulos\n"
+}
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">terraform init
+terraform apply -auto-approve
+
+terraform state list
+# local_file.nota
+
+terraform state show local_file.nota
+# # local_file.nota:
+# resource "local_file" "nota" {
+#     content  = "estado y modulos\n"
+#     filename = "./salida/nota.txt"
+#     id       = "b3f1...c9"
+# }
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>terraform state list</code></strong>: imprime las direcciones que Terraform gestiona. Cada línea es un recurso <em>real</em> que existe por ahí y que el código declara.</li>
+          <li><strong><code>terraform state show local_file.nota</code></strong>: revela los atributos guardados, incluido el <code>id</code> real. Es la ventana al contenido del estado sin abrir el JSON a mano.</li>
+          <li><strong>El <code>id</code></strong>: lo devuelve el proveedor al crear el recurso. Es lo que ata tu dirección lógica (<code>local_file.nota</code>) al objeto físico.</li>
+        </ol>
+        <div class="callout callout--warning">
+          <p>Prueba a renombrar el recurso en el código de <code>local_file.nota</code> a <code>local_file.bienvenida</code> y ejecuta <code>terraform plan</code> <strong>sin</strong> mover el estado: verás <code>- destroy</code> y <code>+ create</code> (borra el archivo y lo crea de nuevo). Es exactamente el <em>replace</em> que hay que evitar. Deshazlo, o usa un <code>moved</code>, y el plan dirá <code>No changes</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El Copiloto crece: queremos la <em>misma</em> infraestructura de servicio en <em>staging</em> y en producción, con estados con backend remoto distintos. La estructura que lo resuelve es <strong>un módulo</strong> y <strong>un directorio raíz por entorno</strong> (cada uno con su propio estado).</p>
+        <div class="code-file">infra/</div>
+        <pre><code class="language-text">infra/
+├── modules/
+│   └── service/            # modulo reutilizable: namespace + deployment + service
+│       ├── versions.tf
+│       ├── variables.tf
+│       ├── main.tf
+│       └── outputs.tf
+└── envs/
+    ├── staging/            # modulo raiz, con su backend y su estado
+    │   ├── main.tf
+    │   └── backend.hcl
+    └── prod/
+        ├── main.tf
+        └── backend.hcl
+</code></pre>
+        <p>El módulo encapsula la infraestructura del servicio y expone lo que hay que publicar:</p>
+        <div class="code-file">infra/modules/service/main.tf (esquema)</div>
+        <pre><code class="language-hcl">resource "kubernetes_namespace_v1" "this" {
+  metadata {
+    name   = "copiloto-${var.environment}"
+    labels = { app = "copiloto", env = var.environment }
+  }
+}
+
+resource "kubernetes_deployment_v1" "this" {
+  metadata {
+    name      = "copiloto-api"
+    namespace = kubernetes_namespace_v1.this.metadata[0].name
+  }
+  spec {
+    replicas = var.replicas
+    # ... selector, template y container con var.image
+  }
+}
+</code></pre>
+        <div class="code-file">infra/modules/service/outputs.tf</div>
+        <pre><code class="language-hcl">output "namespace" {
+  value = kubernetes_namespace_v1.this.metadata[0].name
+}
+
+output "service_name" {
+  value = kubernetes_deployment_v1.this.metadata[0].name
+}
+</code></pre>
+        <p>Cada entorno es un módulo raíz que llama al módulo y declara su backend. El código es idéntico; solo cambian los valores y la <code>key</code> del estado:</p>
+        <div class="code-file">infra/envs/staging/main.tf</div>
+        <pre><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.6"
+  backend "s3" {
+    key          = "copiloto/staging/terraform.tfstate"
+    use_lockfile = true
+  }
+}
+
+module "service" {
+  source = "../../modules/service"
+
+  environment = "staging"
+  image       = "ghcr.io/academy/copiloto-api:v1.4.0-rc.1"
+  replicas    = 1
+}
+</code></pre>
+        <div class="code-file">infra/envs/staging/backend.hcl</div>
+        <pre><code class="language-hcl">bucket = "academy-tfstate"
+region = "eu-west-1"
+encrypt = true
+</code></pre>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash">cd infra/envs/staging
+terraform init -backend-config=backend.hcl -migrate-state
+terraform plan -out=tfplan
+terraform apply tfplan
+
+# Las direcciones del estado llevan el prefijo del modulo:
+terraform state list
+# module.service.kubernetes_namespace_v1.this
+# module.service.kubernetes_deployment_v1.this
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Un estado por entorno</strong> (<code>copiloto/staging/…</code> y <code>copiloto/prod/…</code>): un <code>apply</code> en staging no puede tocar producción, ni siquiera por error. Aislamiento por diseño.</li>
+          <li><strong>El módulo no declara backend.</strong> El backend pertenece al módulo <strong>raíz</strong>; un módulo hijo no decide dónde vive el estado. Por eso <code>modules/service</code> no tiene bloque <code>backend</code>.</li>
+          <li><strong><code>-backend-config=backend.hcl</code></strong>: bucket y región fuera del código, para que el mismo módulo raíz sirva en otra cuenta sin editar <code>.tf</code>.</li>
+          <li><strong><code>module.service.service_name</code></strong>: los outputs del hijo se leen con ese prefijo. Es la única superficie de comunicación hacia fuera.</li>
+          <li><strong><code>use_lockfile = true</code></strong>: si dos runs coinciden (tú y el CI), el segundo espera o falla con <code>state locked</code> en lugar de corromper el estado.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Lee los outputs de otro estado con el <em>data source</em> <code>terraform_remote_state</code>: define su <code>backend</code> y su <code>key</code>, y accede a los valores con <code>data.terraform_remote_state.<nombre>.outputs.<clave></code>. Sirve para que el módulo raíz de red y el de aplicación se comuniquen sin acoplarse a la misma carpeta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Backend remoto con locking desde el día uno</td>
+              <td>Estado local en el portátil</td>
+              <td>Compartido, bloqueado y respaldado; el local se pierde y se desincroniza</td>
+            </tr>
+            <tr>
+              <td>Un estado por entorno</td>
+              <td>Un único estado para staging y prod</td>
+              <td>Errores en staging no deben poder alcanzar producción</td>
+            </tr>
+            <tr>
+              <td>Tratar el estado como un secreto</td>
+              <td>Subirlo a Git o a un bucket público</td>
+              <td>Contiene valores sensibles en claro; fuga garantizada</td>
+            </tr>
+            <tr>
+              <td>Usar bloques <code>moved</code> para renombrar</td>
+              <td><code>terraform state mv</code> a mano</td>
+              <td>El renombrado queda en la PR y se aplica solo, sin destruir nada</td>
+            </tr>
+            <tr>
+              <td><code>terraform import</code> para adoptar recursos existentes</td>
+              <td>Recrear lo que ya existe</td>
+              <td>Adoptar evita downtime y duplicados</td>
+            </tr>
+            <tr>
+              <td>Módulos pequeños, con variables y outputs claros</td>
+              <td>Un módulo «que hace todo»</td>
+              <td>Reutilizables, testeables y con superficie de cambio acotada</td>
+            </tr>
+            <tr>
+              <td>Fijar la <code>source</code> remota a una versión (<code>?ref=v1.2.0</code>)</td>
+              <td>Apuntar a <code>main</code> de otro repo</td>
+              <td>Un cambio ajeno no debería romper tu infra sin avisar</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Versionar el estado en Git</h3>
+        <span class="code-label code-label--wrong">Mal — el estado en el repositorio</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ El tfstate guarda secretos en claro y, ademas, provoca conflictos en cada merge.
+$ git add terraform.tfstate
+$ git commit -m "state"
+</code></pre>
+        <span class="code-label code-label--right">Bien — backend remoto e ignorado en Git</span>
+        <pre class="code-right"><code class="language-text"># ✅ .gitignore
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+</code></pre>
+
+        <h3>Dos <code>apply</code> a la vez sobre el mismo estado</h3>
+        <span class="code-label code-label--wrong">Mal — sin locking</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ Backend local o sin bloqueo: tu apply y el del CI escriben a la vez.
+# Resultado: estado corrupto, recursos duplicados o huerfanos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — estado remoto con locking</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ El backend bloquea durante la operacion; el segundo run espera o falla limpiamente.
+terraform {
+  backend "s3" {
+    key          = "copiloto/staging/terraform.tfstate"
+    use_lockfile = true
+  }
+}
+</code></pre>
+
+        <h3>Renombrar un recurso sin mover el estado</h3>
+        <span class="code-label code-label--wrong">Mal — renombrar y esperar</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ El estado apunta a "copiloto"; el codigo ahora dice "copiloto_api" → destroy + create.
+resource "kubernetes_namespace_v1" "copiloto_api" {
+  metadata { name = "copiloto-staging" }
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — dirigir el cambio con <code>moved</code></span>
+        <pre class="code-right"><code class="language-hcl"># ✅ El estado sigue el renombrado sin destruir ni recrear el recurso.
+moved {
+  from = kubernetes_namespace_v1.copiloto
+  to   = kubernetes_namespace_v1.copiloto_api
+}
+</code></pre>
+
+        <h3>Compartir un solo estado entre entornos</h3>
+        <span class="code-label code-label--wrong">Mal — un estado para todo</span>
+        <pre class="code-wrong"><code class="language-text"># ❌ Staging y produccion comparten estado: un plan de staging puede listar
+# cambios de produccion, y un error de dedo aplica en el entorno equivocado.
+# Y como extra, cada plan tarda una eternidad.
+</code></pre>
+        <span class="code-label code-label--right">Bien — estados separados por entorno</span>
+        <pre class="code-right"><code class="language-text"># ✅ infra/envs/staging → copiloto/staging/terraform.tfstate
+#    infra/envs/prod    → copiloto/prod/terraform.tfstate
+# Mismo modulo, dos estados aislados.
+</code></pre>
+
+        <h3>Módulo remoto apuntando a una rama</h3>
+        <span class="code-label code-label--wrong">Mal — seguir <code>main</code> de otro repo</span>
+        <pre class="code-wrong"><code class="language-hcl"># ❌ El modulo puede cambiar sin que tu repositorio lo sepa.
+module "service" {
+  source = "git::https://github.com/academy/terraform-service.git"
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — fijar una versión</span>
+        <pre class="code-right"><code class="language-hcl"># ✅ La version es explicita y subirla es un cambio revisable en tu PR.
+module "service" {
+  source = "git::https://github.com/academy/terraform-service.git?ref=v1.2.0"
+}
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver con tus ojos por qué el estado es imprescindible, cómo el prefijo <code>module.</code> aparece al refactorizar, y cómo un <code>moved</code> evita destruir. Sin nube: el módulo escribe archivos con el proveedor <code>local</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un módulo que escriba una nota por entorno.
+            <pre><code class="language-bash">mkdir -p copiloto-state/modules/nota copiloto-state/envs/staging
+</code></pre>
+            <pre><code class="language-hcl"># modules/nota/variables.tf
+variable "environment" { type = string }
+
+# modules/nota/main.tf
+resource "local_file" "nota" {
+  filename = "${path.module}/../../salida/${var.environment}.txt"
+  content  = "entorno=${var.environment}\n"
+}
+</code></pre>
+            <p>Resultado esperado: el directorio del módulo y su variable. Aún no hay estado.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> crea el módulo raíz que lo llama y aplica.
+            <pre><code class="language-hcl"># envs/staging/main.tf
+module "nota" {
+  source      = "../../modules/nota"
+  environment = "staging"
+}
+</code></pre>
+            <pre><code class="language-bash">cd copiloto-state/envs/staging
+terraform init &amp;&amp; terraform apply -auto-approve
+</code></pre>
+            <p>Resultado esperado: se crea <code>salida/staging.txt</code> y aparece <code>terraform.tfstate</code> en la carpeta del entorno.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> mira el estado y localiza el prefijo del módulo.
+            <pre><code class="language-bash">terraform state list
+</code></pre>
+            <p>Resultado esperado: <code>module.nota.local_file.nota</code>. Los recursos del hijo viven en el estado del <strong>raíz</strong>, con el prefijo <code>module.nota</code>. El módulo no tiene estado propio.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> simula que alguien pierde el estado. Aparta el archivo y planifica.
+            <pre><code class="language-bash">mv terraform.tfstate terraform.tfstate.old
+terraform plan
+</code></pre>
+            <p>Resultado esperado: <code>Plan: 1 to add</code> — Terraform no recuerda que la nota ya existe y quiere <strong>crearla otra vez</strong>. Restaura el archivo (<code>mv terraform.tfstate.old terraform.tfstate</code>) y repite <code>plan</code>: vuelve a decir <code>No changes</code>. Acabas de demostrar para qué sirve el estado.</p>
+          </li>
+          <li>
+            <strong>Paso 5:</strong> renombra el recurso <em>con</em> un bloque <code>moved</code> y comprueba que no se destruye nada.
+            <pre><code class="language-hcl"># modules/nota/main.tf
+resource "local_file" "nota_copiloto" {
+  filename = "${path.module}/../../salida/${var.environment}.txt"
+  content  = "entorno=${var.environment}\n"
+}
+
+moved {
+  from = local_file.nota
+  to   = local_file.nota_copiloto
+}
+</code></pre>
+            <pre><code class="language-bash">terraform plan
+</code></pre>
+            <p>Resultado esperado: <code>No changes</code> (Terraform reconoce el <em>moved</em>, no hay <code>destroy</code>). Quita el bloque <code>moved</code> y repite: ahora propondría <code>-/+</code> <em>replace</em>. Vuelve a ponerlo.</p>
+          </li>
+          <li>
+            <strong>Paso 6 (verificación):</strong> prepara el salto a backend remoto y comprueba el bloqueo.
+            <pre><code class="language-hcl"># envs/staging/main.tf (añade)
+terraform {
+  backend "s3" {
+    key          = "copiloto/staging/terraform.tfstate"
+    use_lockfile = true
+  }
+}
+</code></pre>
+            <pre><code class="language-bash">terraform init -migrate-state
+# Si no tienes AWS, comprueba primero que el plan sigue igual tras el cambio:
+terraform plan -lock-timeout=5m
+</code></pre>
+            <p>Resultado esperado: <code>init</code> migra el estado local al backend remoto sin recrear recursos; en un run concurrente, el segundo recibiría <code>Error: state locked</code> en lugar de corromper el archivo. Si no tienes bucket, deja el bloque comentado y anota el paso como pendiente de credenciales.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Añade <code>.terraform/</code>, <code>*.tfstate</code> y <code>*.tfstate.*</code> al <code>.gitignore</code> del ejercicio. Solo <code>.tf</code>, <code>.tfvars</code> y <code>.terraform.lock.hcl</code> van a Git.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Partir el estado en dos sin recrear nada</h3>
+          <p>Tienes un único estado con toda la infraestructura del Copiloto: red, base de datos y aplicación. Pártelo en <strong>dos estados independientes</strong> —<code>infra-base</code> (red y base de datos) y <code>infra-app</code> (namespace, despliegue, servicio)— de forma que <strong>no se destruya ningún recurso</strong> en el proceso. El de la aplicación debe leer lo que necesita del estado de la base con <code>terraform_remote_state</code>.</p>
+          <p>Documenta el proceso como una sucesión de <code>terraform state mv</code> o de bloques <code>moved</code> (justifica cuál eliges), y añade un <code>output</code> en <code>infra-base</code> que exponga lo que consume la app.</p>
+          <p><em>Pista: para no destruir nada, el orden importa. Primero escribe el nuevo módulo raíz con su backend y su <code>key</code> propia; después <code>terraform init</code> y <code>terraform state mv</code> (o <code>moved</code>) para trasladar las entradas del estado viejo al nuevo; por último, <code>terraform plan</code> en ambos y exige <code>No changes</code> antes de borrar el estado antiguo. En <code>infra-app</code>, el data source <code>terraform_remote_state</code> apunta al backend de <code>infra-base</code> y lees <code>data.terraform_remote_state.base.outputs.…</code>. Si algún plan dice <code>destroy</code>, el movimiento no está bien hecho: para y corrígelo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>estado</strong> asocia cada recurso del código con su objeto real (<code>id</code>) y sus atributos. Es la memoria de Terraform y la fuente de verdad del <code>plan</code>.</li>
+          <li>Es <strong>crítico</strong>: sin él, Terraform cree que nada existe; además puede contener <strong>secretos en claro</strong>. Nunca va a Git.</li>
+          <li>Vive en un <strong>backend remoto</strong> con <strong>locking</strong> para que equipo y CI compartan un único estado sin corromperlo.</li>
+          <li><strong>Un estado por entorno</strong>: aislamiento por diseño entre staging y producción.</li>
+          <li>Los <strong>módulos</strong> encapsulan infraestructura reutilizable y se comunican por <strong>variables</strong> y <strong>outputs</strong>; no tienen estado propio.</li>
+          <li>Renombrar se hace con bloques <code>moved</code> (revisables) en lugar de editar el estado a mano; adoptar recursos existentes, con <code>terraform import</code>.</li>
+          <li><code>terraform_remote_state</code> conecta estados distintos sin acoplarlos en la misma carpeta.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece en HCL</th></tr></thead>
+          <tbody>
+            <tr><td>Estado</td><td>Asocia recurso ↔ objeto real</td><td><code>terraform.tfstate</code> (backend, no Git)</td></tr>
+            <tr><td>Backend remoto</td><td>Almacenamiento compartido del estado</td><td><code>backend "s3" { … }</code></td></tr>
+            <tr><td>Locking</td><td>Evita escrituras simultáneas</td><td><code>use_lockfile = true</code></td></tr>
+            <tr><td>Módulo hijo</td><td>Infraestructura reutilizable invocada</td><td><code>module "service" { source = … }</code></td></tr>
+            <tr><td>Entrada/salida de módulo</td><td>Su interfaz</td><td><code>variable</code> / <code>module.service.salida</code></td></tr>
+            <tr><td>Renombrado</td><td>Mueve la dirección en el estado</td><td><code>moved { from = … to = … }</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué pasa si pierdo el estado de verdad?</summary>
+            <div>
+              <p>Lo recuperas <em>importando</em> cada recurso existente: escribes el recurso en el código y ejecutas <code>terraform import</code> con su <code>id</code>. Funciona, pero es lento y delicado, y cualquier recurso que no importes o que esté mal importado puede quedar huérfano o duplicado. La mejor estrategia es no llegar ahí: backend remoto con <strong>versionado</strong> (S3 lo tiene por defecto) y, si puedes, un backend que guarde historial de versiones del estado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el estado guarda secretos?</summary>
+            <div>
+              <p>Porque el proveedor devuelve atributos sensibles (contraseñas autogeneradas, tokens, claves) y Terraform los guarda para saber si cambiaron sin tener que volver a crearlos. <code>sensitive = true</code> solo oculta el valor en los <em>logs</em>: el estado sigue conteniéndolo. Trátalo como un secreto: backend cifrado, acceso restringido, nunca en Git.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los módulos tienen su propio estado?</summary>
+            <div>
+              <p>No. Todos los recursos de todos los módulos hijos viven en el estado del <strong>módulo raíz</strong>, con direcciones prefijadas por <code>module.<nombre></code>. Por eso un módulo raíz = un estado, sin excepciones. Si quieres estados separados, necesitas módulos raíz separados (directorios con su propio backend), no más módulos hijos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Backend remoto o <em>workspaces</em>?</summary>
+            <div>
+              <p>Son ortogonales. El <strong>backend</strong> decide <em>dónde</em> vive el estado; los <strong>workspaces</strong> deciden <em>cuántos estados</em> hay bajo el mismo backend (uno por workspace). Muchos equipos prefieren un directorio por entorno con su backend explícito, porque es más legible y fácil de aislar. Comparamos las dos opciones a fondo en la lección 4.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo editar el estado a mano para arreglar algo?</summary>
+            <div>
+              <p>Es la última opción y suele salir mal: el formato tiene seriales y conteos que, si te equivocas, lo corrompen. Usa <code>terraform state mv</code>, <code>terraform state rm</code>, <code>terraform import</code> o bloques <code>moved</code>, que respetan el formato. Y, sobre todo: con el estado en un backend remoto, primero <strong>haz una copia</strong> antes de tocarlo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

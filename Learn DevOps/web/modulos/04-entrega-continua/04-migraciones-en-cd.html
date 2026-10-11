@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-migraciones-en-cd">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Migraciones en CD — Módulo 4 · Curso DevOps</title>
+  <meta name="description" content="Migraciones de base de datos en entrega continua: el patrón expand/contract, compatibilidad hacia atrás, orden de despliegue y migraciones reversibles sin downtime.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Migraciones en CD</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Entrega continua</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La Copiloto API tiene datos: conversaciones, usuarios, embeddings. Y el código cambia; a veces, de forma que necesita una <strong>nueva forma de la base de datos</strong> —una columna, un índice, una tabla—. Ese cambio se llama <strong>migración</strong>, y es la parte del despliegue que asusta a todo el mundo, con razón: una aplicación se puede reiniciar, un esquema de base de datos no.</p>
+        <p>El problema es que la base de datos es <strong>estado</strong>. Cuando despliegas una versión nueva de la app, durante unos segundos <strong>conviven dos versiones del código</strong> (la vieja apagándose, la nueva arrancando). Si el esquema cambió de golpe, la versión vieja se rompe. Por eso una migración en CD no es «aplicar un <code>ALTER TABLE</code>», sino orquestar esquema y código para que <strong>todas las versiones en vuelo sean compatibles</strong>. Esta lección enseña cómo.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque la mayoría de incidentes graves de despliegue no son de código, son de <em>datos</em>. Un <code>DROP COLUMN</code> en el momento equivocado, una migración que no se puede deshacer o que se ejecuta dos veces simultáneamente puede destruir información irrecuperable. Saber ordenar los cambios es lo que separa un despliegue aburrido de un desastre.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>La migración nunca se ejecuta al arrancar la app.</strong> Si cada réplica aplica migraciones al iniciarse, varias se pisan a la vez y corrompen el estado. Las migraciones son un <strong>job propio</strong>, una sola vez, antes de desplegar la nueva versión.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué migrar es distinto de desplegar</h3>
+        <p>El código es <em>efímero</em>: se reemplaza y listo. Los datos son <em>persistentes</em>: no puedes «volver a una versión anterior» de un dato que ya transformaste. Además, durante un despliegue <strong>sin parar el servicio</strong>, la app vieja y la nueva coexisten. Mira:</p>
+        <pre class="diagram">
+   t0: [ v1 ]                    migracion aplicada
+        │                              │
+        ├── v2 arranca ◀────────────────┤         ┌── hay un instante con v1 Y v2 vivas ──┐
+        │                                   v2   │  ambas deben saber leer el esquema     │
+        │                        [ v1 ] ──────▶ [ v1 apagandose, v2 arrancando ]
+        │                                          │
+        └── [ v2 ] ◀───────────────────────────────┘  solo cuando v1 muere, el esquema viejo sobra
+        </pre>
+        <p>Conclusión ineludible: <strong>cada versión del código debe funcionar con el esquema de antes y con el de después</strong>. Al cambio de esquema que cumple esto se le llama compatibilidad hacia atrás (y hacia adelante).</p>
+
+        <h3>El patrón expand/contract</h3>
+        <p>La técnica estándar para lograr esa compatibilidad se llama <strong>expand/contract</strong> (expandir y contraer). Consiste en romper un cambio incompatible en una secuencia de cambios compatibles repartidos en varias releases:</p>
+        <table>
+          <thead><tr><th>Fase</th><th>Qué haces</th><th>Compatibilidad</th></tr></thead>
+          <tbody>
+            <tr><td><strong>1. Expand</strong></td><td>Añadir lo nuevo sin quitar lo viejo (nueva columna opcional, nueva tabla)</td><td>v1 y v2 funcionan</td></tr>
+            <tr><td><strong>2. Migrar datos</strong></td><td>Backfill: rellenar lo nuevo a partir de lo viejo</td><td>v1 y v2 funcionan</td></tr>
+            <tr><td><strong>3. Cambiar el código</strong></td><td>v2 escribe y lee lo nuevo (y, si hace falta, aún mantiene lo viejo)</td><td>v1 y v2 funcionan</td></tr>
+            <tr><td><strong>4. Contract</strong></td><td>Cuando ya nadie usa lo viejo, eliminarlo (otra release)</td><td>solo v2+</td></tr>
+          </tbody>
+        </table>
+        <p>Nunca se pasa de «renombrar una columna» a «añadir + backfill + cambiar + borrar». Se reparte en el tiempo para que cada paso sea aburrido.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> cambiar el motor de un coche en marcha. No desmontas el viejo antes de tener el nuevo montado: primero acoplas el nuevo motor (expand), trasvasa todo (backfill), empiezas a usarlo (cambio de código) y solo entonces desmontas el viejo (contract). Nunca dejas el coche sin motor.</p>
+        </div>
+
+        <h3>Orden de despliegue: esquema primero, código después</h3>
+        <p>El orden correcto casi siempre es <strong>migración → despliegue del código</strong>. ¿Por qué? Porque el código nuevo puede <em>requerir</em> la columna nueva, pero el código viejo no debe <em>romperse</em> si ya existe. La migración de la fase <em>expand</em> es aditiva (solo añade), así que la app vieja la ignora sin problema. Después se despliega el código que la usa.</p>
+        <div class="callout callout--tip">
+          <p><strong>Regla de oro:</strong> «añade antes de usar; elimina mucho después de dejar de usar». Si tu migración <em>rompe</em> el código viejo (borra, renombra, hace NOT NULL sobre datos existentes), estás mezclando fases y vas a romper el despliegue.</p>
+        </div>
+
+        <h3>Migraciones reversibles… y por qué a veces no lo son</h3>
+        <p>Una migración <em>reversible</em> tiene un <code>up</code> (aplicar) y un <code>down</code> (deshacer). En la práctica:</p>
+        <ul>
+          <li><strong>Reversible de verdad:</strong> añadir una tabla o una columna (se deshace con <code>DROP</code>).</li>
+          <li><strong>No reversible sin pérdida:</strong> eliminar una columna con datos, o transformar valores (¿recuperas los originales?).</li>
+        </ul>
+        <p>Por eso, cada vez más equipos prefieren <strong>forward-fix</strong> (arreglar hacia adelante con otra migración) antes que <em>rollback</em> del esquema. El patrón expand/contract lo hace posible: si el cambio destructivo es siempre el <em>último</em> paso, casi siempre hay marcha atrás. Y si no la hay, al menos el paso destructivo llega cuando ya no hay código que dependa de él.</p>
+        <div class="callout callout--note">
+          <p>Una migración también debe ser <strong>idempotente</strong> o, al menos, no reejecutarse sola. Las herramientas serias (Alembic, Flyway, Liquibase…) llevan una tabla de control con las migraciones ya aplicadas; aplican solo las pendientes, en orden. Confía en ese mecanismo, no en scripts improvisados.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una migración aditiva (fase <em>expand</em>) en SQL puro: añadir una columna <strong>opcional</strong> que el código nuevo usará y el viejo ignora. Es el átomo de todo el patrón.</p>
+        <div class="code-file">migrations/0007_add_conversation_summary.sql</div>
+        <pre><code class="language-sql">-- Fase EXPAND: solo anade. La app v1 ignora la columna; la v2 la usara.
+ALTER TABLE conversations
+  ADD COLUMN summary TEXT;
+
+-- Indice para las consultas nuevas, sin bloquear escrituras en la mayoria de motores.
+CREATE INDEX CONCURRENTLY idx_conversations_summary
+  ON conversations (summary);
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>ADD COLUMN summary TEXT</code></strong>: columna nueva <em>nullable</em> (sin <code>NOT NULL</code>). Aditiva y compatible: el código viejo hace <code>SELECT *</code> y ve una columna más que puede ignorar; el nuevo la escribe.</li>
+          <li><strong>Sin <code>DEFAULT</code> bloqueante</strong>: en tablas grandes, añadir una columna con valor por defecto puede reescribir toda la tabla y bloquearla. Aquí no lo necesitamos.</li>
+          <li><strong><code>CREATE INDEX CONCURRENTLY</code></strong>: en PostgreSQL, construir el índice sin bloquear escrituras. En motores pequeños da igual; en tablas grandes, marca la diferencia entre un despliegue y una caída.</li>
+          <li><strong>Nombre con número <code>0007</code></strong>: las migraciones se ordenan y se registran. La herramienta sabrá que esta ya se aplicó y no la repetirá.</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Este archivo <strong>no toca la aplicación</strong>: es un cambio del esquema independiente. Ese es el punto. El código v2 vendrá después, en su propio despliegue, a usar <code>summary</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El Copiloto necesita <strong>renombrar</strong> <code>body</code> a <code>content</code> en la tabla <code>messages</code>. Un <code>RENAME COLUMN</code> rompería la app vieja al instante. Aplicamos expand/contract repartido en tres releases.</p>
+
+        <h3>Release 1 — expand: la columna nueva convive con la vieja</h3>
+        <div class="code-file">migrations/0011_expand_messages_content.sql</div>
+        <pre><code class="language-sql">-- EXPAND: anade la columna nueva. Aun no se borra "body".
+ALTER TABLE messages
+  ADD COLUMN content TEXT;
+
+-- Backfill por lotes para no bloquear la tabla en produccion.
+UPDATE messages
+   SET content = body
+ WHERE content IS NULL
+   AND id IN (
+     SELECT id FROM messages WHERE content IS NULL ORDER BY id LIMIT 10000
+   );
+</code></pre>
+        <p>El código de la release 1 sigue leyendo y escribiendo <code>body</code>; y además empieza a escribir <em>también</em> en <code>content</code> (dual-write). Así la columna nueva se mantiene al día mientras la vieja sigue siendo la fuente de verdad.</p>
+        <div class="code-file">migrations/0011_rollback.sql</div>
+        <pre><code class="language-sql">-- Deshacer la fase expand es seguro: solo quita lo anadido.
+ALTER TABLE messages DROP COLUMN content;
+</code></pre>
+
+        <h3>Release 2 — switch: el código pasa a leer lo nuevo</h3>
+        <p>Cuando el backfill terminó y ya no hay <code>content</code> nulos, la release 2 cambia la lectura a <code>content</code> y sigue escribiendo en ambas columnas. Verificación previa en el pipeline:</p>
+        <div class="code-file">scripts/check_backfill.sh</div>
+        <pre><code class="language-bash"># Antes de permitir el switch, comprobar que no quedan filas sin migrar.
+PENDIENTES=$(psql "$DATABASE_URL" -tAc \
+  "SELECT count(*) FROM messages WHERE content IS NULL")
+
+if [ "$PENDIENTES" -ne 0 ]; then
+  echo "Backfill incompleto: $PENDIENTES filas pendientes" &gt;&amp;2
+  exit 1
+fi
+echo "Backfill completo: se puede hacer switch a content"
+</code></pre>
+
+        <h3>Release 3 — contract: ya nadie usa la columna vieja</h3>
+        <div class="code-file">migrations/0012_contract_drop_body.sql</div>
+        <pre><code class="language-sql">-- CONTRACT: la ejecutamos solo cuando ninguna version en vuelo usa "body".
+ALTER TABLE messages DROP COLUMN body;
+</code></pre>
+        <p>Y el job que aplica las migraciones, separado del despliegue de la app:</p>
+        <div class="code-file">.github/workflows/cd.yml</div>
+        <pre><code class="language-yaml">jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aplicar migraciones pendientes
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+  deploy:
+    needs: migrate            # el codigo se despliega DESPUES del esquema
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/deploy.sh --image "$IMAGE" --env production
+      env:
+        IMAGE: ghcr.io/academy/copiloto-api:${{ github.ref_name }}
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Un job <code>migrate</code> aparte</strong>: se ejecuta una sola vez, antes del despliegue. Nada de migrar al arrancar cada réplica.</li>
+          <li><strong><code>needs: migrate</code></strong>: impone el orden esquema → código. Si la migración falla, no se despliega la app: mejor quedarse en la versión anterior que romperse.</li>
+          <li><strong>Backfill por lotes</strong> (<code>LIMIT 10000</code>): evita un <code>UPDATE</code> gigantesco que bloquearía la tabla. En producción se repite por lotes hasta vaciar <code>NULL</code>.</li>
+          <li><strong>Dual-write entre releases</strong>: mientras conviven v1 y v2, ambas columnas se mantienen coherentes; ninguna versión lee datos que la otra no escribió.</li>
+          <li><strong>El <code>DROP</code> va al final y aparte</strong>: es el único paso destructivo y llega cuando ya no queda código que dependa de <code>body</code>.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Si este flujo se te antoja lento, piensa qué gana: cero downtime, cero pérdida de datos y la capacidad de revertir las fases intermedias. La lentitud es <em>por release</em>, no por cambio: cada release avanza un paso pequeño.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Dividir cambios incompatibles en expand → backfill → switch → contract</td>
+              <td>Un <code>ALTER</code> que rompe la versión anterior</td>
+              <td>Durante el despliegue coexisten dos versiones del código</td>
+            </tr>
+            <tr>
+              <td>Aplicar migraciones en un job propio antes del deploy</td>
+              <td>Migrar al arrancar la aplicación</td>
+              <td>Varias réplicas migrando a la vez corrompen el estado</td>
+            </tr>
+            <tr>
+              <td>Añadir columnas <em>nullable</em> y backfill por lotes</td>
+              <td><code>NOT NULL</code> o <code>DEFAULT</code> sobre tablas grandes</td>
+              <td>Evita reescrituras y bloqueos de la tabla completa</td>
+            </tr>
+            <tr>
+              <td>Versionar migraciones y confiar en la tabla de control</td>
+              <td>Scripts SQL sueltos ejecutados a mano</td>
+              <td>Aplicar solo las pendientes, en orden, sin repetir</td>
+            </tr>
+            <tr>
+              <td>Probar la migración contra una copia realista</td>
+              <td>Estrenar la migración en producción</td>
+              <td>Lo que tarda un segundo en <em>staging</em> puede bloquear 10 min en prod</td>
+            </tr>
+            <tr>
+              <td>Preferir forward-fix para cambios con pérdida</td>
+              <td>Confiar en un <code>down</code> que no puede recuperar datos</td>
+              <td>No todo cambio es reversible; el contrato lo reconoce</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Renombrar o borrar en el mismo release</h3>
+        <span class="code-label code-label--wrong">Mal — cambio destructivo de golpe</span>
+        <pre class="code-wrong"><code class="language-sql">-- ❌ Rompe al instante la version vieja que aun se esta apagando.
+ALTER TABLE messages RENAME COLUMN body TO content;
+</code></pre>
+        <span class="code-label code-label--right">Bien — expand primero, contract al final</span>
+        <pre class="code-right"><code class="language-sql">-- ✅ Release 1: anadir la nueva y backfill (la vieja sigue viva).
+ALTER TABLE messages ADD COLUMN content TEXT;
+-- Release 3 (semanas despues): ya nadie usa "body".
+ALTER TABLE messages DROP COLUMN body;
+</code></pre>
+
+        <h3>Migrar al arrancar cada réplica</h3>
+        <span class="code-label code-label--wrong">Mal — migración en el startup</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Cada una de las N replicas aplica migraciones al arrancar: se pisan.
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+# (y dentro del arranque de la app: alembic upgrade head)
+</code></pre>
+        <span class="code-label code-label--right">Bien — un job de migración, una sola vez</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Las migraciones corren una vez, antes de desplegar la app.
+jobs:
+  migrate:
+    steps:
+      - run: alembic upgrade head
+  deploy:
+    needs: migrate
+</code></pre>
+
+        <h3>Columna <code>NOT NULL</code> sin backfill previo</h3>
+        <span class="code-label code-label--wrong">Mal — exigir datos que aún no existen</span>
+        <pre class="code-wrong"><code class="language-sql">-- ❌ Falla si hay filas existentes sin valor, o reescribe toda la tabla.
+ALTER TABLE messages ADD COLUMN content TEXT NOT NULL;
+</code></pre>
+        <span class="code-label code-label--right">Bien — nullable, backfill y luego la restricción</span>
+        <pre class="code-right"><code class="language-sql">-- ✅ 1) anadir nullable, 2) backfill, 3) en un release posterior, la restriccion.
+ALTER TABLE messages ADD COLUMN content TEXT;          -- 1
+UPDATE messages SET content = body WHERE content IS NULL;  -- 2 (por lotes)
+ALTER TABLE messages ALTER COLUMN content SET NOT NULL;    -- 3 (cuando ya no hay nulos)
+</code></pre>
+
+        <h3>Un backfill gigantesco de una sola pasada</h3>
+        <span class="code-label code-label--wrong">Mal — bloquear la tabla</span>
+        <pre class="code-wrong"><code class="language-sql">-- ❌ Un solo UPDATE de millones de filas: locks largos y riesgo de timeout.
+UPDATE messages SET content = body;
+</code></pre>
+        <span class="code-label code-label--right">Bien — por lotes, en bucle</span>
+        <pre class="code-right"><code class="language-sql">-- ✅ Lotes pequenos: se puede ejecutar en bucle sin bloquear el servicio.
+UPDATE messages
+   SET content = body
+ WHERE content IS NULL
+   AND id IN (SELECT id FROM messages WHERE content IS NULL ORDER BY id LIMIT 10000);
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> planificar y ejecutar una migración aditiva para el Copiloto (añadir <code>conversations.summary</code>), entender el rollout por lotes y verificar que la app vieja sigue funcionando con la columna nueva presente.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea la migración con Alembic (la herramienta de migraciones de SQLAlchemy, que ya usa la Copiloto API):
+            <pre><code class="language-bash">alembic revision -m "add conversations.summary"
+</code></pre>
+            <p>Resultado esperado: aparece un archivo nuevo en <code>migrations/versions/</code>. Ábrelo y rellena <code>upgrade()</code> y <code>downgrade()</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> implementa la fase <em>expand</em> en Python (Alembic) equivalente al SQL del ejemplo:
+            <pre><code class="language-bash"># En el archivo generado:
+# op.add_column("conversations", sa.Column("summary", sa.Text(), nullable=True))
+# op.create_index("idx_conversations_summary", "conversations", ["summary"])
+</code></pre>
+            <p>Observa: <code>nullable=True</code> es la clave de la compatibilidad. La app vieja ignora la columna; la nueva la usa.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> aplica y comprueba contra <em>staging</em>:
+            <pre><code class="language-bash">alembic upgrade head
+psql "$DATABASE_URL" -c "\d conversations"
+</code></pre>
+            <p>Resultado esperado: la tabla muestra <code>summary</code> y el índice. La app desplegada sigue funcionando (no la has tocado).</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> escribe el backfill por lotes como script y ejecútalo en bucle hasta que no queden nulos:
+            <pre><code class="language-sql">-- Repite hasta que el numero de pendientes sea 0.
+UPDATE conversations
+   SET summary = left(first_message, 200)
+ WHERE summary IS NULL
+   AND id IN (SELECT id FROM conversations WHERE summary IS NULL ORDER BY id LIMIT 5000);
+</code></pre>
+            <p>Resultado esperado: tras varias iteraciones, <code>SELECT count(*) FROM conversations WHERE summary IS NULL</code> devuelve 0. Mide cuánto tarda cada lote: así dimensionas el <code>LIMIT</code> para producción.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación de reversibilidad):</strong> en <em>staging</em>, retrocede un paso con <code>alembic downgrade -1</code> y comprueba que la columna desaparece y la app sigue arrancando. Confirma en el historial (<code>alembic history</code>) que <code>down</code> deshace exactamente lo que hizo <code>up</code>. En cambios con datos, anota por qué el <code>down</code> podría no ser seguro.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Migración con backfill reanudable y verificación en el pipeline</h3>
+          <p>Implementa un job de migración que sea <strong>reanudable</strong>: si el backfill se interrumpe a medias (timeout, cancelación), al relanzarlo continúa donde lo dejó sin repetir trabajo, y solo pasa a la fase de switch cuando verifica que no quedan filas pendientes. Añade al pipeline una comprobación que <strong>bloquee el despliegue</strong> si la migración dejó filas sin backfillear, y un mecanismo para estimar el progreso (cuántas van, cuántas faltan).</p>
+          <p><em>Pista: usa un identificador incremental (por <code>id</code>) y guarda en una tabla o en una variable el último id procesado; cada lote avanza el puntero. La verificación del pipeline puede ser un script (<code>scripts/check_backfill.sh</code>) que cuente los nulos y salga con error si hay alguno. Para el progreso, ejecuta un <code>SELECT count(*)</code> de pendientes frente al total cada cierto número de lotes. Reflexiona: ¿por qué un backfill reanudable es más seguro que uno «todo o nada» en un sistema que no debe parar?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La base de datos es <strong>estado</strong>; durante un despliegue sin downtime coexisten dos versiones del código, así que el esquema debe ser compatible con ambas.</li>
+          <li><strong>Expand/contract</strong>: expandir (añadir), migrar datos (backfill), cambiar el código, y solo al final contraer (eliminar).</li>
+          <li>El orden es <strong>esquema → código</strong>: la migración aditiva primero, la versión que la usa después.</li>
+          <li>Las migraciones son un <strong>job propio</strong>, una sola vez, nunca al arrancar cada réplica.</li>
+          <li>Prefiere cambios <strong>reversibles</strong>; para los que no lo son, planifica <strong>forward-fix</strong>. El <code>DROP</code> siempre al final y aparte.</li>
+          <li>Backfill por <strong>lotes</strong> e índices <code>CONCURRENTLY</code> para no bloquear tablas grandes.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece</th></tr></thead>
+          <tbody>
+            <tr><td>Expand</td><td>Añadir lo nuevo sin quitar lo viejo</td><td><code>ADD COLUMN summary TEXT</code></td></tr>
+            <tr><td>Backfill</td><td>Rellenar lo nuevo desde lo viejo, por lotes</td><td><code>UPDATE … WHERE … IS NULL</code></td></tr>
+            <tr><td>Switch</td><td>El código pasa a usar lo nuevo</td><td>Release intermedia del código</td></tr>
+            <tr><td>Contract</td><td>Eliminar lo viejo cuando nadie lo usa</td><td><code>DROP COLUMN body</code></td></tr>
+            <tr><td>Job de migración</td><td>Aplicar migraciones una vez, antes del deploy</td><td><code>alembic upgrade head</code> + <code>needs</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no puedo simplemente migrar al desplegar?</summary>
+            <div>
+              <p>Porque «al desplegar» implica varias réplicas arrancando a la vez. Si cada una intenta aplicar la misma migración, compiten por la tabla de control, se pisan y pueden dejar el esquema a medias. Además, si la migración falla, ya has desplegado una app que espera un esquema que no existe. El job separado permite <em>fallar antes</em> de tocar el código.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Todas las migraciones deben ser reversibles?</summary>
+            <div>
+              <p>No siempre es posible: borrar datos o transformarlos sin vuelta atrás no se deshace. Lo importante es <strong>saber cuáles no lo son</strong> y asegurarse de que llegan al final del patrón (el <em>contract</em>), cuando ya no hay código dependiendo de ellas. Para el resto, prefiere <em>forward-fix</em>: una migración nueva que corrija, en lugar de un <code>down</code> arriesgado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo debe pasar entre expand y contract?</summary>
+            <div>
+              <p>Todo el que tarde el código viejo en desaparecer por completo: normalmente una o dos releases. La señal de que puedes contraer es que <strong>ninguna versión en vuelo</strong> use la columna o tabla antigua. Si dudas, espera otra release: el coste de mantener una columna de más es mínimo; el de borrarla antes de tiempo puede ser un incidente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si una migración tarda mucho en una tabla enorme?</summary>
+            <div>
+              <p>Divide en dos: primero el cambio de esquema que es rápido (añadir columna nullable), después el backfill por lotes que puedes pausar y reanudar. Para índices, usa <code>CONCURRENTLY</code> (PostgreSQL) o el equivalente de tu motor. Y prueba siempre contra una copia realista: en <em>staging</em> con datos de verdad descubrirás los bloqueos antes que en producción.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa con el rollback de la aplicación si ya migré?</summary>
+            <div>
+              <p>Gracias a expand/contract, la versión anterior <strong>sigue funcionando</strong> con el esquema nuevo (la columna añadida es opcional para ella). Así puedes revertir el código sin revertir el esquema. Solo las fases destructivas (<em>contract</em>) rompen esa garantía, y por eso van al final, cuando revertir el código ya no es una opción esperada.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

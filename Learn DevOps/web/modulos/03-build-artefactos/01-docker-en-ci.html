@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-docker-en-ci">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Docker en CI: la imagen multi-stage con Buildx — Módulo 3 · Curso DevOps</title>
+  <meta name="description" content="Cómo construir la imagen Docker de la Copiloto API dentro de GitHub Actions con docker/build-push-action y Buildx: runners efímeros, builds multi-stage, explicado paso a paso y sin depender de tu máquina.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Docker en CI: la imagen multi-stage con Buildx</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Build y artefactos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En el Módulo 2 montamos un pipeline de <strong>integración continua</strong>: en cada <code>push</code> y cada <em>pull request</em>, GitHub Actions hacía <em>checkout</em>, instalaba dependencias, corría el <em>lint</em> y los tests. Eso te dice si el código está sano, pero <strong>no produce nada que puedas desplegar</strong>. Al terminar el job, el runner —una máquina temporal— se destruye, y con él todo lo que se compiló.</p>
+        <p>Esta lección da el paso que convierte «código que pasa los tests» en <strong>un artefacto</strong>: la <strong>imagen Docker</strong> de la Copiloto API. Y lo hace donde debe hacerse: <em>en CI</em>, no en tu portátil. El objetivo es que el binario que se despliegue más adelante (Módulo 4) sea exactamente el que se construyó aquí, a partir de un <em>commit</em> concreto, con la misma receta para todo el equipo.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué construir en CI y no en local?</strong> Porque «en mi máquina funciona» deja de ser una excusa cuando la máquina deja de ser la tuya. El runner es <strong>efímero y limpio</strong>: nadie ha dejado ahí un <code>node_modules</code> a medias ni una variable de entorno mágica. Si el build pasa en CI, pasa con lo que hay en el repositorio, y solo con eso. Esa es la diferencia entre un <em>artefacto reproducible</em> y una caja negra.</p>
+        </div>
+        <div class="callout callout--note">
+          <p><strong>Lo que verás en este módulo:</strong> aquí construimos la imagen; en la lección 2 la publicamos en un <em>registry</em> con etiquetas inmutables; en la 3 le añadimos <strong>SBOM y procedencia</strong> (cadena de suministro); y en la 4 afinamos la <strong>caché</strong> para que los builds vuelen. Todo gira alrededor del mismo objeto: <em>el artefacto que se prueba es el que se despliega</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Del código fuente al artefacto</h3>
+        <p>Un pipeline de release tiene dos mitades bien separadas. La primera <em>verifica</em> (integración continua); la segunda <em>produce</em> (el build). El artefacto es el eslabón que las une: es lo que viaja hacia los entornos.</p>
+        <div class="diagram">
+  commit     ┌─────────────── CI (Módulo 2) ───────────────┐
+  ────────►  │  lint ─► test ─► cobertura ─► (pasa)        │
+             └─────────────────────────────────────────────┘
+                              │
+                              ▼
+             ┌─────────────── BUILD (esta lección) ────────────────┐
+             │  docker buildx build  ──►  IMAGEN (artefacto)       │
+             └─────────────────────────────────────────────────────┘
+                              │   imagen + digest  (inmutable)
+                              ▼
+                      REGISTRY (lección 2)  ──►  CD (Módulo 4)  ──►  entornos
+        </div>
+        <p>Fíjate en la dirección del flujo: <strong>el artefacto se construye una sola vez</strong> y se <em>promociona</em> entre entornos sin reconstruirse. Reconstruir en cada entorno (staging, producción) es el pecado original de la entrega continua: dos builds distintos nunca son la misma imagen, aunque salgan del mismo <em>commit</em>.</p>
+
+        <h3>El runner es efímero: la caché local no existe</h3>
+        <p>Cuando lanzas <code>docker build</code> en tu portátil, Docker reutiliza las <strong>capas</strong> ya construidas y el <em>rebuild</em> es casi instantáneo. En GitHub Actions, cada job arranca en una máquina virtual <strong>recién creada</strong>: no hay capas anteriores, no hay <code>node_modules</code>, no hay nada. El primer build en CI siempre parte de cero.</p>
+        <p>Eso cambia cómo piensas el <code>Dockerfile</code>: el orden de las instrucciones deja de ser una preferencia estética y pasa a ser <strong>ingeniería de caché</strong> (lo veremos a fondo en la lección 4). Y explica por qué el build en CI, la primera vez, siempre «tarda más de lo que tarda en mi máquina».</p>
+
+        <h3>Buildx: el builder que sí funciona en CI</h3>
+        <p>Docker moderno trae <strong>BuildKit</strong> como motor de build, y <strong>Buildx</strong> como su interfaz. En un runner limpio conviene crear un builder propio con el <em>driver</em> <code>docker-container</code>, y para eso está la action oficial <code>docker/setup-buildx-action</code>:</p>
+        <ul>
+          <li><strong>Multi-plataforma:</strong> construir <code>linux/amd64</code> y <code>linux/arm64</code> desde un solo job.</li>
+          <li><strong>Exportar/importar caché:</strong> clave para que el CLI no reconstruya todo cada vez.</li>
+          <li><strong>Attestations:</strong> SBOM y procedencia (lección 3), que el exporter clásico no soporta.</li>
+          <li><strong>Secrets de build:</strong> inyectar credenciales sin dejarlas en capas.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía — el obrador y la vitrina:</strong> el runner es el obrador (efímero: se monta cada día y se desmonta al cerrar). Buildx es la maquinaria que traes al obrador para amasar rápido y guardar los preparados de un día para otro (la caché). La imagen final es la <em>tarta terminada</em> que sale a la vitrina: no la montas en cada tienda, la horneas una vez en el obrador y la distribuyes.</p>
+        </div>
+
+        <h3>docker/build-push-action: el build como paso declarativo</h3>
+        <p>Podrías escribir un <code>run: docker build ...</code> a mano, pero la comunidad usa la action oficial <code>docker/build-push-action</code> porque expone Buildx como <strong>entradas declarativas</strong> (<code>with:</code>) en lugar de una línea de shell larga y frágil. Estas son las que tocarás:</p>
+        <table>
+          <thead><tr><th>Entrada</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>context</code></td><td>Carpeta que se envía como contexto de build (por defecto, el repo clonado).</td></tr>
+            <tr><td><code>file</code></td><td>Ruta al <code>Dockerfile</code> cuando no está en la raíz del contexto.</td></tr>
+            <tr><td><code>target</code></td><td>Construye <strong>solo</strong> una etapa del multi-stage (por ejemplo <code>runtime</code>).</td></tr>
+            <tr><td><code>tags</code></td><td>Etiquetas de la imagen resultante.</td></tr>
+            <tr><td><code>push</code></td><td><code>true</code> publica en el registry; <code>false</code> la deja local (útil para <em>smoke tests</em>).</td></tr>
+            <tr><td><code>load</code></td><td>Carga la imagen en el Docker del runner para poder <code>docker run</code> en el mismo job.</td></tr>
+            <tr><td><code>cache-from</code> / <code>cache-to</code></td><td>De dónde leer y dónde escribir la caché de build (lección 4).</td></tr>
+            <tr><td><code>platforms</code></td><td>Arquitecturas objetivo (por defecto, la del runner).</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Multi-stage: una receta, dos mundos</h3>
+        <p>La Copiloto API es una aplicación Python. Sus dependencias se instalan con <code>uv</code> (o <code>pip</code>), y para producir la imagen de producción <strong>no necesitas</strong> ni el gestor de paquetes, ni las dependencias de desarrollo, ni el código de tests. El multi-stage separa el <em>taller</em> de la <em>vitrina</em> en un único <code>Dockerfile</code>:</p>
+        <div class="diagram">
+  ETAPA "builder" (taller)                    ETAPA "runtime" (vitrina) = IMAGEN FINAL
+  ─────────────────────────                   ────────────────────────────────────────
+  FROM python:3.12-slim AS builder            FROM python:3.12-slim AS runtime
+  COPY pyproject.toml uv.lock                 ENV PATH=/app/.venv/bin:$PATH
+  RUN uv sync --frozen --no-dev               COPY --from=builder /app/.venv  /app/.venv
+  COPY app ./app                              COPY --from=builder /app/app    /app/app
+  (dependencias + resolución)                 USER app
+                                              CMD ["uvicorn", "app.main:app"]
+
+            │  SOLO viaja lo copiado con COPY --from=builder
+            └───────────────►  uv, caches y dev-deps se quedan en el taller
+        </div>
+        <p>El resultado de la etapa <code>runtime</code> es la <strong>imagen de producción</strong>: más pequeña, sin herramientas de construcción y con menos superficie que atacar. Es el mismo principio que viste en <code>Learn Docker</code>, ahora dentro de un job de CI.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El workflow más pequeño que <strong>construye la imagen en CI y comprueba que arranca</strong>. Todavía no publica nada (eso es la lección 2): solo demuestra que el build ocurre en el runner, no en tu portátil.</p>
+        <div class="code-file">.github/workflows/build.yml</div>
+        <pre><code class="language-yaml">name: build
+
+# Se dispara en cada push y en cada pull request: el artefacto debe
+# poder construirse SIEMPRE, no solo cuando decidimos publicar.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Traer el código al runner.
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # 2. Crear un builder de Buildx con driver docker-container:
+      #    es lo que habilita caché exportable y (más adelante) attestations.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 3. Construir la imagen. push: false -&gt; no sale del runner.
+      #    load: true -&gt; queda en el Docker local para poder probarla abajo.
+      - name: Build image (sin publicar)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime        # construye SOLO la última etapa
+          push: false
+          load: true
+          tags: copiloto-api:ci
+
+      # 4. Verificación funcional: si la imagen no arranca, el job falla.
+      - name: Smoke test
+        run: |
+          docker run -d --name api -p 8000:8000 copiloto-api:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health && break
+            sleep 1
+          done
+          docker logs api
+          docker rm -f api
+        </code></pre>
+        <p>Línea por línea, las decisiones que importan:</p>
+        <ul>
+          <li><strong><code>on: push</code> + <code>on: pull_request</code>:</strong> el artefacto se construye en cada cambio. Si algo rompe el <code>Dockerfile</code>, te enteras en la PR, no al desplegar un viernes.</li>
+          <li><strong><code>setup-buildx-action</code>:</strong> crea un builder con el driver <code>docker-container</code>. Sin él, <code>cache-to</code> y las attestations no están disponibles.</li>
+          <li><strong><code>target: runtime</code>:</strong> pedimos explícitamente la etapa final. Es la imagen que se desplegará; construirla ahora evita sorpresas después.</li>
+          <li><strong><code>push: false</code> + <code>load: true</code>:</strong> la imagen se queda en el runner y se carga en el Docker local, lo que permite el <em>smoke test</em>.</li>
+          <li><strong><code>curl -fsS .../health</code>:</strong> un build que no arranca no es un artefacto. Verificamos que responde antes de dar el job por bueno.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>El <code>-f</code> de <code>curl</code> no es decoración:</strong> sin <code>-f</code>, <code>curl</code> devuelve <code>0</code> aunque el servidor responda <code>500</code>. Con <code>-f</code>, un error HTTP hace fallar el paso, y con él el job. Un test que nunca puede fallar no es un test.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>Dockerfile</code> real de la Copiloto API y el job que lo construye en el proyecto conductor <code>proyectos/pipeline/</code>. Es un multi-stage con <code>uv</code>: la etapa <code>builder</code> resuelve las dependencias desde el <em>lockfile</em>, y la etapa <code>runtime</code> recibe solo el entorno virtual y el código de la aplicación.</p>
+        <div class="code-file">proyectos/pipeline/Dockerfile</div>
+        <pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+# ---------- Etapa 1: builder (taller) ----------
+FROM python:3.12-slim AS builder
+
+# Copiamos el binario de uv desde su imagen oficial. Fija una etiqueta
+# concreta (por ejemplo la ultima 0.x estable) en lugar de "latest".
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /bin/
+
+WORKDIR /app
+# uv copia (en vez de enlazar) y compila bytecode: rutas aptas para imagen.
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# 1) Manifiestos primero: si no cambian, esta capa se reutiliza (caché).
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# 2) Ahora el codigo de la aplicacion.
+COPY app ./app
+# 3) Instalamos el proyecto en si (--no-dev: sin herramientas de desarrollo).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# ---------- Etapa 2: runtime (vitrina) = IMAGEN FINAL ----------
+FROM python:3.12-slim AS runtime
+
+# Usuario sin privilegios: la app no necesita ser root.
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+
+# Copiamos SOLO el entorno virtual y el codigo, nunca el taller.
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/app /app/app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+USER appuser
+EXPOSE 8000
+# Exec form: la senal llega directamente al proceso (PID 1 correcto).
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+        </code></pre>
+        <div class="code-file">proyectos/pipeline/.github/workflows/publish.yml</div>
+        <pre><code class="language-yaml">name: publish
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (artefacto del pipeline)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          # Etiqueta provisional por commit: la publicacion real (con
+          # login y push) llega en la leccion 2.
+          push: false
+          load: true
+          tags: copiloto-api:${{ github.sha }}
+
+      - name: Comprobar el endpoint de salud
+        run: |
+          docker run -d --name copiloto -p 8000:8000 \
+            -e ENVIRONMENT=ci copiloto-api:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health && break
+            sleep 1
+          done
+          docker rm -f copiloto
+        </code></pre>
+        <div class="callout callout--why">
+          <p><strong>Por qué etiquetamos con <code>${{ github.sha }}</code> ya aquí:</strong> porque cada imagen debe poder rastrearse hasta el <em>commit</em> que la produjo. Es la semilla de la <em>inmutabilidad</em> que formalizamos en la lección 2: un identificador que <strong>nunca</strong> se reutiliza. Si el artefacto de hoy y el de mañana comparten etiqueta, ya no sabes qué desplegaste.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Construye el artefacto <strong>una sola vez</strong> en CI</td>
+              <td>Reconstruir en cada entorno (staging, prod)</td>
+              <td>Dos builds nunca son idénticos. Si pruebas una imagen y despliegas otra, tu verificación no vale nada.</td>
+            </tr>
+            <tr>
+              <td>Usa un <em>multi-stage</em> con etapa <code>runtime</code> mínima</td>
+              <td>Terminar el <code>Dockerfile</code> en la etapa de build</td>
+              <td>Menos tamaño, sin compiladores ni dev-deps en producción: menos superficie de ataque y escaneos más limpios.</td>
+            </tr>
+            <tr>
+              <td>Etiqueta con el <em>commit</em>: <code>${{ github.sha }}</code></td>
+              <td>Depender de <code>latest</code> como única etiqueta</td>
+              <td>Trazabilidad. Debes poder responder «¿qué commit produjo esta imagen?» sin adivinar.</td>
+            </tr>
+            <tr>
+              <td>Fija la versión de las imágenes base (<code>python:3.12-slim</code>)</td>
+              <td><code>FROM python:latest</code></td>
+              <td>Una base que cambia sola rompe builds sin que toques nada. El <em>pin</em> hace el build reproducible.</td>
+            </tr>
+            <tr>
+              <td>Ejecuta la app como usuario sin privilegios (<code>USER appuser</code>)</td>
+              <td>Dejar que la imagen corra como <code>root</code></td>
+              <td>Un contenedor comprometido como <em>root</em> es mucho más peligroso. Es gratis evitarlo.</td>
+            </tr>
+            <tr>
+              <td>Haz un <em>smoke test</em> de la imagen construida en el mismo job</td>
+              <td>Asumir que «compiló, luego funciona»</td>
+              <td>Un build exitoso solo prueba que se construyó. Arrancar y responder es lo que valida el artefacto.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Construir en local y subir el artefacto a mano</h3>
+        <span class="code-label code-label--wrong">Mal — el artefacto nace en tu portátil</span>
+        <pre class="code-wrong"><code class="language-bash"># En tu maquina: nadie sabe que paso aqui ni con que versiones
+docker build -t copiloto-api:latest .
+docker push copiloto-api:latest   # a un registry
+</code></pre>
+        <span class="code-label code-label--right">Bien — el artefacto nace en el runner, desde el commit</span>
+        <pre class="code-right"><code class="language-yaml">- name: Build image
+  uses: docker/build-push-action@v7
+  with:
+    context: .            # exactamente lo que hay en el commit
+    push: false
+    tags: copiloto-api:${{ github.sha }}
+</code></pre>
+
+        <h3>2. Copiar el código antes de las dependencias (mata la caché)</h3>
+        <span class="code-label code-label--wrong">Mal — cualquier cambio de código reinstala todo</span>
+        <pre class="code-wrong"><code class="language-dockerfile">FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY . .                       # el codigo cambia en cada commit...
+RUN uv sync --frozen --no-dev  # ...y esta capa se invalida SIEMPRE
+</code></pre>
+        <span class="code-label code-label--right">Bien — manifiestos primero, código después</span>
+        <pre class="code-right"><code class="language-dockerfile">WORKDIR /app
+COPY pyproject.toml uv.lock ./                 # solo cambian si tocan deps
+RUN uv sync --frozen --no-install-project --no-dev
+COPY app ./app                                 # el codigo va al final
+RUN uv sync --frozen --no-dev
+</code></pre>
+
+        <h3>3. Un <code>Dockerfile</code> fuera de la raíz sin decir dónde está</h3>
+        <span class="code-label code-label--wrong">Mal — la action busca <code>./Dockerfile</code> y no lo encuentra</span>
+        <pre class="code-wrong"><code class="language-yaml">- uses: docker/build-push-action@v7
+  with:
+    context: .
+    # El Dockerfile vive en docker/, pero no lo indicamos -&gt;
+    # "ERROR: failed to solve: failed to read dockerfile"
+</code></pre>
+        <span class="code-label code-label--right">Bien — indica <code>file</code> (y el <code>context</code> correcto)</span>
+        <pre class="code-right"><code class="language-yaml">- uses: docker/build-push-action@v7
+  with:
+    context: .
+    file: ./docker/Dockerfile
+</code></pre>
+
+        <h3>4. Creer que <code>docker build</code> a secas basta en CI</h3>
+        <p>Funciona, pero pierdes lo que hace útil a Buildx en un runner: caché exportable, multi-plataforma y <em>attestations</em>. Además, mezclar <code>run: docker build</code> con <code>push</code> a mano dispersa la lógica. Usa la action declarativa.</p>
+        <div class="callout callout--warning">
+          <p><strong>Ojo con <code>load: true</code> y las attestations:</strong> el exporter <code>docker</code> (que es lo que hace <code>load</code>) <strong>no soporta</strong> SBOM ni procedencia. Cuando activemos esas attestations en la lección 3, el patrón cambiará a <code>push: true</code>, porque las attestations se adjuntan a la imagen <em>en el registry</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir en CI la imagen multi-stage de la Copiloto API y verificar, con evidencia, que la imagen final <em>no</em> contiene el taller (ni <code>uv</code>, ni dev-deps).</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea el mini-proyecto.</strong>
+            <pre><code class="language-bash">mkdir -p copiloto-ci/app
+cd copiloto-ci
+            </code></pre>
+            <div class="code-file">app/main.py</div>
+            <pre><code class="language-python">from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/health")
+def health():
+    # Endpoint minimo para el smoke test del pipeline.
+    return {"status": "ok"}
+            </code></pre>
+            <div class="code-file">pyproject.toml</div>
+            <pre><code class="language-toml">[project]
+name = "copiloto-api"
+version = "0.1.0"
+requires-python = "&gt;=3.12"
+dependencies = ["fastapi", "uvicorn[standard]"]
+
+[dependency-groups]
+dev = ["pytest"]
+            </code></pre>
+            <pre><code class="language-bash"># Genera el lockfile que el Dockerfile exige (uv sync --frozen)
+uv lock
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Escribe el <code>Dockerfile</code> multi-stage.</strong>
+            <div class="code-file">Dockerfile</div>
+            <pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM python:3.12-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /bin/
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+COPY app ./app
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+
+FROM python:3.12-slim AS runtime
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/app /app/app
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+            </code></pre>
+            <div class="code-file">.dockerignore</div>
+            <pre><code class="language-text">.git/
+.venv/
+.github/
+infra/
+*.log
+.env
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Añade el workflow.</strong>
+            <div class="code-file">.github/workflows/build.yml</div>
+            <pre><code class="language-yaml">name: build
+on:
+  push:
+    branches: [main]
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: copiloto-api:ci
+      - name: Verifica que arranca
+        run: |
+          docker run -d --name api -p 8000:8000 copiloto-api:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/health && break
+            sleep 1
+          done
+          docker rm -f api
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Reproduce el build en local (opcional) y observa las etapas.</strong>
+            <pre><code class="language-bash">docker buildx build --target runtime -t copiloto-api:local --load .
+# Veras decrecer las capas y, al final, la imagen final.
+docker run --rm -p 8000:8000 copiloto-api:local
+curl -fsS http://localhost:8000/health     # -&gt; {"status":"ok"}
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — La prueba del taller: ¿viajó <code>uv</code> a la imagen final?</strong>
+            <pre><code class="language-bash">docker run --rm copiloto-api:local which uv
+# Esperado: SIN salida (uv NO existe en runtime); el comando devuelve 1.
+docker run --rm copiloto-api:local which uvicorn
+# Esperado: /app/.venv/bin/uvicorn  (esto SI esta en la imagen final)
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Sube el proyecto a GitHub y observa la ejecución.</strong>
+            <pre><code class="language-bash">git add .
+git commit -m "ci: build multi-stage de la Copiloto API"
+git push origin main
+# En la pestana Actions veras el job "docker" en verde y el
+# smoke test respondiendo /health.
+gh run watch        # si tienes el CLI de GitHub instalado
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Resultado esperado del Paso 5:</strong> que <code>uv</code> <em>no</em> esté en la imagen final es la prueba empírica de que la etapa <code>builder</code> se quedó fuera. Si <code>which uv</code> responde con una ruta, has copiado de más (probablemente con un <code>COPY --from=builder /app /app</code> que arrastra el taller).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 La misma imagen para <code>amd64</code> y <code>arm64</code></h3>
+          <p>Hoy mucha gente despliega en runners ARM (por ejemplo, instancias Graviton, o portátiles/Apple Silicon para desarrollo). Tu reto: hacer que <strong>un solo job</strong> produzca una imagen <strong>multi-arquitectura</strong> para la Copiloto API, con las mismas etiquetas, sin construir dos veces a mano.</p>
+          <pre><code class="language-yaml"># PISTA — dos piezas: emulacion (QEMU) y los "platforms".
+#   - uses: docker/setup-qemu-action@v4        # habilita emular la arquitectura que no es la del runner
+#   - uses: docker/setup-buildx-action@v4
+#   - uses: docker/build-push-action@v7
+#     with:
+#       platforms: linux/amd64,linux/arm64
+          # OJO: al empaquetar varias plataformas la action NO puede usar
+          # "load: true" (el exporter docker solo admite una). Tendras que
+          # pasar a "push: true" contra un registry, que veras en la leccion 2.
+          </code></pre>
+          <p>Investiga: ¿qué requiere <code>load: false</code> para probar la imagen ARM en un runner <code>amd64</code>? ¿Compensa <em>emular</em> ARM con QEMU o usar un runner <strong>nativo</strong> ARM de GitHub? Compara tiempos si puedes. <strong>No busques aquí la solución resuelta</strong>: experimenta y mide; la lección 2 te dará la pieza del registry que te falta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>El artefacto es la imagen.</strong> Se construye <em>una vez</em> en CI y se promociona entre entornos sin reconstruirse.</li>
+          <li><strong>El runner es efímero:</strong> no hay caché local; el orden del <code>Dockerfile</code> pasa a ser ingeniería de caché.</li>
+          <li><strong>Buildx + <code>docker-container</code>:</strong> habilita caché exportable, multi-plataforma, secrets y attestations. Lo crea <code>docker/setup-buildx-action</code>.</li>
+          <li><strong><code>docker/build-push-action</code>:</strong> el build como paso declarativo (<code>context</code>, <code>file</code>, <code>target</code>, <code>push</code>, <code>load</code>, <code>cache-*</code>, <code>platforms</code>).</li>
+          <li><strong>Multi-stage:</strong> taller (<code>builder</code>) y vitrina (<code>runtime</code>) en un solo <code>Dockerfile</code>; solo lo copiado con <code>COPY --from</code> llega a producción.</li>
+          <li><strong>Trazabilidad:</strong> etiqueta con <code>${{ github.sha }}</code> desde el primer momento.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>YAML / instrucción</th></tr></thead>
+          <tbody>
+            <tr><td>Crear el builder Buildx</td><td><code>- uses: docker/setup-buildx-action@v4</code></td></tr>
+            <tr><td>Construir sin publicar, para probar</td><td><code>push: false</code> + <code>load: true</code></td></tr>
+            <tr><td>Construir solo la etapa final</td><td><code>target: runtime</code></td></tr>
+            <tr><td><code>Dockerfile</code> que no está en la raíz</td><td><code>file: ./docker/Dockerfile</code></td></tr>
+            <tr><td>Etiquetar con el commit</td><td><code>tags: copiloto-api:${{ github.sha }}</code></td></tr>
+            <tr><td>Copiar del taller a la vitrina</td><td><code>COPY --from=builder /app/.venv /app/.venv</code></td></tr>
+            <tr><td>Multi-arquitectura</td><td><code>platforms: linux/amd64,linux/arm64</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no basta con <code>run: docker build</code> en el job?</summary>
+            <div>
+              <p>Funcionar, funciona. Pero pierdes el builder <code>docker-container</code> (y con él la caché exportable, el multi-plataforma y las attestations), y sustituyes un contrato declarativo por una línea de shell larga que cada persona escribe distinto. La action oficial existe justo para eso: que el build sea <em>igual</em> en todos los repositorios.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo uso <code>load: true</code> y cuándo <code>push: true</code>?</summary>
+            <div>
+              <p><code>load: true</code> cuando quieres la imagen <strong>en el runner</strong> para probarla en el mismo job (smoke tests, escaneos, multi-etapa de test). <code>push: true</code> cuando quieres <strong>publicarla</strong> en un registry para que otros la consuman. Y recuerda: con varias <code>platforms</code> no puedes usar <code>load</code>; necesitas <code>push</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>El build funciona en local pero falla en CI. ¿Por qué?</summary>
+            <div>
+              <p>Casi siempre, por tres motivos: (1) falta un archivo que tu <code>.dockerignore</code> excluye en local pero que CI necesita; (2) el runner no tiene algo que tu máquina sí (una variable de entorno, un binario); o (3) una imagen base que en local tenías cacheada y que en CI se descarga distinta. Reproduce con un contenedor limpio: <code>docker build --no-cache .</code> es tu mejor simulador de runner.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Construir la imagen en la PR es tirar recursos?</summary>
+            <div>
+              <p>No: es barato comparado con el coste de descubrir en producción que la imagen no construye. Si te preocupa el tiempo, la caché de la lección 4 reduce el build de la PR a segundos cuando solo cambia el código. Y puedes condicionar el <em>push</em> a <code>main</code>: construye siempre, publica solo cuando toque.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La imagen que pruebo en CI es la misma que se despliega?</summary>
+            <div>
+              <p>Solo si la publicas y despliegas <strong>por digest</strong> (por ejemplo <code>imagen@sha256:...</code>). El <code>smoke test</code> de esta lección prueba la imagen <em>del mismo job</em>: es una garantía fuerte. La lección 2 te enseña a conservar esa garantía al cruzar el registry con etiquetas inmutables y digests.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-rollback">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rollback — Módulo 5 · Curso DevOps</title>
+  <meta name="description" content="Rollback seguro: revertir a la imagen anterior por digest, qué lo hace posible (migraciones compatibles, configuración versionada, flags) y cómo automatizarlo en el pipeline.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Rollback seguro</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Estrategias de despliegue</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo lo que has aprendido sobre estrategias de despliegue —rolling, blue/green, canary— existe para responder a <strong>una sola pregunta</strong>: «¿y si la versión nueva es mala?». El <strong>rollback</strong> es la respuesta: volver a la versión anterior, de la forma más rápida y segura posible.</p>
+        <p>En DevOps, la calidad de un equipo no se mide por no caerse nunca, sino por <strong>cuánto tarda en recuperarse</strong>. Esa métrica tiene nombre: <strong>MTTR</strong> (Mean Time To Recovery, tiempo medio de recuperación). Un despliegue que tarda 40 minutos en revertirse duele mucho más que uno que revierte en 40 segundos, aunque el segundo falle con más frecuencia. El rollback no es un plan B improvisado: es una <strong>capacidad de ingeniería</strong> que se diseña, se prueba y se automatiza.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque mucha gente cree que «hacer rollback» es tan simple como volver a desplegar la versión anterior, y descubre en el peor momento que <em>no puede</em>: usó <code>:latest</code> y ya no sabe qué imagen corría, o la base de datos cambió de forma irreversible, o la configuración estaba a mano en el servidor. El rollback no es un comando: es una propiedad del sistema que hay que <strong>construir antes</strong> de necesitarla.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Lo que NO revierte un rollback de aplicación.</strong> Revertir el código no revierte los datos que ese código ya escribió, ni un esquema ya migrado, ni los correos ya enviados, ni los pedidos ya creados. Si el cambio produjo efectos secundarios irreversibles, volver al binario anterior no arregla el mundo. Por eso el rollback <em>de la app</em> y la <strong>reversibilidad de los datos</strong> son problemas distintos —y el segundo se diseña con migraciones compatibles.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Revertir la aplicación (no el código en Git)</h3>
+        <p>Hay una confusión clásica: pensar que «rollback» significa hacer <code>git revert</code> y volver a construir. Eso sería un <strong>roll-forward lento</strong> (reconstruir el pasado), no un rollback. Un buen rollback <strong>no vuelve a construir nada</strong>: despliega exactamente el artefacto que ya sabes que funcionaba, porque lo tienes guardado, inmutable y trazable.</p>
+        <pre class="diagram">
+   desplegado y roto                      rollback
+   ┌───────────────────────┐             ┌───────────────────────┐
+   │  v1.4.2  (digest AB12) │             │  v1.4.1  (digest 9F03) │  ◀── el artefacto
+   │  errores al alza       │  ───────▶   │  el que ya funcionaba  │      que SI probaste
+   └───────────────────────┘             └───────────────────────┘
+      "¿que corria antes?" ──▶ 9F03          NO se reconstruye: se re-despliega el digest
+        </pre>
+        <p>La clave es que el artefacto es <strong>inmutable</strong> y está identificado por un <strong>digest</strong> (el <code>sha256:…</code> que viste en el módulo de build y artefactos). El digest es la huella exacta de esos bytes: no puede mentir ni cambiar. Volver a él es, literalmente, volver a la versión que funcionaba.</p>
+
+        <h3>Los cuatro pilares que hacen posible un rollback</h3>
+        <p>«Volver a la versión anterior» solo funciona si el sistema cumple estas condiciones. Es donde se decide, <em>antes</em> del incidente, si tienes un rollback de verdad o un deseo:</p>
+        <table>
+          <thead><tr><th>Pilar</th><th>Qué garantiza</th><th>Sin él…</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Artefacto inmutable y trazable</strong></td>
+              <td>Sabes exactamente qué digest corría antes</td>
+              <td>No sabes a qué volver; <code>:latest</code> cambió bajo tus pies</td>
+            </tr>
+            <tr>
+              <td><strong>2. Migraciones compatibles</strong></td>
+              <td>El código viejo funciona con el esquema actual</td>
+              <td>El rollback arranca y falla: la BD ya no es la que esperaba</td>
+            </tr>
+            <tr>
+              <td><strong>3. Configuración versionada</strong></td>
+              <td>La config vuelve con la versión, no se queda desincronizada</td>
+              <td>Reviertes el código pero no los ajustes que lo acompañaban</td>
+            </tr>
+            <tr>
+              <td><strong>4. Flags (kill switch)</strong></td>
+              <td>Puedes apagar un comportamiento sin desplegar</td>
+              <td>Cualquier problema exige un ciclo completo de deploy</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un rollback es como el botón «deshacer» de un editor. Funciona porque el programa <em>guarda el historial de estados</em> (arte facto anterior), porque los documentos siguen siendo legibles entre estados (migraciones compatibles) y porque no lanza acciones irreversibles a medio camino (los correos enviados no se deshacen). Si el editor solo guardara «el estado actual» sobreescribiendo, no habría deshacer: eso es un sistema sin rollback.</p>
+        </div>
+
+        <h3>Rollback vs roll-forward: cuál usar</h3>
+        <p>No siempre la respuesta correcta es volver atrás. Depende de qué sea más rápido y seguro restaurar el servicio:</p>
+        <table>
+          <thead><tr><th>Situación</th><th>Mejor opción</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>La versión nueva falla y la anterior estaba sana</td><td><strong>Rollback</strong></td><td>Volver a lo conocido es rápido y predecible</td></tr>
+            <tr><td>El fallo es un cambio de configuración trivial</td><td><strong>Roll-forward</strong> (corregir y desplegar)</td><td>El arreglo es más rápido que revertir</td></tr>
+            <tr><td>Ya migraste el esquema de forma destructiva</td><td><strong>Roll-forward</strong></td><td>El código viejo <em>no</em> puede leer los datos nuevos</td></tr>
+            <tr><td>La funcionalidad nueva es la que falla, el resto va bien</td><td><strong>Kill switch</strong> (flag)</td><td>Apagar el comportamiento es instantáneo y sin deploy</td></tr>
+            <tr><td>El problema es datos corruptos, no código</td><td>Restaurar datos (backup) + rollback</td><td>Ningún cambio de binario revierte los datos</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Regla mental:</strong> el rollback de <em>código</em> es barato y rápido <em>siempre que</em> los datos y el esquema sigan siendo compatibles. En cuanto hay una migración destructiva de por medio, el rollback se convierte en roll-forward casi por obligación. Por eso expand/contract —separar el <em>cambia el esquema</em> del <em>borra lo viejo</em>— es lo que mantiene vivo el botón de deshacer.</p>
+        </div>
+
+        <h3>Automatizar el rollback: que el sistema se autocure</h3>
+        <p>Un rollback manual depende de que alguien esté mirando, entienda el problema y acierte el comando —a las 3 de la mañana. El estándar es <strong>automatizar la detección y la reversión</strong>:</p>
+        <ol class="steps">
+          <li><strong>Desplegar</strong> la versión nueva (<code>rollout status</code> ya espera a que arranque).</li>
+          <li><strong>Verificar</strong> con <em>smoke tests</em> y una ventana corta de métricas tras el despliegue.</li>
+          <li><strong>Detectar</strong> el fallo: readiness que no converge, error rate por encima del umbral, smoke test que devuelve error.</li>
+          <li><strong>Revertir</strong> automáticamente al último digest conocido y bueno, sin intervención humana.</li>
+          <li><strong>Notificar</strong> a las personas con el contexto (qué versión, por qué, qué métricas).</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>El <strong>MTTR</strong> no solo cuenta el tiempo de revertir: cuenta el tiempo hasta <em>detectar</em>. Un rollback automático disparado por métricas baja el MTTR muchísimo porque elimina las dos partes más lentas: que alguien se dé cuenta y que decida. La observabilidad (módulo del proyecto final) y el rollback automático son las dos caras de la misma moneda.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El átomo del rollback en Kubernetes: volver a la <strong>revisión anterior</strong> del Deployment. El orquestador guarda el historial de especificaciones; revertir es pedir la de antes.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># 1) Ver el historial de revisiones del despliegue.
+kubectl rollout history deployment/copiloto-api
+
+# 2) Volver a la revision anterior (la que funcionaba).
+kubectl rollout undo deployment/copiloto-api
+
+# 3) Esperar a que el rollback converja.
+kubectl rollout status deployment/copiloto-api --timeout=120s
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>rollout history</code></strong>: lista las revisiones (<code>1</code>, <code>2</code>, <code>3</code>…) con su cambio. Es tu «deshacer» con vista: antes de revertir, sabes a dónde vas. Añade <code>--revision=3</code> para ver el detalle de una en concreto.</li>
+          <li><strong><code>rollout undo</code></strong>: sin número, vuelve <em>una</em> revisión atrás. Con <code>--to-revision=2</code>, salta a una concreta. El Deployment crea una revisión nueva a partir de la antigua y hace el rolling correspondiente.</li>
+          <li><strong><code>rollout status</code></strong>: el rollback también es un despliegue y también hay que <strong>esperarlo</strong>. Un rollback que no compruebas es un rollback que puede estar fallando en silencio (por ejemplo, porque la imagen antigua ya no es compatible con el esquema).</li>
+        </ol>
+        <div class="callout callout--note">
+          <p>Esto funciona porque cada revisión del Deployment quedó registrada con la imagen concreta que usaba. Si hubieras desplegado siempre con <code>:latest</code>, las revisiones podrían apuntar todas a la misma etiqueta mutable y el «undo» no te devolvería al artefacto correcto. <strong>La inmutabilidad es lo que hace fiable este comando.</strong></p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Automaticemos el rollback del Copiloto: el pipeline <strong>recuerda</strong> qué digest estaba sano, despliega el nuevo, verifica con <em>smoke tests</em> y, si algo falla, revierte solo al anterior reportando por qué.</p>
+
+        <h3>El workflow con verificación y rollback automático</h3>
+        <div class="code-file">.github/workflows/cd.yml</div>
+        <pre><code class="language-yaml">jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recordar el digest saludable actual (para poder volver)
+        id: previous
+        run: |
+          # Leemos del cluster la imagen que corre AHORA: es nuestro punto de retorno.
+          DIGEST=$(kubectl get deployment copiloto-api \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "digest=$DIGEST" &gt;&gt; "$GITHUB_OUTPUT"
+          echo "Version de retorno: $DIGEST"
+
+      - name: Desplegar el digest nuevo
+        id: deploy
+        run: |
+          kubectl set image deployment/copiloto-api api="$IMAGE"
+          kubectl rollout status deployment/copiloto-api --timeout=180s
+
+      - name: Smoke tests contra produccion
+        id: smoke
+        continue-on-error: true
+        run: ./scripts/smoke-test.sh --url https://copiloto.academy.dev
+
+      - name: Vigilar metricas durante la ventana
+        id: watch
+        continue-on-error: true
+        run: ./scripts/check-health.sh --window 5m --max-error-rate 0.01
+
+      - name: Rollback automatico si algo fallo
+        if: steps.smoke.outcome == 'failure' || steps.watch.outcome == 'failure'
+        run: |
+          echo "::warning::Despliegue fallido; revirtiendo a ${{ steps.previous.outputs.digest }}"
+          kubectl set image deployment/copiloto-api \
+            api="${{ steps.previous.outputs.digest }}"
+          kubectl rollout status deployment/copiloto-api --timeout=180s
+
+      - name: Fallar el pipeline (con el servicio ya restaurado)
+        if: steps.smoke.outcome == 'failure' || steps.watch.outcome == 'failure'
+        run: |
+          echo "El despliegue de ${{ github.sha }} fue revertido." &gt;&amp;2
+          exit 1
+        env:
+          IMAGE: ghcr.io/academy/copiloto-api@${{ steps.digest.outputs.digest }}
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Leer el digest actual antes de tocar nada</strong>: el «punto de retorno» no se adivina, se <em>lee</em> del estado real del clúster. Guardarlo en la salida del step lo hace disponible para el rollback.</li>
+          <li><strong>Desplegar por digest</strong> (<code>@sha256:…</code>): el rollback restaura exactamente los bytes que funcionaban, no «una etiqueta que ayer apuntaba a otra cosa».</li>
+          <li><strong><code>continue-on-error: true</code></strong>: los pasos de verificación <em>no</em> fallan el pipeline por sí mismos; su <em>outcome</em> se consulta después. Así el rollback puede ejecutarse <strong>antes</strong> de que el pipeline muera, dejando el servicio sano.</li>
+          <li><strong>El orden importa</strong>: primero se revierte, luego se marca el pipeline en rojo. Si fallas el pipeline sin revertir, has dejado producción rota y una alerta —lo peor de los dos mundos.</li>
+          <li><strong>Verificación en dos capas</strong>: <em>smoke tests</em> (¿responde lo básico?) y métricas en ventana (¿se comporta bien con tráfico real?). Un rollback que solo mira «arrancó» no detecta regresiones silenciosas.</li>
+        </ul>
+
+        <h3>Lo que hace posible que ese rollback funcione</h3>
+        <p>El workflow de arriba es la parte fácil. Lo que de verdad lo sostiene es lo que hiciste <em>antes</em>:</p>
+        <div class="code-file">scripts/deploy.sh (extracto — compatibilidad)</div>
+        <pre><code class="language-bash"># Antes de permitir el rollback, comprobar que la version anterior
+# sigue siendo compatible con el esquema ACTUAL de la base de datos.
+# Si la migracion fue destructiva, el rollback de codigo NO es seguro.
+PREV_REVISION="$1"
+REQUIRED_REVISION=$(psql "$DATABASE_URL" -tAc \
+  "SELECT min_schema_revision FROM app_versions WHERE image_digest='$PREV_REVISION'")
+
+CURRENT_REVISION=$(alembic current 2&gt;/dev/null | awk '{print $1}')
+if [ "$CURRENT_REVISION" != "$REQUIRED_REVISION" ]; then
+  echo "Rollback incompatible: esquema $CURRENT_REVISION no legible por $PREV_REVISION" &gt;&amp;2
+  exit 1
+fi
+echo "Rollback seguro hacia $PREV_REVISION"
+</code></pre>
+        <div class="callout callout--tip">
+          <p>Este es el punto exacto donde <strong>todo el curso converge</strong>: el rollback por digest (módulo de build y artefactos) solo es seguro si las migraciones fueron compatibles (módulo de entrega continua) y si la configuración viaja con la versión. Un rollback es la <em>prueba de fuego</em> de que hiciste bien lo anterior. Si el pipeline no puede revertir, alguna de esas piezas falta.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>Prueba el rollback antes de necesitarlo.</strong> Un rollback que nunca has ejecutado no es un rollback: es una hipótesis. Haz <em>rollback drills</em> —despliega una versión mala a propósito en <em>staging</em> y comprueba que la reversión funciona, que el esquema lo admite y que la configuración vuelve—. La primera vez que ejecutes un rollback no debe ser en producción, a las 3 de la mañana.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Desplegar siempre por digest o etiqueta inmutable</td>
+              <td><code>:latest</code> o etiquetas mutables</td>
+              <td>Sin un artefacto identificable no sabes a qué volver</td>
+            </tr>
+            <tr>
+              <td>Leer del clúster la versión actual antes de desplegar</td>
+              <td>Confiar en «me acuerdo de lo que corría»</td>
+              <td>El estado real es la única fuente fiable del punto de retorno</td>
+            </tr>
+            <tr>
+              <td>Revertir antes de fallar el pipeline</td>
+              <td>Marcar el pipeline en rojo y dejar producción rota</td>
+              <td>El objetivo es restaurar el servicio, no solo avisar</td>
+            </tr>
+            <tr>
+              <td>Verificar con smoke tests y métricas en ventana</td>
+              <td>Dar por bueno «arrancó sin error»</td>
+              <td>Las regresiones silenciosas no se ven en el arranque</td>
+            </tr>
+            <tr>
+              <td>Migraciones compatibles (expand/contract)</td>
+              <td>Cambios de esquema destructivos antes de revertir</td>
+              <td>Sin compatibilidad, el código viejo no arranca</td>
+            </tr>
+            <tr>
+              <td>Versionar la configuración junto a la app</td>
+              <td>Config editada a mano en el servidor</td>
+              <td>Revertir el código sin la config deja un estado incoherente</td>
+            </tr>
+            <tr>
+              <td>Practicar rollback drills periódicos</td>
+              <td>Estrenar el rollback en un incidente real</td>
+              <td>Un rollback no probado es una hipótesis, no una capacidad</td>
+            </tr>
+            <tr>
+              <td>Tener un kill switch (flag) para lo arriesgado</td>
+              <td>Depender siempre de un ciclo completo de deploy</td>
+              <td>Apagar un comportamiento en segundos es menos arriesgado</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Desplegar con <code>:latest</code>: pierdes el punto de retorno</h3>
+        <span class="code-label code-label--wrong">Mal — etiqueta mutable</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Todos los deploys apuntan a :latest. Al ir a revertir, la "revision
+#    anterior" tambien dice :latest: no sabes que bytes corrian antes.
+kubectl set image deployment/copiloto-api api=ghcr.io/academy/copiloto-api:latest
+</code></pre>
+        <span class="code-label code-label--right">Bien — digest inmutable por despliegue</span>
+        <pre class="code-right"><code class="language-bash"># ✅ Cada despliegue fija un digest concreto: el rollback sabe a que volver.
+kubectl set image deployment/copiloto-api \
+  api=ghcr.io/academy/copiloto-api@sha256:9f03...
+</code></pre>
+
+        <h3>Revertir el código después de una migración destructiva</h3>
+        <span class="code-label code-label--wrong">Mal — el código viejo no puede arrancar</span>
+        <pre class="code-wrong"><code class="language-sql">-- ❌ Se aplico junto al despliegue nuevo y de forma irreversible.
+ALTER TABLE messages DROP COLUMN body;
+-- Al revertir la app, la version vieja hace SELECT body y falla: rollback roto.
+</code></pre>
+        <span class="code-label code-label--right">Bien — separar cambio destructivo del despliegue</span>
+        <pre class="code-right"><code class="language-sql">-- ✅ El DROP va mucho despues, cuando ya nadie puede volver a la version vieja.
+--    Mientras el rollback sea una opcion, lo viejo sigue existiendo (expand).
+ALTER TABLE messages ADD COLUMN content TEXT;   -- compatible con ambas versiones
+</code></pre>
+
+        <h3>Rollback que no revierte la configuración</h3>
+        <span class="code-label code-label--wrong">Mal — config pegada al servidor</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ Alguien cambio la config en produccion a mano. El rollback del codigo
+#    deja la version vieja con la config nueva: estado incoherente.
+kubectl edit configmap copiloto-api    # cambiado a mano, sin versionar
+</code></pre>
+        <span class="code-label code-label--right">Bien — config versionada que viaja con la versión</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ La config esta en el repo y el pipeline la aplica junto al artefacto.
+#    Al revertir, vuelven juntos el codigo y su configuracion.
+# config/production.yaml (versionado en Git)
+</code></pre>
+
+        <h3>Rollback manual sin runbook ni verificación</h3>
+        <span class="code-label code-label--wrong">Mal — improvisar en el incidente</span>
+        <pre class="code-wrong"><code class="language-bash"># ❌ En pleno incidente, alguien teclea comandos de memoria y espera
+#    que "haya vuelto". Sin verificar, puede estar a medias.
+kubectl rollout undo deployment/copiloto-api
+# (¿y ahora? nadie comprueba que el servicio volvio bien)
+</code></pre>
+        <span class="code-label code-label--right">Bien — automatizado, verificado y notificado</span>
+        <pre class="code-right"><code class="language-bash"># ✅ El rollback es un paso del pipeline, se espera y se verifica;
+#    las personas reciben contexto de que paso y por que.
+kubectl set image deployment/copiloto-api api="$PREVIOUS_DIGEST"
+kubectl rollout status deployment/copiloto-api --timeout=180s
+./scripts/smoke-test.sh --url https://copiloto.academy.dev
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> provocar un despliegue malo, detectarlo con las comprobaciones del pipeline y <strong>revertir automáticamente</strong> a la versión anterior por digest, verificando que el servicio vuelve a estar sano.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un clúster y despliega una versión sana (la «buena»):
+            <pre><code class="language-bash">kind create cluster --name rollback-lab
+kubectl apply -f k8s/deployment.yaml        # imagen v1.4.1, sana
+kubectl rollout status deployment/copiloto-api
+</code></pre>
+            <p>Resultado esperado: 3 réplicas listas. Anota el digest actual: <code>kubectl get deployment copiloto-api -o jsonpath='{.spec.template.spec.containers[0].image}'</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> simula el pipeline que recuerda el punto de retorno:
+            <pre><code class="language-bash">PREVIOUS=$(kubectl get deployment copiloto-api \
+  -o jsonpath='{.spec.template.spec.containers[0].image}')
+echo "Punto de retorno: $PREVIOUS"
+</code></pre>
+            <p>Resultado esperado: imprime el digest de la versión sana. Ese valor es lo que tu workflow guardaría en una salida para poder revertir.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> despliega una versión «mala» y comprueba que la verificación la detecta:
+            <pre><code class="language-bash">kubectl set image deployment/copiloto-api \
+  api=ghcr.io/academy/copiloto-api:v1.4.2-broken
+kubectl rollout status deployment/copiloto-api --timeout=30s
+# (falla por timeout) -> el smoke test tambien debe fallar:
+./scripts/smoke-test.sh --url http://localhost:8080 || echo "FALLO detectado"
+</code></pre>
+            <p>Resultado esperado: el rollout no converge y el <em>smoke test</em> sale con error. En el pipeline, ese fallo dispararía el rollback.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> ejecuta el rollback <strong>por digest</strong> al punto de retorno y espera:
+            <pre><code class="language-bash">kubectl set image deployment/copiloto-api api="$PREVIOUS"
+kubectl rollout status deployment/copiloto-api --timeout=120s
+kubectl get pods -l app=copiloto-api
+</code></pre>
+            <p>Resultado esperado: las réplicas vuelven a estar <code>1/1 Ready</code> y el servicio responde. Ese es el MTTR de tu sistema: lo que tardó el rollback.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (verificación y limpieza):</strong> confirma que el servicio está sano y guarda la lección:
+            <pre><code class="language-bash">./scripts/smoke-test.sh --url https://copiloto.academy.dev
+kubectl rollout history deployment/copiloto-api
+kind delete cluster --name rollback-lab
+</code></pre>
+            <p>Resultado esperado: los <em>smoke tests</em> pasan y el historial muestra la revisión de rollback. Reflexiona: ¿cuánto tardó entre la detección y el servicio restaurado? Ese número es lo que quieres reducir con la automatización.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rollback automático con guardia de esquema y simulacro periódico</h3>
+          <p>Diseña un sistema de rollback para el Copiloto que cubra los tres frentes a la vez: (1) <strong>detección</strong> —verifica con smoke tests y métricas en ventana, y define qué umbral dispara la reversión—; (2) <strong>seguridad</strong> —antes de revertir, comprueba que el digest anterior sigue siendo compatible con el <strong>esquema actual</strong> de la base de datos, y si no lo es, decide explícitamente entre roll-forward o restauración de datos—; y (3) <strong>preparación</strong> —añade al pipeline un <strong>simulacro programado</strong> (<em>rollback drill</em>) que despliegue a <em>staging</em> una versión mala conocida y verifique que la reversión automática funciona sin intervención humana.</p>
+          <p><em>Pista: la guardia de esquema se apoya en saber qué revisión de migración requiere cada digest (la tabla <code>app_versions</code> del ejemplo real sirve de punto de partida). El simulacro puede ser un workflow con <code>schedule:</code> que use una imagen deliberadamente rota. Reflexiona: ¿por qué un rollback que nunca se ha probado es más peligroso que no tener rollback en absoluto —qué falsa sensación de seguridad introduce, y cómo cambia eso cuando el rollback está automatizado y se ejercita con regularidad?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>rollback</strong> es una capacidad que se diseña y se prueba, no un comando improvisado; su métrica es el <strong>MTTR</strong>.</li>
+          <li>Un buen rollback <strong>no reconstruye</strong>: re-despliega el <strong>digest inmutable</strong> que ya funcionaba.</li>
+          <li>Sus cuatro pilares: artefacto <strong>inmutable y trazable</strong>, migraciones <strong>compatibles</strong>, configuración <strong>versionada</strong> y <strong>flags</strong> (kill switch).</li>
+          <li>Revertir el código <strong>no revierte</strong> los datos, el esquema ni los efectos secundarios: eso se diseña con expand/contract.</li>
+          <li>Con migraciones destructivas, el rollback se convierte en <strong>roll-forward</strong>; decídelo explícitamente.</li>
+          <li>Automatiza: detectar (smoke + métricas) → <strong>revertir antes de fallar el pipeline</strong> → verificar → notificar.</li>
+          <li>Practica <em>rollback drills</em>: un rollback sin ensayar es una hipótesis.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece</th></tr></thead>
+          <tbody>
+            <tr><td>Punto de retorno</td><td>El digest que corría y funcionaba</td><td><code>jsonpath '{.…image}'</code></td></tr>
+            <tr><td>Reversión</td><td>Volver al artefacto anterior</td><td><code>kubectl set image … @sha256:…</code> / <code>rollout undo</code></td></tr>
+            <tr><td>Verificación</td><td>Confirmar que el servicio volvió sano</td><td><code>smoke-test.sh</code> + métricas en ventana</td></tr>
+            <tr><td>Guardia de esquema</td><td>¿Es legible el esquema actual por la versión anterior?</td><td>Consulta a <code>app_versions</code></td></tr>
+            <tr><td>Kill switch</td><td>Apagar un comportamiento sin desplegar</td><td><code>flags.sh set … off</code></td></tr>
+            <tr><td>Rollback drill</td><td>Ensayo programado de la reversión</td><td>Workflow con <code>schedule:</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Rollback no es lo mismo que <code>git revert</code>?</summary>
+            <div>
+              <p>No. <code>git revert</code> deshace un cambio <em>en el código fuente</em> y, en la mayoría de flujos, dispara una <strong>reconstrucción</strong> completa: eso es un roll-forward lento. El rollback real re-despliega el <strong>artefacto ya construido</strong> que funcionaba (por su digest), sin volver a construir ni ejecutar el pipeline de build. Es cuestión de minutos frente a decenas de minutos, y no reintroduce el riesgo de que el nuevo build salga distinto. Revertir en Git es para arreglar el futuro; el rollback es para restaurar el ahora.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>:latest</code> me impide hacer rollback?</summary>
+            <div>
+              <p>Porque <code>:latest</code> es una etiqueta <strong>mutable</strong>: apunta a la imagen más reciente, y «la más reciente» cambia cada vez que publicas. Si todas tus revisiones dicen <code>:latest</code>, tu historial de despliegue no registra qué bytes concretos corrían cuando el servicio iba bien, así que no puedes volver a <em>ellos</em> con precisión. Con un <strong>digest</strong> (<code>@sha256:…</code>) o una etiqueta inmutable, cada revisión identifica un artefacto único e imposible de cambiar. La trazabilidad del artefacto es el primer pilar del rollback.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo revertir la base de datos?</summary>
+            <div>
+              <p>Solo en parte, y con cuidado. Volver el esquema atrás (<code>down</code> de una migración) no recupera los <strong>datos</strong> que ya se pudieron transformar o borrar. Por eso la estrategia correcta no es «revertir la BD», sino <strong>diseñar los cambios para que nunca necesites revertirla</strong>: expand/contract hace que el esquema nuevo sea compatible con el código viejo, de modo que puedes revertir la <em>aplicación</em> sin tocar los datos. Para lo verdaderamente irreversible, la red de seguridad son los <em>backups</em> y la restauración, que es otro tipo de operación (más lenta, con posible pérdida de lo ocurrido desde la copia).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Rollback o roll-forward?</summary>
+            <div>
+              <p>Depende de qué restaure el servicio antes y con menos riesgo. Si la versión anterior estaba sana y el esquema es compatible, el <strong>rollback</strong> es rápido y predecible. Si el fallo es un ajuste trivial, o ya aplicaste una migración destructiva que el código viejo no entiende, el <strong>roll-forward</strong> (corregir y volver a desplegar) es más seguro. Y si solo falla una funcionalidad concreta, el <strong>kill switch</strong> (apagar la flag) es lo más rápido de todo. La decisión debe estar escrita en un runbook, no improvisarse bajo presión.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé que mi rollback va a funcionar cuando lo necesite?</summary>
+            <div>
+              <p>Porque lo has <strong>probado</strong>. Un rollback que nunca se ha ejecutado no es una capacidad, es una esperanza. La práctica es hacer <em>rollback drills</em>: en <em>staging</em>, despliega deliberadamente una versión rota y comprueba de punta a punta que la reversión automática funciona, que el esquema lo admite y que la configuración vuelve. Hazlo con periodicidad (por ejemplo, en un workflow con <code>schedule:</code>). Así, cuando llegue el incidente real, el camino ya está transitado y medido, no descubierto.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

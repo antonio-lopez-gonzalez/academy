@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-rolling">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Despliegue rolling — Módulo 5 · Curso DevOps</title>
+  <meta name="description" content="Despliegue rolling y health checks: reemplazo gradual de instancias, readiness y liveness probes, graceful shutdown y estrategia maxSurge/maxUnavailable en Kubernetes.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Despliegue rolling</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Estrategias de despliegue</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La <strong>Copiloto API</strong> corre en <strong>varias réplicas</strong> detrás de un balanceador. Eso significa que ya no hay un único servidor: hay N copias idénticas del proceso, y el tráfico se reparte entre ellas. Desplegar entonces no es «parar el servidor y arrancar el nuevo» —eso sería una caída—, sino <strong>reemplazar las instancias de una en una</strong> hasta que todas corran la versión nueva. Eso es un despliegue <strong>rolling</strong> (rodante).</p>
+        <p>Parece trivial, pero la parte difícil no es «qué instancias mato», sino <strong>cuándo una instancia está lista para recibir tráfico</strong>. Un proceso de FastAPI puede estar «arrancado» y todavía no haber cargado el modelo, no haber abierto el pool de conexiones o no haber calentado las cachés. Si el balanceador le manda tráfico en ese momento, el usuario ve un <code>502</code> o un <code>500</code> esporádico. La herramienta que lo evita son los <strong>health checks</strong>: <em>readiness</em> y <em>liveness</em>.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué esta lección existe?</strong> Porque el rolling es la estrategia por defecto de casi todo el mundo, y es también donde se cometen los errores más silenciosos: sin health checks parece que todo va bien hasta que un pico de tráfico coincide con un despliegue y aparecen errores intermitentes que nadie sabe reproducir. Entender el ciclo de vida de una instancia es la base de todas las estrategias más avanzadas.</p>
+        </div>
+        <div class="callout callout--warning">
+          <p><strong>El rolling no es gratis.</strong> Durante el proceso siempre <em>falta</em> capacidad: mientras arranca una instancia nueva, otra ya se apagó o se está apagando. Si tu margen de capacidad es cero, el despliegue se convierte en una degradación del servicio. Se planifica con holgura (surge) o en ventanas de bajo tráfico.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué hace un despliegue rolling, paso a paso</h3>
+        <p>Un orquestador (Kubernetes, ECS, un servicio del cloud…) conoce la versión deseada y la versión actual. El <em>controlador de despliegue</em> hace esto en bucle, hasta converger:</p>
+        <ol class="steps">
+          <li><strong>Crea</strong> una instancia nueva con la versión deseada.</li>
+          <li><strong>Espera</strong> a que pase su <em>readiness</em> (esté lista para tráfico).</li>
+          <li><strong>Añade</strong> esa instancia al balanceador y <strong>retira</strong> una vieja del balanceador.</li>
+          <li><strong>Termina</strong> la instancia vieja de forma ordenada (graceful shutdown).</li>
+          <li><strong>Repite</strong> hasta que no quede ninguna instancia vieja.</li>
+        </ol>
+        <pre class="diagram">
+   estado inicial          medio despliegue               estado final
+   ┌──┐┌──┐┌──┐            ┌──┐┌──┐┌──┐                ┌──┐┌──┐┌──┐
+   │v1││v1││v1│     ──▶    │v1││v2││v2│      ──▶       │v2││v2││v2│
+   └──┘└──┘└──┘            └──┘└──┘└──┘                └──┘└──┘└──┘
+   todas v1               v1 se apaga / v2 entra         todas v2
+
+   el balanceador NUNCA ve el servicio caido: siempre hay instancias listas
+        </pre>
+        <p>Dos parámetros gobiernan el ritmo:</p>
+        <ul>
+          <li><strong><code>maxSurge</code></strong>: cuántas instancias <em>de más</em> sobre el número deseado se pueden crear a la vez (sube la capacidad durante el proceso).</li>
+          <li><strong><code>maxUnavailable</code></strong>: cuántas instancias <em>de menos</em> se permiten estar no disponibles a la vez (baja la capacidad).</li>
+        </ul>
+        <p>Si <code>maxSurge: 1</code> y <code>maxUnavailable: 0</code>, nunca falta capacidad: primero arranca de más, luego apaga. Es el modo seguro (y más lento). Si <code>maxUnavailable: 2</code> con 3 réplicas, dos tercios del servicio se apagan antes de que las nuevas estén listas: rápido y arriesgado.</p>
+
+        <h3>Dónde encaja el rolling frente a otras estrategias</h3>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Cómo cambia</th><th>Downtime</th><th>Coste</th><th>Rollback</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Recreate</strong></td><td>Apaga todo y arranca lo nuevo</td><td>Sí</td><td>Mínimo</td><td>Re-desplegar</td></tr>
+            <tr><td><strong>Rolling</strong></td><td>Instancia a instancia</td><td>No</td><td>Bajo</td><td>Rolling inverso (lento)</td></tr>
+            <tr><td><strong>Blue/green</strong></td><td>Dos entornos, cambio de tráfico</td><td>No</td><td>Alto (2×)</td><td>Inmediato (volver el tráfico)</td></tr>
+            <tr><td><strong>Canary</strong></td><td>Un % del tráfico a la versión nueva</td><td>No</td><td>Bajo</td><td>Inmediato (0 %)</td></tr>
+          </tbody>
+        </table>
+        <p>El rolling es el <em>punto de partida</em>: no necesita infraestructura extra y ya evita el downtime. Sus dos debilidades son que la <strong>reversión es lenta</strong> (hay que volver a rodar hacia atrás) y que <strong>no puedes probar la versión nueva con tráfico real antes de exponerla a todos</strong>. Blue/green y canary existen precisamente para cubrir eso.</p>
+
+        <h3>Readiness vs liveness: los dos health checks que estás obligado a conocer</h3>
+        <p>Son parecidos en la forma (una sonda que el orquestador ejecuta periódicamente) pero responden a preguntas opuestas:</p>
+        <table>
+          <thead><tr><th>Sonda</th><th>Pregunta</th><th>Si falla…</th></tr></thead>
+          <tbody>
+            <tr><td><strong>readiness</strong></td><td>«¿Puedo recibir tráfico <em>ahora mismo</em>?»</td><td>Se <strong>retira</strong> del balanceador, pero el proceso sigue vivo. Vuelve cuando recupere.</td></tr>
+            <tr><td><strong>liveness</strong></td><td>«¿Sigo vivo, o estoy atascado?»</td><td>El orquestador <strong>mata</strong> el proceso y arranca otro (reinicio).</td></tr>
+            <tr><td><strong>startup</strong></td><td>«¿He terminado de arrancar?»</td><td>Retrasa las otras dos sondas: evita que un arranque lento se confunda con un cuelgue.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> readiness es el letrero «abierto» de una tienda: si el dependiente está reponiendo, cierra un momento y no deja entrar a nadie, pero la tienda no ha cerrado. Liveness es comprobar que el dependiente sigue <em>consciente</em>: si se ha desmayado, hay que sustituirlo. Confundirlos es un error clásico: una readiness que en realidad comprueba «estoy vivo» deja entrar tráfico a una instancia saturada.</p>
+        </div>
+        <div class="callout callout--tip">
+          <p><strong>Regla práctica:</strong> la <em>liveness</em> debe ser barata y comprobar solo que el proceso no está en un punto muerto (que responde). La <em>readiness</em> puede ser más estricta: que las dependencias críticas respondan. Y <strong>nunca</strong> pongas una dependencia externa (una base de datos) en la <em>liveness</em>: si la BD cae un momento, reiniciar todas tus réplicas no arregla la BD, solo empeora las cosas.</p>
+        </div>
+
+        <h3>El otro extremo del ciclo: la terminación ordenada</h3>
+        <p>El deployment no solo debe llegar bien: también debe <strong>irse bien</strong>. Cuando el orquestador decide terminar una instancia vieja, normalmente hace dos cosas: deja de mandarle tráfico nuevo y le envía una señal <code>SIGTERM</code>. La instancia debe:</p>
+        <ol class="steps">
+          <li><strong>Dejar de aceptar</strong> peticiones nuevas.</li>
+          <li><strong>Terminar las que están en vuelo</strong> (las que ya había empezado a atender).</li>
+          <li><strong>Liberar recursos</strong> y salir con código 0.</li>
+        </ol>
+        <p>Hay un <em>desfase</em> fundamental: el balanceador tarda unos instantes en dejar de enviar tráfico, y la base de datos puede tener transacciones abiertas. Por eso el orquestador espera un <code>terminationGracePeriodSeconds</code> antes de matar a la fuerza, y por eso se suele añadir un <code>preStop</code> que duerme uno o dos segundos: da tiempo a que el balanceador <em>deje de enrutar</em> antes de que el proceso cierre su socket.</p>
+        <div class="callout callout--warning">
+          <p>Sin terminación ordenada, el rolling pierde peticiones: cada instancia que se apaga abruptamente con conexiones abiertas provoca errores que el usuario ve como «el despliegue rompió el servicio». La <strong>readiness</strong> de entrada y el <strong>graceful shutdown</strong> de salida son las dos mitades de un rolling correcto.</p>
+        </div>
+
+        <h3>Disponibilidad bajo disrupciones: el PodDisruptionBudget</h3>
+        <p>Un despliegue no es la única cosa que puede apagar instancias: un nodo que se drena, un autoescalado, un mantenimiento… El <strong>PodDisruptionBudget (PDB)</strong> declara cuántas instancias deben permanecer disponibles <em>siempre</em>, y el orquestador respeta ese mínimo incluso al actualizar y drenar nodos. Es la red de seguridad que evita que una operación legítima te deje sin servicio.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El átomo de un rolling en Kubernetes: decir «quiero la imagen nueva» y <strong>esperar a que el despliegue termine</strong>. Dos comandos, y el segundo es el que casi todo el mundo olvida.</p>
+        <div class="code-file">terminal</div>
+        <pre><code class="language-bash"># 1) Cambiar la imagen del contenedor "api" a una version concreta.
+kubectl set image deployment/copiloto-api \
+  api=ghcr.io/academy/copiloto-api:1.4.2
+
+# 2) Bloquear hasta que el despliegue converja (o fallar por timeout).
+kubectl rollout status deployment/copiloto-api --timeout=120s
+</code></pre>
+        <p>Línea por línea:</p>
+        <ol class="steps">
+          <li><strong><code>kubectl set image</code></strong>: no reinicia nada a la fuerza; actualiza la <em>especificación</em> del Deployment. El controlador detecta que la plantilla cambió y <strong>empieza el rolling</strong> por sí solo, respetando <code>maxSurge</code>/<code>maxUnavailable</code>.</li>
+          <li><strong><code>=ghcr.io/academy/copiloto-api:1.4.2</code></strong>: una <strong>etiqueta concreta</strong>, nunca <code>:latest</code>. Con <code>:latest</code> el orquestador no distingue «versión nueva» de «la misma» y no puedes revertir con precisión (lo veremos en la lección de rollback).</li>
+          <li><strong><code>kubectl rollout status … --timeout</code></strong>: convierte el despliegue en algo <strong>esperable</strong>. Sin esto, tu pipeline sigue adelante y cree que todo fue bien mientras las réplicas aún arrancan o han fallado. Con esto, un rollout que no converge puede <strong>fallar el pipeline</strong>.</li>
+        </ol>
+        <p>Y el Deployment que hace que ese rolling sea <em>seguro</em> (con readiness viva):</p>
+        <div class="code-file">k8s/deployment.yaml</div>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copiloto-api
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # +1 instancia durante el despliegue
+      maxUnavailable: 0    # nunca menos de las deseadas: cero perdida de capacidad
+  selector:
+    matchLabels:
+      app: copiloto-api
+  template:
+    metadata:
+      labels:
+        app: copiloto-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/academy/copiloto-api:1.4.2
+          ports:
+            - containerPort: 8000
+          readinessProbe:              # ¿puedo recibir trafico?
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+</code></pre>
+        <div class="callout callout--note">
+          <p>La pieza clave es <code>readinessProbe</code>: hasta que <code>/health/ready</code> no responde 200, el balanceador <strong>no enruta</strong> tráfico a esa instancia. El controlador no la cuenta como «lista», así que no añade la siguiente ni retira la vieja. El rolling <em>espera</em> a que la app esté de verdad preparada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Llevemos el Copiloto a un rolling <strong>completo</strong>: sondas bien calibradas, terminación ordenada, límites de recursos y la protección de disponibilidad. Después lo orquestamos desde el pipeline.</p>
+
+        <h3>El Deployment de producción, con todo</h3>
+        <div class="code-file">k8s/deployment.yaml</div>
+        <pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copiloto-api
+  labels:
+    app: copiloto-api
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: copiloto-api
+  template:
+    metadata:
+      labels:
+        app: copiloto-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: ghcr.io/academy/copiloto-api@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          startupProbe:                 # arranques lentos: no confundir con cuelgue
+            httpGet:
+              path: /health/live
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 2             # hasta 60s para arrancar
+          livenessProbe:                # ¿estoy atascado? -> reinicio
+            httpGet:
+              path: /health/live
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:               # ¿listo para trafico?
+            httpGet:
+              path: /health/ready
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "2"]  # deja que el balanceador deje de enrutar
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong><code>maxSurge: 1</code> / <code>maxUnavailable: 0</code></strong>: nunca baja la capacidad. Cada instancia nueva debe estar <em>lista</em> antes de retirar una vieja. Lo más lento y lo más seguro para un servicio con tráfico.</li>
+          <li><strong><code>startupProbe</code></strong>: cubre el arranque lento (cargar el modelo). Mientras no pase, liveness y readiness están <em>desactivadas</em>: así un arranque de 40 s no se interpreta como un cuelgue.</li>
+          <li><strong><code>readinessProbe</code> en <code>/health/ready</code></strong>: puede comprobar dependencias (pool de BD, caché) sin reiniciar la app. Si una dependencia falla, la instancia sale del balanceador y vuelve sola.</li>
+          <li><strong><code>livenessProbe</code> en <code>/health/live</code></strong>: barata y sin dependencias externas. Solo responde «sigo respondiendo». Por eso una caída de BD <em>no</em> dispara reinicios en cascada.</li>
+          <li><strong><code>terminationGracePeriodSeconds: 30</code> + <code>preStop sleep 2</code></strong>: le da al balanceador tiempo a dejar de enrutar y a la app a terminar las peticiones en vuelo. La mitad «de salida» del rolling.</li>
+          <li><strong><code>resources.requests/limits</code></strong>: sin ellos, el arranque puede quedar ahogado por falta de CPU (nunca pasa la readiness y el rolling se cuelga) o consumir memoria sin control.</li>
+          <li><strong>Imagen por <em>digest</em> (<code>@sha256:…</code>)</strong>: el artefacto exacto que se probó; imposible que un <em>push</em> posterior cambie lo que se despliega. Trazabilidad total.</li>
+        </ul>
+
+        <h3>La red de seguridad: PodDisruptionBudget</h3>
+        <div class="code-file">k8s/pdb.yaml</div>
+        <pre><code class="language-yaml">apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: copiloto-api
+spec:
+  minAvailable: 2          # de 3 replicas, al menos 2 siempre disponibles
+  selector:
+    matchLabels:
+      app: copiloto-api
+</code></pre>
+        <p>Con <code>minAvailable: 2</code>, ni un drenado de nodo ni un error de planificación pueden dejar el Copiloto con menos de dos réplicas sanas. El rolling ya se autoimpone esa restricción con <code>maxUnavailable: 0</code>; el PDB la extiende a <em>cualquier</em> disrupción.</p>
+
+        <h3>El paso del pipeline que despliega y espera</h3>
+        <div class="code-file">.github/workflows/cd.yml</div>
+        <pre><code class="language-yaml">jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar acceso al cluster
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" &gt; "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Aplicar manifiestos
+        run: kubectl apply -f k8s/
+
+      - name: Fijar la imagen a desplegar
+        run: |
+          kubectl set image deployment/copiloto-api \
+            api="$IMAGE"
+
+      - name: Esperar al rollout (o fallar)
+        run: |
+          kubectl rollout status deployment/copiloto-api --timeout=180s \
+            || (kubectl rollout undo deployment/copiloto-api &amp;&amp; exit 1)
+        env:
+          IMAGE: ghcr.io/academy/copiloto-api@${{ steps.digest.outputs.digest }}
+</code></pre>
+        <div class="callout callout--tip">
+          <p>El paso clave es el <strong><code>rollout status</code> con <code>|| rollout undo</code></strong>: si el despliegue no converge en 3 minutos (readiness nunca pasa, la imagen no arranca…), el pipeline revierte solo y falla. Un rolling sin esta espera es simplemente «disparar y rezar». El rollback automático tiene su propia lección; aquí basta ver que el rolling <em>debe</em> ser esperado para poder reaccionar.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Readiness que comprueba que la app puede atender</td>
+              <td>Sin readiness o una que devuelve 200 siempre</td>
+              <td>El balanceador enrutaría a instancias aún no preparadas</td>
+            </tr>
+            <tr>
+              <td>Liveness barata y sin dependencias externas</td>
+              <td>Liveness que consulta la base de datos</td>
+              <td>Una caída de BD reiniciaría todas las réplicas a la vez</td>
+            </tr>
+            <tr>
+              <td><code>maxUnavailable: 0</code> en servicios con tráfico</td>
+              <td><code>maxUnavailable</code> alto para «ir más rápido»</td>
+              <td>Menos capacidad durante el despliegue = degradación visible</td>
+            </tr>
+            <tr>
+              <td><code>preStop</code> + <code>terminationGracePeriodSeconds</code></td>
+              <td>Matar el proceso en cuanto se decide</td>
+              <td>Se perderían peticiones ya enrutadas o en vuelo</td>
+            </tr>
+            <tr>
+              <td>Imágenes por etiqueta concreta o digest</td>
+              <td><code>:latest</code></td>
+              <td>Sin versión identificable no hay rollback fiable</td>
+            </tr>
+            <tr>
+              <td><code>startupProbe</code> para arranques lentos</td>
+              <td>Subir <code>initialDelaySeconds</code> a lo bruto</td>
+              <td>Un delay enorme retrasa la detección real de fallos</td>
+            </tr>
+            <tr>
+              <td>Un PodDisruptionBudget que fije un mínimo</td>
+              <td>Ignorar drenados de nodo y mantenimientos</td>
+              <td>Otras operaciones también pueden dejarte sin servicio</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Desplegar sin readiness: tráfico a instancias que no están listas</h3>
+        <span class="code-label code-label--wrong">Mal — el balanceador enruta antes de tiempo</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Sin readinessProbe: la instancia entra en el balanceador al arrancar
+#    el proceso, aunque aun no haya cargado el modelo ni abierto el pool.
+containers:
+  - name: api
+    image: ghcr.io/academy/copiloto-api:1.4.2
+</code></pre>
+        <span class="code-label code-label--right">Bien — readiness que confirma que puede atender</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ El balanceador solo enruta cuando /health/ready responde 200.
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+  periodSeconds: 5
+  failureThreshold: 3
+</code></pre>
+
+        <h3>Liveness equivocada: reinicios en cascada</h3>
+        <span class="code-label code-label--wrong">Mal — liveness que depende de la base de datos</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Si la BD parpadea, TODAS las replicas no pasan liveness y se reinician.
+#    Reiniciar la app no arregla la BD; agrava el incidente.
+livenessProbe:
+  httpGet:
+    path: /health/deep     # consulta a la base de datos
+    port: 8000
+</code></pre>
+        <span class="code-label code-label--right">Bien — liveness barata; la dependencia va en readiness</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ liveness = "el proceso sigue respondiendo" (sin dependencias).
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8000
+# ✅ readiness = "puedo atender de verdad" (puede mirar dependencias).
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+</code></pre>
+
+        <h3>Cerrar sin terminar lo que estaba en vuelo</h3>
+        <span class="code-label code-label--wrong">Mal — apagado abrupto</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Sin preStop ni grace period: al salir el balanceador del enrutado,
+#    hay peticiones ya enviadas que se cortan -> errores 502 en cada rollout.
+containers:
+  - name: api
+    image: ghcr.io/academy/copiloto-api:1.4.2
+</code></pre>
+        <span class="code-label code-label--right">Bien — ventana de terminación ordenada</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ 2s de preStop para que deje de enrutarse + 30s para acabar lo empezado.
+terminationGracePeriodSeconds: 30
+# ...
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "2"]
+</code></pre>
+
+        <h3>Maximizar la velocidad sacrificando disponibilidad</h3>
+        <span class="code-label code-label--wrong">Mal — apagar la mitad del servicio</span>
+        <pre class="code-wrong"><code class="language-yaml"># ❌ Con 3 replicas, 2 pueden estar caidas a la vez: el pico de trafico
+#    se encuentra con un tercio de la capacidad y todo se degrada.
+rollingUpdate:
+  maxSurge: 0
+  maxUnavailable: 2
+</code></pre>
+        <span class="code-label code-label--right">Bien — subir antes de bajar, sin perder capacidad</span>
+        <pre class="code-right"><code class="language-yaml"># ✅ Crea una de mas y solo retira la vieja cuando la nueva esta lista.
+rollingUpdate:
+  maxSurge: 1
+  maxUnavailable: 0
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver con tus ojos cómo un rolling reemplaza instancias sin dejar el servicio caído, y cómo una <em>readiness</em> mal puesta rompe el despliegue. Usaremos un clúster local con <code>kind</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1:</strong> crea un clúster local:
+            <pre><code class="language-bash">kind create cluster --name rolling-lab
+kubectl get nodes
+</code></pre>
+            <p>Resultado esperado: un nodo <code>Ready</code>. Ya tienes un orquestador para experimentar sin coste.</p>
+          </li>
+          <li>
+            <strong>Paso 2:</strong> despliega el Copiloto con sondas correctas (usa el Deployment del ejemplo mínimo con <code>readinessProbe</code> apuntando a un endpoint que exista o, para el laboratorio, a <code>/</code>):
+            <pre><code class="language-bash">kubectl apply -f k8s/deployment.yaml
+kubectl rollout status deployment/copiloto-api
+kubectl get pods -l app=copiloto-api
+</code></pre>
+            <p>Resultado esperado: 3 pods <code>Running</code>. Ejecuta <code>kubectl get endpoints copiloto-api</code> y observa que los 3 aparecen como listos.</p>
+          </li>
+          <li>
+            <strong>Paso 3:</strong> dispara un rolling cambiando de versión y <strong>observa en una segunda terminal</strong> cómo cambian los pods:
+            <pre><code class="language-bash"># Terminal A: mira los pods en vivo.
+kubectl get pods -l app=copiloto-api -w
+
+# Terminal B: cambia la imagen y espera.
+kubectl set image deployment/copiloto-api \
+  api=ghcr.io/academy/copiloto-api:1.4.2
+kubectl rollout status deployment/copiloto-api
+</code></pre>
+            <p>Resultado esperado: aparecen pods nuevos (<em>surge</em>) y desaparecen los viejos de uno en uno; en ningún momento hay menos de 3 listos.</p>
+          </li>
+          <li>
+            <strong>Paso 4:</strong> rompe la readiness a propósito y mira cómo el rollout se <strong>atasca</strong> en vez de servir tráfico roto:
+            <pre><code class="language-bash"># Una imagen que no levanta /health/ready se queda sin entrar en el balanceador.
+kubectl set image deployment/copiloto-api \
+  api=ghcr.io/academy/copiloto-api:broken
+kubectl rollout status deployment/copiloto-api --timeout=60s
+# (fallara por timeout) -> revisa con:
+kubectl describe pod -l app=copiloto-api | tail -30
+</code></pre>
+            <p>Resultado esperado: los pods nuevos <code>Running</code> pero <strong>0/1 Ready</strong>, el rollout no avanza y las réplicas viejas siguen sirviendo. Es la lectura correcta: mejor no avanzar que servir mal.</p>
+          </li>
+          <li>
+            <strong>Paso 5 (limpieza y reversión):</strong> revierte y comprueba el estado final:
+            <pre><code class="language-bash">kubectl rollout undo deployment/copiloto-api
+kubectl rollout status deployment/copiloto-api
+kubectl rollout history deployment/copiloto-api
+kind delete cluster --name rolling-lab
+</code></pre>
+            <p>Resultado esperado: el rollout vuelve a converger y el historial lista las revisiones. Fíjate en <code>rollout history</code>: es la materia prima del rollback de la lección 4.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rolling con verificación de salud y auto-abort</h3>
+          <p>Diseña un despliegue rolling para el Copiloto que <strong>se detenga solo</strong> si la versión nueva es mala, sin depender de que alguien mire la pantalla. El pipeline debe: desplegar un porcentaje inicial, comprobar durante unos minutos que las instancias nuevas están listas y que la tasa de errores no sube, y si algo va mal, <strong>abortar y revertir automáticamente</strong>. Además, define cuál es tu «criterio de salud» del despliegue: qué métricas y qué umbral harían saltar el abort (por ejemplo, readiness al 0 %, o un aumento de latencia p99 por encima de un umbral).</p>
+          <p><em>Pista: el <code>rollout status --timeout</code> solo cubre «¿arrancaron las instancias?», no «¿van bien con tráfico real?». Para lo segundo necesitas una fase de observación tras el despliegue (mira <code>readiness</code> sostenida y métricas del servicio) y una condición de salida que lance <code>kubectl rollout undo</code>. Reflexiona: ¿por qué un rolling <em>no puede</em> medir bien el efecto de la versión nueva sobre el tráfico real hasta que está en todas las réplicas —y qué estrategia de la próxima lección lo resuelve mejor?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>rolling</strong> reemplaza instancias una a una; el balanceador nunca ve el servicio caído porque siempre quedan réplicas listas.</li>
+          <li><code>maxSurge</code>/<code>maxUnavailable</code> controlan el ritmo; <strong><code>maxUnavailable: 0</code></strong> garantiza cero pérdida de capacidad a cambio de ser más lento.</li>
+          <li><strong>readiness</strong> decide si una instancia recibe tráfico; <strong>liveness</strong> si el proceso debe reiniciarse. Nunca mezcles dependencias externas en la liveness.</li>
+          <li>Un rolling correcto tiene dos mitades: <strong>entrada ordenada</strong> (readiness) y <strong>salida ordenada</strong> (<code>preStop</code> + <code>terminationGracePeriodSeconds</code>).</li>
+          <li>El <strong>PodDisruptionBudget</strong> protege la disponibilidad frente a drenados, mantenimientos y autoescalado.</li>
+          <li>El pipeline <strong>espera</strong> al rollout (<code>rollout status</code>); sin esa espera, no puede reaccionar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Dónde aparece</th></tr></thead>
+          <tbody>
+            <tr><td>RollingUpdate</td><td>Reemplazo gradual de réplicas</td><td><code>strategy.type: RollingUpdate</code></td></tr>
+            <tr><td>Ritmo</td><td>Cuántas de más / de menos a la vez</td><td><code>maxSurge</code> / <code>maxUnavailable</code></td></tr>
+            <tr><td>Readiness</td><td>«¿Puedo recibir tráfico?»</td><td><code>readinessProbe</code></td></tr>
+            <tr><td>Liveness</td><td>«¿Sigo vivo?»</td><td><code>livenessProbe</code></td></tr>
+            <tr><td>Arranque lento</td><td>No confundir arrancar con colgarse</td><td><code>startupProbe</code></td></tr>
+            <tr><td>Salida ordenada</td><td>Terminar peticiones en vuelo</td><td><code>preStop</code> + <code>terminationGracePeriodSeconds</code></td></tr>
+            <tr><td>Disponibilidad mínima</td><td>Sobrevivir a disrupciones</td><td><code>PodDisruptionBudget</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Readiness y liveness no son lo mismo?</summary>
+            <div>
+              <p>No. Son ortogonales: <strong>readiness</strong> dice «ahora mismo puedo atender tráfico, o no» y solo añade/quita del balanceador (reversible en segundos). <strong>Liveness</strong> dice «estoy vivo o me he bloqueado» y provoca un <em>reinicio</em> del proceso. Un error típico es poner la comprobación de una dependencia (la base de datos) en la liveness: si la BD parpadea, todas tus réplicas se reinician y empeoras el incidente. Esa comprobación pertenece a la readiness.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el despliegue «se queda» y no avanza?</summary>
+            <div>
+              <p>Casi siempre porque las instancias nuevas <strong>nunca pasan la readiness</strong>. El controlador no las cuenta como listas, así que no añade la siguiente ni retira las viejas: el servicio sigue funcionando con la versión anterior, que es <em>justo</em> lo que quieres, pero el despliegue se atasca. Mira <code>kubectl describe pod</code>: verás eventos de <em>readiness probe failed</em>. Las causas habituales son un endpoint de salud que devuelve error, falta de recursos (<code>requests</code> mal puestos) o un arranque más largo de lo que permite la sonda.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué aparecen errores 502 justo al desplegar, si uso rolling?</summary>
+            <div>
+              <p>Porque falta la <strong>mitad de salida</strong>: cuando el orquestador manda <code>SIGTERM</code>, el balanceador puede tardar un instante en dejar de enrutar, y las conexiones que ya estaban abiertas se cortan. La solución es una ventana de terminación: un <code>preStop</code> que espere uno o dos segundos (para que el balanceador te quite) y un <code>terminationGracePeriodSeconds</code> suficiente para acabar las peticiones en vuelo. La readiness te protege al entrar; esto te protege al salir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un rolling sirve para probar la versión nueva con tráfico real?</summary>
+            <div>
+              <p>No del todo. El rolling <strong>distribuye el tráfico</strong> entre viejas y nuevas durante el proceso, pero lo hace sin control ni medida: no puedes decidir «solo el 5 %», ni comparar métricas de una versión contra la otra con calma, y no puedes pedir «vuelve atrás ya» sin rodar en sentido inverso. Si eso es lo que necesitas, querrás <em>canary</em> (un porcentaje controlado con análisis) o <em>blue/green</em> (dos entornos con cambio de tráfico instantáneo). El rolling es la base; esas son las especializadas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué valor pongo en <code>maxSurge</code> y <code>maxUnavailable</code>?</summary>
+            <div>
+              <p>Depende de cuánta capacidad tienes y cuánto te importa el ritmo. Para un servicio con tráfico y margen, <code>maxSurge: 1</code> y <code>maxUnavailable: 0</code> es lo más seguro. Si tienes poco margen de recursos, sube <code>maxSurge: 0</code> y acepta <code>maxUnavailable: 1</code> (una instancia menos a la vez). Y con muchas réplicas puedes permitirte porcentajes (<code>maxUnavailable: 25%</code>). La regla mental: <strong>cuántas instancias menos puede soportar tu servicio sin degradarse</strong>. Eso es, como máximo, tu <code>maxUnavailable</code>.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
