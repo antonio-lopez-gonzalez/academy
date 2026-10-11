@@ -50,6 +50,7 @@ curso y en su `AGENTS.md`.
 | `Learn FastAPI` | FastAPI: APIs modernas en Python | `spec.md` | `fapi-theme/progress` | 8 | 32 | `proyectos/copiloto-api` |
 | `Learn DevOps` | CI/CD y DevOps: GitHub Actions, IaC | `spec.md` | `devops-theme/progress` | 8 | 32 | `proyectos/pipeline` |
 | `Learn Cloud` | Cloud: Azure/AWS con Terraform | `spec.md` | `cloud-theme/progress` | 8 | 32 | `proyectos/infra-cloud` |
+| `Learn System Design` | System Design: arquitectura a escala | `spec.md` | `sysd-theme/progress` | 8 | 32 | `proyectos/case-studies` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.
@@ -275,7 +276,7 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 - Cada tarjeta muestra el **progreso** del curso: lee la clave `<clave>-progress` de `localStorage`
   (con `data-key` y `data-lessons`) y pinta una barra. Requiere navegar desde el **mismo origen**
   (servir la Academy desde una raíz común); si el origen se aísla, se muestra "sin empezar".
-- `<footer>` indica el número de cursos disponibles (hoy **15**).
+- `<footer>` indica el número de cursos disponibles (hoy **16**).
 - Al añadir un curso, añadir su tarjeta (con `data-key` y `data-lessons`) y actualizar el contador.
 
 ---

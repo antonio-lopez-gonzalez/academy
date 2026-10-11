@@ -46,6 +46,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Learn FastAPI` | FastAPI (APIs modernas en Python) | 8 | 32 | `proyectos/copiloto-api` |
 | `Learn DevOps` | CI/CD y DevOps (Actions, IaC) | 8 | 32 | `proyectos/pipeline` |
 | `Learn Cloud` | Cloud (Azure / AWS, Terraform) | 8 | 32 | `proyectos/infra-cloud` |
+| `Learn System Design` | System Design (arquitectura a escala) | 8 | 32 | `proyectos/case-studies` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
