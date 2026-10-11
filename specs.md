@@ -269,8 +269,11 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 # 12. Página principal (`index.html` de la raíz)
 
 - Portada tipo grid de `.card`; cada tarjeta enlaza a `Learn <Curso>/web/index.html`.
+- Cada tarjeta muestra el **progreso** del curso: lee la clave `<clave>-progress` de `localStorage`
+  (con `data-key` y `data-lessons`) y pinta una barra. Requiere navegar desde el **mismo origen**
+  (servir la Academy desde una raíz común); si el origen se aísla, se muestra "sin empezar".
 - `<footer>` indica el número de cursos disponibles (hoy **15**).
-- Al añadir un curso, añadir su tarjeta y actualizar el contador.
+- Al añadir un curso, añadir su tarjeta (con `data-key` y `data-lessons`) y actualizar el contador.
 
 ---
 
