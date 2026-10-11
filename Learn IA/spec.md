@@ -288,23 +288,23 @@ Portada con hero, firma (conversacion que se escribe), estadisticas y `<div id="
 - [x] `spec.md` (este documento).
 - [x] `AGENTS.md` (puntero corto). Skills centralizadas en `Academy/.agents/skills/`.
 
-## Fase 1 — Scaffold
-- [ ] `package.json` (script `serve`), `pnpm-workspace.yaml`, `.gitignore`, `.gitattributes` (LF).
-- [ ] `scripts/serve-web.mjs`.
-- [ ] Assets: `web/assets/{css,js,fonts,favicon.svg}` re-tematizados (violeta/cian), `course-data.js` completo.
-- [ ] Portada `web/index.html` + firma.
+## Fase 1 — Scaffold ✅
+- [x] `package.json` (script `serve`), `pnpm-workspace.yaml`, `.gitignore`, `.gitattributes` (LF).
+- [x] `scripts/serve-web.mjs`.
+- [x] Assets: `web/assets/{css,js,fonts,favicon.svg}` re-tematizados (violeta/cian), `course-data.js` completo.
+- [x] Portada `web/index.html` + firma.
 
-## Fase 2 — Lecciones (web/modulos/)
-- [ ] 00-preparacion … 08-proyecto-final (36 lecciones).
+## Fase 2 — Lecciones (web/modulos/) ✅
+- [x] 00-preparacion … 08-proyecto-final (36 lecciones).
 
-## Fase 3 — Recursos
-- [ ] `web/recursos/{cheatsheet,glosario,faq}.html`.
+## Fase 3 — Recursos ✅
+- [x] `web/recursos/{cheatsheet,glosario,faq}.html`.
 
-## Fase 4 — Proyecto Copiloto (ejecutable)
-- [ ] `proyectos/copiloto/` con `uv`, RAG + tools + evals y README.
+## Fase 4 — Proyecto Copiloto (ejecutable) ✅
+- [x] `proyectos/copiloto/` con `uv`, RAG + tools + evals y README.
 
-## Fase 5 — Academy
-- [ ] Tarjeta en `Academy/index.html` + contador + fila en `specs.md` §3 y `README.md`.
+## Fase 5 — Academy ✅
+- [x] Tarjeta en `Academy/index.html` + contador + fila en `specs.md` §3 y `README.md`.
 
 ---
 
