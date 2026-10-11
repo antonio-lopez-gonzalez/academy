@@ -49,6 +49,7 @@ curso y en su `AGENTS.md`.
 | `Learn IA` | IA aplicada: LLM, RAG, agentes, MCP, evals | `spec.md` | `ia-theme/progress` | 9 | 36 | `proyectos/copiloto` |
 | `Learn FastAPI` | FastAPI: APIs modernas en Python | `spec.md` | `fapi-theme/progress` | 8 | 32 | `proyectos/copiloto-api` |
 | `Learn DevOps` | CI/CD y DevOps: GitHub Actions, IaC | `spec.md` | `devops-theme/progress` | 8 | 32 | `proyectos/pipeline` |
+| `Learn Cloud` | Cloud: Azure/AWS con Terraform | `spec.md` | `cloud-theme/progress` | 8 | 32 | `proyectos/infra-cloud` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.
@@ -268,7 +269,7 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 # 12. Página principal (`index.html` de la raíz)
 
 - Portada tipo grid de `.card`; cada tarjeta enlaza a `Learn <Curso>/web/index.html`.
-- `<footer>` indica el número de cursos disponibles (hoy **14**).
+- `<footer>` indica el número de cursos disponibles (hoy **15**).
 - Al añadir un curso, añadir su tarjeta y actualizar el contador.
 
 ---
