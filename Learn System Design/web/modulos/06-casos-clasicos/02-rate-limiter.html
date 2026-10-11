@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-rate-limiter">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso: rate limiter — Módulo 6 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso: rate limiter</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Casos clásicos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== --&gt;
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un <strong>rate limiter</strong> (limitador de tasa) decide cuántas peticiones puede hacer un
+          cliente en una ventana de tiempo. Si se pasa, se le rechaza con <code>429 Too Many Requests</code>
+          (o se le encola, o se le degrada). Es la puerta que protege tu sistema de un cliente que dispara
+          demasiado, de un error en bucle, de un ataque y de un abuso —y también la que reparte recursos
+          equitativamente entre planes (free vs pago).</p>
+        <p>Es un caso clásico porque reúne tres tensiones: <strong>¿qué algoritmo?</strong> (precisión vs
+          coste), <strong>¿dónde vive el estado?</strong> (en memoria local o compartido) y
+          <strong>¿cómo hago la operación atómica</strong> cuando varios nodos compiten por el mismo
+          contador. Es, en esencia, un problema de <strong>estado distribuido muy caliente</strong>.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe?</div>
+          <p>Sin límites, un solo cliente puede consumir toda tu capacidad y tumbar a los demás. El rate
+            limiter es tanto <strong>protección</strong> (Módulo 5, resiliencia) como
+            <strong>producto</strong> (planes de uso, cuotas de API). Y es uno de los pocos sitios donde un
+            contador global importa de verdad.</p>
+        </div>
+        <div class="callout callout--warning">
+          <div class="callout__title">Errores típicos</div>
+          <p>Limitar <em>después</em> de haber procesado la petición. Usar solo un contador local por nodo
+            (con 10 nodos aplicas 10× el límite). Hacer <code>GET</code> y luego <code>INCR</code> en dos
+            pasos (condición de carrera: entre leer y escribir, otro nodo se cuela). Y elegir el algoritmo
+            más exacto sin mirar cuánta memoria y CPU cuesta a tu escala.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== --&gt;
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Requisitos y supuestos</h3>
+        <p><strong>Funcionales:</strong> limitar por clave (usuario, IP, API key, ruta); devolver
+          <code>429</code> con cabeceras informativas; permitir distintos límites por plan/ruta.</p>
+        <p><strong>No funcionales:</strong> bajísima latencia añadida (el limitador está en <em>cada</em>
+          petición), alta disponibilidad (si el limitador cae, decides <em>fail-open</em> o <em>fail-closed</em>),
+          y precisión suficiente (no exactitud perfecta si cuesta caro).</p>
+        <div class="callout callout--note">
+          <div class="callout__title">Supuestos</div>
+          <p>API pública con 10 M de usuarios activos, límite de <strong>100 peticiones/minuto</strong> por
+            usuario, pico global de <strong>50 000 peticiones/s</strong>. El limitador debe ser
+            <em>distribuido</em>: muchos nodos de API, un estado compartido.</p>
+        </div>
+
+        <h3>Los algoritmos (de simple a exacto)</h3>
+
+        <h3>Fixed window (ventana fija)</h3>
+        <p>Un contador por ventana (p. ej. por minuto). Al llegar una petición, incrementa y compara con el
+          límite; la clave expira al cambiar de minuto.</p>
+        <pre><code class="language-text">Minuto 12:00  contador=100  -&gt; 429
+Minuto 12:01  contador=0    -&gt; se reinicia
+</code></pre>
+        <p><strong>Problema:</strong> el <em>burst</em> de frontera. El cliente puede mandar 100 al final
+          del minuto y 100 al principio del siguiente: <strong>200 en pocos milisegundos</strong>, el doble
+          del límite. Barato pero impreciso.</p>
+
+        <h3>Sliding window log (registro deslizante)</h3>
+        <p>Guarda la marca de tiempo de cada petición. Para validar, cuenta cuántas hay en los últimos 60 s
+          y descarta las antiguas.</p>
+        <pre><code class="language-text">ahora = 12:00:45
+cuenta peticiones con timestamp en [12:59:45 .. 12:00:45]
+si cuenta &lt; 100  -&gt; permitir y registrar timestamp
+</code></pre>
+        <p><strong>Exacto</strong>, pero la memoria crece con el número de peticiones (100 timestamps por
+          usuario). Con 10 M de usuarios, son miles de millones de entradas. Preciso y caro.</p>
+
+        <h3>Sliding window counter (contador deslizante)</h3>
+        <p>Compromiso elegante: mantén dos contadores (ventana actual y anterior) y <strong>pondera</strong>.</p>
+        <pre><code class="language-text">estimado = anterior * (1 - fraccion_transcurrida) + actual
+</code></pre>
+        <p>A las 12:00:15 (25% transcurrido), el 75% de la ventana anterior pesa. Aproxima muy bien el
+          sliding log con <strong>memoria constante</strong> (dos números). Es el favorito en producción.</p>
+
+        <h3>Token bucket (cubo de fichas)</h3>
+        <p>Un cubo con capacidad <code>C</code> que se rellena a razón de <code>r</code> fichas/segundo.
+          Cada petición consume una ficha; si no hay, se rechaza. Permite <strong>ráfagas</strong> de hasta
+          <code>C</code> y una tasa sostenida de <code>r</code>.</p>
+        <pre><code class="language-text">   se rellenan r fichas/s
+        |
+        v
+   +-----------+
+   |  C fichas |  cada peticion consume 1
+   +-----------+
+    ¿cubo vacio? -&gt; 429
+</code></pre>
+        <p>Se guardan solo <strong>dos números</strong> por clave (fichas actuales y último instante de
+          recarga). Es el más usado para APIs porque modela bien "te dejo ráfagas, pero no te pases".</p>
+
+        <h3>Leaky bucket (cubo agujereado)</h3>
+        <p>Como una cola que <strong>drena a ritmo constante</strong>: las peticiones entran en el cubo y
+          salen a velocidad fija. Suaviza el tráfico (no permite ráfagas hacia dentro si el cubo es
+          pequeño). Útil para <em>shaping</em> (controlar el caudal de salida), no solo para limitar.</p>
+
+        <table>
+          <thead><tr><th>Algoritmo</th><th>Memoria/clave</th><th>Exactitud</th><th>Ráfagas</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td>Fixed window</td><td>1 contador</td><td>Baja (burst de frontera)</td><td>Sí (2×)</td><td>Protección gruesa, poco crítica</td></tr>
+            <tr><td>Sliding window log</td><td>N timestamps</td><td>Exacta</td><td>No</td><td>Poca escala / límites estrictos</td></tr>
+            <tr><td>Sliding window counter</td><td>2 contadores</td><td>Muy buena</td><td>Limitadas</td><td>APIs a escala (equilibrio)</td></tr>
+            <tr><td>Token bucket</td><td>2 números</td><td>Alta</td><td>Sí (hasta C)</td><td>APIs con ráfagas permitidas</td></tr>
+            <tr><td>Leaky bucket</td><td>Cola + ritmo</td><td>Alta</td><td>No (suaviza)</td><td>Shaping de salida</td></tr>
+          </tbody>
+        </table>
+
+        <h3>La versión distribuida: el estado compartido</h3>
+        <p>Con muchos nodos de API, el contador no puede vivir en la memoria de cada uno (cada nodo
+          aplicaría el límite completo). El estado va a un <strong>almacén compartido</strong>, típicamente
+          <strong>Redis</strong>, porque es rápido, en memoria y —clave— <strong>de un solo hilo</strong>:
+          cada comando es atómico.</p>
+        <pre><code class="language-text">  [ API-1 ] --\
+  [ API-2 ] ---+--&gt; [ Redis: contador por clave ]  &lt;-- estado COMPARTIDO
+  [ API-3 ] --/         (single-threaded: INCR atomico)
+</code></pre>
+        <h3>El problema de la atomicidad</h3>
+        <p>El error clásico es hacer dos operaciones separadas:</p>
+        <pre><code class="language-text">v = GET  cliente:42          # leer
+si v &lt; 100:                   # decidir
+    INCR cliente:42           # escribir   &lt;-- entre leer y escribir, otro
+                              #                nodo tambien leyo 99 y ambos
+                              #                escriben: ahora son 101.
+</code></pre>
+        <p>La solución es <strong>hacer leer-decidir-escribir como una sola operación atómica</strong>. Con
+          token bucket, eso se implementa en un <em>script</em> que Redis ejecuta de forma indivisible
+          (Lua embebido), de modo que nadie se cuela entre el cálculo y la escritura.</p>
+        <div class="callout callout--tip">
+          <div class="callout__title">Regla de oro del rate limiter distribuido</div>
+          <p>Cada operación de límite debe ser <strong>atómica</strong> en el almacén compartido. Si tu lógica
+            necesita dos viajes a Redis (leer y escribir), tienes una condición de carrera y, con carga,
+            permitirás más peticiones que el límite. Un solo viaje, un solo script.</p>
+        </div>
+
+        <h3>Precisión vs coste</h3>
+        <table>
+          <thead><tr><th>Ganas</th><th>Pagas</th></tr></thead>
+          <tbody>
+            <tr><td>Exactitud (sliding log)</td><td>Memoria por petición; más RAM y más coste</td></tr>
+            <tr><td>Memoria constante (fixed window)</td><td>Imprecisión en las fronteras (2×)</td></tr>
+            <tr><td>Atomicidad fuerte (Redis central)</td><td>Un salto de red por petición y un punto caliente</td></tr>
+            <tr><td>Latencia mínima (límite local por nodo)</td><td>Puedes multiplicar el límite por el número de nodos</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== --&gt;
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un token bucket de una sola clave, con <strong>capacidad C = 3</strong> y
+          <strong>recarga r = 1 ficha/s</strong>. Empezamos con el cubo lleno. Traza de peticiones:</p>
+        <pre><code class="language-text">t=0,0s  fichas=3  peticion -&gt; gasto 1, quedan 2  -&gt; 200 OK
+t=0,1s  fichas=2  peticion -&gt; gasto 1, quedan 1  -&gt; 200 OK
+t=0,2s  fichas=1  peticion -&gt; gasto 1, quedan 0  -&gt; 200 OK
+t=0,3s  fichas=0  peticion -&gt; cubo vacio         -&gt; 429 TOO MANY
+t=1,0s  recarga 1 ficha   (fichas=1)
+t=1,5s  fichas=1  peticion -&gt; gasto 1, quedan 0  -&gt; 200 OK
+t=2,0s  recarga 1 ficha   (fichas=1)
+</code></pre>
+        <p>Observa dos cosas: se permitió una <strong>ráfaga inicial de 3</strong> (las fichas acumuladas) y
+          después la <strong>tasa sostenida quedó en 1/s</strong>. Solo necesitamos guardar
+          <code>fichas</code> y <code>último_ts</code>:</p>
+        <div class="code-file">estado por clave (2 números)</div>
+        <pre><code class="json">{ "key": "user:42", "tokens": 1.0, "last_refill_ts": 1712345678.5 }
+</code></pre>
+        <p>Recargar sin necesidad de un <em>timer</em> (más simple y barato): calculamos cuántas fichas
+          "habrían" entrado desde el último acceso:</p>
+        <pre><code class="language-text">nuevas = (ahora - last_refill_ts) * r
+fichas = min(C, fichas + nuevas)
+last_refill_ts = ahora
+si fichas &gt;= 1: fichas -= 1; permitir
+si no: rechazar
+</code></pre>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== --&gt;
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Un limitador distribuido completo. Cada nodo de API comparte estado con Redis, pero aplicando
+          <strong>una sola operación atómica</strong> por petición.</p>
+        <pre><code class="language-text">   Cliente
+      |
+      v
+  [ API Gateway ] --&gt; [ Middleware rate-limit ] --&gt; [ servicio destino ]
+                        |              ^
+                        v              |  (permitir / 429)
+                 [ Redis Cluster ] &lt;----+
+                 clave: user:42
+                 script atomico: token bucket
+</code></pre>
+        <h3>Reglas por plan (configuración)</h3>
+        <p>Los límites se definen por plan o por ruta y viven como configuración, no en el código:</p>
+        <div class="code-file">reglas.sql — configuración de límites</div>
+        <pre><code class="language-sql">-- Cada regla define clave, capacidad (rafaga) y ritmo sostenido
+CREATE TABLE rate_limit_rules (
+  id          BIGINT PRIMARY KEY,
+  scope       TEXT   NOT NULL,      -- 'user' | 'ip' | 'api_key'
+  plan        TEXT   NOT NULL,      -- 'free' | 'pro' | 'internal'
+  capacity    INT    NOT NULL,      -- fichas maximas (C)
+  refill_rate NUMERIC NOT NULL,     -- fichas por segundo (r)
+  applies_to  TEXT   NOT NULL       -- ruta o '*'
+);
+
+INSERT INTO rate_limit_rules (id, scope, plan, capacity, refill_rate, applies_to) VALUES
+  (1, 'api_key', 'free',     100, 1.66, '*'),   -- ~100/min con rafaga de 100
+  (2, 'api_key', 'pro',     1000, 16.6, '*'),   -- ~1000/min
+  (3, 'ip',      'free',     300,   5.0, '/auth/login'); -- proteccion anti fuerza bruta
+</code></pre>
+        <h3>La operación atómica</h3>
+        <p>El middleware, en cada petición, ejecuta un script que hace token bucket de una sola pasada. El
+          script (pseudo, se ejecuta indivisible dentro de Redis):</p>
+        <pre><code class="language-text">-- KEYS[1] = "rate:user:42"
+-- ARGV    = { capacity, refill_rate, now_seconds, cost }
+local state  = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or ARGV[1]        -- empieza lleno
+local ts     = tonumber(state[2]) or ARGV[3]
+
+local nuevas = (ARGV[3] - ts) * ARGV[2]
+tokens = math.min(ARGV[1], tokens + nuevas)
+local permitido = tokens &gt;= tonumber(ARGV[4])
+if permitido then tokens = tokens - ARGV[4] end
+
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', ARGV[3])
+redis.call('EXPIRE', KEYS[1], 3600)                 -- limpieza de claves inactivas
+return { permitido and 1 or 0, math.floor(tokens) }
+</code></pre>
+        <p>Una sola llamada: nadie puede colarse entre "leer" y "escribir". Si <code>permitido</code> es 0,
+          el gateway devuelve <code>429</code>.</p>
+        <div class="code-file">respuesta 429 con cabeceras informativas</div>
+        <pre><code class="json">{
+  "status": 429,
+  "headers": {
+    "Retry-After": "1",
+    "X-RateLimit-Limit": "100",
+    "X-RateLimit-Remaining": "0",
+    "X-RateLimit-Reset": "1712345700"
+  },
+  "body": { "error": "rate_limit_exceeded" }
+}
+</code></pre>
+        <h3>Escala y fallo</h3>
+        <ul>
+          <li><strong>Clúster de Redis</strong> particionado por clave (<code>user:42</code> siempre al mismo
+            nodo). 50 000 peticiones/s → 50 000–150 000 operaciones/s repartidas; un clúster lo aguanta.</li>
+          <li><strong>Fail-open vs fail-closed</strong>: si Redis no responde, ¿permito (fail-open, riesgo de
+            abuso) o bloqueo (fail-closed, riesgo de tumbar el servicio por un fallo del limitador)? En una
+            API pública normalmente <strong>fail-open</strong> con alerta: mejor arriesgar abuso que caer.</li>
+          <li><strong>Capa local</strong>: para no golpear Redis con cada petición, algunos añaden un
+            limitador local "grueso" por nodo y reservan el exacto para lo crítico.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <div class="callout__title">Optimización: límites locales con cuota reservada</div>
+          <p>Los nodos piden a Redis un bloque de fichas (p. ej. 100) y las reparten localmente. Reduce los
+            viajes a Redis de "una por petición" a "una por bloque", a cambio de tolerar un pequeño sobrepaso.
+            Otra vez: precisión vs coste.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== --&gt;
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Limitar al <em>entrar</em> (gateway/middleware)</td>
+              <td>Rechazar después de procesar</td>
+              <td>Si ya gastaste CPU/DB, el límite no protegió nada</td>
+            </tr>
+            <tr>
+              <td>Operación atómica en el almacén compartido</td>
+              <td>GET seguido de INCR</td>
+              <td>La carrera entre leer y escribir permite superar el límite</td>
+            </tr>
+            <tr>
+              <td>Elegir algoritmo según exactitud necesaria</td>
+              <td>Sliding log "porque es exacto" a gran escala</td>
+              <td>La memoria por petición explota con millones de usuarios</td>
+            </tr>
+            <tr>
+              <td>Devolver <code>Retry-After</code> y cabeceras de cuota</td>
+              <td>429 seco sin información</td>
+              <td>El cliente puede reintentar bien y no a ciegas</td>
+            </tr>
+            <tr>
+              <td>Definir la política de fallo (open/closed)</td>
+              <td>Que el limitador caiga y se lleve el servicio</td>
+              <td>El limitador está en el camino crítico: su fallo hay que diseñarlo</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== --&gt;
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Contador local por nodo</h3>
+        <span class="code-label code-label--wrong">Mal — estado en la memoria de cada nodo</span>
+        <pre class="code-wrong"><code class="language-text">// Nodo A cuenta 100 para user:42, Nodo B tambien cuenta 100...
+// Con 10 nodos el usuario hace 1.000 peticiones, no 100.
+</code></pre>
+        <span class="code-label code-label--right">Bien — estado compartido</span>
+        <pre class="code-right"><code class="language-text">// El contador de user:42 vive en Redis.
+// Todos los nodos leen y escriben la MISMA clave.
+</code></pre>
+
+        <h3>2. Leer y escribir en dos pasos</h3>
+        <span class="code-label code-label--wrong">Mal — entre GET y INCR cabe otro nodo</span>
+        <pre class="code-wrong"><code class="language-text">v = GET    "user:42"     # ambos nodos leen 99
+# ambos ven 99 &lt; 100
+INCR "user:42"           # ambos escriben -&gt; 101
+</code></pre>
+        <span class="code-label code-label--right">Bien — una sola operación atómica</span>
+        <pre class="code-right"><code class="language-text">// Un script que calcula y escribe de una vez:
+// Redis lo ejecuta indivisible. Nunca hay ventana de carrera.
+</code></pre>
+
+        <h3>3. Olvidar el TTL de las claves</h3>
+        <span class="code-label code-label--wrong">Mal — claves que nunca mueren</span>
+        <pre class="code-wrong"><code class="language-text">// Cada usuario crea una clave que se queda para siempre.
+// Con 10M de usuarios, Redis se llena de basura inactiva.
+</code></pre>
+        <span class="code-label code-label--right">Bien — expirar lo inactivo</span>
+        <pre class="code-right"><code class="language-text">// EXPIRE 3600: si nadie vuelve a tocar la clave en 1h,
+// desaparece. El estado activo permanece, el frio se limpia.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== --&gt;
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> diseñar un limitador para el endpoint de login (anti fuerza bruta),
+          con método y números.</p>
+        <ol class="steps">
+          <li><strong>Requisitos.</strong> Limitar intentos de login por IP a <strong>10/min</strong>,
+            permitiendo ráfagas cortas. Proteger tanto contra fuerza bruta como contra <em>password
+            spraying</em>.</li>
+          <li><strong>Elige el algoritmo.</strong> Necesitamos permitir ráfagas controladas y no castigar
+            picos legítimos → <strong>token bucket</strong> con C = 10, r = 10/60 ≈ <strong>0,166 f/s</strong>.</li>
+          <li><strong>Clave.</strong> <code>rate:login:ip:203.0.113.7</code>. Además, una segunda regla por
+            cuenta de usuario (para no dejar que un atacante pruebe muchas IPs contra un email).</li>
+          <li><strong>Atomicidad.</strong> El middleware ejecuta el script de una pasada (ver arriba). Nunca
+            <code>GET</code> + <code>INCR</code>.</li>
+          <li><strong>Estimación.</strong> 50 000 r/s de pico global, cada login = 1 operación atómica a
+            Redis → 50 000 ops/s, repartidas por hash de clave. Con un clúster de 3–6 nodos sobra.</li>
+          <li><strong>Fallback.</strong> Si Redis no responde: fail-open en login (no bloquear a usuarios
+            legítimos) pero con rate-limit local de emergencia y alerta al equipo.</li>
+          <li><strong>Respuesta.</strong> <code>429</code> con <code>Retry-After</code> calculado como
+            <code>1/r</code> ≈ 6 s (tiempo hasta la siguiente ficha).</li>
+          <li><strong>Verificación.</strong> Traza 15 peticiones seguidas: las 10 primeras pasan (ráfaga),
+            las 5 siguientes reciben 429; a los 6 s vuelve a pasar una. Resultado esperado y predecible.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== --&gt;
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Límite por usuario con múltiples nodos sin condición de carrera</h3>
+          <p>Diseña la variante <strong>fixed window distribuida</strong> (no token bucket): clave
+            <code>user:42:1712345700</code> con límite 100. Debes conseguir que, incluso con 20 nodos
+            concurrentes, nunca se superen 100 en la ventana, y que la clave expire sola. Escribe la
+            secuencia exacta de operaciones atómicas y explica por qué no hace falta un script completo.</p>
+          <p><em>Pista: piensa en <code>INCR</code> como operación atómica que <em>devuelve</em> el valor
+            nuevo, y en cómo usar ese valor de retorno para decidir; y en el <em>burst</em> de frontera…
+            ¿lo aceptas o lo corriges con sliding window counter?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== --&gt;
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El rate limiter es un problema de <strong>estado compartido caliente</strong>, no de reglas.</li>
+          <li>Algoritmos: <em>fixed window</em> (barato, impreciso), <em>sliding log</em> (exacto, caro),
+            <em>sliding counter</em> (equilibrio), <em>token bucket</em> (ráfagas), <em>leaky bucket</em>
+            (shaping).</li>
+          <li>En distribuido, el estado va a <strong>Redis</strong> y cada decisión es
+            <strong>atómica</strong> (un solo viaje).</li>
+          <li><code>GET</code> + <code>INCR</code> = condición de carrera; un contador local por nodo
+            multiplica el límite.</li>
+          <li>Siempre define la política de <strong>fallo</strong> (fail-open/closed) y devuelve
+            <code>Retry-After</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Algoritmo</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td>Fixed window</td><td>Protección simple donde un 2× de ráfaga es tolerable</td></tr>
+            <tr><td>Sliding window counter</td><td>API a escala que quiere precisión con memoria constante</td></tr>
+            <tr><td>Token bucket</td><td>APIs que deben permitir ráfagas (planes, picos legítimos)</td></tr>
+            <tr><td>Sliding window log</td><td>Límites estrictos a baja escala (la memoria no es problema)</td></tr>
+            <tr><td>Leaky bucket</td><td>Controlar el caudal de salida (shaping)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== --&gt;
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué Redis y no la base de datos principal?</summary>
+            <div>
+              <p>Porque el rate limiter está en <em>cada</em> petición y la base de datos principal es
+                demasiado lenta y demasiado valiosa para escribir en ella 50 000 veces por segundo. Redis es
+                en memoria (microsegundos), mono-hilo (comandos atómicos) y sus claves expiran solas. Es el
+                lugar natural para un contador caliente y efímero.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Fail-open o fail-closed? ¿Cuál es lo correcto?</summary>
+            <div>
+              <p>Depende de qué es peor. En una API pública, caerse por un fallo del limitador es peor que
+                tolerar algo de abuso → <strong>fail-open</strong> con alerta. En un sistema de seguridad
+                (login, pagos) puede ser peor dejar pasar → <strong>fail-closed</strong>. No hay una respuesta
+                universal: hay una decisión que se documenta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un límite global o por usuario?</summary>
+            <div>
+              <p>Normalmente ambos, en capas: un límite <strong>global</strong> para proteger el sistema
+                entero (no más de X r/s), un límite <strong>por usuario/clave</strong> para equidad, y a veces
+                <strong>por IP</strong> para ataques anónimos. Se aplican en cascada; el primero que rechaza,
+                gana.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo afecta el rate limit a la latencia?</summary>
+            <div>
+              <p>Añade un salto de red a Redis (~0,5–2 ms). Es tolerable en el gateway, pero si es
+                inaceptable, se baja a límites locales con cuota reservada (el nodo pide un bloque de fichas
+                de vez en cuando). Ese es el pacto: exactitud distribuida a cambio de un pequeño sobrepaso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El sliding window log es siempre mejor porque es exacto?</summary>
+            <div>
+              <p>No. La exactitud se paga en memoria: hay que guardar cada timestamp. Con 10 M de usuarios y
+                100 peticiones, son 1 000 M de marcas de tiempo. El sliding window counter aproxima casi
+                igual de bien con dos números. "Más exacto" no es "mejor": es "más caro".</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

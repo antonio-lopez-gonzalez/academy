@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-chat-colaborativo">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso: chat colaborativo — Módulo 6 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso: chat colaborativo</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Casos clásicos</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <strong>chat en tiempo real</strong> (y su primo, la edición colaborativa) es el caso donde el
+          sistema debe <em>empujar</em> datos al cliente en cuanto ocurren, no esperar a que pregunte. Aquí
+          entran los <strong>WebSockets</strong>: una conexión persistente y bidireccional donde el servidor
+          habla cuando quiere. A diferencia de una API REST (el cliente pregunta, el servidor responde), el
+          chat vive de conexiones abiertas que hay que mantener, contar y repartir.</p>
+        <p>Es un caso clásico porque combina tres problemas difíciles: <strong>conexiones persistentes
+          masivas</strong> (millones de sockets a la vez), <strong>presencia</strong> (¿quién está
+          conectado?) y <strong>orden/entrega</strong> (¿en qué orden llegan los mensajes y cómo me aseguro
+          de que ninguno se pierde?). Y todo ello sobre servidores que, por tener sockets, son
+          <em>stateful</em> —justo lo contrario de lo que aprendiste a hacer en el Módulo 1.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe?</div>
+          <p>Porque es el contraejemplo perfecto del "servicio sin estado". El chat obliga a separar el
+            <strong>estado de la conexión</strong> (que vive en el socket) del
+            <strong>estado de la aplicación</strong> (que se externaliza a Redis y a un almacén de mensajes).
+            Aprender a hacerlo es aprender a escalar sistemas stateful.</p>
+        </div>
+        <div class="callout callout--warning">
+          <div class="callout__title">Errores típicos</div>
+          <p>Usar <em>polling</em> agresivo ("pregunta cada segundo") y creer que es tiempo real. Guardar
+            quién está conectado solo en la memoria de un nodo (el usuario se reconecta a otro y "desaparece").
+            Suponer orden global cuando solo puedes garantizar orden <em>por conversación</em>. Y olvidar que
+            las conexiones se caen: hacen falta <em>heartbeats</em> y reconexión.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Requisitos y supuestos</h3>
+        <p><strong>Funcionales:</strong> enviar y recibir mensajes en conversaciones (1:1 o grupo);
+          ver el historial; ver quién está conectado (presencia); confirmar la entrega; (opcional) edición
+          colaborativa en documento.</p>
+        <p><strong>No funcionales:</strong> entrega <strong>en tiempo real</strong> (latencia de milisegundos),
+          <strong>orden por conversación</strong>, <strong>no perder mensajes</strong> (al menos
+          <em>at-least-once</em>), y presencia que tolere desconexiones sin mentir.</p>
+        <div class="callout callout--note">
+          <div class="callout__title">Supuestos</div>
+          <p>5 M de usuarios <strong>concurrentes</strong>, cada uno con <strong>1 WebSocket</strong> abierto.
+            Cada usuario envía 0,5 mensajes/minuto. Cada mensaje va a una conversación de
+            <strong>10</strong> miembros de media.</p>
+        </div>
+
+        <h3>Estimación de capacidad</h3>
+        <table>
+          <thead><tr><th>Métrica</th><th>Cálculo</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Conexiones simultáneas</td><td>dato directo</td><td>5 000 000 sockets</td></tr>
+            <tr><td>Mensajes enviados</td><td>5 M × 0,5 / 60</td><td>≈ 41 700 msg/s</td></tr>
+            <tr><td>Entregas (fan-out a 10)</td><td>41 700 × 10</td><td>≈ 417 000 entregas/s</td></tr>
+            <tr><td>Memoria por conexión</td><td>~20 KB (buffers + estado)</td><td>~20 KB por socket</td></tr>
+            <tr><td>Memoria total de conexiones</td><td>5 M × 20 KB</td><td>≈ 100 GB</td></tr>
+            <tr><td>Nodos de conexión</td><td>100 GB / (50 K conn × 20 KB)</td><td>≈ 100 nodos</td></tr>
+          </tbody>
+        </table>
+        <p>Dos ideas clave: (1) las conexiones consumen <strong>memoria</strong>, por eso hay una
+          <strong>capacidad finita de sockets por nodo</strong> (~decenas de miles); (2) cada mensaje se
+          <strong>multiplica por los miembros</strong> de la conversación, así que la entrega domina frente
+          al envío.</p>
+
+        <h3>¿Por qué WebSockets y no lo anterior?</h3>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Cómo funciona</th><th>Latencia</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Polling</td><td>El cliente pregunta cada N s</td><td>Hasta N s de retraso</td><td>Muchas peticiones vacías</td></tr>
+            <tr><td>Long polling</td><td>El servidor retiene la petición hasta tener datos</td><td>Baja</td><td>Reconexión por cada mensaje</td></tr>
+            <tr><td>SSE (Server-Sent Events)</td><td>Flujo unidireccional servidor → cliente</td><td>Baja</td><td>No permite enviar por el mismo canal</td></tr>
+            <tr><td><strong>WebSocket</strong></td><td>Conexión persistente bidireccional</td><td>Muy baja</td><td>Stateful: hay que sostener el socket</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">Regla práctica</div>
+          <p>Si el servidor solo necesita <em>empujar</em> (notificaciones), SSE basta y es más simple. Si
+            necesitas <strong>bidireccional</strong> de verdad (chat, edición colaborativa, juegos),
+            WebSocket. El chat usa WebSocket por la conversación bidireccional constante.</p>
+        </div>
+
+        <h3>El ciclo de vida de una conexión WebSocket</h3>
+        <pre><code class="language-text">Cliente                         Servidor de conexion
+   |                                    |
+   |--- HTTP Upgrade: websocket --------&gt;|   handshake (rota por el LB)
+   |&lt;-- 101 Switching Protocols ---------|
+   |                                    |  registrar: user:42 -&gt; nodo-7
+   |======= canal bidireccional ========|
+   |--- ping (heartbeat 30s) -----------&gt;|
+   |&lt;-- pong ----------------------------|
+   |                                    |
+   |  (si no hay pong en X s -&gt; desconectar y liberar)
+</code></pre>
+        <p>El servidor <strong>no puede saber</strong> si una conexión murió hasta que intenta escribir o
+          hacer un <em>heartbeat</em>. Por eso existen los <em>ping/pong</em>: si no respondes, se cierra el
+          socket y se limpia el estado.</p>
+
+        <h3>Presencia: "¿quién está conectado?" sin mentir</h3>
+        <p>La presencia no puede vivir en la memoria de un nodo, porque el usuario se reconecta a cualquier
+          otro. Se externaliza a Redis con un <strong>TTL</strong>:</p>
+        <pre><code class="language-text">al conectar:   SET presence:user:42 "online" EX 45     # expira en 45s
+cada heartbeat: EXPIRE presence:user:42 45             # renueva
+al desconectar: DEL presence:user:42
+</code></pre>
+        <p>Si un nodo se cae sin avisar, la clave <strong>expira sola</strong> a los 45 s y el usuario pasa a
+          "ausente". La presencia es, otra vez, consistencia eventual: puede haber unos segundos de
+          imprecisión a cambio de no mentir eternamente.</p>
+
+        <h3>Orden y entrega: lo que sí y lo que no puedes garantizar</h3>
+        <ul>
+          <li><strong>Orden por conversación</strong>: sí. El servidor asigna un <strong>número de
+            secuencia</strong> monótono por conversación. Los clientes ordenan por él.</li>
+          <li><strong>Orden global</strong>: no. Entre conversaciones distintas no hay un "antes" común, y
+            tampoco hace falta.</li>
+          <li><strong>Entrega</strong>: <em>at-least-once</em> (Módulo 4). Cada mensaje lleva un
+            <code>message_id</code>; el cliente <strong>deduplica</strong> los repetidos.</li>
+        </ul>
+        <pre><code class="language-text">Conversacion #ciudad:
+  seq=101  msg_id=a1  autor=ana    "llegamos a las 8"
+  seq=102  msg_id=b2  autor=luis   "yo salgo ahora"
+  seq=103  msg_id=c3  autor=ana    "vale!"
+</code></pre>
+        <div class="callout callout--note">
+          <div class="callout__title">Ack y reenvío</div>
+          <p>El cliente confirma con un <code>ack(message_id)</code>. Si el servidor no recibe ack, reenvía.
+            Como la entrega es at-least-once, el receptor <em>verá</em> duplicados y debe descartarlos por
+            <code>message_id</code>. Intentar "exactly-once" end-to-end es carísimo e innecesario.</p>
+        </div>
+
+        <h3>Historial: no vivas del socket</h3>
+        <p>El WebSocket solo sirve para el mensaje <em>en vivo</em>. El historial se guarda en un almacén
+          (<code>message_id</code>, <code>conversation_id</code>, <code>seq</code>, <code>ts</code>, texto)
+          particionado por conversación. Al abrir un chat, el cliente pide la última página y luego se
+          suscribe. Así, si el socket se cae, no pierdes nada: reabres y relees.</p>
+
+        <h3>Escalado con pub/sub y backplane</h3>
+        <p>El problema central: el usuario A está conectado al <strong>nodo 3</strong> y el usuario B al
+          <strong>nodo 7</strong>. Si A escribe, ¿cómo llega a B? No puedes asumir que comparten nodo.
+          Solución: un <strong>backplane</strong> de mensajería (pub/sub) que conecta todos los nodos.</p>
+        <pre><code class="language-text">  [ Nodo 3 ] --- publica mensaje en canal "conv:#ciudad" ---&gt; [ Redis Pub/Sub ]
+                                                                     |
+                          +------------------------------------------+
+                          |                      |
+                     [ Nodo 3 ]            [ Nodo 7 ]
+                     (A local)             (B local) -&gt; entrega a B por su socket
+</code></pre>
+        <p>Cada nodo <strong>se suscribe</strong> a los canales de las conversaciones de sus usuarios
+          conectados. Cuando llega un mensaje a un canal, cada nodo lo reenvía a los sockets locales que
+          correspondan. Esto desacopla "quién envía" de "quién tiene el socket".</p>
+        <div class="callout callout--tip">
+          <div class="callout__title">Registro de sesiones</div>
+          <p>Para mensajes <strong>directos</strong> (1:1) es útil un mapa <code>user -&gt; nodo</code> en
+            Redis: así enrutas el mensaje directamente al nodo que tiene la conexión de destino, sin
+            difundir a todos. Es un patrón de "session registry".</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Dos clientes en la misma conversación, <strong>un solo servidor</strong> (sin backplane todavía).
+          Ana y Luis están conectados al mismo nodo en la sala <code>#ciudad</code>.</p>
+        <pre><code class="language-text">Servidor (en memoria):
+  sala #ciudad -&gt; [ socket_ana, socket_luis ]
+
+Ana envia "hola"
+  -&gt; servidor recibe por el socket de Ana
+  -&gt; asigna seq=1, msg_id=m1
+  -&gt; guarda el mensaje en el historial de #ciudad
+  -&gt; reenvia a TODOS los sockets de la sala:
+       socket_ana  &lt;- m1 (seq=1)
+       socket_luis &lt;- m1 (seq=1)
+</code></pre>
+        <p>El mensaje de protocolo (JSON) que viaja por el socket:</p>
+        <div class="code-file">mensaje saliente por el WebSocket</div>
+        <pre><code class="json">{
+  "type": "message",
+  "conversation_id": "ciudad",
+  "seq": 1,
+  "message_id": "m1",
+  "author": "ana",
+  "text": "hola",
+  "ts": "2026-10-11T10:00:00Z"
+}
+</code></pre>
+        <p>Y la confirmación del cliente:</p>
+        <pre><code class="json">{ "type": "ack", "message_id": "m1" }
+</code></pre>
+        <p>Con un solo nodo esto es trivial. El problema aparece cuando Ana y Luis están en
+          <strong>nodos distintos</strong>: ahí entra el pub/sub del ejemplo real.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Arquitectura completa: conexiones repartidas en muchos nodos, presencia en Redis, historial en un
+          almacén y un <strong>backplane pub/sub</strong> que une los nodos.</p>
+        <pre><code class="language-text">                    [ Load Balancer ]  (sticky por conexion)
+                            |
+        +-------------------+-------------------+
+        |                                       |
+  [ Nodo de conexion 3 ]                 [ Nodo de conexion 7 ]
+   sockets: ana, carla                    sockets: luis, marta
+        |          ^                            |          ^
+        |          |                            |          |
+        v          |                            v          |
+   [ Registro de sesiones (Redis): user -&gt; nodo ]          |
+        |                                                 |
+        +------&gt; [ Backplane pub/sub: canal por conversacion ] &lt;------+
+                            |
+                            v
+              [ Servicio de mensajes ] --&gt; [ Historial (particion por conversacion) ]
+                            |
+                            v
+                    [ Cola ] --&gt; [ Notificaciones push, busqueda, analitica ]
+</code></pre>
+        <h3>Flujo de un mensaje, paso a paso</h3>
+        <ol class="steps">
+          <li><strong>Ana (nodo 3) envía</strong> "hola" por su WebSocket.</li>
+          <li>El <strong>servicio de mensajes</strong> valida, asigna <code>seq</code> y
+            <code>message_id</code>, y <strong>persiste en el historial</strong> de la conversación. Hasta
+            que no está persistido, no se hace fan-out: así un mensaje aceptado no se pierde.</li>
+          <li>El nodo <strong>publica</strong> el mensaje en el canal <code>conv:ciudad</code> del backplane.</li>
+          <li>Todos los nodos <strong>suscritos</strong> al canal (nodo 3 y nodo 7) reciben el mensaje y lo
+            <strong>reenvían</strong> a sus sockets locales: Ana y Carla (nodo 3), Luis y Marta (nodo 7).</li>
+          <li>Cada cliente responde <code>ack</code>. Los <em>acks</em> pendientes se reenvían con backoff.</li>
+          <li>De forma asíncrona, el mensaje va a la cola para notificaciones push, búsqueda y analítica
+            (fuera del camino crítico).</li>
+        </ol>
+        <h3>Números del diseño</h3>
+        <table>
+          <thead><tr><th>Componente</th><th>Carga</th><th>Cómo la aguanta</th></tr></thead>
+          <tbody>
+            <tr><td>Conexiones WebSocket</td><td>5 M sockets</td><td>~100 nodos, ~50 K conexiones cada uno</td></tr>
+            <tr><td>Enrutado (LB)</td><td>5 M conexiones</td><td>Sticky por conexión; reconexión reasigna nodo</td></tr>
+            <tr><td>Pub/sub backplane</td><td>41 700 msg/s × canales</td><td>Clúster de pub/sub; suscripción por conversación activa</td></tr>
+            <tr><td>Entregas a sockets</td><td>417 000/s</td><td>Reparto por nodo; escritura directa al socket</td></tr>
+            <tr><td>Historial</td><td>41 700 msg/s</td><td>Almacén particionado por conversación</td></tr>
+            <tr><td>Presencia (Redis)</td><td>latidos cada 30 s</td><td>5 M / 30 ≈ 167 K ops/s de TTL renew</td></tr>
+          </tbody>
+        </table>
+        <h3>Cómo se degrada si algo cae</h3>
+        <ul>
+          <li><strong>Se cae un nodo de conexión</strong>: sus sockets se cortan; los clientes reconectan (con
+            backoff + jitter, Módulo 5) y el LB los reparte a otros nodos. Al reconectar, piden los mensajes
+            desde el último <code>seq</code> conocido: <strong>nada se pierde</strong>.</li>
+          <li><strong>Se cae el backplane</strong>: los mensajes dentro de un mismo nodo siguen fluyendo;
+            entre nodos se encolan y se entregan al recuperar. Se degrada, no se cae.</li>
+          <li><strong>Lag en el historial</strong>: el mensaje se acepta y se entrega en vivo aunque el
+            guardado se retrase; el histórico se rellena al recuperar.</li>
+        </ul>
+        <div class="callout callout--why">
+          <div class="callout__title">La gran lección: stateful por fuera, stateless por dentro</div>
+          <p>Los nodos de conexión son <em>stateful</em> (sostienen sockets), pero todo el estado
+            <strong>compartido</strong> (presencia, sesiones, mensajes, canales) vive <strong>fuera</strong>
+            de ellos, en Redis y en el almacén. Por eso un nodo puede morir y el sistema seguir: solo se
+            pierden conexiones, no datos. Es el mismo principio del Módulo 1 aplicado a un servicio que
+            obligatoriamente guarda estado local.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Externalizar presencia/sesiones a Redis con TTL</td>
+              <td>Guardarlas en memoria del nodo</td>
+              <td>El usuario se reconecta a otro nodo; la presencia debe ser global</td>
+            </tr>
+            <tr>
+              <td>Persistir el mensaje <em>antes</em> del fan-out</td>
+              <td>Entregar en vivo y guardar "luego"</td>
+              <td>Si el guardado falla, un mensaje entregado podría no existir nunca</td>
+            </tr>
+            <tr>
+              <td>Número de secuencia por conversación</td>
+              <td>Fiarse del orden de llegada del socket</td>
+              <td>El orden global no existe; el por-conversación sí y basta</td>
+            </tr>
+            <tr>
+              <td>Heartbeats (ping/pong) y reconexión con backoff</td>
+              <td>Asumir que el socket "sigue vivo"</td>
+              <td>Las conexiones mueren en silencio; hay que detectarlo y reconectar</td>
+            </tr>
+            <tr>
+              <td>At-least-once + dedup por <code>message_id</code></td>
+              <td>Perseguir exactly-once end-to-end</td>
+              <td>La idempotencia es barata; el exactly-once real es carísimo</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Presencia en memoria local</h3>
+        <span class="code-label code-label--wrong">Mal — cada nodo sabe solo de los suyos</span>
+        <pre class="code-wrong"><code class="language-text">// Nodo 3: "ana esta online" (lo tiene en un mapa local).
+// El nodo 7 pregunta por ana -&gt; no la encuentra -&gt; "offline".
+// Al reconectar, ana cambia de nodo y "desaparece" para todos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — presencia global con TTL</span>
+        <pre class="code-right"><code class="language-text">// Redis: SET presence:ana "online" EX 45, renovado por heartbeat.
+// Cualquier nodo consulta la MISMA clave. Si el nodo muere,
+// la clave expira sola y ana pasa a ausente.
+</code></pre>
+
+        <h3>2. Asumir orden global de los mensajes</h3>
+        <span class="code-label code-label--wrong">Mal — fiarse del reloj o del orden de llegada</span>
+        <pre class="code-wrong"><code class="language-text">// El cliente ordena por timestamp del remitente.
+// Los relojes de las maquinas no estan sincronizados:
+// dos mensajes pueden "intercambiarse" de orden.
+</code></pre>
+        <span class="code-label code-label--right">Bien — secuencia asignada por el servidor</span>
+        <pre class="code-right"><code class="language-text">// El servidor asigna seq=101,102,103 por conversacion.
+// El cliente ordena por seq, no por reloj.
+</code></pre>
+
+        <h3>3. Hacer fan-out sin persistir primero</h3>
+        <span class="code-label code-label--wrong">Mal — entregar en vivo y guardar después</span>
+        <pre class="code-wrong"><code class="language-text">// 1) reenviar el mensaje a los sockets.
+// 2) guardar en el historial  &lt;-- si esto falla,
+//    el mensaje se vio pero no existe en el historial.
+</code></pre>
+        <span class="code-label code-label--right">Bien — persistir primero, luego fan-out</span>
+        <pre class="code-right"><code class="language-text">// 1) guardar en el historial (fuente de verdad).
+// 2) publicar en el backplane para entregar en vivo.
+// Un mensaje entregado siempre existe.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> dimensionar un chat de soporte en vivo con método y números.</p>
+        <ol class="steps">
+          <li><strong>Requisitos.</strong> Chat 1:1 de soporte; <strong>200 000</strong> agentes conectados a
+            la vez; cada agente intercambia 2 mensajes/minuto con un cliente (1:1, sin grupos).</li>
+          <li><strong>Mensajes.</strong>
+            <pre><code class="language-text">mensajes/s = 200.000 x 2 / 60 ≈ 6.670 msg/s
+</code></pre>
+          </li>
+          <li><strong>Entregas (1:1).</strong> Cada mensaje va a 1 destinatario →
+            <strong>≈ 6.670 entregas/s</strong>. Al no haber grupos, el fan-out es mínimo.</li>
+          <li><strong>Conexiones.</strong> 200 000 sockets a ~20 KB → ~4 GB de memoria. Con 4–8 nodos de
+            50 K conexiones sobra.</li>
+          <li><strong>Enrutado 1:1.</strong> Con un <strong>registro de sesiones</strong> (<code>agente -&gt;
+            nodo</code>) en Redis, el mensaje se enruta directo al nodo del destinatario, sin difundir a
+            todos los nodos.</li>
+          <li><strong>Presencia.</strong> Heartbeat cada 30 s → 200 000/30 ≈ <strong>6 700 </strong> renovaciones
+            de TTL por segundo. Trivial para Redis.</li>
+          <li><strong>Historial.</strong> Se persiste por <code>conversation_id</code>; al reabrir, se pide la
+            última página y se resume la suscripción.</li>
+          <li><strong>Verificación.</strong> Comprueba que ningún nodo sostiene más sockets de los que puede
+            y que la caída de un nodo solo obliga a reconectar (con <code>seq</code> para no perder nada).
+            Resultado esperado: chat estable y barato con <em>sticky routing</em> + registro de sesiones.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Edición colaborativa de un documento</h3>
+          <p>Lleva el mismo problema a la edición colaborativa: varias personas escribiendo en el
+            <strong>mismo documento</strong> a la vez. Los mensajes ya no son "añade al final" sino "cambia
+            los caracteres 10–15". Diseña cómo garantizar que dos ediciones concurrentes no corrompan el
+            documento (¿qué pasa si dos usuarios editan el mismo párrafo?), qué estado se persiste y cómo se
+            combinan los cambios. Propón el diagrama y una decisión de trade-off.</p>
+          <p><em>Pista: investiga los <strong>CRDTs</strong> (tipos de datos conmutativos) y los
+            <em>Operational Transforms</em>. La clave es que el resultado no dependa del orden de llegada;
+            piensa qué garantía necesitas y cuánta memoria/complejidad estás dispuesto a pagar.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>WebSockets</strong> dan bidireccionalidad persistente; son <em>stateful</em>, así que
+            hay una capacidad finita de conexiones por nodo.</li>
+          <li>El estado compartido (<strong>presencia, sesiones, historial</strong>) se externaliza;
+            los nodos solo sostienen <strong>sockets</strong>.</li>
+          <li>El orden es <strong>por conversación</strong> (números de secuencia), nunca global.</li>
+          <li>La entrega es <strong>at-least-once</strong> con <em>ack</em> y dedup por
+            <code>message_id</code>; el mensaje se <strong>persiste antes</strong> del fan-out.</li>
+          <li>El escalado de extremo a extremo usa <strong>pub/sub (backplane)</strong> + registro de
+            sesiones para enrutar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>WebSocket</td><td>Comunicación bidireccional en tiempo real (chat, colaboración)</td></tr>
+            <tr><td>SSE</td><td>Solo empujar del servidor al cliente (notificaciones)</td></tr>
+            <tr><td>Long polling</td><td>Compatibilidad donde no hay WebSocket; no muy exigente</td></tr>
+            <tr><td>Pub/sub backplane</td><td>Conectar nodos cuando el emisor y el receptor están en nodos distintos</td></tr>
+            <tr><td>Registro de sesiones</td><td>Mensajes 1:1 / directos: enrutar al nodo correcto sin difundir</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no usar polling? El servidor responde igual.</summary>
+            <div>
+              <p>Porque el polling introduce latencia (hasta el intervalo) y desperdicia peticiones vacías.
+                Con 5 M de usuarios preguntando cada segundo son 5 M de peticiones <em>casi siempre sin
+                datos</em>. El WebSocket mantiene una conexión y el servidor escribe cuando hay algo: menos
+                peticiones, menor latencia. El coste es que ahora sostienes 5 M de conexiones abiertas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si los nodos son stateful, ¿cómo escalo horizontalmente?</summary>
+            <div>
+              <p>Añadiendo nodos de conexión y dejando que el balanceador reparta los sockets nuevos. El
+                "estado" que importa (presencia, sesiones, mensajes) vive fuera de los nodos, así que escalar
+                es añadir nodos; no hay nada que rebalancear ni migrar. La conexión sí es <em>sticky</em>
+                (un socket vive en un nodo), pero su pérdida solo obliga a reconectar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé que un mensaje llegó si el socket se cayó justo al enviarlo?</summary>
+            <div>
+              <p>Por el <code>ack</code> y por el <code>seq</code>. El servidor no borra el mensaje pendiente
+                hasta recibir el <em>ack</em>; si el cliente reconecta, pide todos los mensajes posteriores a
+                su último <code>seq</code> conocido. Como la entrega es <em>at-least-once</em>, puede recibir
+                algún duplicado y lo descarta por <code>message_id</code>. Así no se pierde nada.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La presencia es fiable al 100%?</summary>
+            <div>
+              <p>No, es eventualmente consistente. Un usuario puede aparecer "online" hasta 45 s después de
+                caerse (hasta que expira su TTL) o "ausente" un instante al reconectar. Se elige el TTL con
+                un trade-off: TTL corto = más preciso pero más latidos (más carga); TTL largo = menos carga
+                pero presencia más imprecisa. Para un chat, unos segundos de imprecisión es aceptable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo necesito un backplane y cuándo me basta con un nodo?</summary>
+            <div>
+              <p>Un solo nodo, sin backplane, funciona mientras todos los interlocutores de una conversación
+                estén en él (útil para prototipos o chats pequeños). En cuanto hay varios nodos —y a 5 M de
+                conexiones hay decenas— el emisor y el receptor casi nunca comparten nodo, y necesitas el
+                pub/sub para unirlos. Es el mismo salto que de una sola máquina a un clúster.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

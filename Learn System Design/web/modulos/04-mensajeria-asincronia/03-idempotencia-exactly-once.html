@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="03-idempotencia-exactly-once">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Idempotencia y exactly-once — Módulo 4 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Idempotencia y exactly-once</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Mensajería y asincronía</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección 1 dejamos una frase a medias: «toda entrega se asume <em>at-least-once</em>». Es decir, un mensaje puede llegar <strong>más de una vez</strong>. Esto no es un defecto de un producto concreto: es una consecuencia inevitable de distribuir trabajo por una red, donde los acuses de recibo se pueden perder. Si el consumidor procesa y muere <em>antes</em> de acusar, el broker reintenta y el efecto se aplica dos veces.</p>
+        <p>Y aquí choca con una expectativa muy común: «yo quiero <strong>exactly-once</strong>, que se procese una sola vez y punto». La realidad es que <strong>exactly-once</strong>, entendido como «el efecto ocurre exactamente una vez», no se puede garantizar de extremo a extremo en un sistema distribuido solo con el broker. Lo que sí se puede construir —y es lo que hacen los sistemas serios— es:</p>
+        <div class="callout callout--why">
+          <p><strong>La clave de esta lección:</strong> <code>exactly-once</code> real ≈ <strong>at-least-once + idempotencia</strong>. El transporte puede repetir; si el consumidor es <strong>idempotente</strong> (procesar dos veces el mismo mensaje deja el sistema igual que procesarlo una), el resultado <em>efectivo</em> es «una sola vez» aunque el mensaje haya llegado dos.</p>
+        </div>
+        <p>Entender esta idea es lo que separa un diseño que aguanta reintentos de un diseño que, ante la primera caída de red, <strong>cobra dos veces</strong> o crea pedidos duplicados.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Las tres garantías de entrega</h3>
+        <table>
+          <thead><tr><th>Garantía</th><th>Qué promete</th><th>Cuándo se pierde</th><th>Cuándo se duplica</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>At-most-once</strong></td>
+              <td>Se entrega 0 o 1 vez; <em>nunca</em> se duplica</td>
+              <td><strong>Sí</strong>: si se pierde, no se reintenta</td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td><strong>At-least-once</strong></td>
+              <td>Se entrega 1 o más veces; <em>nunca</em> se pierde</td>
+              <td>No</td>
+              <td><strong>Sí</strong>: reintentos duplican</td>
+            </tr>
+            <tr>
+              <td><strong>Exactly-once</strong></td>
+              <td>Se entrega y <em>efectúa</em> una sola vez</td>
+              <td>No</td>
+              <td>No (a nivel de efecto)</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>La mayoría de los sistemas reales eligen <strong>at-least-once</strong> y resuelven los duplicados en el consumidor. ¿Por qué no <em>at-most-once</em>? Porque perder un pago es peor que duplicarlo <em>si</em> puedes deduplicarlo; y para deduplicar existen las herramientas que veremos (claves y operaciones idempotentes).</p>
+
+        <pre><code class="language-text">POR QUE AT-LEAST-ONCE ES LO NORMAL
+
+  Consumidor recibe m1 -> procesa (cobra 10 EUR) -> CRASH antes del ack
+  Broker no ve el ack -> reencola m1 -> otro consumidor lo procesa (cobra 10 EUR otra vez)
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  Perdida de ack => duplicado INEVITABLE si quieres no perder mensajes.
+  La solucion no es "no reintentar" (perderias pagos): es DEDUPLICAR en el consumidor.
+</code></pre>
+
+        <h3>Idempotencia: la definición precisa</h3>
+        <p>Una operación es <strong>idempotente</strong> si aplicarla <em>N</em> veces produce el mismo estado que aplicarla una. En matemáticas, <code>f(f(x)) = f(x)</code>. En sistemas: «procesar el mensaje dos veces no cambia nada respecto a procesarlo una».</p>
+        <ul>
+          <li><strong>Naturalmente idempotente:</strong> <code>SET estado = 'pagado'</code> (poner un valor absoluto) — repetirlo no cambia nada. Un <code>PUT</code> que reemplaza un recurso completo suele serlo.</li>
+          <li><strong>NO idempotente:</strong> <code>incrementar contador en 1</code>, <code>INSERT de una fila</code> sin restricción única, <code>cobrar 10 €</code>, <code>enviar un correo</code>. Repetirlos duplica el efecto. Un <code>POST</code> que crea suele no serlo.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> un interruptor de pared es idempotente: darle a «encender» dos veces deja la luz encendida. Un botón de «subir un piso de volumen» no lo es: pulsarlo dos veces sube dos. Los sistemas de mensajería te obligan a tener interruptores, no botones, porque el mensajero puede llamar a tu puerta dos veces con la misma orden.</p>
+        </div>
+
+        <h3>Herramientas para hacer un consumidor idempotente</h3>
+        <p>Hay tres técnicas que cubren casi todo:</p>
+        <ol>
+          <li>
+            <strong>Operaciones naturalmente idempotentes.</strong> Prefiere «fijar un valor» a «incrementar». Si el mensaje dice «el pedido está pagado», escribe <code>status = 'pagado'</code>; repetirlo es inofensivo. Evita «sumar 10 € al saldo» salvo que puedas deduplicar.
+          </li>
+          <li>
+            <strong>Clave de idempotencia (idempotency key).</strong> El productor asigna a cada operación un identificador único y estable (por ejemplo, <code>request_id</code>). El consumidor comprueba, en una tabla o almacén de claves ya vistas, si esa clave ya se procesó; si sí, <strong>ignora</strong> el mensaje y acusa. La tabla suele tener una <strong>restricción de unicidad</strong> sobre la clave, lo que hace la comprobación atómica.
+          </li>
+          <li>
+            <strong>Upsert.</strong> «Insertar o actualizar» (<code>INSERT ... ON CONFLICT DO UPDATE</code>, o su equivalente). Si el registro ya existe por la misma clave, se actualiza en vez de crear otro. Convierte un INSERT (no idempotente) en una operación que converge al mismo estado.
+          </li>
+        </ol>
+        <pre><code class="language-text">DEDUPLICACION CON CLAVE DE IDEMPOTENCIA
+
+  Mensaje: { idempotency_key: "ord-42-pay", amount: 10 }
+
+  Consumidor:
+    1. INSERT INTO processed_keys (key) VALUES ('ord-42-pay')
+         ON CONFLICT DO NOTHING
+    2. Si el INSERT insertó fila (0 filas antes) -> es la PRIMERA vez -> aplicar efecto
+       Si ya existia (0 filas insertadas)         -> DUPLICADO       -> no hacer nada
+    3. ack del mensaje
+
+  La unicidad de 'key' hace la comprobacion ATOMICA: no hay carrera entre dos
+  consumidores intentando procesar la misma clave a la vez.
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>El detalle que más se olvida:</strong> la deduplicación debe ser <strong>atómica con el efecto</strong>. Si primero marcas la clave y <em>luego</em> fallas antes de aplicar el pago, has perdido el pago; si aplicas el pago y fallas antes de marcar la clave, puedes duplicarlo. La forma robusta es hacer ambos dentro de <strong>una misma transacción</strong> (marca + efecto) o apoyarse en la unicidad de la tabla que guarda el efecto (por ejemplo, la propia fila del pago lleva <code>idempotency_key</code> con índice único).</p>
+        </div>
+
+        <h3>¿Y el «exactly-once» que anuncian algunos brokers?</h3>
+        <p>Algunos sistemas ofrecen <em>exactly-once semantics</em> (EOS). Conviene precisar qué significan:</p>
+        <ul>
+          <li><strong>Dentro del broker</strong> (por ejemplo, entre un stream y otro, o en el commit de offsets): el broker garantiza que un mensaje se procesa una vez <em>en su propio ámbito</em>, típicamente usando transacciones y offset commits atómicos.</li>
+          <li><strong>Fuera del broker</strong> (el mundo real): en el momento en que tu consumidor envía un correo, llama a la pasarela de pago o escribe en una base de datos ajena, esa garantía <strong>no te cubre</strong>. El efecto externo puede ejecutarse dos veces.</li>
+        </ul>
+        <p>Por eso la conclusión práctica sigue siendo la misma: <strong>la idempotencia en la frontera con los efectos</strong> (base de datos, APIs externas) es responsabilidad tuya, no del broker.</p>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> la deduplicación cuesta <strong>almacenamiento de claves</strong> y una <strong>escritura extra por mensaje</strong> (comprobar/marcar). Además, hay que decidir cuánto tiempo guardar las claves: si las borras demasiado pronto, un reintento tardío duplica; si las guardas para siempre, crece el almacén. Una ventana de retención de claves <strong>mayor que la ventana máxima de reintentos</strong> es el criterio habitual (por ejemplo, reintentos hasta 24 h → claves 7 días).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> cobrar un pago de 10 € al procesar el mensaje <code>OrderPaid</code>. Si el mensaje llega dos veces, <strong>no podemos cobrar 20 €</strong>.</p>
+        <p>Compara las dos versiones del consumidor:</p>
+        <p><span class="code-label code-label--wrong">No idempotente</span></p>
+        <pre><code class="language-text">on_message(m):
+    charge(customer, m.amount)          # cobra 10 EUR
+    db.execute("INSERT INTO payments (order_id, amount) VALUES (?, ?)",
+               m.order_id, m.amount)    # crea una fila nueva cada vez
+    ack(m)
+
+# m llega 2 veces -> 2 cobros, 2 filas. Desastre.
+</code></pre>
+        <p><span class="code-label code-label--right">Idempotente</span></p>
+        <pre><code class="language-text">on_message(m):
+    # 1) La clave del pago es el order_id (un pedido se cobra una sola vez)
+    first_time = idempotency_store.claim(key = m.order_id)   # atomico
+    if not first_time:
+        ack(m)                       # ya cobrado -> ignorar y acusar
+        return
+
+    # 2) Solo la primera vez se ejecuta el efecto
+    charge(customer, m.amount)
+    db.execute("INSERT INTO payments (order_id, amount) VALUES (?, ?)",
+               m.order_id, m.amount)
+    ack(m)
+</code></pre>
+        <p>Con la segunda versión, 1, 2 o 5 entregas del mismo <code>OrderPaid</code> producen <strong>un único cobro</strong>. El transporte puede repetir cuanto quiera; el efecto es «exactamente una vez».</p>
+        <p><strong>Números que enseñan el porqué.</strong> Con una tasa de fallo del 0,5 % de acks perdidos y 1 M de pagos/día, hay ≈ 5.000 mensajes que se <strong>reintentan</strong> aunque se aplicaron. Sin idempotencia, serían <strong>5.000 cobros duplicados al día</strong>: con un ticket medio de 40 €, <strong>200.000 €/día</strong> en devoluciones y soporte. El coste de la tabla de idempotencia (una clave por pago) es una fracción minúscula. El trade-off está servido: un poco de almacenamiento evita un problema enorme.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Volvamos al <strong>feed de noticias</strong> y a su canal de notificaciones. El evento <code>PostCreated</code> alimenta un servicio que envía notificaciones push a los seguidores. Ese servicio <em>no</em> puede ser no idempotente: un reintento tras un pico enviaría la misma notificación cientos de veces.</p>
+        <p><strong>Diseño:</strong> la unidad idempotente no es «la notificación», es el par <code>(post_id, recipient_id)</code>: un destinatario recibe la notificación de un post una sola vez.</p>
+        <pre><code class="language-text">CLAVE DE IDEMPOTENCIA POR EFECTO
+
+  Evento:  PostCreated { post_id: 9981, author: 7 }
+  Efecto:  enviar push a cada seguidor de 7
+
+  Por cada seguidor r:
+     key = "notif:9981:" + r        # (post, destinatario)
+     si processed_keys.claim(key):
+         send_push(r, "Nueva publicacion de ...")
+     # si ya existia la clave: no reenviar
+
+  Reintento del evento completo -> las claves ya existen -> 0 pushes duplicados.
+</code></pre>
+        <p><strong>Números.</strong> Un autor con 2 M de seguidores publica; el fan-out encola 2 M de notificaciones. Si el procesamiento de un lote falla a medias (digamos 200.000 enviadas antes de un crash), el reintento reencola las 2 M; sin deduplicación se enviarían ~200.000 pushes duplicados. Con clave <code>(post, recipient)</code>, solo se envían las que faltan. El coste: una tabla con 2 M de claves por publicación, que se purga tras la ventana de reintentos.</p>
+        <table>
+          <thead><tr><th>Paso</th><th>Sin idempotencia</th><th>Con idempotencia</th></tr></thead>
+          <tbody>
+            <tr><td>Llega evento 1ª vez</td><td>Envía 200.000 pushes</td><td>Envía 200.000, marca 200.000 claves</td></tr>
+            <tr><td>Crash antes del ack</td><td>—</td><td>—</td></tr>
+            <tr><td>Llega evento 2ª vez (reintento)</td><td>Envía <em>otra vez</em> los 200.000</td><td>0 duplicados, solo los que falten</td></tr>
+            <tr><td>Resultado</td><td>Usuarios con 2 notificaciones</td><td>Una notificación por usuario</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> la idempotencia añade una escritura de clave por efecto y un almacén que hay que purgar. A cambio, hace que los reintentos —indispensables para no perder mensajes— sean seguros. Renunciar a ella por «ahorrarnos la tabla» es cambiar un coste pequeño y predecible por pérdidas y duplicados impredecibles.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Diseñar el consumidor <strong>idempotente desde el inicio</strong></td>
+              <td>Añadir idempotencia «cuando aparezcan duplicados»</td>
+              <td>Los duplicados aparecen el primer día que hay un reintento; parchear tarde toca datos ya corrompidos</td>
+            </tr>
+            <tr>
+              <td>Una clave de idempotencia con <strong>índice único</strong> por efecto</td>
+              <td>Comprobar con un <code>SELECT</code> y luego un <code>INSERT</code> por separado</td>
+              <td>Entre el SELECT y el INSERT cabe una carrera que duplica; la unicidad lo hace atómico</td>
+            </tr>
+            <tr>
+              <td>Que el productor genere la clave y la repita en cada reintento</td>
+              <td>Que el consumidor genere una clave nueva en cada entrega</td>
+              <td>Una clave nueva por entrega hace imposible deduplicar</td>
+            </tr>
+            <tr>
+              <td>Retener las claves más tiempo que la ventana de reintentos</td>
+              <td>Borrar claves «en cuanto se procesan»</td>
+              <td>Un reintento tardío pasaría la deduplicación y duplicaría</td>
+            </tr>
+            <tr>
+              <td>Distinguir <em>efectos internos</em> (DB, en tu control) de <em>externos</em> (correo, pago)</td>
+              <td>Confiar en el «EOS del broker» para un correo o un cobro externo</td>
+              <td>La garantía del broker no cruza la frontera hacia sistemas ajenos</td>
+            </tr>
+            <tr>
+              <td>Registrar un ID de correlación y contar duplicados deduplicados</td>
+              <td>Silenciar los duplicados sin medida</td>
+              <td>Ver cuántos deduplicas te dice si hay un problema aguas arriba</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Comprobar y escribir sin atomicidad</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text">exists = SELECT 1 FROM processed WHERE key = ?
+if not exists:
+    do_effect()                                   # &lt;- aqui cabe otro consumidor
+    INSERT INTO processed (key) VALUES (?)        # carrera: dos pueden pasar el if
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text">inserted = INSERT INTO processed (key) VALUES (?)
+             ON CONFLICT DO NOTHING            # atomico: solo uno "gana"
+if inserted == 1:        # este consumidor es el primero
+    do_effect()
+# el resto ve inserted == 0 y no hace nada
+</code></pre>
+
+        <h3>Generate una clave nueva en cada entrega</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># El consumidor inventa una clave por intento: nunca coincide
+key = uuid4()        # en cada reintento es distinta -> jamás deduplica
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># La clave viene del PRODUCTOR (o es derivable del mensaje) y es estable
+key = message.idempotency_key      # "ord-42-pay": igual en todos los reintentos
+# o derivada determinista: key = "notif:" + post_id + ":" + recipient_id
+</code></pre>
+
+        <h3>Usar incrementos donde bastaba un valor absoluto</h3>
+        <p>«Suma 1 al contador de visitas por cada evento» no es idempotente: un reintento suma de más. Si puedes, prefiere <strong>valores absolutos</strong> (<code>SET views = 1234</code>) o <strong>deduplicar por evento</strong> (<code>visits(event_id)</code> con unicidad) y agregar. El error es elegir la operación no idempotente por costumbre.</p>
+
+        <h3>Confundir exactly-once del broker con exactly-once del efecto</h3>
+        <p>El error más conceptual: creer que activar «exactly-once» en el broker protege un <code>POST</code> a una pasarela de pago o un envío de correo. El broker solo garantiza su parte; el efecto externo debe protegerse <strong>además</strong> con una clave de idempotencia (que la API externa suele aceptar precisamente para esto).</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> hacer idempotente un consumidor de reservas que hoy duplica asientos. Paso a paso.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Observa el defecto.</strong> El consumidor actual:
+            <pre><code class="language-text">on_message(m):                       # m = SeatReserved { booking_id, seat, flight }
+    db.execute("INSERT INTO seats_booked (booking_id, seat, flight) VALUES (?, ?, ?)",
+               m.booking_id, m.seat, m.flight)
+    ack(m)
+# Un reintento del mensaje inserta el mismo asiento OTRA vez ->
+# el vuelo aparece sobrevendido en los informes.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Identifica el efecto lógico.</strong> ¿Cuál es la unidad que no debe repetirse? La reserva del asiento <code>(flight, seat)</code> por un <code>booking_id</code>. La clave natural: <code>(flight, seat)</code> — un asiento no se reserva dos veces para el mismo vuelo.
+          </li>
+          <li>
+            <strong>Paso 3 — Añade unicidad y upsert.</strong>
+            <pre><code class="language-text">ALTER TABLE seats_booked
+  ADD CONSTRAINT uq_seat UNIQUE (flight, seat);
+
+on_message(m):
+    db.execute("INSERT INTO seats_booked (booking_id, seat, flight)
+                VALUES (?, ?, ?)
+                ON CONFLICT (flight, seat) DO NOTHING",
+               m.booking_id, m.seat, m.flight)
+    ack(m)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Comprueba el caso límite.</strong> ¿Qué pasa si el mismo mensaje llega 3 veces a la vez desde 3 consumidores? La <strong>restricción única</strong> deja pasar solo un INSERT; los otros dos reciben conflicto y no insertan. Correcto: el asiento se reserva una vez.
+          </li>
+          <li>
+            <strong>Paso 5 — Estima el impacto.</strong> 2 M de reservas/día, 0,5 % de reintentos = 10.000 mensajes repetidos/día. Sin el arreglo, 10.000 asientos ficticios/día publicados como «sobreventa»; con él, 0. Coste: una restricción única (índice) y un <code>ON CONFLICT</code>.
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación.</strong>
+            <pre><code class="language-text">[ ] El efecto tiene una clave natural (flight, seat) con UNIQUE
+[ ] El insert es UPSERT / ON CONFLICT DO NOTHING
+[ ] El ack va DESPUES del efecto
+[ ] Reintento del mismo mensaje -> estado identico
+[ ] Existe metrica de "conflictos" para detectar reintentos
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> consumidor idempotente mediante <code>UNIQUE (flight, seat)</code> + <code>ON CONFLICT DO NOTHING</code>; 0 asientos duplicados ante reintentos.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Exactly-once cruzando una frontera</h3>
+          <p>Tu servicio debe <strong>enviar un correo</strong> (API externa, sin transacción compartida con tu base de datos) y <strong>marcar el pedido como notificado</strong> en tu propia base. El mensajero puede reintentar. Diseña el flujo para que el usuario reciba el correo <em>una sola vez</em> aunque el proceso se caiga en cualquier punto (<code>send</code> y <code>mark</code> son dos pasos que no pueden ser atómicos entre sí).</p>
+          <p>Deja por escrito: (1) por qué el orden «marcar y luego enviar» y «enviar y luego marcar» falla cada uno en un escenario distinto, (2) qué clave de idempotencia pasarías a la API externa, (3) qué pasa si el correo se envió pero el <code>mark</code> no se llegó a ejecutar, (4) el trade-off entre «nunca duplicar» y «no perder nunca», y qué eliges.</p>
+          <p><em>Pista: piensa en «dos fases» con estado intermedio (<code>PENDING → SENT</code>), en la clave de idempotencia que acepta el proveedor de correo, y en la idempotencia como contrato del receptor. No escribas el código completo: decide y justifica.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Tres garantías: <strong>at-most-once</strong> (puede perderse), <strong>at-least-once</strong> (puede duplicarse, lo normal) y <strong>exactly-once</strong> (el efecto, una vez).</li>
+          <li>Perder un ack <strong>duplica inevitablemente</strong> si quieres no perder mensajes.</li>
+          <li><strong>Idempotencia</strong>: aplicar N veces = aplicar una. Operaciones absolutas y <em>upsert</em> la dan gratis.</li>
+          <li><strong>Clave de idempotencia</strong>: identifica el efecto; se comprueba con <strong>unicidad atómica</strong>, no con SELECT+INSERT.</li>
+          <li><code>exactly-once</code> real = <strong>at-least-once + idempotencia</strong> en la frontera con los efectos.</li>
+          <li>El EOS del broker <strong>no cruza</strong> a bases de datos ajenas ni a APIs externas.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Situación</th><th>Opción</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Fijar un estado («pagado», «enviado»)</td><td>Operación absoluta</td><td>Repetirla no cambia el resultado</td></tr>
+            <tr><td>Crear un recurso ante reintentos</td><td>Clave de idempotencia + UNIQUE</td><td>La unicidad deduplica atómicamente</td></tr>
+            <tr><td>Actualizar o crear sin duplicar</td><td>Upsert (ON CONFLICT)</td><td>Converge al mismo estado</td></tr>
+            <tr><td>Efecto externo (correo, pago)</td><td>Clave de idempotencia hacia el proveedor</td><td>El broker no protege fuera de su ámbito</td></tr>
+            <tr><td>Purga de claves</td><td>Ventana &gt; ventana de reintentos</td><td>Evita que un reintento tardío duplique</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si no puedo tener exactly-once de verdad, ¿para qué existe el término?</summary>
+            <div>
+              <p>Porque es útil describir el <strong>efecto</strong> deseado, aunque se construya por partes. «Exactly-once» en la práctica significa «at-least-once en el transporte + idempotencia en el efecto». El broker puede ofrecer una variante acotada (dentro de su propio sistema, con transacciones y offsets atómicos), pero el efecto de extremo a extremo siempre necesita idempotencia en la frontera.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo guardo las claves de idempotencia?</summary>
+            <div>
+              <p>Más que la <strong>ventana máxima de reintentos</strong>, con margen. Si un mensaje se reintenta como máximo durante 24 h, guarda las claves, digamos, 7 días: así un reintento tardío (por un consumidor que estuvo caído) sigue deduplicándose. Si las purgas antes, abres la puerta a un duplicado tardío. A cambio, el almacén crece: dimensiona según el volumen (por ejemplo, 1 M de claves/día × 7 días × ~100 bytes ≈ 700 MB, trivial).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La idempotencia no es lo mismo que una transacción?</summary>
+            <div>
+              <p>Se complementan. Una transacción garantiza <em>atomicidad</em>: todo o nada, dentro de un sistema. La idempotencia garantiza <em>seguridad ante repetición</em>: da igual cuántas veces llegue. Un consumidor que hace «marcar clave + efecto» en una transacción obtiene ambas: atomicidad local y deduplicación. Pero cuando el efecto cruza a otro sistema (correo, pago), no hay transacción común y la idempotencia es lo único que te salva.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué clave de idempotencia elijo?</summary>
+            <div>
+              <p>La que identifique <strong>el efecto lógico que no debe repetirse</strong>: <code>order_id</code> para un cobro, <code>(post_id, recipient_id)</code> para una notificación, <code>(flight, seat)</code> para una reserva. Debe ser (1) estable entre reintentos (generada por el productor), (2) única por efecto, y (3) no cambiar nunca para el mismo efecto. Si dos efectos distintos comparten clave, uno se tragará al otro: no la «reutilices» por comodidad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Toda operación puede volverse idempotente?</summary>
+            <div>
+              <p>Casi toda. La receta: define la clave del efecto, impón unicidad sobre ella y usa <em>upsert</em> o «reclamar clave antes de actuar». Los casos difíciles son los <strong>incrementos y acumulaciones</strong> (contadores, saldos) y los <strong>efectos externos irreversibles</strong> (enviar un SMS). Para los primeros, deduplica por <code>event_id</code> y agrega desde el log; para los segundos, apóyate en la clave de idempotencia del proveedor externo y en un estado intermedio que distinga «pendiente» de «hecho».</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

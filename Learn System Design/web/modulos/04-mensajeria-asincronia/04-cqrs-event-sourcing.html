@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-cqrs-event-sourcing">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CQRS y event sourcing — Módulo 4 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>CQRS y event sourcing</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Mensajería y asincronía</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En el modelo tradicional, una misma base de datos sirve para <strong>escribir</strong> (guardar el pedido, actualizar su estado) y para <strong>leer</strong> (listar pedidos por cliente, contar ventas por día). Funciona hasta que las lecturas y las escrituras tienen <em>necesidades distintas</em>: la escritura quiere normalización y transacciones; la lectura quiere desnormalización, índices y velocidad. Es la misma tabla sirviendo a dos amos.</p>
+        <p><strong>CQRS</strong> (<em>Command Query Responsibility Segregation</em>) separa esas dos responsabilidades: un modelo para <strong>escribir</strong> (comandos) y otro, optimizado para <strong>leer</strong> (consultas), que se mantiene al día mediante mensajería. Y <strong>event sourcing</strong> lleva la idea un paso más allá: en lugar de guardar solo el <em>estado actual</em>, guarda <strong>la secuencia de hechos que lo produjo</strong> — el <em>log de eventos</em> es la fuente de verdad, y el estado se deriva de él.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existen estos patrones?</strong> Porque muchos sistemas tienen lecturas y escrituras con formas muy distintas (un feed, un panel de analítica, un sistema de auditoría) y porque a veces necesitas saber <em>cómo se llegó</em> al estado, no solo <em>cuál es</em>. Pero ambos son <strong>complejidad añadida</strong>: esta lección no es un «úsalos siempre», es un «entiende qué te dan y qué te cuestan para decidir con criterio».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El punto de partida: un modelo para dos usos</h3>
+        <p>Imagina un comercio. La <strong>escritura</strong> necesita integridad: un pedido con sus líneas, sin estados incoherentes, con transacciones. La <strong>lectura</strong> necesita velocidad: «dame los últimos 20 pedidos del cliente», «suma las ventas por categoría», «¿cuántas unidades vendidas hoy?». Si ambas van contra las mismas tablas normalizadas, o las lecturas son lentas (muchos JOIN) o el modelo se contamina con índices y columnas derivadas que complican la escritura.</p>
+        <pre><code class="language-text">MODELO CLASICO (una sola base para todo)
+
+  Escribir -----> +-------------------------+ &lt;----- Leer
+                  |  tablas normalizadas    |
+  (transaccion)   |  pedidos, lineas, ...   |  (consultas con JOIN, lentas)
+                  +-------------------------+
+
+  Una tabla sirviendo a dos amos: la escritura quiere integridad,
+  la lectura quiere velocidad. Se estorban mutuamente.
+</code></pre>
+
+        <h3>CQRS: separar escritura y lectura</h3>
+        <p>En CQRS, el lado de escritura acepta <strong>comandos</strong> (intenciones: «crea el pedido», «marca como enviado»), valida reglas de negocio y persiste el cambio. Ese cambio se publica como <strong>evento</strong> y un conjunto de <strong>proyecciones</strong> (proyectores) construyen los modelos de lectura que cada consulta necesita. El lado de lectura solo lee: no valida reglas de negocio, no modifica nada.</p>
+        <pre><code class="language-text">CQRS
+
+   Comandos (escritura)                    Eventos                       Consultas (lectura)
+  +------------------+                 +-----------+                 +----------------------+
+  |  Command side    |  -- OrderPlaced ->| BROKER   |-- proyecciones ->|  Read model: pedidos |
+  |  valida reglas   |  -- OrderShipped ->| (stream) |                  |  por cliente (rapido)|
+  |  escribe estado  |                 +-----------+                  +----------------------+
+  +------------------+                       |                         +----------------------+
+                                             +--- proyecciones ------>|  Read model: ventas  |
+                                                                       |  por categoria       |
+                                                                       +----------------------+
+</code></pre>
+        <p>Propiedades:</p>
+        <ul>
+          <li><strong>Modelos de lectura a medida:</strong> uno por consulta o familia de consultas, desnormalizados y en el motor que mejor encaje (una tabla, un índice de búsqueda, una caché).</li>
+          <li><strong>Consistencia eventual:</strong> el modelo de lectura va unos milisegundos por detrás del de escritura, porque se actualiza por mensajes. Eso es un <strong>trade-off</strong>, no un defecto: hay que decidir si «leer tu propio cambio al instante» es un requisito (a menudo lo es para el usuario que acaba de escribir).</li>
+          <li><strong>Escalado independiente:</strong> puedes tener muchas réplicas de lectura y un lado de escritura pequeño, o al revés.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>CQRS no exige dos bases de datos ni un broker.</strong> Es una <em>separación de responsabilidades</em>. Puedes hacer CQRS «ligero» con un modelo de escritura y vistas materializadas en la misma base. La versión con broker y proyectos separados es la que aporta escalado, pero también la que trae consistencia eventual y más piezas que operar.</p>
+        </div>
+
+        <h3>Event sourcing: el log de eventos como fuente de verdad</h3>
+        <p>En el modelo clásico guardas el <strong>estado</strong>: «el pedido 42 está ENVIADO». En <strong>event sourcing</strong> guardas los <strong>hechos</strong>: «pedido 42 creado», «pedido 42 pagado», «pedido 42 enviado». El estado actual se <em>deriva</em> aplicando los hechos en orden. El log de eventos es la fuente de verdad, <strong>append-only e inmutable</strong>.</p>
+        <pre><code class="language-text">EVENT SOURCING
+
+  Estado clasico:    pedido#42 -> { status: "enviado" }         (solo el ahora)
+
+  Event sourcing:    [ creado | pagado | enviado ]              (el como)
+                      \_____ log append-only, inmutable _____/
+
+  Reconstruir el estado = aplicar los eventos en orden:
+      {} + creado -> {status: creado} + pagado -> {status: pagado} + enviado -> {status: enviado}
+</code></pre>
+        <p>Esto te da cosas que el estado puro no puede:</p>
+        <ul>
+          <li><strong>Historial completo y auditable:</strong> sabes exactamente qué pasó y cuándo, no solo dónde acabó.</li>
+          <li><strong>Reconstruir y reproyectar:</strong> si cambias una regla o añades una vista nueva, <strong>reprocesas el log</strong> y la generas desde cero. Es «viajar en el tiempo».</li>
+          <li><strong>Depuración y modelado:</strong> puedes reconstruir cualquier estado pasado para investigar.</li>
+          <li><strong>Encaja con CQRS:</strong> el log es el lado de escritura; las proyecciones alimentan los modelos de lectura.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p><strong>El coste de event sourcing es real.</strong> (1) <strong>Reconstruir es caro</strong> si hay millones de eventos por entidad → se usan <em>snapshots</em> (guardar el estado cada N eventos). (2) <strong>La evolución del esquema es difícil</strong>: los eventos son inmutables, así que un cambio de formato exige <em>upcasting</em> (traducir eventos viejos) y disciplina de versionado. (3) <strong>Las consultas se complican</strong>: no puedes hacer un <code>UPDATE</code> ni una consulta simple; casi siempre necesitas proyecciones (de ahí que event sourcing y CQRS se usen juntos). (4) <strong>Borrar es incómodo</strong>: por ley puedes necesitar eliminar datos (GDPR), y el log inmutable choca con eso (se resuelve con cifrado por sujeto o eventos de borrado).</p>
+        </div>
+
+        <h3>Cuándo aportan y cuándo no</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>¿CQRS? / ¿ES?</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>CRUD simple de un catálogo pequeño</td><td>No</td><td>Un modelo basta; separar es coste sin beneficio</td></tr>
+            <tr><td>Lecturas mucho más frecuentes que escrituras y con formas distintas</td><td>CQRS</td><td>Escalas lectura y escritura por separado; lecturas a medida</td></tr>
+            <tr><td>Auditoría/regulación: hay que saber cómo se llegó al estado</td><td>Event sourcing</td><td>El log es el historial; el estado es derivado</td></tr>
+            <tr><td>Informes que cambian de lógica a menudo</td><td>Event sourcing + proyecciones</td><td>Reprocesas el log y regeneras el informe, sin migrar datos</td></tr>
+            <tr><td>Dominio con datos que deben ser inmutables y trazables (finanzas, sanidad)</td><td>Event sourcing</td><td>Inmutabilidad y trazabilidad son parte del requisito</td></tr>
+            <tr><td>Un sistema de datos sencillo con lecturas y escrituras parecidas</td><td>No ninguno</td><td>La consistencia eventual y las proyecciones complican sin ganar nada</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> el estado puro es una <em>foto</em> de la ciudad; el event sourcing es el <strong>libro de actas con todas las reformas</strong>. La foto te dice cómo está la ciudad hoy. El libro te deja reconstruir cómo era hace diez años y por qué cambió. Si solo necesitas la foto, el libro es papeleo; si necesitas historia, es imprescindible.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> el saldo de una cuenta bancaria. Con estado guardas <code>saldo = 250 €</code>; con event sourcing guardas los movimientos y derivas el saldo.</p>
+        <pre><code class="language-text">Event sourcing — cuenta #7
+
+  Log de eventos (fuente de verdad):
+    [1] CuentaAbierta    { saldo_inicial: 100 }
+    [2] dineroIngresado  { importe: +200 }
+    [3] dineroRetirado   { importe: -50  }
+
+  Reconstruir saldo aplicando en orden:
+    100 -> 300 -> 250      = saldo actual 250 EUR
+
+  Consulta de auditoria "¿por que el saldo es 250?": el log la responde entera.
+  Con estado puro, esa respuesta se perdio al hacer el UPDATE.
+</code></pre>
+        <p><strong>Ahora CQRS encima.</strong> Dos lecturas distintas: (a) «saldo actual de la cuenta» (pocas filas, lectura instantánea) y (b) «media de ingresos de los últimos 12 meses» (agregación costosa). Con CQRS, la escritura publica cada evento, y dos proyecciones lo consumen:</p>
+        <pre><code class="language-text">Escritura -> CuentaAbierta / Ingreso / Retirada -> STREAM
+     |
+     +-- Proyeccion A: tabla saldos(cuenta_id, saldo)          -> lectura instantanea
+     +-- Proyeccion B: tabla ingresos_mensuales(mes, total)    -> informes rapidos
+</code></pre>
+        <p>La proyección B se puede <strong>reconstruir desde cero</strong> reprocesando el log si cambia la definición de «ingreso». Sin event sourcing, recalcular eso exigiría rehacer el histograma desde los datos actuales (si es que aún están).</p>
+        <p><strong>Números del trade-off.</strong> Con 5 M de movimientos/día y ~40 eventos por cuenta, reconstruir el saldo de una cuenta aplicando 40 eventos tarda microsegundos: no hay problema. Pero una cuenta con 500.000 eventos tardaría mucho → se guarda un <strong>snapshot cada 1.000 eventos</strong>: reconstruir pasa a «cargar snapshot + aplicar ≤1.000 eventos». Ese es el patrón estándar y la razón de que el número de eventos por entidad importe.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <strong>panel de un comercio</strong> es el caso donde CQRS se justifica solo, con números delante.</p>
+        <p><strong>Requisitos:</strong></p>
+        <ul>
+          <li>Escritura: 5.000 pedidos/s en pico; cada pedido son varias escrituras (pedido + líneas + estado) y exige integridad transaccional.</li>
+          <li>Lectura 1: «página de pedidos del cliente», 20.000 req/s, necesita respuesta &lt; 100 ms: desnormalizada, una sola tabla o índice.</li>
+          <li>Lectura 2: «panel de ventas por categoría y hora», se recalcula cada minuto: agregación pesada, no debe tocar la base de escritura.</li>
+        </ul>
+        <p><strong>Diseño CQRS:</strong></p>
+        <pre><code class="language-text">                    STREAM de eventos de pedido
+  Command side  --OrderPlaced/Paid/Shipped-->  [ particionado por order_id ]
+       |                                              |
+  (5.000/s, transaccional)               +--------------+--------------+
+                                         v                             v
+                              +---------------------+        +------------------------+
+                              | Proyeccion "orders" |        | Proyeccion "analytics" |
+                              | por cliente (20k/s) |        | agregados por hora     |
+                              | base clave-valor    |        | almacen de columnas    |
+                              +---------------------+        +------------------------+
+</code></pre>
+        <p><strong>Cifras y decisiones:</strong></p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Número / supuesto</th><th>Trade-off</th></tr></thead>
+          <tbody>
+            <tr><td>Particionar el stream por <code>order_id</code></td><td>32 particiones → orden por pedido, 32 lectores por grupo</td><td>Sin orden global entre pedidos (no se necesita)</td></tr>
+            <tr><td>Proyección «orders» desnormalizada</td><td>Sirve 20.000 req/s con réplicas de lectura</td><td>Duplica datos; hay que mantenerla sincronizada</td></tr>
+            <tr><td>Proyección «analytics» en almacén de columnas</td><td>Agregación de 1 min sobre 30 M eventos</td><td>Más infraestructura; lag de hasta 1 min es aceptable</td></tr>
+            <tr><td>Consistencia eventual</td><td>Lag típico 50–200 ms</td><td>El usuario puede no ver su pedido al instante tras crearlo</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>El requisito que salva CQRS: «leer tu propio cambio».</strong> Si el cliente crea un pedido y la página siguiente (que lee de la proyección) aún no lo muestra, parece roto. Solución habitual: <em>read-your-writes</em>: tras escribir, lee el pedido del modelo de escritura (o espera a un offset concreto antes de responder). Es un parche necesario; documentarlo como decisión es parte del diseño.</p>
+        </div>
+        <p><strong>¿Y event sourcing aquí?</strong> El panel <em>no</em> exige event sourcing, pero la <strong>auditoría financiera</strong> sí: «¿por qué este pedido se reembolsó?». Guardar el log de eventos permite responderlo y, además, reconstruir el modelo de lectura si cambia una regla de negocio: se reproyecta el stream (por ejemplo, 30 días de retención) y listo. Sin el log, ese cambio exigiría migrar la base de datos.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Adoptar CQRS solo cuando lecturas y escrituras tengan formas o volúmenes muy distintos</td>
+              <td>CQRS por defecto en cualquier CRUD</td>
+              <td>Sin esa diferencia, pagas consistencia eventual y proyecciones sin ganar nada</td>
+            </tr>
+            <tr>
+              <td>Diseñar <strong>un modelo de lectura por consulta</strong></td>
+              <td>Un único modelo «que sirva para todo»</td>
+              <td>Un modelo para todo vuelve a ser el problema de la tabla sirviendo a dos amos</td>
+            </tr>
+            <tr>
+              <td>Resolver <em>read-your-writes</em> explícitamente (offset o lectura del modelo de escritura)</td>
+              <td>Ignorar la consistencia eventual y esperar que «casi siempre» se vea</td>
+              <td>El usuario que acaba de escribir es el que más nota el lag</td>
+            </tr>
+            <tr>
+              <td>Versionar los eventos y prever <em>upcasting</em></td>
+              <td>Cambiar el esquema de un evento ya escrito</td>
+              <td>Los eventos son inmutables; cambiarlos rompe la reconstrucción histórica</td>
+            </tr>
+            <tr>
+              <td>Usar <strong>snapshots</strong> cuando las entidades acumulan muchos eventos</td>
+              <td>Reconstruir siempre desde el evento 1</td>
+              <td>Reconstruir 500.000 eventos por lectura es inviable</td>
+            </tr>
+            <tr>
+              <td>Las proyecciones, <strong>idempotentes y reintentables</strong></td>
+              <td>Proyecciones que asumen «llega una vez»</td>
+              <td>Se reprocesan tras un fallo o un cambio de lógica; deben soportar reproducir</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Aplicar CQRS sin necesidad</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Un CRUD de usuarios que se lee y escribe igual -> meter CQRS con broker
+Command side -> stream -> proyeccion de usuarios -> API de lectura
+# Lecturas y escrituras eran casi identicas: ahora hay lag, dos modelos y un broker
+# para resolver un problema que no existia.
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Pregunta primero: ¿lecturas y escrituras difieren en forma o en volumen?
+#   NO -> un solo modelo (simple).     SI -> entonces CQRS aporta.
+</code></pre>
+
+        <h3>Usar event sourcing para todo y luego no poder consultar</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Guardar solo eventos y consultar recorriendo el log entero en cada peticion
+saldo = sum(e.importe for e in todos_los_eventos_de_la_cuenta)   # 500k eventos por vez
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Event sourcing + proyeccion (CQRS): el estado de lectura se mantiene al dia
+# y ademas un snapshot periodico evita reconstruir todo el log.
+saldo = SELECT saldo FROM saldos WHERE cuenta_id = ?   # proyeccion
+# snapshot cada N eventos -> reconstruccion acotada
+</code></pre>
+
+        <h3>Cambiar el formato de un evento ya escrito</h3>
+        <p>Los eventos son inmutables. Si el evento <code>OrderPlaced</code> de hace un año tiene campos distintos, <em>no se reescribe</em>: se añade una versión y un <strong>upcaster</strong> que traduce al leerlo. El error es editar el esquema «para todos» y romper la reconstrucción histórica.</p>
+
+        <h3>Ignorar la consistencia eventual en la interfaz</h3>
+        <p>El error de UX más frecuente: el usuario guarda algo, la vista de lectura aún no lo tiene y la interfaz parece perdida. Hay que decidir de antemano: leer del modelo de escritura tras escribir (<em>read-your-writes</em>), esperar el offset, mostrar «procesando…» o hacer <em>optimistic UI</em>. No es opcional: es parte del contrato de CQRS.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> decidir si un sistema merece CQRS y/o event sourcing, y esbozar las proyecciones. Paso a paso.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Recoge las cifras.</strong>
+            <pre><code class="language-text">Sistema: gestion de tareas de un equipo.
+Escrituras: 200 tareas/min (~3,3/s)  -> bajas.
+Lecturas: 50 usuarios * refresco cada 30 s = ~1,7 lecturas/s -> bajas.
+Forma: leer y escribir son casi iguales (tareas con estado).
+Requisito: auditar quien cambio cada tarea y cuando.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Decide CQRS.</strong> Lecturas y escrituras tienen el <em>mismo</em> perfil y la misma forma → <strong>CQRS no aporta</strong>. Un modelo relacional con historial basta.
+          </li>
+          <li>
+            <strong>Paso 3 — Decide event sourcing.</strong> El requisito de <em>auditoría</em> («quién cambió qué y cuándo») pide historia. Dos opciones:
+            <pre><code class="language-text">A) Tabla de auditoria (audit log) junto al estado: sencillo, resuelve el requisito.
+B) Event sourcing puro: log como fuente de verdad. Mas potente, mas complejo.
+Con 3,3 escrituras/s, (A) es suficiente: no necesita reconstructible ni reproyeccion.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Contrasta con otro caso.</strong> Ahora un sistema con lecturas y escrituras muy distintas:
+            <pre><code class="language-text">Ingesta de eventos: 50.000 escrituras/s, forma append (eventos crudos).
+Informes: 5 consultas/segundo, agregaciones por hora sobre 100 M eventos.
+-> AQUI si: CQRS (escritura append vs lectura agregada) y probablemente
+   event sourcing (los eventos crudos SON los hechos, con valor de replay).
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Esboza las proyecciones.</strong>
+            <pre><code class="language-text">Proyeccion 1: "ingesta_ultimos_5min"   (contadores por minuto, lectura rapida)
+Proyeccion 2: "informe_por_hora"       (agregados por hora, almacen de columnas)
+Ambas idempotentes: clave por event_id; reprocesables desde el offset 0.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación.</strong>
+            <pre><code class="language-text">[ ] ¿CQRS se justifica por diferencia de forma/volumen entre leer y escribir?
+[ ] ¿Event sourcing se justifica por necesidad de historia/replay?
+[ ] ¿Cada proyeccion tiene una clave idempotente y es reprocesable?
+[ ] ¿He resuelto read-your-writes si aplica?
+[ ] ¿He escrito el coste: lag, infraestructura, versionado de eventos?
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> el gestor de tareas NO usa CQRS ni event sourcing (audit log basta); la ingesta de eventos SÍ usa ambos, con dos proyecciones idempotentes y read-your-writes solo donde importe.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Reproyectar sin romper la lectura</h3>
+          <p>Tienes un sistema con event sourcing y CQRS: 200 M de eventos retenidos y una proyección «ventas_por_dia». La definición de «venta» cambia (ahora excluye devoluciones). Hay que <strong>regenerar la proyección desde el log</strong> sin dejar de servir lecturas, y sin que la proyección quede a medias si el proceso se cae a la mitad.</p>
+          <p>Deja por escrito: (1) cómo construyes una proyección nueva en paralelo sin tocar la que sirve, (2) en qué momento haces el «cambio» de una a otra, (3) por qué la proyección debe ser idempotente para ser reprocesable, (4) cómo acotas el tiempo de reproyección de 200 M de eventos (números y supuestos), (5) el trade-off entre reproyectar en caliente y hacer una ventana de mantenimiento.</p>
+          <p><em>Pista: piensa en «proyección azul/verde» (construir la nueva, conmutar cuando alcanza el offset), en particionar el reproceso para paralelizarlo, y en idempotencia por <code>event_id</code>. No implementes el código: decide y justifica con cifras.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>CQRS</strong> separa el modelo de <strong>escritura</strong> (comandos, reglas) del de <strong>lectura</strong> (consultas, desnormalizado), unidos por eventos.</li>
+          <li>Los modelos de lectura son <strong>proyecciones</strong>; van un poco por detrás → <strong>consistencia eventual</strong>.</li>
+          <li><strong>Event sourcing</strong> guarda los <strong>hechos</strong> (log append-only) como fuente de verdad; el estado se <strong>deriva</strong>.</li>
+          <li>Da historial auditable, replay y reproyección, a cambio de complejidad, snapshots y versionado de eventos.</li>
+          <li>Se justifican por <strong>diferencia real</strong> entre leer y escribir, o por necesidad de <strong>historia/trazabilidad</strong>, no por moda.</li>
+          <li>Las proyecciones deben ser <strong>idempotentes y reprocesables</strong>; hay que resolver <em>read-your-writes</em>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Necesidad</th><th>Patrón</th><th>Coste que asumes</th></tr></thead>
+          <tbody>
+            <tr><td>Lecturas y escrituras con formas/volúmenes distintos</td><td>CQRS</td><td>Consistencia eventual + proyecciones que mantener</td></tr>
+            <tr><td>Saber cómo se llegó al estado (auditoría)</td><td>Event sourcing</td><td>Complejidad de consulta; snapshots</td></tr>
+            <tr><td>Reprocesar informes al cambiar una regla</td><td>ES + reproyección</td><td>Versionado de eventos, ventana de reproceso</td></tr>
+            <tr><td>CRUD sencillo</td><td>Ninguno</td><td>—</td></tr>
+            <tr><td>Usuario que debe ver su propio cambio</td><td>Read-your-writes sobre CQRS</td><td>Lógica extra de lectura/espera de offset</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿CQRS obliga a usar dos bases de datos distintas?</summary>
+            <div>
+              <p>No. Es una separación de <em>responsabilidades</em>, no una topología. Puede implementarse con dos esquemas en la misma base (o vistas materializadas) y sin broker, o con modelos y motores completamente separados unidos por un stream. Cuanta más separación, más escalado pero también más piezas, más lag y más operación. Elige el mínimo que cumpla el requisito.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Event sourcing sustituye a la base de datos?</summary>
+            <div>
+              <p>En la práctica, el log de eventos <em>es</em> la fuente de verdad, pero casi siempre <strong>convive</strong> con una o varias bases de datos de lectura (proyecciones) y con snapshots. No es «tira tu base de datos por un log»: es «el log manda, y de él se derivan vistas optimizadas para consultar».</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo manejo la consistencia eventual para el usuario?</summary>
+            <div>
+              <p>Tres estrategias según el caso: (1) <em>read-your-writes</em>: tras un comando, lee el resultado del modelo de escritura o espera a que la proyección alcance un <code>offset</code>/<code>sequence</code> conocido; (2) <em>optimistic UI</em>: la interfaz muestra el cambio de inmediato y reconcilia cuando llega la confirmación; (3) aceptar el lag cuando es invisible (informes que se actualizan cada minuto). Lo que no vale es ignorarlo y esperar que «casi siempre» se vea: el usuario que acaba de escribir es el primero que lo nota.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es un snapshot y cuándo lo necesito?</summary>
+            <div>
+              <p>Un <strong>snapshot</strong> es el estado materializado de una entidad tras aplicar N eventos. Evita reconstruir todo el log en cada operación: cargas el snapshot más reciente y aplicas solo los eventos posteriores. Lo necesitas cuando las entidades acumulan muchos eventos. Criterio orientativo: si reconstruir tarda más de lo que toleras (p. ej. «más de 10 ms» o «más de ~1.000 eventos por entidad»), añade snapshots cada N eventos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo borro datos personales si el log es inmutable?</summary>
+            <div>
+              <p>Con dos técnicas compatibles. (1) <strong>Cifrado por sujeto</strong> (<em>crypto-shredding</em>): los datos personales de un usuario se cifran con una clave suya; «borrar» es destruir la clave, y el resto del evento queda ilegible y sin valor. (2) <strong>Eventos de borrado</strong>: añades un hecho <code>UserErased</code> y las proyecciones lo aplican, dejando el log intacto para el resto. La inmutabilidad del log y el derecho al olvido se reconcilian así, sin reescribir el histórico.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

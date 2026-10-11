@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-timeouts-retries-backoff">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Timeouts, reintentos y backoff — Módulo 5 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Timeouts, reintentos y backoff</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Resiliencia</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo sistema distribuido falla. No es una posibilidad: es una certeza estadística. Con cientos de servicios y miles de máquinas, siempre hay alguna llamada que se pierde, alguna dependencia que va lenta, algún paquete que se descarta. El error de diseño más caro no es que algo falle, sino <strong>no haber decidido qué hacer cuando falle</strong>. Y la primera línea de defensa son tres decisiones que casi nadie toma explícitamente: <strong>timeouts</strong>, <strong>reintentos</strong> y <strong>backoff</strong>.</p>
+        <p>La regla más importante de esta lección se puede decir en una frase:</p>
+        <div class="callout callout--why">
+          <p><strong>«Ninguna llamada de red puede esperar para siempre.»</strong> Sin <em>timeout</em>, un servicio lento se convierte en un servicio caído —no porque falle, sino porque <em>acumula</em> conexiones esperando hasta agotar sus propios recursos. El timeout es lo que convierte un fallo remoto en un error local que puedes manejar.</p>
+        </div>
+        <p>Y una vez que tienes un error local, aparece la tentación: «pues lo reintento». Pero reintentar mal <em>empeora</em> las cosas: puede multiplicar la carga sobre un servicio ya en apuros hasta <strong>tumbarlo del todo</strong>. El arte está en reintentar <strong>con backoff y jitter, con un presupuesto acotado, y solo si la operación puede repetirse de forma segura</strong>.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Timeouts: poner un límite al esperar</h3>
+        <p>Un <em>timeout</em> es el tiempo máximo que esperas una respuesta antes de darla por perdida. Sin él, una petición a un servicio que no responde se queda colgada, ocupando un <em>thread</em>, una conexión o memoria, <strong>para siempre</strong>. Cuando eso le pasa a muchas peticiones, el cliente agota sus propios recursos y muere: es una <strong>cascada de fallos</strong>.</p>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> llamar a un amigo que no contesta. Si dejas el teléfono sonando indefinidamente, no puedes llamar a nadie más (tu línea está ocupada) y él tampoco puede contestarte luego. Poner un límite («si no contesta en 30 s, cuelgo») te libera la línea y te deja intentarlo por otra vía. El timeout <em>no</em> arregla que el amigo no conteste; te devuelve el control.</p>
+        </div>
+        <p>Decisiones al fijar un timeout:</p>
+        <ul>
+          <li><strong>Breve pero realista:</strong> debe cubrir el caso normal con margen (por ejemplo, p99 + 50 %) y, sobre todo, ser <strong>menor que el timeout de quien te llama</strong>. Si tu cliente tiene 1 s y tú esperas 30 s a la base de datos, morirás antes de poder reaccionar.</li>
+          <li><strong>Presupuesto de extremo a extremo:</strong> en una cadena de servicios A→B→C→D, los timeouts deben <em>disminuir</em> hacia dentro. A da 1.000 ms a B; B debe dar <em>menos</em> (por ejemplo, 800 ms) a C, y C menos a D. Así el servicio de más arriba siempre recibe una respuesta (éxito o error) <strong>dentro de su propio plazo</strong>.</li>
+          <li><strong>Distinguir «no conecta» de «conecta pero tarda»:</strong> conviene separar el timeout de <em>conexión</em> (corto: 200–500 ms) del de <em>lectura/operación</em> (más largo).</li>
+        </ul>
+        <pre><code class="language-text">PRESUPUESTO DE TIMEOUTS EN CASCADA
+
+  Cliente  A  --1000ms-->  B  --800ms-->  C  --600ms-->  D
+           |                |               |
+  Si D tarda 2s:            |               |
+    tiempo total permitido   1s: A ya habra cortado.
+    -> C debe cortar antes  (600ms) para tener tiempo de responder a B
+    -> B debe cortar antes  (800ms) para tener tiempo de responder a A
+  El timeout EXTERNO manda: cada capa deja margen a la de fuera.
+</code></pre>
+
+        <h3>Reintentos: cuándo sí y cuándo no</h3>
+        <p>Los fallos se dividen en dos clases, y solo una merece un reintento:</p>
+        <table>
+          <thead><tr><th>Tipo de fallo</th><th>Ejemplos</th><th>¿Reintentar?</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Transitorio</strong></td><td>Timeout de red, 503, conexión rechazada por sobrecarga, <em>leader election</em> en curso</td><td><strong>Sí</strong>: probablemente funcione en el siguiente intento</td></tr>
+            <tr><td><strong>Permanente</strong></td><td>400 (petición inválida), 401/403, 404, error de validación</td><td><strong>No</strong>: reintentar da el mismo error y gasta recursos</td></tr>
+          </tbody>
+        </table>
+        <p>Y una condición no negociable: <strong>reintentar solo es seguro si la operación es idempotente</strong> (lección 3 del módulo 4). Reintentar un cobro sin clave de idempotencia puede cobrar dos veces. Reintentar un <code>GET</code> es seguro; reintentar un <code>POST</code> no lo es por defecto.</p>
+
+        <h3>Backoff: no reintentes de inmediato (y no todos a la vez)</h3>
+        <p>Si reintentas al instante, machacas a un servicio que ya está mal. La solución es esperar cada vez más: <strong>backoff exponencial</strong>. Pero si miles de clientes usan la misma fórmula sin aleatoriedad, reintentan <em>sincronizados</em> y crean un pico (el <em>thundering herd</em>). Por eso se añade <strong>jitter</strong> (aleatoriedad):</p>
+        <pre><code class="language-text">BACKOFF EXPONENCIAL CON JITTER (full jitter)
+
+  intento 1: espera = random(0, 100ms)      en vez de  100ms fijos
+  intento 2: espera = random(0, 200ms)      en vez de  200ms fijos
+  intento 3: espera = random(0, 400ms)      en vez de  400ms fijos
+  intento 4: espera = random(0, 800ms)      en vez de  800ms fijos
+  intento 5: espera = random(0, 1600ms)     -> y despues, rendirse (max_attempts)
+
+  Sin jitter  -> todos los clientes reintentan al mismo tiempo -> pico sincronizado
+  Con jitter  -> los reintentos se reparten en el tiempo -> el servicio se recupera
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Además de reintentos individuales, existe el «retry budget».</strong> Se fija un porcentaje máximo de reintentos sobre el total de peticiones (por ejemplo, «los reintentos no pueden superar el 10 % del tráfico»). Si se supera, se dejan de reintentar y se deja fallar rápido. Evita que el mecanismo de recuperación se convierta en la causa de la caída.</p>
+        </div>
+
+        <h3>Retry storms: cómo los reintentos tumban un servicio</h3>
+        <p>El peligro: un servicio que va un poco lento recibe <em>más</em> carga precisamente porque va lento. Cada petición que tarda más de la cuenta se reintenta, y esos reintentos se suman a las peticiones nuevas. La <strong>amplificación</strong> puede ser brutal:</p>
+        <pre><code class="language-text">AMPLIFICACION POR REINTENTOS
+
+  Trafico normal: 1.000 req/s hacia el servicio S
+  S se degrada y empieza a tardar. Regla: hasta 3 intentos por peticion.
+  Si todas fallan y se reintentan:
+      1.000 (originales) + 1.000 (retry 1) + 1.000 (retry 2) = 3.000 req/s
+  -> x3 de carga sobre un servicio YA debil. Es el "retry storm".
+  Con 5 reintentos y una cadena de 3 servicios, el factor puede ser x15.
+</code></pre>
+        <p>Mitigaciones: <strong>jitter</strong> (no todos a la vez), <strong>límite de intentos</strong> bajo (2–3), <strong>retry budget</strong>, <strong>circuit breaker</strong> (lección 2) para cortar cuando el fallo es masivo, y <strong>reintentar solo en el borde</strong> (no en cada servicio de la cadena), porque reintentar en cada capa multiplica el efecto.</p>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> cada reintento mejora la probabilidad de éxito de <em>una</em> petición a costa de <em>más</em> carga sobre el sistema. Con un sistema sano, ×2 o ×3 de carga es nada; con un sistema al límite, es la puntilla. Por eso el reintento agresivo va bien en el cliente (donde conoces la intención) y mal en el interior de la cadena (donde se amplifica).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> tu API llama a un servicio de recomendaciones. Mídelo y decide timeout + política de reintentos.</p>
+        <p><strong>Supuestos:</strong></p>
+        <ul>
+          <li>Latencia normal del servicio: p50 = 40 ms, p99 = 250 ms.</li>
+          <li>Tu endpoint tiene un presupuesto de <strong>1.000 ms</strong> para responder al usuario.</li>
+          <li>La llamada es un <code>GET</code> (idempotente y segura de reintentar).</li>
+          <li>Fallo observado: en cada pico, ~2 % de las llamadas devuelven 503 o hacen timeout.</li>
+        </ul>
+        <p><strong>Cálculo del timeout:</strong></p>
+        <pre><code class="language-text">Timeout de lectura = p99 + margen = 250ms * 1,5 = 375ms  -> redondeamos a 400ms
+Timeout de conexion = 250ms (si no conecta rapido, es que esta saturado)
+-&gt; 400ms deja ~600ms del presupuesto para reintentos sin pasarnos de 1.000ms
+</code></pre>
+        <p><strong>Política de reintentos:</strong> 2 reintentos, backoff exponencial con jitter, y respetando el presupuesto total.</p>
+        <pre><code class="language-yaml"># Politica del cliente hacia el servicio de recomendaciones
+call:
+  timeout_ms: 400              # por intento
+  max_attempts: 3              # 1 original + 2 reintentos
+  retry_on: [timeout, 503, connection_error]   # solo transitorios
+  backoff:
+    type: exponential
+    base_ms: 100
+    factor: 2                  # 100, 200
+    jitter: full               # aleatoriedad completa
+  total_budget_ms: 1000        # nunca superar el presupuesto del usuario
+</code></pre>
+        <p><strong>Por qué encaja:</strong> worst case es 3 × 400 ms = 1.200 ms, que supera el presupuesto, pero con backoff (0–100 + 0–200 ms de espera) y con el <code>total_budget_ms</code> como corte, el cliente <strong>abandona</strong> antes de pasarse y devuelve una degradación (lección 3) en lugar de un error. El timeout de 400 ms da margen sobre el p99, y el jitter evita que todos los clientes reintenten a la vez tras un pico compartido.</p>
+        <p><strong>El número que decide:</strong> con 400 ms de timeout, cortas las llamadas que van más allá del p99 (250 ms). Estás tirando el 1 % más lento <em>a propósito</em>: son precisamente las que no caben en tu presupuesto. Recuperas la probabilidad de éxito con los reintentos, y si todos fallan, degradas.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <strong>checkout de un comercio</strong> encadena servicios: <code>checkout</code> → <code>pagos</code> → <code>antifraude</code> → <code>facturación</code>. Aquí los reintentos y timeouts se vuelven críticos, y se ve el porqué de cada decisión.</p>
+        <pre><code class="language-text">CADENA DE CHECKOUT
+
+  Usuario -> checkout(1.500ms) -> pagos(1.000ms) -> antifraude(600ms) -> facturacion(400ms)
+                                                                               |
+  Presupuestos de timeout DECRECIENTES:                   el mas interno corta antes
+</code></pre>
+        <p><strong>Decisiones y su justificación:</strong></p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Número</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Timeout de checkout</td><td>1.500 ms</td><td>El de más fuera; cubre la cadena con margen</td></tr>
+            <tr><td>Timeout de pagos</td><td>1.000 ms</td><td>Deja 500 ms a checkout para reintentar/responder</td></tr>
+            <tr><td>Timeout de antifraude</td><td>600 ms</td><td>Deja margen a pagos; antifraude es «best-effort»</td></tr>
+            <tr><td>Reintentos de <code>GET</code> (consulta de saldo)</td><td>2</td><td>Idempotente, seguro de repetir</td></tr>
+            <tr><td>Reintentos del cobro</td><td>2, con <strong>clave de idempotencia</strong></td><td>No idempotente por naturaleza; la clave lo hace seguro</td></tr>
+            <tr><td>Reintentos del antifraude</td><td>0 (fail-open)</td><td>Si no responde, se permite con marcado para revisión posterior</td></tr>
+          </tbody>
+        </table>
+        <p><strong>El caso del antifraude</strong> enseña un trade-off clásico: reintentar 3 veces el antifraude, cuando está degradado, añadiría ×3 carga y retrasaría todo el checkout. En vez de eso, se decide <strong>fail-open</strong> (no bloquear la venta) pero <strong>marcar la transacción para revisión</strong>. Se prioriza no perder la venta sobre la garantía de no fraudar <em>en el acto</em> —decisión de negocio, no técnica, y debe estar escrita.</p>
+        <p><strong>Cálculo de la tormenta evitada.</strong> Si el antifraude se degrada a 2 s y cada capa reintenta 3 veces, la carga sobre él sería: 3 (checkout) × 3 (pagos) × 3 (antifraude) = hasta <strong>×27</strong> de amplificación. Con «reintentar solo en el borde» (checkout) y circuit breaker en el interior, la amplificación baja a ×3, y con el budget de reintentos, a ~×1,1.</p>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> reintentar <em>en cada capa</em> multiplica el efecto (x27 en el ejemplo). Por eso la regla práctica es <strong>reintentar cerca del cliente</strong> y dejar que los servicios internos fallen rápido (lección 2) en vez de insistir. Es más fácil de razonar y mucho menos dañino para un sistema degradado.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Timeout en <strong>toda</strong> llamada de red</td>
+              <td>Dejar el valor por defecto (a menudo infinito)</td>
+              <td>Sin límite, un servicio lento agota tus threads/conexiones y te tumba</td>
+            </tr>
+            <tr>
+              <td>Timeouts <strong>decrecientes</strong> a lo largo de la cadena</td>
+              <td>Timeouts iguales o crecientes hacia dentro</td>
+              <td>El servicio interno debe cortar antes para que el externo responda a tiempo</td>
+            </tr>
+            <tr>
+              <td>Reintentar solo fallos <strong>transitorios</strong></td>
+              <td>Reintentar un 400/404</td>
+              <td>Ese error es determinista: reintentar no lo cambia y gasta recursos</td>
+            </tr>
+            <tr>
+              <td><strong>Backoff exponencial + jitter</strong></td>
+              <td>Backoff fijo o reintento inmediato</td>
+              <td>Sin jitter, los clientes reintentan sincronizados y crean un pico</td>
+            </tr>
+            <tr>
+              <td>Reintentar solo operaciones <strong>idempotentes</strong> (o con clave)</td>
+              <td>Reintentar un cobro/POST sin clave</td>
+              <td>Un reintento sin idempotencia duplica el efecto</td>
+            </tr>
+            <tr>
+              <td>Fijar un <strong>retry budget</strong> (p. ej. 10 % del tráfico)</td>
+              <td>Permitir reintentos ilimitados en proporción</td>
+              <td>Evita que el mecanismo de recuperación se vuelva la causa de la caída</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>No poner timeout (o confiar en el del sistema operativo)</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Cliente HTTP sin timeout explicito
+response = http.get("http://recomendaciones/api/list")
+# Si el servicio no responde, espera ~indefinidamente (o el timeout de TCP, minutos)
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Timeout explicito, menor que el presupuesto del que te llama
+response = http.get("http://recomendaciones/api/list", timeout=0.4)   # 400 ms
+</code></pre>
+
+        <h3>Reintentar con backoff fijo (sincronizado)</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text">for attempt in range(3):
+    try: return call()
+    except Transient: sleep(1.0)     # 1 s fijo: todos los clientes a la vez
+# Tras una caida, 10.000 clientes reintentan en el MISMO instante -> pico que la tumba de nuevo
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text">for attempt in range(3):
+    try: return call()
+    except Transient:
+        cap = 0.1 * (2 ** attempt)             # 100ms, 200ms, ...
+        sleep(random.uniform(0, cap))          # full jitter: cada cliente en un momento distinto
+</code></pre>
+
+        <h3>Reintentar un POST no idempotente</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Reintentar un cobro sin proteccion
+retry(charge(customer, 10))    # un timeout ambiguo puede cobrar 2 veces
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Clave de idempotencia: el mismo intento NUNCA cobra 2 veces
+retry(charge(customer, 10, idempotency_key="ord-42-pay"))
+</code></pre>
+
+        <h3>Reintentar en todas las capas de la cadena</h3>
+        <p>Ya lo vimos en el ejemplo real: 3 capas × 3 intentos = hasta ×27 de carga sobre el servicio débil. La corrección es <strong>reintentar solo en el borde</strong> (el cliente que conoce la intención) y hacer que los servicios internos <strong>fallen rápido</strong>.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> calcular el timeout, la política de reintentos y la amplificación para una dependencia concreta.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Datos del servicio.</strong>
+            <pre><code class="language-text">Dependencia: servicio de divisas (GET, idempotente)
+Latencia: p50 = 30ms, p95 = 120ms, p99 = 300ms
+Presupuesto del endpoint cliente: 800ms
+Fallos en pico: 1% timeout, 1% 503 (transitorios)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Fija el timeout.</strong> p99 + 50 % ≈ 450 ms; redondea a <strong>450 ms</strong>. Comprueba que deja margen: 800 − 450 = 350 ms para un reintento.
+          </li>
+          <li>
+            <strong>Paso 3 — Decide los intentos.</strong> Con 450 ms por intento, caben 1 original + 1 reintento dentro de 800 ms (450 + espera ~100 + 450 = 1.000, demasiado). Ajusta: <strong>timeout 350 ms, 2 intentos</strong>: 350 + espera(≤100) + 350 = 800 ms. Encaja en el presupuesto.
+          </li>
+          <li>
+            <strong>Paso 4 — Calcula la mejora de éxito del reintento.</strong> Con fallo por intento p = 2 % (1 % + 1 %) y 2 intentos:
+            <pre><code class="language-text">P(fallo total) = p^2 = 0,02^2 = 0,0004  -> 0,04%
+P(exito)       = 1 - 0,0004 = 99,96%
+Antes (1 intento): 98% de exito.
+Con 1 reintento:   99,96%. Un segundo intento BARATO elimina casi todo el fallo.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Calcula la amplificación y acótala.</strong>
+            <pre><code class="language-text">Trafico: 2.000 req/s.
+Peor caso (todo falla y se reintenta 1 vez): 2.000 + 2.000 = 4.000 req/s -> x2
+Con 2% de fallo real: reintentos = 2.000 * 0,02 = 40 req/s extra -> x1,02 (insignificante)
+</code></pre>
+            <p>Conclusión: un solo reintento con jitter mejora el éxito del 98 % al 99,96 % y apenas añade carga (×1,02) <em>en condiciones normales</em>. La amplificación solo es peligrosa si el fallo es masivo, y ahí entra el <strong>circuit breaker</strong> (lección 2).</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación.</strong>
+            <pre><code class="language-text">[ ] Timeout &lt; presupuesto del cliente y &gt; p99
+[ ] Nº de intentos cabe en el presupuesto total (incl. esperas)
+[ ] Backoff exponencial + jitter
+[ ] Solo se reintenta lo idempotente y lo transitorio
+[ ] Existe un retry budget / circuit breaker para el caso masivo
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> timeout 350 ms, 2 intentos con jitter, éxito 99,96 %, amplificación normal ×1,02, con circuit breaker como red de seguridad.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El reintento que tumbó el servicio</h3>
+          <p>Un servicio se degrada los viernes por la tarde. El equipo añade «3 reintentos con backoff» para mejorar la fiabilidad y, sorprendentemente, los viernes empeoran: el servicio se cae del todo. Explica el mecanismo (tormenta de reintentos) y rediseña la política para que la fiabilidad <em>mejore</em> en vez de empeorar.</p>
+          <p>Deja por escrito: (1) el factor de amplificación con 3 reintentos y 2 capas de la cadena, (2) por qué el backoff sin jitter no basta, (3) cómo usarías un retry budget y un circuit breaker juntos, (4) en qué capa reintentarías y en cuáles no, (5) el trade-off entre «más intentos = más éxito» y «más intentos = más carga».</p>
+          <p><em>Pista: piensa en «reintentar en el borde, fallar rápido dentro», en el full jitter para desincronizar, y en el circuit breaker que corta cuando el fallo es masivo. Calcula la amplificación con números. No escribas el código: decide y justifica.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Ninguna llamada de red sin timeout.</strong> El timeout convierte un fallo remoto en un error local manejable.</li>
+          <li>Los timeouts deben ser <strong>decrecientes</strong> hacia el interior de la cadena (presupuesto de extremo a extremo).</li>
+          <li>Reintentar solo <strong>fallos transitorios</strong> y solo operaciones <strong>idempotentes</strong>.</li>
+          <li><strong>Backoff exponencial + jitter</strong>: sin jitter, todos reintentan a la vez y crean un pico.</li>
+          <li>La <strong>retry storm</strong> multiplica la carga sobre un servicio ya débil; se acota con límite de intentos y <strong>retry budget</strong>.</li>
+          <li>Reintenta en el <strong>borde</strong>; dentro de la cadena, <strong>falla rápido</strong> (lección 2).</li>
+        </ul>
+        <table>
+          <thead><tr><th>Situación</th><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Llamada a una dependencia</td><td>Timeout &gt; p99, &lt; presupuesto del cliente</td><td>Corta lo lento sin penalizar lo normal</td></tr>
+            <tr><td>Fallo 503/timeout puntual</td><td>Reintento con backoff + jitter</td><td>Es transitorio; un intento extra barato ayuda</td></tr>
+            <tr><td>Error 400/401/404</td><td>No reintentar</td><td>Determinista; reintentar no cambia nada</td></tr>
+            <tr><td>POST no idempotente</td><td>Reintentar solo con clave de idempotencia</td><td>Evita duplicar el efecto</td></tr>
+            <tr><td>Fallo masivo de una dependencia</td><td>Circuit breaker + retry budget</td><td>Deja de insistir y evita la tormenta</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos reintentos son «los correctos»?</summary>
+            <div>
+              <p>Pocos: casi siempre <strong>1 o 2</strong> por operación. La razón matemática es que el beneficio decrece muy rápido: si el fallo por intento es del 2 %, un reintento baja el fallo total al 0,04 %; un tercero lo baja a 0,0008 %, una mejora ya irrelevante a cambio de más carga y más latencia de cola. Con fallos transitorios raros, 1–2 reintentos con jitter capturan casi todo el beneficio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el jitter es tan importante?</summary>
+            <div>
+              <p>Porque sin él los reintentos se <strong>sincronizan</strong>. Si 10.000 clientes usan «espera 1 s, luego 2 s», reintentan exactamente a la vez y recrean el pico que tumbó el servicio. El jitter aleatoriza la espera y reparte los reintentos en el tiempo. Si solo recuerdas una cosa de esta lección, que sea: <em>backoff sin jitter es un temporizador sincronizado hacia el desastre</em>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo reintentar un POST si el servidor es idempotente?</summary>
+            <div>
+              <p>Sí, si el <em>efecto</em> es idempotente. La forma limpia es que el servidor acepte una <strong>clave de idempotencia</strong> y garantice que el mismo intento no repita el efecto (módulo 4, lección 3). Sin esa garantía, un timeout ambiguo (¿se procesó o no?) deja la duda de si reintentar duplica. La regla es: reintenta el POST <em>solo</em> si el receptor promete idempotencia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El timeout no es simplemente «cortar» y perder la respuesta?</summary>
+            <div>
+              <p>Es cortar la <em>espera</em>, no necesariamente el trabajo remoto. Muchas veces la operación sí se completa en el servidor aunque tú ya hayas cortado. Por eso un timeout <strong>no</strong> significa «no pasó nada»: significa «no sé qué pasó». Esa ambigüedad es exactamente la razón de que los reintentos exijan idempotencia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde debe vivir el reintento, en el cliente o en el servidor?</summary>
+            <div>
+              <p>Preferiblemente en el <strong>borde</strong> (quien conoce la intención del usuario) y con un límite estricto. El reintento interno, en cada servicio de la cadena, se <strong>amplifica</strong>: cada capa que reintenta multiplica la carga sobre la más interna. Si reintentas en dos capas con 3 intentos cada una, la capa interna puede recibir hasta ×9. La distribución sana es: reintentos en el borde, fallo rápido (circuit breaker) dentro.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

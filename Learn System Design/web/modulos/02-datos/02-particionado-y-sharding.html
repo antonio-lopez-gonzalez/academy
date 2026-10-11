@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-particionado-y-sharding">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Particionado y sharding — Módulo 2 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Particionado y sharding</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Datos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hay un momento en la vida de todo sistema de datos en el que <strong>un solo servidor deja de bastar</strong>: el disco no da para el volumen, la RAM no cabe en el índice, o las escrituras por segundo superan lo que una máquina absorbe. Escalar <em>vertical</em> (una máquina más gorda) tiene un techo físico y un precio que crece más rápido que la capacidad. La salida es <strong>repartir los datos entre varios servidores</strong>: eso es particionar.</p>
+        <p>Esta lección trata del <strong>cómo</strong> y, sobre todo, del <strong>por qué</strong>: qué es un <em>shard</em>, cómo se elige la clave de partición, por qué el <em>hash</em> y el <em>rango</em> se comportan distinto, qué es un <em>hotspot</em>, y cómo se reequilibra cuando el reparto se tuerce. La regla que resume el riesgo: <strong>una mala clave de partición convierte un sistema distribuido en un servidor saturado con réplicas de adorno</strong>.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque el sharding es la herramienta que más gente usa mal. Se elige la clave "que parece", y a los tres meses el <em>shard</em> del mes actual de un feed está al 100% de CPU mientras los demás están al 5%. Entender el reparto (y el rebalanceo) es lo que separa un diseño que escala de uno que solo lo parece.</p>
+        </div>
+        <p><strong>Errores típicos:</strong></p>
+        <ul>
+          <li>Particionar por un campo <strong>monótono</strong> (fecha, autoincremento) y crear un shard caliente: el último.</li>
+          <li>Particionar por un campo aleatorio y luego necesitar "dame todos los pedidos de un usuario": <em>scatter-gather</em> en N shards.</li>
+          <li>Usar <code>hash(key) mod N</code> y descubrir que añadir un nodo remapea casi todo.</li>
+          <li>Asumir que podrás hacer <em>joins</em> entre shards con la misma comodidad que dentro de uno.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Particionar no siempre es "sharding"</h3>
+        <p>Conviene separar dos ideas que se mezclan:</p>
+        <table>
+          <thead><tr><th>Término</th><th>Qué reparte</th><th>Dónde</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Particionado</strong></td><td>Las filas de una tabla en trozos lógicos</td><td>Puede ser dentro del <strong>mismo</strong> servidor (particiones de Postgres) o entre varios</td></tr>
+            <tr><td><strong>Sharding</strong></td><td>Las particiones entre <strong>servidores distintos</strong></td><td>Cada shard es un servidor (o clúster) independiente con su propia CPU, disco y memoria</td></tr>
+            <tr><td><strong>Particionado vertical</strong></td><td>Las <strong>columnas</strong> (p. ej. separar datos fríos de los calientes)</td><td>Mismo concepto: dividir por "ejes" distintos</td></tr>
+          </tbody>
+        </table>
+        <p>El particionado <strong>horizontal</strong> (por filas) es el que da escalabilidad horizontal y el que nos interesa. El <strong>vertical</strong> (por columnas) ayuda a no cargar datos que casi nunca consultas, pero no reduce la carga de escritura de una tabla enorme.</p>
+
+        <pre><code class="language-text">        TABLA "orders" (1 000 000 000 filas)
+
+  PARTICIONADO HORIZONTAL (por filas)          PARTICIONADO VERTICAL (por columnas)
+  ┌───────────────────────────┐               ┌──────────────┬──────────────────┐
+  │ shard A: user_id 0..24%   │               │ id, user_id, │  dirección completa│
+  │ shard B: user_id 25..49%  │               │ total, fecha │  (datos fríos)     │
+  │ shard C: user_id 50..74%  │               └──────────────┴──────────────────┘
+  │ shard D: user_id 75..99%  │                se leen casi siempre las calientes
+  └───────────────────────────┘
+   cada shard = servidor con su CPU, disco, RAM
+</code></pre>
+
+        <h3>La clave de partición: la decisión central</h3>
+        <p>La clave de partición (<em>partition key</em>) es el campo cuyo valor decide <strong>en qué shard vive cada fila</strong>. Bien elegida, reparte la carga y agrupa lo que se consulta junto. Mal elegida, crea un cuello de botella o convierte cada consulta en una tormenta de N llamadas.</p>
+        <p>Buenas claves comparten dos propiedades:</p>
+        <ul>
+          <li><strong>Alta cardinalidad</strong>: muchos valores distintos, para poder repartir fino.</li>
+          <li><strong>Distribución uniforme</strong>: la carga no se concentra en unos pocos valores.</li>
+        </ul>
+
+        <h3>Tres estrategias de reparto</h3>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Cómo reparte</th><th>Consultas por rango</th><th>Reparto de carga</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Por rango</strong></td><td>shard 1 = A–F, shard 2 = G–M…</td><td>Excelentes (rangos contiguos)</td><td>Riesgo alto de hotspot si la clave es monótona</td></tr>
+            <tr><td><strong>Por hash</strong></td><td><code>shard = hash(key) mod N</code></td><td>Malas (los rangos se dispersan)</td><td>Bueno si la clave es uniforme</td></tr>
+            <tr><td><strong>Geográfico</strong></td><td>shard por región/país/ciudad</td><td>Buenas dentro de una región</td><td>Sesgado si una región domina; ayuda a latencia y residencia de datos</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: la biblioteca y sus salas</div>
+          <p>Por <strong>rango</strong> es ordenar los libros por título en estanterías: buscar "de la A a la M" es rapidísimo, pero si todos piden libros de la "S", esa estantería se colapsa. Por <strong>hash</strong> es repartir libros al azar entre salas: ninguna sala se satura, pero encontrar "todos los libros de un autor" te obliga a recorrerlas todas. <strong>Geográfico</strong> es tener una sala por ciudad: la más cercana responde rápido, pero la sala de la ciudad grande necesita más libreros.</p>
+        </div>
+
+        <h3>El hotspot: el enemigo silencioso</h3>
+        <p>Un <em>hotspot</em> (o <em>hot shard</em>) es un shard que recibe mucho más tráfico que los demás. Aparece cuando la clave de partición correlaciona con el tráfico:</p>
+        <pre><code class="language-text">  CLAVE MONÓTONA (created_at, id autoincremental)
+     hs = hash(created_at)  →  TODAS las escrituras nuevas van al shard "actual"
+     ┌──────────────────────────────────────────────┐
+     │ shard 2026-01... 2026-10  ▓▓▓▓▓▓▓▓▓▓▓ 100% CPU│  ◄── hotspot: solo escribe el presente
+     │ shard 2026-11... 2027-06  ··············  0%   │
+     └──────────────────────────────────────────────┘
+
+  CLAVE DE ALTA CARDINALIDAD Y UNIFORME (user_id con hash)
+     ┌──────────────────────────────────────────────┐
+     │ shard A ▓▓▓▓▓ 24%   shard B ▓▓▓▓▓ 25%         │  ◄── carga repartida
+     │ shard C ▓▓▓▓▓ 25%   shard D ▓▓▓▓ 26%          │
+     └──────────────────────────────────────────────┘
+</code></pre>
+        <p>El error clásico es particionar <strong>por fecha</strong> en un sistema de escritura continua: el shard del "ahora" recibe el 100% de las escrituras, aunque los shards viejos estén vacíos de tráfico. La corrección habitual es <strong>componer</strong> la clave: por ejemplo <code>(user_id, fecha)</code> repartida por <em>hash de user_id</em>, de modo que el presente se reparta entre todos los shards.</p>
+
+        <h3>Rebalanceo: cuando hay que mover datos</h3>
+        <p>El rebalanceo reparte de nuevo las particiones cuando añades/quitas nodos o cuando detectas desequilibrio. Dos mecanismos típicos:</p>
+        <ul>
+          <li><strong>Reasignación de particiones</strong>: divides el espacio en muchas particiones (p. ej. 1 024) y mueves particiones enteras entre nodos. Es el enfoque de sistemas como Kafka o Elasticsearch.</li>
+          <li><strong>Consistent hashing</strong>: colocas nodos y claves en un anillo; añadir un nodo solo "roba" claves a su vecino, moviendo ~<code>1/N</code> de los datos en lugar de casi todo.</li>
+        </ul>
+        <pre><code class="language-text">  hash(key) mod N                          Consistent hashing (anillo)
+  N=4 → N=5: casi TODAS las claves         añadir nodo E en el anillo
+  cambian de sitio (≈80% se mudan)         mueve solo ~1/N de las claves
+  ┌────┬────┬────┬────┐                    ┌────────────────────────┐
+  │ A  │ B  │ C  │ D  │                    │   A ──▶ B ──▶ C ──▶ D  │   E entra entre
+  └────┴────┴────┴────┘                    │   ▲                 │    C y D y solo toma
+   +E → A' B' C' D' E'                      │   └─────────────────┘    las claves de esa
+   (remapeo masivo)                          reasigna ~1/N (barato)    franja de D
+</code></pre>
+
+        <h3>El precio: joins y transacciones cruzan shards</h3>
+        <p>Al repartir, pierdes gratis dos cosas que dentro de un nodo son triviales:</p>
+        <ul>
+          <li><strong>Joins entre shards</strong>: si <code>orders</code> está partido por <code>user_id</code> y <code>products</code> por <code>product_id</code>, unir un pedido con sus productos exige traer datos de dos shards. Solución frecuente: <strong>desnormalizar</strong> (guardar el nombre del producto junto al pedido), que trata la lección <a href="04-indices-y-modelado.html">Índices y modelado</a>.</li>
+          <li><strong>Transacciones entre shards</strong>: un <code>COMMIT</code> que toca dos shards necesita coordinación (2PC, sagas) y es mucho más frágil y lento. La estrategia sana es <strong>diseñar para que cada transacción viva en un solo shard</strong>: para eso la clave de partición debe ser la misma que agrupa los datos que se modifican juntos.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <div class="callout__title">Cómo elegir la clave, en una frase</div>
+          <p>Tu clave de partición debe ser <strong>el campo por el que filtras casi todo</strong> y que <strong>agrupa los datos que se escriben juntos</strong>. Si tienes dos campos así y no coinciden, probablemente necesites desnormalizar o cambiar el límite del sistema.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Supón 6 M de usuarios y 4 shards. Comparemos dos claves de partición para la tabla <code>orders</code> con un número concreto de "cuántos shards toca cada consulta".</p>
+
+        <h3>Clave por <code>order_id</code> (hash)</h3>
+        <pre><code class="language-text">shard = hash(order_id) mod 4
+
+Consulta "dame todos los pedidos del usuario 77":
+  → no se sabe en qué shard están sus pedidos
+  → hay que preguntar a los 4 shards y juntar (SCATTER-GATHER)
+  → latencia = la del shard más lento; coste ×4
+</code></pre>
+
+        <h3>Clave por <code>user_id</code> (hash)</h3>
+        <pre><code class="language-text">shard = hash(user_id) mod 4
+┌─────────────────────────────────────────────────────┐
+│ shard 0 │ shard 1 │ shard 2 │ shard 3 │
+│ u:1,5,9…│ u:2,6,10│ u:3,7,11│ u:4,8,12│   ← usuarios repartidos
+└─────────────────────────────────────────────────────┘
+
+Consulta "dame todos los pedidos del usuario 77":
+  → hash(77) mod 4 = shard 1  → UNA sola llamada, todos sus pedidos
+  → latencia de un shard; coste ×1
+</code></pre>
+        <p>La misma consulta, la misma tabla, dos claves: <strong>una llamada contra cuatro</strong>. Ese es todo el juego del sharding. La clave correcta hace que el sistema parezca "un servidor" para el 99% de las consultas.</p>
+
+        <div class="callout callout--note">
+          <div class="callout__title">El rango también importa</div>
+          <p>Con <code>hash(user_id)</code>, "dame los pedidos de los usuarios 1 a 100" toca los 4 shards (los rangos de usuario se dispersan). Pero esa consulta rara vez existe en producción; "los pedidos del usuario 77" sí. <strong>Optimiza la clave para el acceso frecuente, no para el teórico.</strong></p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El caso <strong>chat/feed</strong> (Módulo 6) es donde el sharding se pone interesante, porque hay dos entidades con necesidades opuestas: <strong>usuarios</strong> y <strong>mensajes</strong>.</p>
+
+        <h3>Requisitos y supuestos</h3>
+        <ul>
+          <li>500 M de mensajes/día ⇒ ~6 000 escrituras/segundo de media (pico ×4 ≈ 24 000/s).</li>
+          <li>Lectura dominante: "dame los últimos 50 mensajes de la conversación X".</li>
+          <li>Objetivo: ninguna consulta debe tocar más de un shard.</li>
+        </ul>
+
+        <h3>Decisión de clave: <code>conversation_id</code>, no <code>message_id</code> ni <code>timestamp</code></h3>
+        <pre><code class="language-text">   ❌ clave = timestamp                  ❌ clave = message_id
+   ┌──────────┬──────────┬──────────┐    (hash aleatorio: los mensajes
+   │ ene      │ feb      │ ... ahora│     de una conversación se dispersan)
+   │ frío     │ frío     │ ▓▓▓ 100% │
+   └──────────┴──────────┴──────────┘
+     hotspot: solo escribe el presente
+
+   ✅ clave = conversation_id (+ orden por sent_ts dentro del shard)
+   ┌───────────────────────────────────────────────────────────┐
+   │ shard A: conv 1..1000   shard B: conv 1001..2000  ...      │
+   │ "últimos 50 de la conversación 427" → 1 shard, 1 rango     │
+   └───────────────────────────────────────────────────────────┘
+</code></pre>
+        <p>Con <code>conversation_id</code>, los mensajes de una conversación viven juntos y ordenados por tiempo dentro del shard: leerlos es <strong>un acceso por rango</strong>. Las escrituras se reparten porque hay millones de conversaciones activas simultáneas. Y sin hotspot, porque ninguna conversación concreta puede escribir miles de mensajes por segundo (excepto un canal enorme, que se trata como caso especial).</p>
+
+        <h3>El problema del canal gigante (hot key)</h3>
+        <p>Un canal de un evento masivo (millones de espectadores escribiendo) sí rompe la regla: todas las escrituras caen en la misma partición. Mitigaciones:</p>
+        <table>
+          <thead><tr><th>Mitigación</th><th>Cómo funciona</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Sub-particionar por <code>(conversation_id, bucket)</code></td><td>El canal se reparte en <em>K</em> sub-particiones (p. ej. por usuario); al leer, se juntan</td><td>La lectura deja de ser un solo acceso</td></tr>
+            <tr><td>Cola de escritura intermedia</td><td>Las escrituras van a una cola y se vuelcan por lotes (Módulo 4)</td><td>Pequeño retraso; más piezas</td></tr>
+            <tr><td>Modo "solo lectura" / broadcast</td><td>El canal se sirve como difusión en streaming, con comentarios muestreados</td><td>Se degrada la funcionalidad, no la disponibilidad</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Toda clave tiene su hot key</div>
+          <p>Cualquier esquema de particionado tiene un valor (o unos pocos) que concentra carga: el usuario famoso, el canal viral, el producto más vendido. Un buen diseño <strong>reconoce su hot key</strong> y decide de antemano qué hacer (sub-particionar, cachear, derivar). "No lo tuvimos en cuenta" no es un plan.</p>
+        </div>
+
+        <h3>Rebalanceo en producción: mover sin romper</h3>
+        <p>Cuando añades el shard D a un clúster de 3 con datos, quieres mover la mínima cantidad. Con <em>consistent hashing</em> solo ~1/4 de las claves cambia de casa. El proceso típico: (1) crear particiones lógicas, (2) migrar una a una en segundo plano, (3) redirigir lecturas cuando esté sincronizada, (4) retirar la vieja. Nunca se para el servicio para reequilibrar.</p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Elige como clave <strong>el campo por el que filtras y escribes</strong></td><td>Elegir la clave "porque es la PK" sin mirar las consultas</td><td>Determina cuántos shards toca cada operación: lo más barato de todas las decisiones</td></tr>
+            <tr><td>Compón la clave si es monótona: <code>(user_id, fecha)</code></td><td>Particionar solo por <code>timestamp</code> o <code>id</code> autoincremental</td><td>Evita el hotspot del "shard del presente"</td></tr>
+            <tr><td>Usa <strong>particiones lógicas</strong> y muévelas enteras</td><td>Asignar "un shard por nodo" rígido</td><td>Rebalancear moviendo unidades lógicas es seguro y sin parada</td></tr>
+            <tr><td>Diseña para que cada transacción <strong>quepa en un shard</strong></td><td>Transacciones que tocan varios shards por diseño</td><td>Las transacciones distribuidas son lentas y frágiles</td></tr>
+            <tr><td><strong>Desnormaliza</strong> lo que un join cruzaría</td><td>Hacer joins cross-shard en cada lectura</td><td>Duplicar un campo es más barato que coordinar dos shards siempre</td></tr>
+            <tr><td>Mide el <strong>sesgo</strong> de cada partición</td><td>Asumir reparto uniforme sin comprobarlo</td><td>El 80/20 es la norma: unas pocas claves acaparan el 80% del tráfico</td></tr>
+            <tr><td>Empieza sin sharding si un nodo basta</td><td>Shardizar "por si acaso" desde el día 1</td><td>El sharding añade coste de operación y de desarrollo; posponlo hasta tener el número</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Particionar por un campo monótono</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-sql">-- ❌ Shard por la parte alta del created_at: todas las filas nuevas
+--    caen en el mismo shard "presente"; los viejos están ociosos.
+--    shard = year(created_at) mod 4
+INSERT INTO events (created_at, ...) VALUES (now(), ...);  -- siempre al shard de hoy
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-sql">-- ✅ Compón con una clave de alta cardinalidad: el "presente" se reparte
+--    shard = hash(device_id) mod 4   (y dentro, orden por created_at)
+INSERT INTO events (device_id, created_at, ...) VALUES ('dev-9f21', now(), ...);
+</code></pre>
+
+        <h3>Olvidar que las consultas de rango cruzan shards</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ Clave = user_id con hash. Consulta de negocio:
+   "dame los pedidos de TODOS los usuarios entre el 1 y el 10 de octubre"
+   → toca los N shards y agrega en la aplicación. Si N=64,
+     cada reporte son 64 llamadas (scatter-gather).
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Los reportes agregados se sirven desde un almacén aparte
+   (data warehouse / modelo analítico) que se alimenta de los shards
+   por streaming. El shard operacional se optimiza para "mi usuario",
+   no para "todos los usuarios".
+</code></pre>
+
+        <h3>Reasignar con <code>mod N</code></h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-bash"># ❌ Pasar de 4 a 5 shards con mod.
+#    hash(key) mod 4  →  hash(key) mod 5
+#    Casi TODAS las claves cambian de shard: migración masiva y errores de lectura.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Usa particiones lógicas + consistent hashing (o tabla de asignación).
+   Añadir un nodo mueve solo ~1/N de las claves; el resto no se toca.
+   shard_actual = ring.lookup(hash(key))
+</code></pre>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ El sharding no arregla un modelo malo</div>
+          <p>Si tus consultas no encajan en una sola clave, shardizar solo multiplica el problema: pasarás de "una consulta lenta" a "N consultas lentas coordinadas". Antes de shardizar, pregúntate si el modelo de datos (índices, desnormalización, caché) puede resolverlo en un solo nodo. Ver <a href="04-indices-y-modelado.html">Índices y modelado</a>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> elegir clave de partición y estrategia de rebalanceo para el servicio de mensajería del caso de chat.</p>
+        <ol class="steps">
+          <li><strong>Paso 1 — lista los accesos con su volumen.</strong>
+            <pre><code class="language-text">A) Enviar mensaje a la conversación C.        → 6 000/s (pico 24 000/s)
+B) Leer los últimos 50 mensajes de C.          → 50 000/s
+C) Listar mis conversaciones y último mensaje. → 5 000/s
+D) Buscar mensajes por texto.                  → 300/s
+</code></pre>
+          </li>
+          <li><strong>Paso 2 — identifica el acceso dominante.</strong> B (50 000/s) manda: todo debe organizarse para que leer una conversación sea <strong>un solo acceso por rango</strong>.</li>
+          <li><strong>Paso 3 — elige la clave.</strong> <code>conversation_id</code> como clave de partición y <code>sent_ts</code> como clave de orden dentro del shard. Verifica: A reparte (muchas conversaciones activas), B es un rango en un shard, C es un índice por usuario (tabla aparte, otra clave).</li>
+          <li><strong>Paso 4 — separa entidades con claves distintas.</strong> <code>messages</code> se particiona por <code>conversation_id</code>; la lista de conversaciones por usuario (<code>user_id</code>) es otra tabla, particionada por <code>user_id</code>. Cada una optimizada para su acceso; nada de un solo esquema para todo.</li>
+          <li><strong>Paso 5 — decide el reparto y el rebalanceo.</strong> Reparto por <em>hash</em> de <code>conversation_id</code>; 1 024 particiones lógicas sobre 16 nodos físicos. Añadir un nodo mueve ~1/16 de las particiones. La migración es en caliente, copiando y redirigiendo lecturas al terminar.</li>
+          <li><strong>Paso 6 — planifica el hot key.</strong> El canal del evento masivo C* se sub-particiona en <code>(conversation_id, bucket=hash(user_id) mod 8)</code>; al leer, se juntan los 8 buckets y se ordenan. Se acepta que esa lectura concreta toca 8 particiones; el resto del sistema no se resiente.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>Un esquema donde cada acceso habitual toca <strong>una sola partición</strong>, con un caso especial documentado para el canal caliente. El trade-off aceptado (la lectura sub-particionada del canal masivo) queda escrito como ADR, no como sorpresa.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El shard que se mudó solo</h3>
+          <p>Tienes un sistema de <strong>pedidos</strong> particionado por <code>hash(customer_id) mod 8</code>. El negocio añade un requisito nuevo: "un <em>manager</em> debe poder ver los pedidos de <strong>toda una región</strong> (p. ej. España) en tiempo casi real, ordenados por fecha".</p>
+          <p>Diseña cómo satisfacerlo <strong>sin cambiar la clave de partición</strong> de la tabla operacional (que sigue optimizando "mis pedidos"). Considera al menos dos opciones (proyección/lectura dedicada, cola de eventos, etc.), estímalas en latencia y coste, y elige una con su trade-off.</p>
+          <p>Después responde: si mañana toda España compra a la vez y el shard de la región se satura, ¿qué parte de tu diseño protege al sistema y cuál se degrada primero?</p>
+          <p><em>Pista: no metas "región" en la clave de escritura (crearías un hotspot enorme por país). Piensa en una <strong>vista materializada</strong> o en un <strong>flujo de cambio</strong> que construye la vista por región a partir de los eventos de todos los shards (Módulo 4). El sistema operacional se queda por <code>customer_id</code>; la vista de manager es un consumidor aparte.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Particionar</strong> reparte filas; <strong>shardizar</strong> reparte particiones entre servidores. Es la vía a la escala horizontal.</li>
+          <li>La <strong>clave de partición</strong> decide todo: qué se consulta en una llamada y qué se reparte entre nodos.</li>
+          <li>Tres repartos: <strong>rango</strong> (rangos rápidos, riesgo de hotspot), <strong>hash</strong> (reparto uniforme, rangos costosos), <strong>geo</strong> (latencia y residencia de datos).</li>
+          <li>Claves <strong>monótonas</strong> (fechas, ids) crean <strong>hotspots</strong>; compón la clave para evitarlo.</li>
+          <li><strong>Rebalancea</strong> con particiones lógicas o <em>consistent hashing</em>, no con <code>mod N</code>.</li>
+          <li><strong>Joins y transacciones cross-shard</strong> se pagan caros: diseña para que quepan en un shard, o desnormaliza.</li>
+          <li>Toda clave tiene su <strong>hot key</strong>: decídete de antemano.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>Particionar por rango</td><td>Consultas por rango frecuentes y clave sin correlación con el tráfico (o con salto tipo <em>leaderboard</em>)</td></tr>
+            <tr><td>Particionar por hash</td><td>Acceso por igualdad de clave y necesidad de reparto uniforme</td></tr>
+            <tr><td>Particionar por geo</td><td>Latencia por cercanía y/o requisitos legales de residencia de datos</td></tr>
+            <tr><td>Consistent hashing / particiones lógicas</td><td>Clúster que crece o encoge; rebalanceo sin parada ni remapeo masivo</td></tr>
+            <tr><td>No shardizar</td><td>Un nodo (o vertical + réplicas) cubre el volumen y el crecimiento no es inminente</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuándo dejo de pensar y shardizo? ¿Hay un número?</summary>
+            <div>
+              <p>No hay un número universal, pero sí señales: el nodo está al <strong>% alto de CPU/IO</strong> en horas punta de forma sostenida; el conjunto de datos no cabe en el disco/RAM del nodo y crece; o las migraciones/backups de una base dominan el tiempo de operación. Antes de shardizar agota lo barato: índices, caché, réplicas de lectura, archivado de datos fríos. El coste del sharding es permanente; el de optimizar, puntual.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo shardizar y seguir haciendo joins?</summary>
+            <div>
+              <p>Sí, pero casi siempre de forma limitada: joins <em>dentro</em> de un shard son gratis; joins <em>entre</em> shards requieren que la aplicación los componga (traer datos y unir en código) o que desnormalices. La práctica habitual en sistemas distribuidos es <strong>replicar los datos que unen</strong> (guardar el nombre del producto junto al pedido) para evitar el join cross-shard. Ver <a href="04-indices-y-modelado.html">Índices y modelado</a>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué es un hotspot y cómo lo detecto?</summary>
+            <div>
+              <p>Un hotspot es una partición que recibe mucha más carga que las demás. Se detecta <strong>midiendo</strong>: CPU/IO por shard, tamaño de cada partición y QPS por shard, no la media global (que esconde el problema). Si un shard va al 90% y el resto al 10%, tienes un sesgo: revisa si la clave de partición correlaciona con el tráfico.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El sharding mejora la latencia?</summary>
+            <div>
+              <p>Puede mejorarla porque cada nodo maneja menos datos (índices más pequeños y en RAM) y menos escrituras. Pero <strong>no es su objetivo principal</strong>: sirve para escalar capacidad de escritura y almacenamiento. Si lo que quieres es bajar la latencia de lectura, suele ser más efectivo un buen caché (Módulo 3) o réplicas de lectura cercanas al usuario.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los shards son lo mismo que las réplicas?</summary>
+            <div>
+              <p>No, y es clave no confundirlos. <strong>Shard</strong> = una parte <em>distinta</em> de los datos (A aquí, B allá) para repartir carga. <strong>Réplica</strong> = una copia <em>completa</em> de los mismos datos para tolerar fallos y servir más lecturas. Lo normal es combinar: cada shard suele tener a su vez réplicas. Eso lo desarrolla <a href="03-replicacion-y-consistencia.html">Replicación y consistencia</a>.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

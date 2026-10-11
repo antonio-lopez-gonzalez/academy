@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-patrones-de-mensajeria">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patrones de mensajería — Módulo 4 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Patrones de mensajería</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Mensajería y asincronía</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya sabemos que un mensaje puede fluir por una <strong>cola</strong> (una tarea para un consumidor) o por un <strong>stream</strong> (un hecho retenido para varios). Pero entre «tengo un broker» y «tengo un sistema de mensajería robusto» hay un conjunto de <strong>patrones</strong> que resuelven los problemas que aparecen el primer día en producción: ¿cómo hago que <em>varios</em> servicios reaccionen al mismo evento? ¿qué hago con el mensaje que siempre falla? ¿qué pasa cuando el consumidor es más lento que el productor? ¿cómo mantengo el orden sin renunciar al paralelismo?</p>
+        <p>Esta lección es un catálogo razonado de seis patrones, cada uno con su problema, su forma y su coste:</p>
+        <ul>
+          <li><strong>Pub/sub</strong> y <strong>fan-out</strong>: un emisor, muchos receptores.</li>
+          <li><strong>Work queue</strong>: una tarea, repartida entre varios trabajadores.</li>
+          <li><strong>Dead-letter queue (DLQ)</strong>: dónde van los mensajes que no se pueden procesar.</li>
+          <li><strong>Backpressure</strong>: qué hacer cuando el consumidor no da abasto.</li>
+          <li><strong>Orden y particiones</strong>: cómo conservar el orden donde importa.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque casi todos los incidentes de mensajería son de estos cinco tipos: un evento que debía llegar a tres servicios llegó a uno; un mensaje «veneno» bloqueó una partición durante horas; el broker se llenó de un millón de mensajes durante un pico; dos eventos del mismo pedido se procesaron al revés. Reconocer el patrón es reconocer el fallo <em>antes</em> de que ocurra.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>1. Pub/sub: un evento, muchos interesados</h3>
+        <p><strong>Publish/Subscribe</strong> desacopla a quien <em>produce</em> un evento de quienes lo <em>consumen</em>: el productor publica en un <em>tópico</em> y no conoce a nadie; cada suscriptor recibe su propia copia. Es el patrón natural cuando un hecho interesa a varios subsistemas independientes.</p>
+        <pre><code class="language-text">PUB/SUB
+
+                 +-------------------+
+  Publisher ---->|  TOPICO           |----> Suscriptor A  (recibe su copia)
+  OrderPlaced    |  "orders.created" |----> Suscriptor B  (recibe su copia)
+                 |                   |----> Suscriptor C  (recibe su copia)
+                 +-------------------+
+
+  El publisher no sabe (ni le importa) cuantos hay. Add un suscriptor = 0 cambios
+  en el publisher.
+</code></pre>
+        <p><strong>Trade-off:</strong> desacoplamiento y extensibilidad a cambio de <strong>opacidad</strong>. El publisher no sabe si un suscriptor procesó o falló; si algo se pierde, se descubre tarde. Por eso pub/sub sin <em>monitorización de lag</em> ni DLQ es peligroso.</p>
+
+        <h3>2. Fan-out: una escritura, N efectos</h3>
+        <p>El <strong>fan-out</strong> es el caso concreto de pub/sub donde <em>un solo</em> evento dispara <em>N</em> efectos. Si el fan-out se hace <em>en el momento de escribir</em> (fan-out on write), el productor encola N trabajos; si se hace <em>al leer</em> (fan-out on read), cada lector calcula su vista bajo demanda. Es una de las decisiones centrales del caso de <strong>feed de noticias</strong> (módulo 6).</p>
+        <pre><code class="language-text">FAN-OUT ON WRITE (escribe para 1.000 seguidores -> 1.000 trabajos)
+  PostCreated --> [ 1000 mensajes ] --> bandejas de seguidores
+  Pro: lectura baratisima (ya esta hecho)   Con: escritura muy cara; autores con 10M
+       seguidores generan tormentas de escritura.
+
+FAN-OUT ON READ (no crea nada; cada lector consulta al abrir)
+  Abrir feed --> consulta "a quien sigo" --> junta últimos posts --> ordena
+  Pro: escritura barata   Con: lectura cara; cada apertura hace mucho trabajo.
+</code></pre>
+        <div class="callout callout--note">
+          <p><strong>El patrón real es híbrido.</strong> Para la mayoría de usuarios, fan-out on write (lectura instantánea); para las pocas cuentas <em>celebrity</em> con millones de seguidores, fan-out on read (para no generar 10 M de trabajos por publicación). Se llama <em>push/pull híbrido</em>. Ni un extremo ni el otro: se elige por coste y por latencia.</p>
+        </div>
+
+        <h3>3. Work queue: una tarea, repartida</h3>
+        <p>El patrón <strong>competing consumers</strong> (ya visto en la lección 1): N trabajadores sacan de la misma cola, cada mensaje lo procesa uno. Sirve para <strong>escalar el procesamiento</strong> y para <strong>limitar la concurrencia</strong> hacia un recurso caro (por ejemplo, solo 5 trabajadores pueden hablar con el ERP a la vez).</p>
+        <pre><code class="language-text">WORK QUEUE
+
+  Productor  --> [ tarea t1 t2 t3 t4 t5 ] -->  pool de N workers --> resultado
+                   (cada tarea la coge UN worker)
+
+  Escala el throughput anadiendo workers, hasta el limite del recurso
+  externo (DB, API de terceros, CPU).
+</code></pre>
+
+        <h3>4. Dead-letter queue: el vertedero de los mensajes imposibles</h3>
+        <p>Algún mensaje <em>siempre</em> fallará: payload corrupto, referencia a un dato que ya no existe, un <em>bug</em> que provoca una excepción. Si lo reintentas indefinidamente, bloqueas la cola o quemas CPU. La <strong>DLQ</strong> es una cola aparte a la que se envían los mensajes tras N intentos fallidos, para inspeccionarlos sin frenar el flujo normal.</p>
+        <pre><code class="language-text">DLQ
+
+  Cola principal --procesar--> Worker
+        ^                        |
+        |  fallo (reintento)     | exito -> ack
+        +------------------------+
+        |
+        +-- tras N intentos --> +-------------+
+                                |    DLQ      |  (se inspecciona y se reencola
+                                +-------------+   manual o automaticamente)
+</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Una DLQ sin dueño es una pérdida silenciosa.</strong> Si nadie mira la DLQ, es equivalente a descartar los mensajes. Necesita <strong>alerta cuando crece</strong> y un proceso para reprocesarla tras corregir la causa. La DLQ no arregla el fallo: lo <em>aísla</em> para que no tumbe lo demás.</p>
+        </div>
+
+        <h3>5. Backpressure: cuando el consumidor no da abasto</h3>
+        <p><strong>Backpressure</strong> (contrapresión) es el mecanismo por el que un sistema lento <em>avisa</em> a otro rápido para que frene, en vez de acumular trabajo hasta morir. Tienes tres palancas y conviene tenerlas decididas <em>de antemano</em>:</p>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Qué hace</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Bloquear / frenar</strong></td><td>El productor espera a que haya hueco</td><td>Traslada la presión hacia arriba (el usuario espera)</td></tr>
+            <tr><td><strong>Descartar</strong></td><td>Se tiran mensajes (los más viejos o los menos importantes)</td><td>Pérdida de datos; debe ser una decisión explícita</td></tr>
+            <tr><td><strong>Degradar</strong></td><td>Se procesan menos cosas o más baratas (solo lo crítico)</td><td>Funcionalidad reducida temporalmente</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-text">BACKPRESSURE — cola acotada (bounded)
+
+  Llegada 800/s                            Consumo 500/s
+       |                                        |
+       v                                        v
+  +---------------------------------------------------+
+  |  Cola con limite MAX = 10.000                     |
+  +---------------------------------------------------+
+       |
+       +-- Si profundidad > MAX: -> rechazar (429/503)   [load shedding]
+                                  -> o degradar (procesar solo lo critico)
+  SIN limite, la cola crece hasta agotar memoria/disco: el sistema muere
+  por saturación, no por el pico.
+</code></pre>
+        <p>La idea central: <strong>un sistema a escala siempre tiene un límite</strong>; la pregunta es si eliges tú dónde ponerlo o lo elige la máquina al quedarse sin recursos. Backpressure es elegir tú.</p>
+
+        <h3>6. Orden y particiones</h3>
+        <p>El orden se consigue <strong>por partición</strong>: misma clave → misma partición → un solo lector por partición garantiza que se leen en orden. El error clásico es mezclar orden con concurrencia sin clave: si dos eventos del mismo pedido caen en particiones distintas, se procesan en paralelo y pueden invertirse.</p>
+        <pre><code class="language-text">ORDEN POR PARTICION
+
+  clave = order_id
+  order#42:  P1: [ created(42) -> paid(42) -> shipped(42) ]   OK, en orden
+  order#43:  P2: [ created(43) -> paid(43) ]                  OK, en orden
+  (order#42 y #43 pueden procesarse en paralelo entre si: no importa su orden relativo)
+</code></pre>
+        <div class="callout callout--tip">
+          <p><strong>Escala vs orden es un trade-off directo.</strong> Una sola partición = orden total = un solo consumidor = poca capacidad. N particiones = capacidad × N = orden solo dentro de cada una. Casi siempre quieres <em>orden por entidad</em>, no orden global, y eso te lo da la clave de partición.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> el evento <code>OrderPaid</code> debe disparar tres cosas: enviar factura, descontar inventario y sumar ventas a métricas. Además, enviar factura a veces falla (el proveedor de PDF se cae).</p>
+        <p><strong>Diseño mínimo con pub/sub + DLQ:</strong></p>
+        <pre><code class="language-text">                          TOPICO "orders.paid"
+  OrderService  --OrderPaid--> [ e1 | e2 | e3 | ... ]
+                                   |     |     |
+             +---------------------+     |     +---------------------+
+             v                           v                           v
+     +----------------+          +----------------+          +----------------+
+     | Factura (cola) |          | Inventario     |          | Metricas       |
+     | -> DLQ si falla|          | (grupo)        |          | (grupo)        |
+     +----------------+          +----------------+          +----------------+
+</code></pre>
+        <p>Supuestos numéricos: 200 pedidos/s de media, pico 800/s. La cola de facturas tiene <strong>4 workers</strong>, cada factura tarda <strong>300 ms</strong> → capacidad 4/0,3 = <strong>13,3/s</strong>.</p>
+        <p>¡Problema! 13/s no absorbe ni la media de 200/s. Aquí el work queue nos da la respuesta aritmética: para sostener 200/s con W = 0,3 s hacen falta L = 200 · 0,3 = <strong>60 workers</strong>. Y para el pico de 800/s, o escalamos a 240 workers, o aceptamos que la cola crezca y drenamos después — decisión según cuánto puede tardar una factura. Como una factura puede esperar minutos, <strong>60 workers + cola profunda acotada</strong> es el punto razonable.</p>
+        <p>Si el proveedor de PDF devuelve un PDF corrupto que siempre falla, ese mensaje va a la <strong>DLQ</strong> tras 5 intentos; la cola principal sigue fluyendo. Y si la cola de facturas pasa de, digamos, 50.000 pendientes (≈ espera de 50.000 / (60/0,3 − 200) ≈ 8 min), se <strong>alerta</strong> y se toma backpressure: la API deja de aceptar pedidos nuevos o los marca como «factura pendiente».</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Este patrón a pequeña escala es <em>exactamente</em> el que aparece en la lección 2 del módulo 6 (rate limiter) y en el <strong>feed de noticias</strong>. Apliquemos los seis patrones a un sistema de notificaciones, tal como lo diseñarías en producción:</p>
+        <table>
+          <thead><tr><th>Patrón</th><th>Dónde aparece</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Pub/sub</td><td>El evento <code>NotificationRequested</code> alimenta Email, Push y SMS</td><td>El emisor no debe conocer los canales</td></tr>
+            <tr><td>Fan-out</td><td>Un post popular genera notificaciones a miles de seguidores</td><td>Un hecho → N efectos; se hace on write con híbrido para celebrities</td></tr>
+            <tr><td>Work queue</td><td>Los envíos de push se reparten entre 40 workers</td><td>El proveedor de push limita la concurrencia</td></tr>
+            <tr><td>DLQ</td><td>Un token de dispositivo inválido tras 3 intentos → DLQ</td><td>No bloquear la cola de push por un token roto</td></tr>
+            <tr><td>Backpressure</td><td>Si la cola de email &gt; 100.000, se degrada a «batch digest»</td><td>Preferimos agrupar correos antes que morir por saturación</td></tr>
+            <tr><td>Orden + particiones</td><td>Stream de notificaciones particionado por <code>user_id</code></td><td>Un usuario ve sus notificaciones en orden</td></tr>
+          </tbody>
+        </table>
+        <p><strong>Números del caso real.</strong> 10 M de notificaciones/día ≈ 116/s de media, con picos ×5 (campaña) = 580/s. El envío de push tarda 100 ms contra el proveedor y este limita a <strong>200 llamadas/s por token de cuenta</strong>. Por la ley de Little, con 40 workers obtienes 400/s de capacidad, por debajo del pico → necesitas <strong>al menos 58 workers</strong> (580 · 0,1) y probablemente más cuentas del proveedor. Ese número —no «muchos workers»— es el que justifica la capacidad.</p>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> el fan-out on write da lecturas instantáneas pero convierte cada publicación de una cuenta popular en millones de escrituras. La solución híbrida (push para el 99 % de cuentas, pull para las <em>celebrity</em>) mantiene ambos costes acotados, a cambio de <strong>dos caminos de lectura</strong> que hay que fusionar y probar. Es más complejo, y por eso solo se justifica cuando las cifras lo exigen.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Definir un número máximo de reintentos y una DLQ</td>
+              <td>Reintentar para siempre un mensaje que no se puede procesar</td>
+              <td>Un mensaje veneno bloquea la partición/cola y consume recursos en vano</td>
+            </tr>
+            <tr>
+              <td>Alertar sobre la <strong>profundidad de cola</strong> y el <strong>lag</strong> del consumidor</td>
+              <td>Mirar solo si el proceso está «up»</td>
+              <td>Un consumidor up pero atrasado 2 horas es un incidente invisible</td>
+            </tr>
+            <tr>
+              <td>Acotar las colas y decidir la reacción al límite (rechazar o degradar)</td>
+              <td>Colas ilimitadas «para no perder nada»</td>
+              <td>Sin límite, el sistema no falla por el pico sino por quedarse sin memoria</td>
+            </tr>
+            <tr>
+              <td>Particionar por la clave de la entidad que necesita orden</td>
+              <td>Particionar al azar y esperar orden</td>
+              <td>El orden solo existe por partición; la clave lo decide</td>
+            </tr>
+            <tr>
+              <td>Usar DLQ por <em>tipo</em> de fallo cuando importe</td>
+              <td>Una única DLQ donde se mezcla todo</td>
+              <td>Distinguir errores transitorios de permanentes acelera el reproceso</td>
+            </tr>
+            <tr>
+              <td>Documentar el contrato del evento (versión, esquema)</td>
+              <td>Cambiar el formato del mensaje sin avisar a los consumidores</td>
+              <td>El broker no valida esquemas por ti; un campo renombrado rompe a todos</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar work queue para algo que necesitaba pub/sub</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Tres consumidores de la MISMA cola "orders.paid"
+# Quieres que los tres reaccionen al pedido, pero compiten:
+Cola [ OrderPaid ] -> Factura lo coge -> se borra.
+                      Inventario y Metricas nunca lo ven.
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Un topico (pub/sub): cada suscriptor recibe su propia copia
+Topico "orders.paid" -> Factura recibe copia
+                     -> Inventario recibe copia
+                     -> Metricas recibe copia
+</code></pre>
+
+        <h3>Reintentar sin límite ni DLQ</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Reintento infinito de un payload corrupto
+on_error: retry_forever()
+# La particion se atasca: todo lo que va detras espera indefinidamente (head-of-line blocking)
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text">max_attempts = 5
+on_error: if attempts >= max_attempts: publish_to_dlq(message)
+          else: retry_with_backoff(message)
+# El flujo normal continua; el mensaje problematico se aisla.
+</code></pre>
+
+        <h3>Cola ilimitada como supuesta tolerancia a picos</h3>
+        <p>Una cola sin cota no absorbe el pico: lo <strong>convierte en un pico de latencia y luego en una caída por memoria</strong>. Si el productor va a 800/s y el consumidor a 500/s, la cola crece 300/s; con mensajes de 10 KB, eso son 3 MB/s, unos 10 GB/día. Hay que acotar y decidir qué se hace al llegar al tope.</p>
+
+        <h3>Confundir «publicó» con «se procesó»</h3>
+        <p>El publisher recibe un acuse de que el broker <em>aceptó</em> el mensaje, no de que un consumidor lo <em>procesó</em>. Si el caso de uso exige confirmación de efecto (por ejemplo, «el pago se aplicó»), necesitas un mecanismo de <strong>respuesta</strong> (un tópico de resultados, una tabla de estado) — pub/sub por sí solo no te lo da.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> añadir DLQ, backpressure y orden a un flujo que ya existe. Vamos paso a paso con números.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Punto de partida.</strong> Un servicio de ingesta recibe eventos de dispositivos IoT y los procesa:
+            <pre><code class="language-text">Llegada: 5.000 eventos/s (pico)
+Procesamiento: 1 ms por evento (CPU ligera)
+Cola: SIN limite, SIN DLQ, SIN particiones
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Dimensiona el consumo.</strong> Con 1 ms por evento, un worker hace 1.000/s. Para 5.000/s necesitas <strong>5 workers</strong> (L = λ·W = 5.000 · 0,001 = 5). Deja margen: <strong>8 workers</strong>.
+          </li>
+          <li>
+            <strong>Paso 3 — Añade la DLQ.</strong> Define la política de fallo:
+            <pre><code class="language-text">max_attempts = 3
+backoff = 100ms, 500ms, 2s   (exponencial, con jitter)
+si attempts >= 3  ->  publicar en "iot.events.dlq"
+                        con metadatos: error, timestamp, payload original
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Acota la cola y define backpressure.</strong> Con 8 workers a 1.000/s = 8.000/s de capacidad, aguantas el pico de 5.000/s con holgura. Pero si un pico dobla a 10.000/s, la cola crece 2.000/s. Fija <code>MAX = 60.000</code> y decide:
+            <pre><code class="language-text">si profundidad > 60.000 (≈ 30 s de cola a 8.000/s de drenaje):
+    -> degradar: procesar SOLO eventos de alarma (criticos)
+    -> descartar el resto (o rechazar 503 al gateway)
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Orden por dispositivo.</strong> Si cada dispositivo debe ver sus eventos en orden, particiona por <code>device_id</code>:
+            <pre><code class="language-text">clave = device_id
+# Todos los eventos de D-17 caen en la misma particion -> un lector -> orden
+# Particiones P = 16 -> hasta 16 consumidores por grupo en paralelo
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación.</strong> Comprueba la decisión contra el checklist:
+            <pre><code class="language-text">[ ] Numero de workers justificado (Ley de Little + margen)
+[ ] DLQ definida con max_attempts y backoff
+[ ] Cola acotada con reaccion al limite (degradar/descartar)
+[ ] Particion por la clave que necesita orden
+[ ] Alertas sobre profundidad de cola y lag
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> 8 workers, cola acotada a 60.000 con degradación a eventos críticos, DLQ tras 3 intentos con backoff, 16 particiones por <code>device_id</code>.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El mensaje veneno que bloquea una partición</h3>
+          <p>En un stream particionado, un mensaje corrupto se reintenta para siempre y bloquea <em>toda</em> su partición: los mensajes que van detrás no avanzan (head-of-line blocking). Diseña una estrategia que permita <strong>saltar el mensaje veneno sin perderlo</strong>, conservando el orden del resto.</p>
+          <p>Deja por escrito: (1) por qué no basta con «reintentar y ya», (2) a dónde va el mensaje para no perderse, (3) cómo se procesan los mensajes posteriores sin romper el orden de la entidad, (4) qué alerta y qué métrica dispararías, (5) qué trade-off introduces al saltarte un mensaje temporalmente.</p>
+          <p><em>Pista: piensa en «enviar el veneno a una DLQ y avanzar el offset», en la diferencia entre orden por partición y orden por entidad, y en «reinyectar el mensaje tras corregir la causa». No escribas el algoritmo completo: decide y justifica.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Pub/sub</strong>: un evento → todos los suscriptores; desacopla, pero oculta el fallo.</li>
+          <li><strong>Fan-out</strong>: un hecho → N efectos; <em>on write</em> (lectura barata) contra <em>on read</em> (escritura barata); híbrido para <em>celebrity</em>.</li>
+          <li><strong>Work queue</strong>: reparte tareas entre consumidores; la ley de Little da el número de workers.</li>
+          <li><strong>DLQ</strong>: aísla el mensaje imposible tras N intentos; necesita vigilancia y reproceso.</li>
+          <li><strong>Backpressure</strong>: frenar, descartar o degradar; acota la cola y decide <em>antes</em> del límite.</li>
+          <li><strong>Orden y particiones</strong>: orden por partición; clave = entidad que necesita orden.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Problema que ves</th><th>Patrón</th><th>Decisión clave</th></tr></thead>
+          <tbody>
+            <tr><td>Un evento debe llegar a varios servicios</td><td>Pub/sub</td><td>Un consumer group por responsabilidad</td></tr>
+            <tr><td>Un hecho dispara miles de efectos</td><td>Fan-out</td><td>On write / on read / híbrido</td></tr>
+            <tr><td>Repartir tareas pesadas y limitar concurrencia</td><td>Work queue</td><td>Nº de workers = throughput × tiempo</td></tr>
+            <tr><td>Mensajes que siempre fallan</td><td>DLQ</td><td>max_attempts + alerta + reproceso</td></tr>
+            <tr><td>Consumidor más lento que el productor</td><td>Backpressure</td><td>Acotar cola; frenar/descartar/degradar</td></tr>
+            <tr><td>Eventos del mismo actor fuera de orden</td><td>Particiones</td><td>Clave de partición + un lector por partición</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Fan-out on write o on read? ¿Cuál elijo y por qué?</summary>
+            <div>
+              <p>Depende de la relación entre <strong>lecturas y escrituras</strong>. Si se publica poco y se lee muchísimo (feeds), <em>on write</em> hace la lectura instantánea y paga el coste en la escritura. Si se publica mucho y se lee poco, <em>on read</em> evita generar miles de trabajos por publicación. Y si hay cuentas con millones de seguidores, la respuesta es <strong>híbrido</strong>: push para la mayoría, pull para las <em>celebrity</em>. Es un trade-off de coste de cómputo y latencia, no una cuestión de gusto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿No es la DLQ una forma de tirar la basura debajo de la alfombra?</summary>
+            <div>
+              <p>Es una forma de <em>aislar</em> la basura, que es distinto. La DLQ evita que un mensaje imposible bloquee a todos los demás; pero sin un <strong>dueño, una alerta y un proceso de reproceso</strong>, se convierte en exactamente eso: una pérdida silenciosa. La regla es que la DLQ tenga las mismas garantías de observabilidad que la cola principal (tamaño, antigüedad, tasa de entrada) y un runbook para reencolar tras corregir la causa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Backpressure y rate limiting son lo mismo?</summary>
+            <div>
+              <p>Se parecen pero actúan en capas distintas. El <strong>rate limiting</strong> limita cuántas peticiones <em>acepta</em> un servicio en un tiempo, normalmente por cliente, para repartir un recurso (módulo 6). El <strong>backpressure</strong> es la señal de un sistema <em>interno</em> hacia quien le produce: «voy lento, frena o descarta». Se combinan: el rate limiter es la puerta de entrada; el backpressure es la respuesta del motor cuando se satura por dentro.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo elijo la clave de partición?</summary>
+            <div>
+              <p>Elige la unidad que necesitas que esté <strong>ordenada</strong>: <code>user_id</code> si el orden es por usuario, <code>conversation_id</code> para chat, <code>order_id</code> para pedidos, <code>device_id</code> para telemetría. Dos comprobaciones: (1) la clave debe <strong>repartir</strong> bien (evita una clave «caliente» que meta todo en una partición), y (2) no puede cambiar con el tiempo para una misma entidad, o perderás el orden garantizado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo tener varios consumidores del mismo grupo en la misma partición?</summary>
+            <div>
+              <p>No a la vez. En un <em>consumer group</em>, cada partición la lee <strong>un solo</strong> miembro; por eso el paralelismo de un grupo está acotado por el número de particiones. Si quieres más paralelismo, más particiones, con el coste de rebalanceos y de que el orden solo se mantiene dentro de cada una.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

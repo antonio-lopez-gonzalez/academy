@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-invalidacion-y-ttl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Invalidación y TTL — Módulo 3 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Invalidación y TTL</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Caché y consistencia</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya sabes <strong>dónde</strong> cachear y con qué <strong>patrón</strong> (<a href="01-estrategias-de-cache.html">Estrategias de caché</a>). Ahora viene la parte que convierte una caché útil en una caché peligrosa: <strong>cómo se entera la copia de que el original cambió</strong>. Un dicho muy repetido en ingeniería dice que hay dos problemas difíciles en informática: la invalidación de caché y ponerle nombre a las cosas.</p>
+        <p>Esta lección cubre tres familias de problemas que aparecen siempre que hay una caché bajo carga:</p>
+        <ul>
+          <li><strong>Datos viejos</strong>: la copia no refleja el original → TTL e invalidación.</li>
+          <li><strong>Stampede / thundering herd</strong>: una clave caliente caduca y miles de peticiones caen a la vez a la base.</li>
+          <li><strong>Penetración y avalancha</strong>: peticiones de datos que no existen, o un expirado masivo simultáneo, tumban la base.</li>
+        </ul>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque la mayoría de incidentes "la base de datos se ha caído sola" son, en realidad, incidentes de caché: una clave popular que expira y manda 50 000 peticiones al mismo sitio, un despliegue que vacía la caché, o alguien pidiendo <code>/usuario/999999999</code> en bucle. Conocer estos patrones y sus mitigaciones es lo que separa una caché que protege de una caché que amplifica el fallo.</p>
+        </div>
+        <p><strong>Errores típicos:</strong></p>
+        <ul>
+          <li>Poner el <strong>mismo TTL</strong> a todo y crear un expirado sincronizado (avalancha).</li>
+          <li>Invalidar con <code>UPDATE</code> en vez de <code>DELETE</code> y arriesgarse a carreras de escritura.</li>
+          <li>No cachear los "no existe" y dejar que un bucle de claves basura llegue siempre a la base (penetración).</li>
+          <li>No proteger la clave más caliente contra el <em>stampede</em> en su expiración.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Cómo expira o se invalida una copia</h3>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Cómo funciona</th><th>Garantía</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td><strong>TTL</strong></td><td>La clave expira sola tras N segundos</td><td>El dato puede estar viejo hasta N segundos</td><td>Fácil, pero define la "frescura máxima"</td></tr>
+            <tr><td><strong>Write-invalidate</strong> (<code>DELETE</code>)</td><td>Al escribir en la base, se borra la clave</td><td>La próxima lectura trae el valor fresco</td><td>Hay que acordarse de invalidar en cada ruta de escritura</td></tr>
+            <tr><td><strong>Write-update</strong></td><td>Al escribir se actualiza la copia</td><td>Fresca al instante</td><td>Más riesgo si escritores concurrentes se pisan</td></tr>
+            <tr><td><strong>TTL + invalidación</strong></td><td>Ambos: expiración como red de seguridad y borrado en la escritura</td><td>Fresca en escritura; autocura si una invalidación falla</td><td>El patrón recomendado: cinturón y tirantes</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">La regla del TTL como red de seguridad</div>
+          <p>Nunca confíes solo en la invalidación explícita: si una ruta de escritura olvida invalidar (y alguna lo hará), el dato se queda viejo indefinidamente. <strong>Pon siempre un TTL</strong>, aunque sea largo, para que cualquier olvido se cure solo. TTL corto si no puedes invalidar; TTL largo si invalidación + TTL cubren bien el caso.</p>
+        </div>
+
+        <h3>Invalidar: ¿borrar o sobrescribir? ¿antes o después de escribir?</h3>
+        <p>El patrón por defecto del <em>cache-aside</em> es <strong>escribir en la base y luego borrar la clave</strong> (no actualizarla). Borrar es más seguro: la próxima lectura reconstruye el valor desde la fuente de verdad, evitando carreras entre dos escritores que actualizan la copia en orden distinto.</p>
+        <pre><code class="language-text">   ESCRITURA (actualizar producto 42)
+   1) UPDATE products SET price=... WHERE id=42;   ← la BASE manda
+   2) cache.delete("product:42");                  ← se borra, no se actualiza
+   3) la próxima lectura MISS → rellena con el valor nuevo
+
+   ¿Y si borras ANTES de escribir? Otro lector puede recachear el valor
+   VIEJO entre el delete y el update, y dejarlo viejo un rato. Por eso:
+   se escribe primero, se borra después (o se borra después de confirmar).
+</code></pre>
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ La carrera del borrado y el rellenado</div>
+          <p>Aun escribiendo primero y borrando después, existe una carrera fina: un lector puede leer el valor viejo de la base justo antes de tu <code>UPDATE</code> y guardarlo en la caché <em>después</em> de tu <code>DELETE</code>. Resultado: caché con dato viejo hasta el TTL. No es grave si el TTL es corto. Si es crítico, se usan versiones/estampas (guardar un <em>updated_at</em> y rechazar rellenos más viejos) o se invalida dos veces con un pequeño retardo. La lección práctica: <strong>elige TTL corto para datos con esta carrera y sé consciente de ella</strong>.</p>
+        </div>
+
+        <h3>El stampede (thundering herd)</h3>
+        <p>Es el problema más común bajo carga. Una clave <strong>muy popular</strong> caduca. En ese instante, <em>todas</em> las peticiones que la pedían fallan a la vez y van simultáneamente a la base para recalcular lo mismo.</p>
+        <pre><code class="language-text">   t=0   "home:popular" está en caché, sirve 50 000 RPS
+   t=60  la clave EXPIRA
+         ┌──────────────────────────────────────────────┐
+         │ 50 000 RPS ─┬─ miss ──┐                        │
+         │             ├─ miss ──┤  todos a la vez         │
+         │             └─ miss ──┴──►  BASE DE DATOS 💥   │
+         └──────────────────────────────────────────────┘
+         La base recibe 50 000 consultas idénticas en un segundo.
+         Muchas veces la base se satura → el sistema entero sufre.
+</code></pre>
+        <p><strong>Mitigaciones:</strong></p>
+        <table>
+          <thead><tr><th>Mitigación</th><th>Cómo funciona</th><th>Cuándo aplicarla</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Single-flight / coalescing</strong></td><td>Solo una petición recalcula; las demás esperan su resultado</td><td>Claves calientes; es la mitigación principal</td></tr>
+            <tr><td><strong>Lock por clave</strong></td><td>Un <em>mutex</em> con <code>SET NX</code>: quien lo coge recalcula, el resto reintenta o espera</td><td>Cuando hay varias instancias de aplicación</td></tr>
+            <tr><td><strong>Stale-while-revalidate</strong></td><td>Se sirve la copia vencida mientras <em>una</em> petición la refresca en segundo plano</td><td>Cuando toleras servir algo viejo 1 segundo para no bloquear</td></tr>
+            <tr><td><strong>Recálculo anticipado</strong></td><td>Un proceso refresca las claves calientes antes de que expiren</td><td>Claves cuyo coste de cálculo es alto</td></tr>
+            <tr><td><strong>Expiración probabilística temprana</strong></td><td>Cada petición tiene una probabilidad pequeña de refrescar <em>antes</em> del TTL</td><td>Evita el pico exacto en el instante de expiración</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cache penetration: pedir lo que no existe</h3>
+        <p>Un dato que <strong>no existe</strong> nunca se cachea (no hay valor que guardar), así que <em>cada</em> petición de una clave inexistente va directa a la base. Si alguien pide <code>/usuario/999999999</code> en bucle, la caché no protege en absoluto.</p>
+        <pre><code class="language-text">   petición por clave inexistente ──► caché MISS ──► BASE (busca, no encuentra)
+        ▲                                                      │
+        └────────────── no se cachea nada ─────────────────────┘
+                        (bucle: cada intento golpea la base)
+</code></pre>
+        <table>
+          <thead><tr><th>Mitigación</th><th>Cómo</th><th>Nota</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cachear negativos</strong></td><td>Guardar un marcador "no existe" con TTL corto (p. ej. 30 s)</td><td>Simple y efectivo; evita el bucle sobre el mismo ID falso</td></tr>
+            <tr><td><strong>Bloom filter</strong></td><td>Estructura que dice "esta clave <em>no</em> está" sin consultar la base</td><td>Filtra claves que no existen; puede dar falsos positivos, nunca falsos negativos</td></tr>
+            <tr><td><strong>Validar la entrada</strong></td><td>Rechazar IDs con formato/range imposible antes de tocar la caché</td><td>La primera línea de defensa, casi siempre la más barata</td></tr>
+            <tr><td><strong>Rate limiting</strong></td><td>Limitar peticiones por cliente</td><td>Contra el abuso deliberado (Módulo 6, rate limiter)</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cache avalanche: cuando expira todo a la vez</h3>
+        <p>Si todas las claves tienen el <strong>mismo TTL</strong> (p. ej. se cargaron en el mismo despliegue), todas expiran en el mismo instante y generan un <em>stampede colectivo</em>. Lo mismo ocurre si el <strong>servidor de caché entero se cae</strong> y de repente todo va a la base.</p>
+        <pre><code class="language-text">   TTL idéntico (300s) para 100 000 claves cargadas a la vez
+        t=0    se llenan 100 000 claves
+        t=300  │◄── TODAS expiran en el mismo segundo ──►│
+                    100 000 misses simultáneos  →  BASE 💥
+   FIX: jitter → TTL = base ± aleatorio (p. ej. 300s ± 30s)
+        las expiraciones se reparten en el tiempo, sin pico.
+</code></pre>
+        <table>
+          <thead><tr><th>Mitigación</th><th>Cómo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Jitter en el TTL</strong></td><td>Añadir un aleatorio (±10–20%) para desincronizar expiraciones</td></tr>
+            <tr><td><strong>Caché en dos niveles</strong></td><td>Caché local pequeña (por instancia) + caché distribuida: si la distribuida cae, la local amortigua</td></tr>
+            <tr><td><strong>Calentado (warm-up)</strong></td><td>Tras un despliegue/reinicio, precargar las claves populares antes de abrir tráfico</td></tr>
+            <tr><td><strong>Cortacircuito en la base</strong></td><td>Si la base se satura, servir <em>stale</em> o degradar en vez de inundarla (Módulo 5)</td></tr>
+            <tr><td><strong>Alta disponibilidad de la caché</strong></td><td>Réplica/sharding de Redis para que "caerse todo" sea improbable</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: la panadería a las 8:00</div>
+          <p>El <strong>stampede</strong> es que todos los clientes lleguen a la panadería justo cuando se acabó el pan y pidan a la vez: el panadero no da abasto. <em>Single-flight</em> es poner una cola y hacer un solo horno grande. La <strong>avalancha</strong> es que las 20 panaderías del barrio cierren el mismo día por vacaciones: todos van a la única abierta. El <em>jitter</em> es escalonar las vacaciones. Y la <strong>penetración</strong> es el cliente que pide un pan que no existe en el catálogo y vuelve cada cinco minutos a preguntar.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La <strong>home</strong> de un portal: una sola clave <code>home:data</code> que sirve 50 000 RPS y se recalcula en <strong>800 ms</strong> (una consulta agregada pesada). TTL de 60 s.</p>
+
+        <h3>Sin protección</h3>
+        <pre><code class="language-text">t=0    cache.set("home:data", v, ttl=60)
+t=60   la clave expira.
+       En los siguientes ~800 ms (mientras se recalcula) llegan
+       40 000 peticiones con MISS → 40 000 consultas de 800 ms a la base.
+       La base se satura y probablemente se caiga en cadena.
+</code></pre>
+
+        <h3>Con single-flight (coalescing)</h3>
+        <pre><code class="language-text">function getHome():
+    v = cache.get("home:data")
+    if v: return v                                  # HIT
+    return singleFlight("home:data", () =&gt; {        # solo UNO recalcula
+        v = db.computeHome()                        # 800 ms, una vez
+        cache.set("home:data", v, ttl = 60s + rand(-10,10))  # +jitter
+        return v
+    })
+</code></pre>
+        <p>Ahora, en la expiración, la base recibe <strong>1 consulta</strong> en lugar de 40 000. Las demás peticiones esperan esos 800 ms (o, si se usa <em>stale-while-revalidate</em>, reciben la copia vencida al instante y ni lo notan). Ese salto —de 40 000 consultas a una— es la diferencia entre aguantar y caerse.</p>
+
+        <div class="callout callout--note">
+          <div class="callout__title">El jitter, dos segundos de código</div>
+          <p>Cambiar <code>ttl = 60s</code> por <code>ttl = 60s ± 10s (aleatorio)</code> evita que miles de claves que se llenaron juntas expiren juntas. Es una de las mejoras de robustez más baratas que existen.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado a un <strong>catálogo de productos</strong> con 40 M de fichas y a la <strong>portada</strong> del portal. Supuestos: 40 000 lecturas de ficha/s (90% concentradas en el 1% de productos), 500 escrituras/s de admin, caché Redis de 8 GB.</p>
+
+        <h3>Diseño integral de invalidación</h3>
+        <table>
+          <thead><tr><th>Dato</th><th>Invalidación</th><th>TTL</th><th>Protección</th></tr></thead>
+          <tbody>
+            <tr><td>Ficha de producto (popular)</td><td><code>DELETE product:{id}</code> al actualizar</td><td>10 min ± 2 min (jitter)</td><td>Single-flight por clave; lock distribuido para el top 100</td></tr>
+            <tr><td>Ficha inexistente (ID falso)</td><td>—</td><td>Negativo 30 s</td><td>Cacheo negativo + validación de formato</td></tr>
+            <tr><td>Portada (agregado pesado)</td><td>Invalidar cada 60 s o por evento</td><td>60 s + jitter, con <em>stale-while-revalidate</em></td><td>Un solo recalculador; si la base va lenta, se sirve la copia vieja</td></tr>
+            <tr><td>Búsqueda por texto</td><td>No se invalida por clave (índice aparte)</td><td>—</td><td>Se apoya en el buscador (M2-01), no en la caché</td></tr>
+          </tbody>
+        </table>
+
+        <h3>El lock distribuido, en pseudocódigo</h3>
+        <div class="code-file">pseudocódigo — single-flight entre instancias</div>
+        <pre><code class="language-text">function getProduct(id):
+    key = "product:" + id
+    v = cache.get(key)
+    if v != null: return v
+
+    # solo UNA instancia recalcula; las demás esperan o sirven stale
+    if cache.setNX("lock:" + key, ttl = 5s):
+        try:
+            v = db.queryProduct(id)            # si no existe → valor negativo
+            cache.set(key, v, ttl = 600s + rand(-120, 120))
+            return v
+        finally:
+            cache.del("lock:" + key)
+    else:
+        # otra instancia está recalculando: espera breve y reintenta
+        sleep(50ms)
+        return getProduct(id)   # con límite de reintentos y fallback a la BD
+</code></pre>
+
+        <h3>Qué protege cada pieza</h3>
+        <ul>
+          <li><strong>Single-flight + lock</strong>: evita que 40 000 peticiones de una ficha popular recaigan en la base a la vez.</li>
+          <li><strong>Cacheo negativo con TTL corto</strong>: corta el bucle de IDs falsos (penetración).</li>
+          <li><strong>Jitter</strong>: impide que las 40 M de fichas expiren el mismo segundo (avalancha).</li>
+          <li><strong>Stale-while-revalidate</strong>: si la base va lenta, la portada sigue sirviendo (algo viejo) en vez de caerse.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Despliegues: el peor enemigo de la caché</div>
+          <p>Un despliegue que reinicia Redis (o cambia el prefijo de claves) vacía la caché de golpe: la base recibe de repente el tráfico que la caché absorbía. Por eso hay que <strong>calentar</strong> las claves populares tras un reinicio y <strong>versionar</strong> las claves con cuidado (borrar sin querer es fácil). El "todo iba bien hasta que desplegamos" suele ser esto: no se cayó la caché, se <em>apagó</em> la protección.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Combina <strong>TTL + invalidación explícita</strong></td><td>Confiar solo en una de las dos</td><td>El TTL cura olvidos; la invalidación da frescura en escritura</td></tr>
+            <tr><td>Invalida con <strong><code>DELETE</code></strong> tras escribir</td><td>Actualizar la copia con <code>SET</code> en cada escritura</td><td>Borrar evita carreras entre escritores; la base reconstruye</td></tr>
+            <tr><td>Protege la clave caliente con <strong>single-flight/lock</strong></td><td>Dejar que miles de peticiones recalculen a la vez</td><td>Convierte 40 000 consultas en una en el momento de expirar</td></tr>
+            <tr><td>Añade <strong>jitter</strong> a todos los TTL</td><td>TTL idénticos para todo</td><td>Desincroniza expiraciones y evita la avalancha</td></tr>
+            <tr><td><strong>Cachea negativos</strong> con TTL corto</td><td>Dejar que los "no existe" golpeen siempre la base</td><td>Corta la penetración y protege de bucles/abuso</td></tr>
+            <tr><td>Sirve <strong>stale-while-revalidate</strong> cuando se pueda</td><td>Bloquear todas las peticiones mientras se recalcula</td><td>Mejor servir algo un poco viejo que caerse</td></tr>
+            <tr><td><strong>Calienta</strong> la caché tras un despliegue</td><td>Vaciar la caché y abrir el tráfico a la vez</td><td>Evita inundar la base justo tras el reinicio</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>TTL idéntico para todo</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ for producto in catalogo:
+       cache.set("product:" + id, valor, ttl = 3600)   # todos 1 h exacta
+   Las 40 M de claves expiran el mismo segundo → avalancha.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ ttl = 3600 + random(-600, 600)      # 1 h ± 10 min
+   Las expiraciones se reparten en 20 minutos: nunca hay un pico.
+</code></pre>
+
+        <h3>No proteger la clave caliente</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ v = cache.get("home")
+   if v == null:
+       v = db.computeHome()      # 800 ms
+       cache.set("home", v)
+       return v
+   # 40 000 peticiones concurrentes entran por el if y llaman a computeHome()
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ v = cache.get("home")
+   if v != null: return v
+   return singleFlight("home", () =&gt; {          # solo una ejecuta el cuerpo
+       v = db.computeHome()
+       cache.set("home", v, ttl = 60 + rand(0,10))
+       return v
+   })
+</code></pre>
+
+        <h3>Olvidar cachear los "no existe"</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ v = cache.get("user:" + id)
+   if v != null: return v
+   return db.findUser(id)   # si no existe, devuelve null y NO se cachea
+   # → cada petición del mismo id falso vuelve a la base (penetración)
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ v = cache.get("user:" + id)
+   if v != null: return v                 # puede ser un marcador NEGATIVO
+   row = db.findUser(id)
+   cache.set("user:" + id, row or NEGATIVE, ttl = 30 if row is None else 600)
+   return row
+</code></pre>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ El "thundering herd" también aparece al arrancar</div>
+          <p>El momento más peligroso no es solo la expiración, es el <strong>arranque en frío</strong>: la caché vacía (reinicio, despliegue, clúster nuevo) y todo el tráfico golpeando a la vez. Las mitigaciones son las mismas (single-flight, calentado, stale) y deben estar listas <em>antes</em> del primer despliegue, no después del primer incidente.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> blindar la caché de una <strong>app de noticias</strong> contra los tres enemigos, con números.</p>
+        <ol class="steps">
+          <li><strong>Paso 1 — identifica las claves y su peligro.</strong>
+            <pre><code class="language-text">"home:top"     → 60 000 RPS, una sola clave (STAMPEDE crítico)
+"article:{id}" → 20 000 RPS, popular (single-flight)
+"user:{id}"    → 5 000 RPS, algunos IDs falsos (PENETRACIÓN)
+"feed:{user}"  → 10 000 RPS, TTL corto, personalizado (AVALANCHA si TTL igual)
+</code></pre>
+          </li>
+          <li><strong>Paso 2 — aplica single-flight a "home:top".</strong> Es una sola clave que recalcula en 300 ms: sin protección, 18 000 recálculos simultáneos. Con single-flight: 1.</li>
+          <li><strong>Paso 3 — jitter a todo.</strong> <code>home</code>: 60 s ± 5 s; <code>article</code>: 600 s ± 60 s; <code>feed</code>: 30 s ± 10 s. Se elimina el expirado sincronizado.</li>
+          <li><strong>Paso 4 — cacheo negativo para "user".</strong> TTL 30 s para el marcador "no existe"; además, valida que el ID sea numérico y esté en rango razonable antes de consultar.</li>
+          <li><strong>Paso 5 — stale-while-revalidate para "feed".</strong> El feed personalizado se sirve hasta 60 s vencido mientras se refresca en segundo plano: el usuario nunca bloquea, y el pico de recálculo se reparte.</li>
+          <li><strong>Paso 6 — plan de despliegue.</strong> Al reiniciar la caché, un <em>job</em> precarga <code>home:top</code> y los 1 000 artículos más leídos antes de abrir tráfico. Se documenta como paso del despliegue (ADR).</li>
+          <li><strong>Paso 7 — mide.</strong> Instrumenta <code>cache_hit_ratio</code>, <code>recompute_concurrency</code> (cuántos recalculan la misma clave a la vez) y <code>db_qps</code> en expiración. El objetivo: <code>recompute_concurrency</code> ≈ 1 en cada clave caliente.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>Cada clave con su TTL con jitter, su protección y su plan de arranque en frío. La métrica de éxito no es el hit ratio (que seguirá igual), sino la <strong>concurrencia de recálculo</strong>: que ninguna clave caliente haga más de un recálculo simultáneo.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El ataque de las claves fantasma</h3>
+          <p>Un sistema sufre un pico anómalo: las métricas muestran <strong>200 000 RPS de consultas a la base</strong> buscando IDs de producto aleatorios que en su mayoría <strong>no existen</strong>. El cacheo negativo habitual no basta porque <strong>cada petición usa un ID distinto</strong>: nunca se repite una clave, así que el cacheo por clave es inútil.</p>
+          <p>Diseña una defensa en capas para un ataque de <em>cache penetration</em> con claves siempre nuevas: piensa en qué estructura puede decir "este ID no existe" <strong>sin</strong> ir a la base y sin cachear cada clave, en cómo limitar el volumen por cliente, y en cómo degradar sin tumbar el sistema. Estima cuántas consultas a la base sobreviven a cada capa.</p>
+          <p><em>Pista: un <strong>Bloom filter</strong> puede responder "definitivamente no está" para claves nuevas sin tocar la base, a costa de un poco de memoria y falsos positivos. Combínalo con <strong>validación de formato</strong> y <strong>rate limiting</strong> por IP/usuario (Módulo 6). Ordena las capas por coste: primero lo barato (formato), luego lo probabilístico (Bloom), luego el límite por cliente. Y piensa qué pasa cuando el atacante usa IDs <em>válidos pero inexistentes</em>: ahí el Bloom es tu única defensa antes de la base.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La <strong>invalidación</strong> es el problema difícil: <strong>TTL</strong> (cura olvidos) + <strong>invalidación explícita</strong> (frescura en escritura) es la combinación recomendada.</li>
+          <li>Invalida con <strong><code>DELETE</code> tras escribir</strong>, no actualizando la copia; deja que la próxima lectura reconstruya.</li>
+          <li><strong>Stampede / thundering herd</strong>: una clave caliente expira y miles de peticiones recaen a la vez. Se arregla con <strong>single-flight</strong>, lock y <em>stale-while-revalidate</em>.</li>
+          <li><strong>Cache penetration</strong>: peticiones a datos inexistentes que la caché nunca puede servir. Se arregla con <strong>cacheo negativo</strong>, <strong>Bloom filter</strong> y validación.</li>
+          <li><strong>Cache avalanche</strong>: expiración masiva simultánea o caída de la caché. Se arregla con <strong>jitter</strong>, dos niveles de caché y calentado.</li>
+          <li>Los <strong>despliegues</strong> que vacían la caché son un disparador clásico de avalancha: calienta antes de abrir tráfico.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Problema</th><th>Mitigación principal</th><th>Extra</th></tr></thead>
+          <tbody>
+            <tr><td>Datos viejos</td><td>Invalidar (DELETE) tras escribir</td><td>TTL como red de seguridad</td></tr>
+            <tr><td>Stampede / thundering herd</td><td>Single-flight / coalescing</td><td>Stale-while-revalidate; expiración probabilística temprana</td></tr>
+            <tr><td>Cache penetration</td><td>Cacheo negativo</td><td>Bloom filter; validación; rate limiting</td></tr>
+            <tr><td>Cache avalanche</td><td>Jitter en el TTL</td><td>Dos niveles de caché; calentado; HA de la caché</td></tr>
+            <tr><td>Arranque en frío</td><td>Warm-up de claves populares</td><td>Degradación elegante si la base va lenta</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuánto TTL pongo? ¿Hay una fórmula?</summary>
+            <div>
+              <p>No hay fórmula mágica: el TTL es tu <strong>frescura máxima tolerada</strong>. Si aceptas que un dato esté 5 minutos viejo, TTL 5 min. Ese es el criterio: pregúntate "¿cuánto daño hace que este dato esté N segundos desactualizado?" y pon ese N (con jitter). TTL largo = menos carga y más riesgo de viejo; TTL corto = más fresco y más carga. Y si puedes invalidar en escritura, el TTL pasa a ser solo la red de seguridad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué borrar la clave es mejor que actualizarla?</summary>
+            <div>
+              <p>Porque actualizarla en la caché requiere que dos escritores concurrentes se pongan de acuerdo en el orden, y pueden actualizarla al revés que la base. Borrar no tiene orden relativo: la próxima lectura reconstruye desde la <strong>fuente de verdad</strong>, que siempre manda. El único caso que favorece actualizar es cuando el dato es carísimo de recomputar y siempre está en caché; aun así, el borrado es más seguro por defecto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Single-flight y un lock distribuido son lo mismo?</summary>
+            <div>
+              <p>No exactamente. <em>Single-flight</em> (coalescing) garantiza que dentro de <strong>una misma instancia</strong> solo una petición recalcula por clave. El <strong>lock distribuido</strong> (p. ej. con Redis <code>SET NX</code>) extiende esa garantía <strong>entre instancias</strong>: sin él, con 100 réplicas de aplicación, podrías tener 100 recálculos simultáneos de la misma clave. Para claves muy calientes conviene el lock; para el resto, single-flight local suele bastar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo cacheo negativo sin romper el flujo "luego sí existe"?</summary>
+            <div>
+              <p>Con un TTL corto (p. ej. 30 s) para los negativos, y con un marcador distinguible de un valor real (un objeto <code>{exists: false}</code>, no un <code>null</code> ambiguo). Así, si el dato se crea después, en menos de un minuto se cachea de verdad. Si el dato puede crearse y debe verse al instante, la ruta de creación <strong>invalida la clave</strong> para forzar la recarga.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Stale-while-revalidate no me rompe la consistencia?</summary>
+            <div>
+              <p>Sirve datos un poco viejos a cambio de no bloquear, así que <strong>solo</strong> vale donde ese pequeño retraso es aceptable (portada, feed, catálogo). No lo uses para "mi saldo" ni "mi stock antes de pagar". Es un trade-off explícito: un pelín de antigüedad menos a cambio de muchísima más resiliencia bajo carga. Documéntalo por dato; no lo apliques en bloque.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

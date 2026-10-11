@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-circuit-breaker-bulkhead">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cortacircuitos y bulkhead — Módulo 5 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Cortacircuitos y bulkhead</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Resiliencia</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La lección anterior nos dio timeouts y reintentos: cortar la espera y volver a intentarlo con mesura. Pero hay un escenario que esos dos mecanismos no resuelven bien: <strong>una dependencia que está cayéndose del todo durante minutos</strong>. En ese caso, cada petición esperará su timeout completo (o casi) antes de fallar, y las que reintenten añadirán aún más carga. El resultado es que <em>tu</em> servicio, que estaba sano, se queda sin recursos esperando a un vecino que está caído. El fallo <strong>se contagia</strong>.</p>
+        <p>Esta lección trata dos patrones que <strong>aíslan el fallo</strong> en lugar de intentar arreglarlo:</p>
+        <ul>
+          <li><strong>Circuit breaker (cortacircuitos):</strong> detecta que una dependencia falla de forma masiva y deja de llamarla durante un rato, <em>fallando rápido</em> en vez de esperar. Como el automático de tu casa: corta la corriente antes de que un cortocircuito queme toda la instalación.</li>
+          <li><strong>Bulkhead (mamparo):</strong> aísla los recursos por dependencia, para que el fallo de una no consuma todos los recursos que necesitan las demás. Como los mamparos de un barco: un compartimento inundado no hunde el barco entero.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existen?</strong> Porque en un sistema con muchas dependencias, el problema no es «una falla» sino «una falla y arrastra a las demás». Estos patrones convierten un fallo masivo en una <strong>degradación local y contenida</strong>: lo que se rompe se rompe solo, y el resto del sistema sigue funcionando.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El contagio del fallo (por qué no basta con timeouts)</h3>
+        <p>Imagina que tu API depende de <code>recomendaciones</code> y de <code>pagos</code>. Comparten un <em>pool</em> de 100 conexiones. Si <code>recomendaciones</code> se cae y cada llamada espera 400 ms antes de fallar, con 500 req/s hacia recomendaciones, en 200 ms <strong>las 100 conexiones están ocupadas esperando</strong>. Ahora una llamada a <code>pagos</code> (que está sana) no encuentra conexión libre y también falla. <strong>El fallo se ha contagiado</strong> sin que pagos tuviera nada que ver.</p>
+        <pre><code class="language-text">CONTAGIO POR RECURSOS COMPARTIDOS
+
+  Pool de 100 conexiones (compartido)
+       |            |
+       |            +--> pagos (SANO)  &lt;- sin hueco, falla
+       |
+       +--> recomendaciones (CAIDO)  &lt;- ocupa las 100 conexiones esperando 400ms
+                                          y las libera ya fallidas
+
+  Resultado: una dependencia caida tumba a las sanas -> cascada de fallos.
+</code></pre>
+
+        <h3>Circuit breaker: dejar de llamar cuando está claro que va a fallar</h3>
+        <p>El cortacircuitos envuelve las llamadas a una dependencia y observa el resultado. Tiene <strong>tres estados</strong>:</p>
+        <pre><code class="language-text">ESTADOS DEL CIRCUIT BREAKER
+
+   +---------+   fallos superan umbral (p.ej. 50% en 20 llamadas)   +---------+
+   | CERRADO |------------------------------------------------------>| ABIERTO |
+   | (normal)|                                                        | (corta) |
+   +---------+                                                        +---------+
+        ^                                                                  |
+        |  exito suficiente                                     pasa el timeout
+        |                                                        (p.ej. 30s)
+   +-----------+                                                          v
+   | SEMIABIERTO|&lt;---------------------------------------------------------+
+   | (prueba 3)|
+   +-----------+
+        |  falla -> vuelve a ABIERTO
+        |  exito -> vuelve a CERRADO
+</code></pre>
+        <ul>
+          <li><strong>Cerrado (closed):</strong> funciona normal; las llamadas pasan y se cuentan los éxitos/fallos.</li>
+          <li><strong>Abierto (open):</strong> cuando los fallos superan un umbral, el circuito se abre: durante un tiempo (por ejemplo, 30 s) <strong>todas las llamadas fallan al instante</strong> sin intentar llegar a la dependencia. Esto es <em>fail fast</em>: libera recursos y da aire al servicio caído para recuperarse.</li>
+          <li><strong>Semiabierto (half-open):</strong> pasado el tiempo, deja pasar <em>unas pocas</em> llamadas de prueba. Si funcionan, vuelve a cerrado; si fallan, reabre. Así la recuperación se descubre sin volver a machacar a la dependencia.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> es el diferencial de tu casa. Si un aparato hace saltar el automático, el diferencial corta <em>toda</em> la línea. No «intenta un poquito más» cada vez; corta, y tras un rato te deja probar a reconectar. Si el problema persiste, vuelve a saltar. Como en casa, el objetivo no es arreglar el aparato, sino evitar el incendio.</p>
+        </div>
+        <p><strong>Parámetros que hay que decidir</strong> (y justificar con números, no «failures = 5»):</p>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Ejemplo</th><th>Por qué ese valor</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Umbral de fallo</strong></td><td>50 % en una ventana de 20 llamadas</td><td>Sensible al fallo masivo, insensible a fallos aislados</td></tr>
+            <tr><td><strong>Ventana mínima</strong></td><td>≥ 20 llamadas antes de evaluar</td><td>Evita abrir por dos fallos en tráfico bajo</td></tr>
+            <tr><td><strong>Tiempo de apertura</strong></td><td>15–30 s</td><td>Suficiente para que la dependencia se recupere; no tanto como para parecer «muerta»</td></tr>
+            <tr><td><strong>Llamadas de prueba</strong></td><td>3 en semiabierto</td><td>Pocas, para no reabrir la tormenta; bastantes para tener señal</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>El circuito necesita un plan B.</strong> Cuando está abierto, ¿qué devuelves? Fallar rápido sin alternativa es correcto para operaciones críticas (cobrar), pero malo para secundarias (recomendaciones). La respuesta suele ser <strong>degradar</strong>: servir un valor por defecto, caché o vacío (lección 3). Un cortacircuitos sin fallback convierte un fallo de la dependencia en un fallo visible del usuario.</p>
+        </div>
+
+        <h3>Bulkhead: aislar recursos para que un fallo no los consuma todos</h3>
+        <p>El patrón <strong>bulkhead</strong> reparte los recursos (conexiones, hilos, peticiones concurrentes) en <strong>compartimentos por dependencia</strong>, de forma que una dependencia no pueda acapararlo todo. Aunque <code>recomendaciones</code> se caiga y ocupe su compartimento entero, <code>pagos</code> conserva el suyo y sigue funcionando.</p>
+        <pre><code class="language-text">BULKHEAD (mamparos por dependencia)
+
+  SIN bulkhead:  [================ Pool unico 100 ================]
+                 recomendaciones (caida) acapara todo -> pagos ahogado
+
+  CON bulkhead:  [ Pool recos: 30 ][ Pool pagos: 50 ][ Pool busqueda: 20 ]
+                 recomendaciones se hunde SOLO en sus 30 -> pagos intacto con sus 50
+</code></pre>
+        <p>Formas de implementarlo:</p>
+        <ul>
+          <li><strong>Pools separados</strong> de conexiones o hilos por dependencia.</li>
+          <li><strong>Límite de concurrencia</strong> por dependencia (por ejemplo, máximo 30 llamadas simultáneas a <code>recomendaciones</code>).</li>
+          <li><strong>Bolsa de trabajo por prioridad</strong>: reservar capacidad para operaciones críticas.</li>
+          <li>A nivel de infraestructura: <strong>instancias o clústeres separados</strong> por dependencia (aislamiento físico).</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p><strong>Bulkhead y circuit breaker se complementan.</strong> El bulkhead limita <em>cuánto</em> puede consumir una dependencia cuando va lenta; el circuit breaker deja de llamarla cuando falla claramente. Juntos: «no te doy más de 30 conexiones» + «si fallas masivamente, ni te llamo». La combinación es la forma estándar de contener un fallo.</p>
+        </div>
+
+        <h3>Fail fast: el coste oculto de esperar</h3>
+        <p>Un error rápido es mejor que uno lento, casi siempre. Si sabes que una dependencia está caída, esperar 400 ms por petición solo sirve para <strong>consumir recursos y latencia</strong> antes de fallar. <strong>Fail fast</strong> (fallar rápido) libera esos recursos y da al usuario una respuesta clara antes. Es un trade-off cultural: duele ver un error inmediato, pero es mejor que una espera que acaba en el mismo error y encima ha bloqueado recursos.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> una API con un pool de 100 conexiones compartido entre <code>recomendaciones</code> (no crítico) y <code>pagos</code> (crítico). Comparamos antes y después de añadir bulkhead + circuit breaker.</p>
+        <p><strong>Antes (sin patrones):</strong></p>
+        <pre><code class="language-text">Pool unico: 100 conexiones
+recomendaciones se cae -> cada llamada espera 400ms -> ocupa las 100
+En 400ms, pagos no tiene conexion -> falla.
+Impacto: UNA dependencia caida degrada TODO el servicio.
+</code></pre>
+        <p><strong>Después (bulkhead + circuit breaker):</strong></p>
+        <pre><code class="language-text">Bulkhead:
+  Pool pagos:          50 conexiones   (critico, nunca se queda sin hueco)
+  Pool recomendaciones: 30 conexiones   (no critico, acotado)
+  Pool busqueda:       20 conexiones
+Circuit breaker en recomendaciones:
+  umbral: 50% en ventana de 20 llamadas
+  tiempo de apertura: 20s
+  semiabierto: 3 llamadas de prueba
+
+Escenario: recomendaciones se cae.
+  1. Las 30 conexiones se saturan, se detectan fallos.
+  2. El circuito se ABRE en ~200ms.
+  3. A partir de ahi, cada llamada a recomendaciones falla en 0ms (fail fast).
+  4. Las 50 conexiones de pagos NUNCA se vieron afectadas.
+  5. A los 20s, 3 llamadas de prueba: si van bien, el circuito cierra.
+</code></pre>
+        <p><strong>El número que decide:</strong> sin bulkhead, una caída de <code>recomendaciones</code> afectaba al <strong>100 %</strong> del servicio; con bulkhead, solo a las operaciones que usan recomendaciones (una parte). Sin circuit breaker, cada llamada a la dependencia caída costaba 400 ms; con él, 0 ms tras abrir. Ambas cifras —100 %→contenido y 400 ms→0— son las que justifican la complejidad.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <strong>rate limiter</strong> del módulo 6 depende de un almacén distribuido (Redis). Ese almacén es <em>crítico</em>: si no responde, ¿dejamos de limitar y aceptamos todo (riesgo de saturación) o rechazamos todo (auto-DoS)? Aplicar circuit breaker y bulkhead hace explícita la respuesta.</p>
+        <p><strong>Diseño del rate limiter frente a la caída de Redis:</strong></p>
+        <pre><code class="language-text">API gateway -> [ circuit breaker ] -> [ bulkhead: 40 conexiones ] -> Redis
+                     |
+                     +-- abierto -> FALLBACK: limitar con estado LOCAL en memoria
+                                    (aproximado, por instancia) durante 20s
+</code></pre>
+        <table>
+          <thead><tr><th>Parámetro</th><th>Valor</th><th>Justificación</th></tr></thead>
+          <tbody>
+            <tr><td>Umbral del circuito</td><td>60 % de fallos en 30 llamadas</td><td>Redis suele fallar «del todo»; umbral alto evita abrir por latencia puntual</td></tr>
+            <tr><td>Tiempo de apertura</td><td>20 s</td><td>Un nodo de Redis suele recuperarse rápido; 20 s limita el periodo degradado</td></tr>
+            <tr><td>Bulkhead</td><td>40 conexiones máx. al almacén</td><td>El breakdown de Redis no consume el pool del gateway</td></tr>
+            <tr><td>Fallback</td><td>Límite por instancia en memoria (local)</td><td>Degradación aceptable: se limita peor, pero no se deja pasar todo</td></tr>
+          </tbody>
+        </table>
+        <p><strong>El trade-off del fallback, con números.</strong> Con 10 instancias y límite global de 10.000 req/s, el fallback local permite 10 × (10.000/10) = 10.000 req/s <em>si el reparto es perfecto</em>, pero si el balanceador envía el 70 % del tráfico a 3 instancias, esas 3 permiten 3.000 req/s cuando deberían sostener 7.000 → <strong>se pasa el límite en un 133 %</strong>. Es un fallback imperfecto: mejor que no limitar en absoluto o que bloquear todo, pero hay que documentar que durante el fallo el límite es <em>aproximado</em>.</p>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> el circuit breaker con fallback introduce una <strong>ventana de comportamiento degradado</strong> (limitación aproximada, datos algo obsoletos, etc.). La decisión no es «¿protejo o no?» sino «¿qué degradación acepto durante N segundos y cómo la hago visible?». Un fallback silencioso que nadie sabe que existe es un fallback que se rompe en el peor momento.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Un <strong>circuito por dependencia</strong></td>
+              <td>Un único circuito compartido por varias dependencias</td>
+              <td>El fallo de una abriría el circuito de todas, contagiando el fallo</td>
+            </tr>
+            <tr>
+              <td>Pools/concurrencia <strong>separados</strong> por dependencia</td>
+              <td>Un pool global para todo</td>
+              <td>Una dependencia lenta consume el pool entero y ahoga a las sanas</td>
+            </tr>
+            <tr>
+              <td>Definir un <strong>fallback</strong> para el estado abierto</td>
+              <td>Dejar el circuito sin plan B</td>
+              <td>Fallar rápido sin alternativa convierte un fallo interno en uno visible</td>
+            </tr>
+            <tr>
+              <td>Reservar capacidad para lo <strong>crítico</strong></td>
+              <td>Repartir el pool a partes iguales entre crítico y secundario</td>
+              <td>Lo crítico (pagos) no debe depender de que lo secundario (recomendaciones) vaya bien</td>
+            </tr>
+            <tr>
+              <td>Monitorizar el <strong>estado del circuito</strong> y los eventos de apertura</td>
+              <td>Ocultar cuándo abre y cierra</td>
+              <td>Las aperturas son señal de un incidente (o de un umbral mal puesto)</td>
+            </tr>
+            <tr>
+              <td>Probar el circuito y los fallbacks <strong>a propósito</strong> (caos)</td>
+              <td>Descubrir el fallback roto durante la caída real</td>
+              <td>Un mecanismo de resiliencia no probado es una ilusión</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Umbral de fallo basado en números absolutos, no en tasa</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Abrir el circuito tras 5 fallos, sin mas contexto
+if consecutive_failures &gt;= 5: open()
+# Con trafico bajo, un par de errores de red abre el circuito y bloquea todo.
+# Con trafico alto, 5 fallos sobre 10.000 es normal y no deberia abrir.
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Abrir por TASA de fallo sobre una ventana minima
+if window.calls &gt;= 20 and window.failure_rate &gt; 0.5: open()
+# Sensible al fallo masivo, robusto en trafico bajo.
+</code></pre>
+
+        <h3>Saltar directo de abierto a cerrado</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text">open for 20s -> closed   # reabre todo el trafico de golpe
+# Si la dependencia solo se recupero un poco, vuelve a caer -> ciclo abrir/cerrar
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text">open for 20s -> half-open (3 pruebas) -> closed
+# La recuperacion se CONFIRMA con pocas llamadas antes de devolver todo el trafico.
+</code></pre>
+
+        <h3>Un pool compartido entre dependencias</h3>
+        <p>El error estructural que ya vimos: sin bulkhead, una dependencia lenta acapara los recursos compartidos. La corrección es separar pools o limitar concurrencia por dependencia. Es más trabajo de configuración, pero es lo que evita que el fallo se propague.</p>
+
+        <h3>Circuit breaker sin fallback para lo secundario</h3>
+        <p>Abrir el circuito de <code>recomendaciones</code> y devolver un error 500 al usuario es peor que servir una lista vacía o una caché: el usuario ve «roto» algo que era prescindible. La corrección: para dependencias no críticas, el estado abierto debe producir una <strong>degradación</strong>, no un error.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> configurar bulkhead y circuit breaker para un checkout, con números.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Mapa de dependencias.</strong>
+            <pre><code class="language-text">checkout depende de:
+  pagos        (CRITICO)    : 80 peticiones concurrentes en pico, p99 300ms
+  antifraude   (CRITICO-ish): 80 concurrentes, p99 600ms
+  recomendaciones (SECUNDARIO): 60 concurrentes, p99 200ms
+Presupuesto del pool total: 200 conexiones
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Reparte el pool (bulkhead).</strong> Reserva a lo crítico y acota lo secundario:
+            <pre><code class="language-text">pagos:           90 conexiones   (critico, con holgura; 80 + 12,5%)
+antifraude:      60 conexiones   (critico pero admite algo de espera)
+recomendaciones: 30 conexiones   (secundario, acotado)
+comodin:         20 conexiones   (reserva para picos puntuales)
+Total: 200
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Configura el circuito de cada dependencia no crítica.</strong> Para <code>recomendaciones</code>:
+            <pre><code class="language-yaml">circuit_breaker:
+  name: recomendaciones
+  failure_rate_threshold: 0.5    # 50%
+  minimum_calls: 20             # ventana minima
+  open_duration_s: 20           # cuanto esta abierto
+  half_open_calls: 3            # pruebas de recuperacion
+  fallback: "lista_vacia_cache" # degradar, no error
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Calcula el efecto del fail fast.</strong> Si recomendaciones se cae y NO hubiera circuito:
+            <pre><code class="language-text">60 concurrentes * 200ms de timeout cada uno = ocupan sus 30 conexiones
++ 30 conexiones del comodin se llenan tambien -> pagos empieza a sufrir
+Con circuito abierto tras ~200ms: llamadas a recomendaciones fallan en 0ms
+-> las 30 conexiones quedan libres -> pagos conserva 90 + comodin. Sin contagio.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Define el comportamiento del fallback.</strong> Cuando el circuito está abierto, el checkout <strong>no falla</strong>: devuelve la página con recomendaciones vacías (o desde caché) y sigue mostrando pagos. Se registra una métrica <code>recomendaciones.circuit_open</code> para saber cuánto tiempo estuvo degradado.
+          </li>
+          <li>
+            <strong>Paso 6 — Verificación.</strong>
+            <pre><code class="language-text">[ ] Cada dependencia tiene su PROPIO circuito
+[ ] Umbral por TASA con ventana minima (no fallos absolutos)
+[ ] Recuperacion via half-open, no salto directo a cerrado
+[ ] Pool repartido (bulkhead); lo critico tiene reserva
+[ ] Fallback definido para lo secundario (degradar, no error)
+[ ] Metricas de estado del circuito y aperturas
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> 90/60/30/20 conexiones por dependencia, circuitos independientes con umbral 50 % en ≥20 llamadas, recuperación half-open a los 20 s, y fallback de lista vacía para recomendaciones.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El circuito demasiado nervioso</h3>
+          <p>Tras añadir un circuit breaker, monitorizas y ves que abre y cierra decenas de veces por hora sin que la dependencia esté realmente caída; solo tiene picos de latencia. Los usuarios ven errores intermitentes que antes no veían. Diagnostica y rediseña la configuración para que el circuito se active ante fallos <em>reales</em> y no ante latencia normal de un sistema sano.</p>
+          <p>Deja por escrito: (1) por qué un umbral mal elegido produce «flapping» (abrir/cerrar continuo), (2) cómo distinguir «lento» de «caído» al contar fallos (pista: ¿cuenta un timeout como fallo?), (3) qué papel juegan la ventana mínima, el tiempo de apertura y el half-open, (4) qué métrica vigilarías para detectar flapping, (5) el trade-off entre sensibilidad (detectar pronto) y estabilidad (no abrir por ruido).</p>
+          <p><em>Pista: piensa en «fallo» como resultado del efecto combinado de timeout y error, en ventanas deslizantes con mínimo de llamadas, y en que abrir el circuito también tiene coste (se deja de usar un servicio que a lo mejor funcionaba). No implementes: decide y justifica.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Sin aislamiento, el fallo <strong>se contagia</strong> por recursos compartidos (cascada).</li>
+          <li><strong>Circuit breaker</strong>: <em>cerrado</em> (normal) → <em>abierto</em> (fail fast durante un tiempo) → <em>semiabierto</em> (pocas pruebas) → cerrado.</li>
+          <li>Parámetros por <strong>tasa</strong> de fallo con ventana mínima, no por fallos absolutos.</li>
+          <li><strong>Bulkhead</strong>: pools/concurrencia separados por dependencia; lo crítico conserva su reserva.</li>
+          <li><strong>Fail fast</strong> libera recursos y da al usuario una respuesta antes.</li>
+          <li>El circuito necesita un <strong>fallback</strong>: degradar lo secundario, no solo fallar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Problema</th><th>Patrón</th><th>Decisión clave</th></tr></thead>
+          <tbody>
+            <tr><td>Una dependencia falla de forma masiva</td><td>Circuit breaker</td><td>Umbral por tasa + half-open + fallback</td></tr>
+            <tr><td>Una dependencia lenta consume todos los recursos</td><td>Bulkhead</td><td>Pool/concurrencia por dependencia</td></tr>
+            <tr><td>Lo crítico se degrada por una dependencia secundaria</td><td>Bulkhead + prioridad</td><td>Reserva capacidad para lo crítico</td></tr>
+            <tr><td>Errores lentos que bloquean recursos</td><td>Fail fast</td><td>Cortar en cuanto se sabe que va a fallar</td></tr>
+            <tr><td>Circuito abierto y usuario ve un error</td><td>Fallback / degradación</td><td>Servir caché/vacío para lo secundario</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿En qué se diferencia un circuit breaker de un timeout?</summary>
+            <div>
+              <p>El timeout actúa <strong>por llamada</strong>: corta <em>una</em> espera concreta. El circuit breaker actúa <strong>por dependencia</strong>: si muchas llamadas fallan, deja de llamarla <em>del todo</em> durante un rato. El timeout pregunta «¿cuánto espero a esta respuesta?»; el circuito pregunta «¿merece la pena seguir llamando a este servicio?». Se usan juntos: el timeout alimenta al circuito con señal de fallo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un timeout cuenta como fallo para el circuito?</summary>
+            <div>
+              <p>Casi siempre sí, y es la parte delicada. Un timeout significa «no obtuve respuesta a tiempo»; si es por lentitud reiterada, el circuito debe abrir para dar aire y proteger al cliente. Pero si la dependencia solo roza tu umbral de timeout ocasionalmente, contar cada uno como fallo hace que el circuito «flappee». La clave es la <strong>tasa sobre una ventana mínima</strong>: unos pocos timeouts no abren nada; una mayoría sí.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Bulkhead no es solo «limitar la concurrencia»?</summary>
+            <div>
+              <p>Limitar la concurrencia <em>de una dependencia</em> es una forma de bulkhead; aislar <em>pools separados</em> es otra; reservar instancias físicas aparte es la versión de infraestructura. La idea común es siempre la misma: garantizar que el consumo de una dependencia no pueda acaparar recursos que necesitan las otras. Cuanto más fina la separación, más aislamiento pero más recursos «inmovilizados» en cada compartimento.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo que el circuit breaker y el fallback funcionan?</summary>
+            <div>
+              <p>Introduciendo fallos <em>a propósito</em>: <strong>chaos engineering</strong>. Apagar/ralentizar una dependencia en un entorno controlado y comprobar (1) que el circuito abre cuando debe, (2) que el fallback responde, (3) que el resto del sistema sigue sano, y (4) que el circuito vuelve a cerrar al recuperarse. Un mecanismo de resiliencia que nunca se ha disparado es un mecanismo en el que no puedes confiar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo debe estar abierto el circuito?</summary>
+            <div>
+              <p>Ni demasiado poco (abre y reabre en bucle, «flapping») ni demasiado (el servicio se recuperó pero tú sigues sin usarlo). Un orden de magnitud típico es <strong>10–30 s</strong>, ligado al tiempo que tarda un servicio en reiniciarse o en drenar su cola. Lo importante es que el estado <em>semiabierto</em> confirme la recuperación con unas pocas llamadas de prueba antes de devolver todo el tráfico, en lugar de saltar directo a cerrado.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

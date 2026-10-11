@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="02-balanceo-de-carga">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Balanceo de carga — Módulo 1 · Curso System Design</title>
+  <meta name="description" content="Balanceadores L4 vs L7, algoritmos (round-robin, least-conn, hash), health checks, sticky sessions y cómo repartir carga sin crear nuevos puntos únicos de fallo.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Balanceo de carga</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Escalabilidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya decidiste que quieres escalar horizontalmente: varias instancias trabajando en paralelo. Pero si hay varias, ¿quién decide cuál atiende cada petición? Ese es el trabajo del <strong>balanceador de carga</strong> (load balancer): recibir el tráfico y repartirlo entre los nodos, detectar los que están enfermos y sacarlos de la rotación. Es la pieza que convierte «varios servidores» en «un servicio».</p>
+        <p>Parece simple —«reparte, ¿no?»—, pero la forma de repartir cambia el comportamiento del sistema entero: con conexiones largas, con datos pegados a un usuario o con nodos de distinta capacidad, un reparto ingenuo puede mandar todo a un nodo y dejarlos a los demás mirando. Aquí aprenderás a elegir con criterio.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque el balanceador es la puerta de entrada del sistema horizontal y, si se diseña mal, él mismo se convierte en el cuello de botella o en el punto único de fallo. Además, sus decisiones (¿sticky o no? ¿L4 o L7?) condicionan la gestión de sesiones de la <a href="03-stateless-y-sesiones.html">lección 3</a>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dónde encaja el balanceador</h3>
+        <pre><code class="language-text">   Clientes ──▶ [ Balanceador ] ──┬──▶ [ Servidor #1 ]
+                                  ├──▶ [ Servidor #2 ]
+                                  ├──▶ [ Servidor #3 ]
+                                  └──▶ [ Servidor #N ]
+
+   El balanceador, además de repartir:
+     · comprueba la SALUD de cada servidor (health checks)
+     · puede terminar TLS (descifrar HTTPS)
+     · puede enrutar por ruta/dominio/headers (si es L7)
+     · mantiene las CONEXIONES abiertas con los nodos (connection pooling)
+        </code></pre>
+        <p>Un balanceador puede vivir en varios sitios: como servicio en la nube (alojado), como software propio (nginx, HAProxy, Envoy), o <em>en el propio cliente</em> (el cliente conoce la lista de nodos y elige). También está el caso especial de los balanceadores de las nubes, que en realidad suelen ser varios nodos redundantes por debajo (para no ser un punto único).</p>
+
+        <h3>Capa 4 vs capa 7: dos niveles de «inteligencia»</h3>
+        <p>Los balanceadores trabajan en una de dos capas del modelo de red:</p>
+        <table>
+          <thead><tr><th></th><th>L4 (transporte: TCP/UDP)</th><th>L7 (aplicación: HTTP)</th></tr></thead>
+          <tbody>
+            <tr><td>Qué ve</td><td>IP, puerto, conexión</td><td>URL, cabeceras, cookies, método</td></tr>
+            <tr><td>Cómo reparte</td><td>Por conexión (una conexión = un nodo)</td><td>Por petición (cada request puede ir a otro nodo)</td></tr>
+            <tr><td>Velocidad</td><td>Muy alto (poco trabajo)</td><td>Menor (hay que parsear HTTP)</td></tr>
+            <tr><td>Enrutado fino</td><td>No (no entiende rutas)</td><td>Sí (<code>/api/*</code> → un servicio; <code>/img/*</code> → otro)</td></tr>
+            <tr><td>Termina TLS</td><td>Normalmente no (passthrough)</td><td>Sí, suele descifrar y volver a cifrar</td></tr>
+            <tr><td>Ejemplos de uso</td><td>Bases de datos, WebSocket crudo, UDP</td><td>APIs REST, webs, enrutado por dominio</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">Cómo decidir en 5 segundos</div>
+          <p>¿Necesitas enrutar por URL, cookies o cabeceras, o terminar TLS? → <strong>L7</strong>. ¿Solo repartir conexiones TCP crudas a máxima velocidad y no te importa HTTP? → <strong>L4</strong>. Muchos sistemas usan <em>ambos</em>: un L4 delante de un clúster de L7.</p>
+        </div>
+
+        <h3>Algoritmos de reparto: no todos sirven para lo mismo</h3>
+        <ul>
+          <li>
+            <strong>Round-robin.</strong> Turnos rotativos: petición 1 → nodo A, petición 2 → nodo B, petición 3 → nodo C, y vuelve a empezar. Simple y justo <em>si</em> todos los nodos son iguales y las peticiones cuestan lo mismo.
+          </li>
+          <li>
+            <strong>Round-robin ponderado.</strong> Como el anterior, pero cada nodo tiene un peso (por ejemplo, un nodo «grande» pesa doble). Útil con hardware heterogéneo.
+          </li>
+          <li>
+            <strong>Least connections.</strong> Manda al nodo con <em>menos conexiones activas</em>. Excelente cuando las peticiones tienen duración muy variable: evita cargar al nodo que ya está ocupado.
+          </li>
+          <li>
+            <strong>Least response time.</strong> Combina conexiones y latencia medida. Más fino, más caro de calcular.
+          </li>
+          <li>
+            <strong>IP hash / hash de la petición.</strong> El mismo cliente (o misma clave) va siempre al mismo nodo. Es la base del «sticky» y del <em>hash consistente</em>.
+          </li>
+        </ul>
+        <pre><code class="language-text">   Round-robin (peticiones cortas e idénticas):
+     P1 ─▶ A   P2 ─▶ B   P3 ─▶ C   P4 ─▶ A   P5 ─▶ B   ...
+
+   Least-conn (peticiones de duración variable):
+     A: 12 conex. activas   B: 3 conex.   C: 8 conex.
+     nueva petición ─▶ B   (la menos cargada, aunque el turno no le toque)
+
+   Hash consistente (misma clave → mismo nodo):
+     hash(user_42) ─▶ nodo B   SIEMPRE, hasta que cambie el anillo
+        </code></pre>
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: el aparcamiento</div>
+          <p>Round-robin es «reparte las entradas por orden de llegada a las plazas», bonito mientras todos los coches ocupen lo mismo. Least-conn es «manda el coche a la fila más corta»: mejor cuando unos tardan mucho (camiones) y otros poco (motos). El hash es «este coche siempre aparca en la plaza 7»: cómodo si el coche guarda cosas allí, pero si la plaza 7 se cierra, hay que reubicar ese coche.</p>
+        </div>
+
+        <h3>Health checks: no repartas hacia un nodo muerto</h3>
+        <p>Un balanceador sin chequeos manda tráfico a nodos caídos y el usuario ve errores. Por eso pregunta periódicamente <em>«¿estás bien?»</em> a un endpoint (por ejemplo <code>/health</code>) y solo reparte a los que responden bien. Hay dos tipos:</p>
+        <ul>
+          <li><strong>Activo:</strong> el balanceador lanza su propia petición de prueba cada X segundos (<code>/health</code> → 200 OK).</li>
+          <li><strong>Pasivo:</strong> observa los fallos reales de las respuestas y marca al nodo como sospechoso por un tiempo (<em>circuit breaking</em> aplicado al balanceador).</li>
+        </ul>
+        <pre><code class="language-text">   cada 5 s:  [ LB ] ──GET /health──▶ [ #1 ]  200 OK  → sigue en rotación
+              [ LB ] ──GET /health──▶ [ #2 ]  200 OK  → sigue
+              [ LB ] ──GET /health──▶ [ #3 ]  500 ⨯   → FUERA de rotación
+                                                     (y vuelve cuando se cura)
+        </code></pre>
+        <div class="callout callout--warning">
+          <div class="callout__title">Chequeo superficial vs profundo</div>
+          <p>Un health check que solo comprueba «el proceso vive» puede dar OK en un nodo cuya <em>base de datos</em> no responde. Un chequeo profundo (¿puedo hacer una consulta?) detecta más, pero es más frágil: si la dependencia se cae para todos, <em>todos</em> los nodos salen de rotación y tumbas el servicio entero. El equilibrio: chequeo ligero en caliente, alertas separadas para dependencias.</p>
+        </div>
+
+        <h3>Sticky sessions: cómodas, pero caras</h3>
+        <p>Una <strong>sesión sticky</strong> fija al cliente con un nodo concreto (por cookie o por IP). Es tentador: si el nodo #2 guardó la sesión en su memoria, que ese usuario vuelva siempre al #2. El problema es que rompe las virtudes del horizontal: si el nodo #2 cae, la sesión se pierde; y se reparte mal (algunos nodos cargados y otros ociosos).</p>
+        <table>
+          <thead><tr><th>Sin sticky (lo deseable)</th><th>Con sticky (a veces inevitable)</th></tr></thead>
+          <tbody>
+            <tr><td>Cualquier nodo atiende a cualquier usuario</td><td>El usuario queda «casado» con un nodo</td></tr>
+            <tr><td>Caída de un nodo = transparente</td><td>Caída de un nodo = el usuario pierde la sesión</td></tr>
+            <tr><td>Reparto uniforme</td><td>Reparto desigual (usuarios «pesados» juntos)</td></tr>
+            <tr><td>Añadir/quitar nodos es trivial</td><td>Añadir/quitar nodos reubica sesiones</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <div class="callout__title">El sticky es un parche, no una solución</div>
+          <p>Casi siempre que necesitas sticky es porque el estado vive en el nodo. La solución limpia es <strong>sacar la sesión del nodo</strong> (a un store compartido o a un token firmado) y no necesitar sticky en absoluto. Lo verás en la lección siguiente; aquí quédate con que sticky y «sin estado» son tensiones opuestas.</p>
+        </div>
+
+        <h3>Hash consistente: repartir por clave sin rebarajar todo</h3>
+        <p>Cuando quieres que la misma clave vaya al mismo nodo (por ejemplo, el mismo usuario o el mismo archivo cacheado), el hash simple tiene un defecto: al añadir o quitar un nodo, <strong>casi todas</strong> las claves cambian de destino. El <strong>hash consistente</strong> coloca nodos y claves en un anillo y solo reubica las claves del tramo afectado.</p>
+        <pre><code class="language-text">   Anillo de hash:          claves y nodos comparten el círculo
+
+              0 ────────▶  hash (sentido horario)
+            ┌─────────────────────┐
+            │        Nodo A       │
+            │   ● clave1          │   cada clave cae en el primer nodo
+            │          Nodo B ●   │   que encuentra "por delante" en el anillo
+            │  ● clave2           │
+            │        Nodo C       │   quitar Nodo B → solo las claves de
+            └─────────────────────┘   su tramo se reubican en Nodo C.
+                                      El resto no se mueve. ← la magia
+        </code></pre>
+        <div class="callout callout--note">
+          <div class="callout__title">El hash consistente reaparece en todo el curso</div>
+          <p>Lo usarás para repartir datos entre shards (módulo 2), para distribuir claves de caché (módulo 3) y para asignar particiones en un broker de mensajes (módulo 4). Es la herramienta estándar para «dividir por clave sin catástrofes al rebalancear».</p>
+        </div>
+
+        <h3>El balanceador también puede caer</h3>
+        <p>Si hay un solo balanceador, acabas de crear un punto único de fallo justo en la puerta de entrada. Las soluciones habituales: <strong>varios balanceadores redundantes</strong> detrás de una IP flotante (VIP) o de un DNS con failover; o balanceadores activos-activos que se reparten el tráfico. El usuario nunca debe depender de un único balanceador.</p>
+        <div class="callout callout--warning">
+          <div class="callout__title">Dos en punto único no son ninguno si comparten el fallo</div>
+          <p>Tener dos balanceadores en la misma zona y con la misma alimentación no elimina el punto único: solo lo disimula. La redundancia real reparte el riesgo (zonas distintas, rutas distintas). Es la misma lección de la <a href="../00-fundamentos/04-latencia-disponibilidad-slo.html">disponibilidad compuesta</a>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un balanceador con tres nodos y seis peticiones cortas e idénticas. Sigámoslas con round-robin.</p>
+        <pre><code class="language-text">   Nodos: A, B, C   (todos 4 vCPU / 16 GB, idénticos)
+
+   Petición   Algoritmo round-robin      Nodo
+   ────────   ───────────────────────    ────
+      1       (turno 1)                    A
+      2       (turno 2)                    B
+      3       (turno 3)                    C
+      4       (turno 1 otra vez)           A
+      5       (turno 2)                    B
+      6       (turno 3)                    C
+
+   Resultado: 2 peticiones a cada nodo. Reparto perfecto.
+        </code></pre>
+        <p>Y ahora el mismo sistema con peticiones de duración muy distinta (una tarda 10 s, el resto 20 ms). Round-robin dejaría al nodo que coge la petición lenta «ocupado» mientras los otros dos esperan turno. Ahí <strong>least-connections</strong> mete la siguiente petición al nodo libre:</p>
+        <pre><code class="language-text">   Round-robin:  A ← larga(10 s)   B ← corta   C ← corta
+                 y P4 vuelve a A ⇒ P4 espera tras la larga. 😕
+
+   Least-conn:   A ocupado (1 conex.)   B libre   C libre
+                 P4 ─▶ B   P5 ─▶ C   (la siguiente a A solo si sigue libre)
+        </code></pre>
+        <div class="callout callout--tip">
+          <div class="callout__title">El algoritmo lo dicta la forma de la carga</div>
+          <p>Peticiones cortas y uniformes → round-robin. Peticiones de duración irregular (consultas pesadas, subidas, websockets) → least-connections. Clave fija que debe caer siempre en el mismo sitio → hash. No hay uno «mejor»: hay uno <em>adecuado</em>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El balanceo del <strong>URL shortener</strong> en su fase de millones de usuarios. La clave es que el balanceador no solo reparte: <em>protege</em> la experiencia.</p>
+        <pre><code class="language-text">   Internet
+      │
+      ▼
+   ┌─────────────────────┐        VIP con failover
+   │  DNS  ─▶  VIP       │  ← la "puerta" pública, redundante en 2 zonas
+   └─────────┬───────────┘
+             │
+   ┌─────────▼───────────┐   ┌─────────────────────┐
+   │  LB L7  (activo)    │   │  LB L7 (reserva)    │   ← redundante en zonas
+   └─────────┬───────────┘   └─────────────────────┘
+             │   HTTPS ya descifrado (TLS termination)
+             │   enruta: /abc123 → servicio de redirección
+             │            /api/* → servicio de gestión
+             │
+   ┌─────────┼──────────────┬──────────────┐
+   ▼         ▼              ▼              ▼
+[API #1] [API #2] ... [API #N]     (least-connections)
+   │         │              │
+   └─────────┴──────┬───────┘
+                    ▼
+             [ Caché ] ──miss──▶ [ KV store particionado ]
+        </code></pre>
+        <p>Decisiones y porqué:</p>
+        <ul>
+          <li><strong>L7, no L4:</strong> porque enroutamos por ruta (<code>/abc123</code> vs <code>/api</code>) y terminamos TLS. El coste extra de parsear HTTP se compensa con esa flexibilidad.</li>
+          <li><strong>Least-connections:</strong> las redirecciones son rapidísimas, pero la gestión de enlaces (crear, borrar) tiene duraciones variables; least-conn equilibra mejor que round-robin.</li>
+          <li><strong>Sin sticky:</strong> las API son sin estado (la sesión no existe en el nodo). Cualquier nodo atiende cualquier redirección.</li>
+          <li><strong>Health checks cada 5 s</strong> a <code>/health</code> (que verifica «puedo hablar con la caché/almacén»), con umbral de 2 fallos para sacar un nodo y 3 éxitos para devolverlo.</li>
+          <li><strong>Balanceador redundante:</strong> dos LB en zonas distintas con una VIP. La caída de uno no corta el servicio.</li>
+        </ul>
+        <div class="callout callout--why">
+          <div class="callout__title">El balanceador como contrato</div>
+          <p>El balanceador materializa varias promesas del SLO: si un nodo va lento, lo saca; si uno cae, los demás siguen; el usuario nunca habla con un nodo muerto. Es una pieza pequeña con un impacto enorme en la disponibilidad. Pero recuerda: <em>no arregla</em> un cuello de botella aguas abajo (la base de datos); solo reparte la entrada.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Elegir el algoritmo según la forma de la carga</td>
+              <td>Usar siempre round-robin por inercia</td>
+              <td>Con peticiones desiguales, round-robin desequilibra y encola</td>
+            </tr>
+            <tr>
+              <td>Configurar health checks con umbrales sensatos</td>
+              <td>Confiar en que «el proceso vive» es suficiente</td>
+              <td>Un nodo vivo pero sin dependencias atiende peticiones que fallan</td>
+            </tr>
+            <tr>
+              <td>Redundar el balanceador (VIP/failover, zonas)</td>
+              <td>Un único balanceador en la puerta</td>
+              <td>Sería un punto único de fallo peor que el que intentabas evitar</td>
+            </tr>
+            <tr>
+              <td>Aspirar a servicios sin estado (sin sticky)</td>
+              <td>Usar sticky como solución por defecto al estado</td>
+              <td>Sticky rompe el reparto uniforme y la tolerancia a fallos</td>
+            </tr>
+            <tr>
+              <td>Terminar TLS en L7 con cifrado hacia dentro</td>
+              <td>Descifrar y dejar el tráfico interno en claro en redes hostiles</td>
+              <td>Privacidad y cumplimiento; el interno también puede ser espiado</td>
+            </tr>
+            <tr>
+              <td>Drenar conexiones antes de retirar un nodo</td>
+              <td>Cortar el nodo en seco durante un despliegue</td>
+              <td>Connection draining deja acabar las peticiones en vuelo</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Sticky sessions como parche permanente</h3>
+        <span class="code-label code-label--wrong">Mal — pegar el usuario al nodo</span>
+        <pre class="code-wrong"><code class="language-text">Sesión en memoria del nodo + sticky por cookie.
+→ Si el nodo cae, el usuario pierde la sesión.
+→ Algunos nodos se cargan más que otros (usuarios "pesados").
+→ Añadir un nodo apenas alivia (los usuarios siguen pegados).
+</code></pre>
+        <span class="code-label code-label--right">Bien — sacar el estado del nodo</span>
+        <pre class="code-right"><code class="language-text">Sesión en un store compartido (Redis) o en un token firmado.
+Los nodos no guardan estado → no hace falta sticky.
+→ Cae un nodo: transparente. Añadir nodo: reparte de inmediato.
+</code></pre>
+
+        <h3>2. Un solo balanceador = nuevo punto único de fallo</h3>
+        <span class="code-label code-label--wrong">Mal — entré el tráfico por un solo sitio</span>
+        <pre class="code-wrong"><code class="language-text">   Cliente ──▶ [ LB único ] ──▶ [ API ×10]   (¡10 réplicas!)
+   → Cae el LB y el servicio ENTERO cae: las 10 API no ven una sola petición.
+</code></pre>
+        <span class="code-label code-label--right">Bien — balanceador redundante</span>
+        <pre class="code-right"><code class="language-text">   Cliente ──▶ [ VIP ] ──▶ [ LB activo ] + [ LB reserva ]
+                          (failover automático, zonas distintas)
+   → Cae un LB: el otro toma la VIP. El servicio sigue.
+</code></pre>
+
+        <h3>3. Elegir L4 o L7 sin pensar en lo que necesitas</h3>
+        <span class="code-label code-label--wrong">Mal — L4 para enrutar por URL</span>
+        <pre class="code-wrong"><code class="language-text">"Necesito /api/* en el servicio A y /img/* en el servicio B,
+ y terminar HTTPS en la entrada."
+→ Un LB L4 no ve la URL ni descifra TLS: no puede hacerlo.
+</code></pre>
+        <span class="code-label code-label--right">Bien — la capa según la función</span>
+        <pre class="code-right"><code class="language-text">Enrutado por ruta + TLS termination → LB L7.
+Reparto de conexiones TCP crudas a máxima velocidad → LB L4.
+Sistemas grandes: L4 delante de un clúster de L7.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> configurar el balanceo de una API de tres rutas con cargas distintas y comprobar el reparto con números.</p>
+        <p><strong>Datos:</strong></p>
+        <pre><code class="language-text">· Rutas:  /search (pesada, 300 ms)
+           /profile (media, 80 ms)
+           /ping (trivial, 5 ms)
+· Nodos: 3, idénticos, 4 vCPU / 16 GB
+· Tráfico: 1.000 QPS total, repartido 10 % /search, 60 % /profile, 30 % /ping
+· Peticiones largas (search) pueden quedar "en vuelo" a la vez
+· Requisito: si un nodo cae, el servicio sigue con latencia degradada
+        </code></pre>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — ¿L4 o L7?</strong> Hay rutas distintas y quizá TLS: elegimos <strong>L7</strong>, que permite enrutar <code>/search</code>, <code>/profile</code> y <code>/ping</code> por separado si conviene.
+          </li>
+          <li>
+            <strong>Paso 2 — ¿Qué algoritmo?</strong> La duración es muy variable (5 ms a 300 ms), así que <strong>least-connections</strong> evita cargar el nodo que ya tiene búsquedas en vuelo. Si todas las rutas fueran iguales, round-robin bastaría.
+          </li>
+          <li>
+            <strong>Paso 3 — Concurrencia por ley de Little.</strong>
+            <pre><code class="language-text">Concurrencia = QPS de la ruta × latencia (s)
+  /search : 100 QPS × 0,300 s =  30 peticiones en vuelo
+  /profile: 600 QPS × 0,080 s =  48 en vuelo
+  /ping   : 300 QPS × 0,005 s = 1,5 en vuelo
+  ─────────────────────────────────────────────
+  TOTAL ≈ 80 peticiones simultáneas en el sistema
+→ ~27 por nodo con 3 nodos. Manejable.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Reparto con round-robin vs least-conn (nodo que coge la búsqueda).</strong>
+            <pre><code class="language-text">Round-robin puro: el que recibe /search (300 ms) acumula cola.
+Least-conn: las siguientes peticiones van a los nodos con menos
+            conexiones activas → se reparte la cola de búsquedas.
+
+   Reparto esperado de las 30 búsquedas en vuelo:
+     round-robin:  10 / 10 / 10 (y se encolan a la par)
+     least-conn:   ~10 /  10 / 10 estables, pero SIN picos locales
+                    (las cortas rellenan los huecos)
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Health checks.</strong>
+            <pre><code class="language-text">check:  GET /health  cada 3 s   (comprueba "puedo consultar la caché")
+sacar:  tras 2 fallos consecutivos (≈6 s)
+devolver: tras 3 éxitos consecutivos (≈9 s)
+→ Un nodo lento se detecta y sale en pocos segundos.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Caída de un nodo.</strong> Con 3 nodos y uno caído, quedan 2 asumiendo ~80 peticiones en vuelo → ~40 por nodo. La latencia sube (degradación), pero el servicio no se corta. Si el SLO exige no degradar, habría que mantener 4 nodos para tolerar la caída de uno.
+          </li>
+          <li>
+            <strong>Verificación:</strong> el ejercicio debe (a) justificar L7 y least-conn, (b) calcular la concurrencia con Little, (c) fijar umbrales de health check y (d) cuantificar el efecto de la caída de un nodo.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>«LB L7 + least-connections; ~80 peticiones en vuelo; salud cada 3 s con 2 fallos/3 éxitos; con un nodo caído el sistema se degrada pero no cae; para no degradar, dimensionar a N+1 nodos».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Balancear sin perder afinidad de caché</h3>
+          <p>Tu servicio tiene detrás una <strong>caché distribuida en 8 nodos</strong>, y cada clave (<code>user_id</code>) vive en uno concreto. Si el balanceador reparte las peticiones sin mirar la clave, cada nodo de aplicación puede acabar consultando <em>todas</em> las cachés. Diseña una estrategia que (a) reparta carga y (b) mantenga la afinidad «usuario → nodo de caché», usando <strong>hash consistente</strong>, y explica qué pasa cuando añades un noveno nodo de caché (¿cuántas claves se mueven?).</p>
+          <p><em>Pista: con hash consistente, al añadir un nodo solo se reubica el tramo (1/9 ≈ 11 %) de las claves, no todas. Pero necesitas que el nodo de aplicación <strong>calcule</strong> el destino con la misma función de hash que usa la caché (enrutado del lado del cliente) o que un proxy lo haga. Piensa qué ganas en afinidad y qué pierdes en complejidad y en qué ocurre si dos clientes usan funciones de hash distintas.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>balanceador</strong> reparte tráfico, comprueba salud, puede terminar TLS y enrutar; es la puerta del sistema horizontal.</li>
+          <li><strong>L4</strong> reparte conexiones TCP rápido; <strong>L7</strong> entiende HTTP y enruta por ruta/cabecera (a cambio de más trabajo).</li>
+          <li>El algoritmo depende de la carga: <strong>round-robin</strong> (uniforme), <strong>least-connections</strong> (desigual), <strong>hash</strong> (afinidad).</li>
+          <li><strong>Health checks</strong> sacan de rotación a los nodos muertos; cuidado con los chequeos demasiado profundos.</li>
+          <li><strong>Sticky sessions</strong> son un parche: la meta es no necesitarlas (servicios sin estado).</li>
+          <li>El propio balanceador necesita <strong>redundancia</strong>, o se convierte en un punto único de fallo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Situación</th><th>Algoritmo / decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Peticiones cortas e idénticas</td><td>Round-robin</td><td>Reparto perfecto sin coste</td></tr>
+            <tr><td>Peticiones de duración muy variable</td><td>Least-connections</td><td>Evita cargar nodos ya ocupados</td></tr>
+            <tr><td>Debe ir a una clave concreta (caché, datos)</td><td>Hash / hash consistente</td><td>Mantiene afinidad y minimiza el rebalanceo</td></tr>
+            <tr><td>Enrutado por URL, cookies o TLS</td><td>Balanceador L7</td><td>Necesita ver la capa de aplicación</td></tr>
+            <tr><td>Solo repartir conexiones TCP crudas</td><td>Balanceador L4</td><td>Máxima velocidad, mínimo trabajo</td></tr>
+            <tr><td>Sesión en memoria del nodo</td><td>Reevaluar: sacar el estado</td><td>Sticky es síntoma, no solución</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito un balanceador aunque solo tenga dos servidores?</summary>
+            <div>
+              <p>Si tienes más de uno y quieres que el usuario no note cuál le toca —y que un servidor caído no rompa a la mitad de los usuarios—, sí. Aunque sea un balanceador pequeño o el que ofrece tu plataforma, cumple dos funciones críticas: reparto y detección de fallos. Con un solo servidor no lo necesitas; en cuanto hay dos, se vuelve útil.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los balanceadores de las nubes no son un punto único de fallo?</summary>
+            <div>
+              <p>Los gestionados están diseñados precisamente para no serlo: por debajo son varios nodos redundantes con una dirección pública estable. El riesgo no desaparece, se delega: confías en que el proveedor mantenga esa redundancia. Si construyes el tuyo propio con un solo nodo, vuelves a tener el problema.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Sticky sessions son siempre malas?</summary>
+            <div>
+              <p>No siempre; a veces son la opción pragmática (por ejemplo, un sistema heredado con estado en memoria difícil de mover). Pero deben elegirse <em>sabiendo</em> su coste: menor tolerancia a fallos (si cae el nodo, la sesión se pierde) y peor reparto. La pregunta correcta es «¿puedo sacar el estado del nodo?»; si sí, se hace y desaparece el sticky.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa con WebSockets y balanceo?</summary>
+            <div>
+              <p>Un WebSocket es una conexión larga y persistente: el balanceador la asigna a un nodo y ahí se queda hasta que se cierra. Eso es afín al L4 y al «sticky» natural. Por eso los sistemas de chat usan nodos de conexión con estado ligero y, para la afinidad, hash por usuario (lo verás en el caso del módulo 6). La clave: si el usuario debe estar «conectado» a un nodo concreto, diseña la recuperación para cuando ese nodo caiga.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que un nodo recién arrancado reciba todo el tráfico de golpe?</summary>
+            <div>
+              <p>Con <em>connection draining</em> al retirar y <em>slow start</em> al añadir: el balanceador introduce el nodo nuevo poco a poco, dándole tiempo a calentar (cachés frías, JIT, conexiones). Sin esto, un nodo que entra en rotación puede caer por la avalancha inicial. Es un detalle de configuración pequeño con un gran efecto en la estabilidad de los despliegues.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

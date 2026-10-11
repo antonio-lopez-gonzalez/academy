@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-feed-de-noticias">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caso: feed de noticias — Módulo 6 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Caso: feed de noticias</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Casos clásicos</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== --&gt;
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <strong>feed de noticias</strong> es la pantalla que ves al abrir una red social: una lista
+          ordenada de publicaciones de las personas a las que sigues. Detrás hay un sistema distribuido que
+          decide <em>qué</em> te enseño, <em>en qué orden</em> y <em>cuándo lo calculo</em>. Y ahí está el
+          gran dilema de este caso: <strong>¿precalculo tu feed cuando alguien publica (fan-out on write) o
+          lo construyo cuando abres la app (fan-out on read)?</strong></p>
+        <p>Es un caso clásico porque es <strong>extremo en asimetría y en fan-out</strong>: pocos usuarios
+          publican mucho y cada publicación se reparte a muchísimos seguidores. Un solo post de una cuenta
+          con 100 M de seguidores puede generar 100 M de escrituras. Diseñar eso sin que se caiga es el
+          corazón de la lección (el problema de las <em>celebridades</em>).</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe?</div>
+          <p>Porque es el caso donde el <strong>fan-out</strong> y la <strong>hot partition</strong> dejan
+            de ser teoría y se convierten en números terribles. Y porque obliga a combinar datos (Módulo 2),
+            caché (Módulo 3) y mensajería (Módulo 4) en un solo diseño.</p>
+        </div>
+        <div class="callout callout--warning">
+          <div class="callout__title">Errores típicos</div>
+          <p>Calcular el feed con una consulta "trae las publicaciones de todos los que sigo y ordénalas":
+            a escala es imposible. Ignorar el ratio de fan-out y tratar celebridades como usuarios normales.
+            Y confundir el <strong>timeline</strong> (mis publicaciones) con el <strong>feed</strong> (lo que
+            veo de otros).</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== --&gt;
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Requisitos y supuestos</h3>
+        <p><strong>Funcionales:</strong> publicar; seguir/dejar de seguir; ver un feed de las cuentas
+          seguidas; (opcional) ranking y paginación infinita.</p>
+        <p><strong>No funcionales:</strong> feed <strong>eventual</strong> (puede tardar segundos en
+          aparecer un post nuevo), lectura muy rápida y cacheable, escritura escalable, y —clave— que el
+          <strong>fan-out</strong> sea sostenible.</p>
+        <div class="callout callout--note">
+          <div class="callout__title">Supuestos</div>
+          <p>500 M de usuarios, 200 M activos al día. Cada usuario sigue a <strong>200</strong> cuentas de
+            media y publica <strong>0,1 posts/día</strong>. Cada activo abre el feed <strong>10 veces/día</strong>.</p>
+        </div>
+
+        <h3>Estimación: aquí se ve el problema</h3>
+        <table>
+          <thead><tr><th>Métrica</th><th>Cálculo</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Posts/día</td><td>500 M × 0,1</td><td>50 M posts/día</td></tr>
+            <tr><td>Escrituras "de post" (medias)</td><td>50 M / 86 400</td><td>≈ 580 w/s</td></tr>
+            <tr><td>Lecturas de feed (medias)</td><td>200 M × 10 / 86 400</td><td>≈ 23 200 r/s</td></tr>
+            <tr><td>Lecturas de feed (pico ×3)</td><td>23 200 × 3</td><td>≈ 70 000 r/s</td></tr>
+            <tr><td><strong>Fan-out en escritura</strong></td><td>50 M × 200 seguidores</td><td><strong>10 000 M entregas/día</strong></td></tr>
+            <tr><td>Fan-out (medias)</td><td>10 000 M / 86 400</td><td>≈ <strong>116 000 w/s</strong></td></tr>
+            <tr><td>Fan-out (pico ×3)</td><td>116 000 × 3</td><td>≈ <strong>347 000 w/s</strong></td></tr>
+          </tbody>
+        </table>
+        <p>Fíjate en el contraste: escribir un post son 580 w/s; <em>repartirlo</em> a los seguidores son
+          347 000 w/s. Ese multiplicador ×200 (los seguidores) es todo el caso.</p>
+
+        <h3>Fan-out on write (push)</h3>
+        <p>Cuando publicas, copio tu post a las "bandejas de entrada" de todos tus seguidores. Leer el feed
+          es leer <em>tu</em> bandeja: trivial y rapidísimo.</p>
+        <pre><code class="language-text">Al publicar:
+  Autor --&gt; [ Servicio de fan-out ] --&gt; Bandeja de A (1 post)
+                                     --&gt; Bandeja de B (1 post)
+                                     --&gt; ... (200 seguidores = 200 escrituras)
+
+Al leer:
+  A --&gt; [ Bandeja de A ] --&gt; feed ya montado (rapido)
+</code></pre>
+        <table>
+          <thead><tr><th></th><th>Fan-out on write (push)</th></tr></thead>
+          <tbody>
+            <tr><td>Lectura</td><td>Muy rápida (feed precalculado)</td></tr>
+            <tr><td>Escritura</td><td>Cara y amplificada (×seguidores)</td></tr>
+            <tr><td>Consistencia</td><td>Eventual (el feed se rellena tras publicar)</td></tr>
+            <tr><td>Problema</td><td>Celebridades: un post → millones de escrituras</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Fan-out on read (pull)</h3>
+        <p>Cuando publicas, guardas tu post una sola vez. Cuando alguien abre el feed, el sistema busca los
+          posts recientes de todas las cuentas que sigue y los combina ordenados.</p>
+        <pre><code class="language-text">Al leer A (sigue a 200):
+  [ Feed Service ] --&gt; lee ultimos posts de los 200 --&gt; merge + orden --&gt; feed
+                     (200 lecturas + merge en cada apertura)
+</code></pre>
+        <table>
+          <thead><tr><th></th><th>Fan-out on read (pull)</th></tr></thead>
+          <tbody>
+            <tr><td>Escritura</td><td>Barata (1 escritura por post)</td></tr>
+            <tr><td>Lectura</td><td>Cara: N fuentes + merge; difícil de cachear bien</td></tr>
+            <tr><td>Consistencia</td><td>Más fresca (lees los posts al momento)</td></tr>
+            <tr><td>Problema</td><td>Latencia de lectura y "N+1 consultas"</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">Ninguno gana: la respuesta es híbrida</div>
+          <p>Push para usuarios normales (la mayoría; lecturas rápidas), pull para <strong>celebridades</strong>
+            (pocas cuentas; evita el fan-out explosivo). Al leer tu feed, se combinan tu bandeja precalculada
+            (push) con los últimos posts de las celebridades a las que sigues (pull).</p>
+        </div>
+
+        <h3>El problema de las celebridades (hot partition)</h3>
+        <p>Una cuenta con 100 M de seguidores: con push puro, un solo post genera 100 M de escrituras. Eso
+          satura el fan-out y crea una <strong>partición caliente</strong> (todo el mundo leyendo/escribiendo
+          la misma clave). La solución híbrida:</p>
+        <pre><code class="language-text">SI seguidores(post.autor) &gt; UMBRAL (p.ej. 1.000.000):
+     marcar como CELEBRIDAD -&gt; NO hacer push
+     guardar el post solo en el timeline del autor (pull al leer)
+SI NO:
+     hacer push normal a las bandejas de los seguidores
+</code></pre>
+
+        <h3>Timeline y almacenamiento</h3>
+        <ul>
+          <li><strong>Timeline</strong> = la lista de posts de un autor (fuente de verdad). Se guarda
+            particionada por autor.</li>
+          <li><strong>Feed (bandeja)</strong> = lista de <em>referencias</em> (id del post) precalculada por
+            usuario. Guardar referencias, no el contenido, ahorra espacio y evita duplicar el post.</li>
+          <li>El feed reciente va en <strong>Redis</strong> (lista acotada a, digamos, 800 entradas);
+            lo antiguo se pagina contra el timeline/almacén.</li>
+        </ul>
+        <pre><code class="language-text">Bandeja de A (Redis list, cap 800):  [ post_id:98, post_id:97, post_id:95, ... ]
+Timeline de @autor (KV):            post_id -&gt; { texto, media, autor, ts }
+</code></pre>
+
+        <h3>Caché y ranking</h3>
+        <p>El feed cacheado hace que la lectura sea un <em>fetch</em> de una lista. Si el producto quiere
+          orden por relevancia (no cronológico), se separan dos pasos:</p>
+        <ol>
+          <li><strong>Candidatos</strong>: los cientos de posts recientes (de la bandeja push+t pull).</li>
+          <li><strong>Ranking</strong>: un modelo puntúa cada candidato (recencia, afinidad, engagement) y
+            ordena. Se puede cachear el resultado por usuario unos minutos.</li>
+        </ol>
+        <div class="callout callout--note">
+          <div class="callout__title">Chronological vs ranked</div>
+          <p>El orden cronológico es simple, barato y predecible: basta con una lista. El ranking mejora el
+            engagement pero necesita features, un modelo y más cómputo por lectura. No metas ranking si no
+            lo pide el producto: es complejidad real.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== --&gt;
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un feed con <strong>fan-out on write</strong>, tres usuarios y números pequeños. Ana sigue a Bruno
+          y a Carla. Bruno sigue a Carla.</p>
+        <pre><code class="language-text">Estado inicial (bandejas vacias):
+  Ana    -&gt; [ ]
+  Bruno  -&gt; [ ]
+  Carla  -&gt; [ ]
+
+Carla publica el post #1 ("hola")
+  -&gt; seguidores de Carla: Ana, Bruno
+  -&gt; push: bandeja de Ana += #1 ; bandeja de Bruno += #1
+  -&gt; guardar timeline de Carla: [ #1 ]
+
+Bandejas:
+  Ana    -&gt; [ #1 ]
+  Bruno  -&gt; [ #1 ]
+  Carla  -&gt; [ ]
+
+Ana abre el feed -&gt; lee su bandeja -&gt; ve el post #1. FIN.
+</code></pre>
+        <p>Coste: una escritura para el post + <strong>2 escrituras de fan-out</strong> (una por seguidor).
+          Leer el feed de Ana = <strong>1 lectura</strong> de su bandeja. Ahora imagina Carla con 100 M de
+          seguidores: el mismo "push" serían <strong>100 M de escrituras</strong> por un solo post. Ese es
+          exactamente el cliff que resuelve el diseño híbrido.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== --&gt;
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Arquitectura completa con fan-out <strong>híbrido</strong> (push para normales, pull para
+          celebridades), bandejas en Redis y ranking opcional.</p>
+        <pre><code class="language-text">ESCRITURA
+  Autor --&gt; [ API de posts ] --&gt; [ Timeline store (autor) ]   fuente de verdad
+                 |
+                 v
+            [ Cola de fan-out ] --&gt; [ Workers de fan-out ]
+                                       |         |
+                     si NO celebridad |         | si celebridad
+                                      v         v
+                        [ Bandejas (Redis) ]   (no se hace push:
+                         de los seguidores      se lee por pull)
+
+LECTURA
+  Usuario --&gt; [ API de feed ] --&gt; [ Bandeja push (Redis) ]
+                 |                        +
+                 |                        +-- [ pull: ultimos posts de
+                 |                                celebridades seguidas ]
+                 v
+            [ Ranking opcional ] --&gt; [ Cache de feed por usuario ] --&gt; feed
+</code></pre>
+        <h3>Camino de escritura</h3>
+        <ol class="steps">
+          <li><strong>Validar y guardar</strong> el post en el timeline del autor (fuente de verdad) y
+            devolver <code>200</code>. El post ya existe, aunque el feed tarde en reflejarlo (consistencia
+            eventual).</li>
+          <li><strong>Publicar en la cola de fan-out</strong> (Módulo 4). La escritura no espera al fan-out:
+            así, un pico de seguidores no bloquea al autor.</li>
+          <li><strong>Worker de fan-out</strong>: consulta el número de seguidores del autor. Si supera el
+            umbral → <strong>no hace push</strong> (es celebridad). Si no → empuja la referencia del post a
+            las bandejas de los seguidores.</li>
+          <li><strong>Bandeja acotada</strong>: al insertar, se recorta a las últimas 800 referencias para
+            que la memoria no crezca sin fin.</li>
+        </ol>
+        <h3>Camino de lectura</h3>
+        <ol class="steps">
+          <li><strong>Bandeja push</strong>: leer la lista de referencias de Redis (rapidísimo).</li>
+          <li><strong>Pull de celebridades</strong>: para las cuentas "grandes" que sigues, leer sus últimos
+            posts directamente y mezclarlos. Son pocas, así que el coste es bajo.</li>
+          <li><strong>Hidratar</strong>: con las referencias (ids), cargar el contenido del timeline y de la
+            caché de posts (evitando N+1).</li>
+          <li><strong>Ranking (opcional)</strong>: puntuar y ordenar; cachear el resultado por unos minutos.</li>
+        </ol>
+        <h3>Números del diseño</h3>
+        <table>
+          <thead><tr><th>Componente</th><th>Carga estimada</th><th>Cómo la aguanta</th></tr></thead>
+          <tbody>
+            <tr><td>API de posts</td><td>~580 w/s (pico 2 k)</td><td>Escritura simple, sin fan-out en línea</td></tr>
+            <tr><td>Workers de fan-out</td><td>~347 k w/s (pico)</td><td>Paralelización de la cola; celebridades excluidas</td></tr>
+            <tr><td>Bandejas Redis</td><td>347 k w/s de escritura + 70 k r/s de lectura</td><td>Clúster particionado por usuario</td></tr>
+            <tr><td>API de feed</td><td>~70 k r/s (pico)</td><td>Caché por usuario + sin estado</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">Por qué el híbrido "cuadra"</div>
+          <p>Las celebridades son <strong>muy pocas</strong> pero generan <strong>el 90% del fan-out</strong>.
+            Sacarlas del push elimina los picos imposibles. Los usuarios normales son muchísimos pero con
+            poquísimos seguidores: su fan-out es perfectamente asumible. El truco es no tratar a todos igual.</p>
+        </div>
+        <h3>Observabilidad y fallo</h3>
+        <ul>
+          <li><strong>Lag del fan-out</strong>: cuánto tarda un post en llegar a las bandejas. Es la
+            <strong>métrica estrella</strong>; si crece, el feed se siente "atrasado".</li>
+          <li><strong>Reintentos</strong>: si un worker falla a mitad, debe ser <strong>idempotente</strong>
+            (Módulo 4): meter dos veces la misma referencia en una bandeja es un duplicado, no corrupción.</li>
+          <li><strong>Degradación</strong>: si el fan-out se atrasa, el feed puede caer temporalmente a
+            <em>pull puro</em> (más lento pero fresco), en vez de dejar de funcionar.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== --&gt;
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Separar <em>timeline</em> (fuente) de <em>feed</em> (bandeja)</td>
+              <td>Duplicar el contenido del post en cada bandeja</td>
+              <td>Guardar referencias ahorra espacio y evita inconsistencias</td>
+            </tr>
+            <tr>
+              <td>Diseño híbrido push/pull</td>
+              <td>Push puro para todos</td>
+              <td>Una celebridad con push puro genera millones de escrituras por post</td>
+            </tr>
+            <tr>
+              <td>Fan-out asíncrono por cola</td>
+              <td>Hacer el fan-out en línea en la petición del autor</td>
+              <td>El autor no debe esperar a 200 (o 100 M) escrituras</td>
+            </tr>
+            <tr>
+              <td>Bandeja acotada (cap de N)</td>
+              <td>Dejar que la bandeja crezca sin límite</td>
+              <td>La memoria de Redis es finita; lo antiguo se pagina</td>
+            </tr>
+            <tr>
+              <td>Ordenar la complejidad: cronológico primero</td>
+              <td>Meter ranking cuando no se pide</td>
+              <td>El ranking trae features, modelo y cómputo; solo si aporta</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== --&gt;
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Calcular el feed con una consulta en vivo</h3>
+        <span class="code-label code-label--wrong">Mal — "trae posts de los seguidos y ordena"</span>
+        <pre class="code-wrong"><code class="language-sql">-- En CADA apertura del feed, para 200 seguidos:
+SELECT * FROM posts
+WHERE author_id IN (SELECT follows FROM following WHERE user_id = :me)
+ORDER BY created_at DESC LIMIT 50;
+-- 200 fuentes + merge + orden a 70.000 r/s: inviable.
+</code></pre>
+        <span class="code-label code-label--right">Bien — bandeja precalculada (+ pull de celebridades)</span>
+        <pre class="code-right"><code class="language-text">// Leer la bandeja (ya ordenada) del usuario.
+// Solo se hace pull para las pocas celebridades que sigue.
+// El coste de armar el feed esta en la ESCRITURA, no en la lectura.
+</code></pre>
+
+        <h3>2. Tratar a la celebridad como usuario normal</h3>
+        <span class="code-label code-label--wrong">Mal — push a 100 M de bandejas</span>
+        <pre class="code-wrong"><code class="language-text">// post de @celebridad (100M seguidores)
+// --&gt; encolar 100.000.000 escrituras de fan-out
+// --&gt; la cola se atasca horas y el feed de todos se congela.
+</code></pre>
+        <span class="code-label code-label--right">Bien — umbral de celebridad → pull</span>
+        <pre class="code-right"><code class="language-text">// si seguidores &gt; UMBRAL -&gt; NO push.
+// El post vive en el timeline del autor y se mezcla
+// en tiempo de lectura para quienes lo siguen.
+</code></pre>
+
+        <h3>3. Guardar el contenido en la bandeja</h3>
+        <span class="code-label code-label--wrong">Mal — copiar el post entero a cada bandeja</span>
+        <pre class="code-wrong"><code class="language-text">// 200 bandejas x 2 KB de texto+media = duplicacion masiva.
+// Editar o borrar el post obliga a tocar 200 copias.
+</code></pre>
+        <span class="code-label code-label--right">Bien — guardar solo la referencia</span>
+        <pre class="code-right"><code class="language-text">// La bandeja guarda post_id (8 bytes).
+// El contenido se lee una vez desde el timeline / cache de posts.
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== --&gt;
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> decidir push/pull para un producto concreto y dimensionar el fan-out.
+          Usa el método y anota cada número.</p>
+        <ol class="steps">
+          <li><strong>Contexto.</strong> Red profesional (estilo LinkedIn): 100 M de usuarios, 20 M activos,
+            cada uno sigue a <strong>500</strong> personas, publica <strong>0,05 posts/día</strong>, abre el
+            feed <strong>5 veces/día</strong>.</li>
+          <li><strong>Posts y lecturas.</strong>
+            <pre><code class="language-text">posts/dia   = 100M x 0,05 = 5M       -&gt; 58 w/s
+lecturas/dia= 20M x 5 = 100M         -&gt; 1.157 r/s (pico 3.500)
+</code></pre>
+          </li>
+          <li><strong>Fan-out push puro.</strong>
+            <pre><code class="language-text">entregas/dia = 5M x 500 = 2.500M      -&gt; 28.935 w/s (pico ~87.000)
+</code></pre>
+          </li>
+          <li><strong>¿Es viable el push puro?</strong> El fan-out (~29 k w/s) es mucho mayor que las
+            lecturas (1,2 k r/s). Pero los usuarios muy seguidos harían explotar el pico. Decisión: híbrido.</li>
+          <li><strong>Umbral de celebridad.</strong> Con esta distribución de seguidores, un buen umbral para
+            esta red sería ~50 000 seguidores: los que lo superan van por pull.</li>
+          <li><strong>Almacenamiento de bandejas.</strong> 2 500 M de referencias/día × 8 B ≈ 20 GB/día.</li>
+          <li><strong>Caché de feed.</strong> El feed de cada activo se cachea 5–10 min; con eso la mayoría de
+            las 5 aperturas diarias son <em>hits</em>.</li>
+          <li><strong>Verificación.</strong> Comprueba que ningún componente pasa del orden de 100 k ops/s
+            y que las celebridades no están en el camino de push. Resultado esperado: diseño híbrido con lag
+            de fan-out bajo control.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== --&gt;
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Unfollow correcto con fan-out ya hecho</h3>
+          <p>Con fan-out on write, cuando dejas de seguir a alguien, <strong>sus posts ya están</strong> en
+            tu bandeja. Diseña cómo hacer <em>unfollow</em> para que sus posts dejen de aparecer (o se
+            marquen como no vistos) y, a la vez, cómo manejar que también quieres que los posts <em>ya
+            vistos</em> no se dupliquen. Incluye el diagrama y una decisión de trade-off (¿limpiar la bandeja
+            o filtrar al leer?).</p>
+          <p><em>Pista: comparar "purge" de la bandeja (costoso, N entradas) contra guardar el conjunto de
+            <code>following</code> y <strong>filtrar en lectura</strong> (barato de escribir, algo más de
+            trabajo al leer). Piensa también en la idempotencia del fan-out.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== --&gt;
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>fan-out</strong> multiplica cada post por el número de seguidores: es el número que
+            domina el diseño.</li>
+          <li><strong>Push</strong> = lectura rápida, escritura cara. <strong>Pull</strong> = escritura barata,
+            lectura cara. <strong>Híbrido</strong> = push para normales, pull para celebridades.</li>
+          <li>La <strong>bandeja</strong> guarda <em>referencias</em>, no contenido; el <strong>timeline</strong>
+            del autor es la fuente de verdad.</li>
+          <li>El fan-out va <strong>asíncrono</strong> por cola; el worker debe ser <strong>idempotente</strong>.</li>
+          <li>Métrica clave: el <strong>lag del fan-out</strong>. El ranking es opcional y caro.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>Fan-out on write (push)</td><td>Usuarios con pocos seguidores; se quiere lectura ultrarrápida</td></tr>
+            <tr><td>Fan-out on read (pull)</td><td>Muchos seguidos por usuario; se quiere escritura barata y frescura</td></tr>
+            <tr><td>Híbrido</td><td>Redes reales con celebridades: lo normal (push) + lo grande (pull)</td></tr>
+            <tr><td>Ranking</td><td>Solo si el producto lo pide; añade features, modelo y cómputo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== --&gt;
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no guardar el feed como una lista completa para siempre?</summary>
+            <div>
+              <p>Porque la memoria es finita y la mayoría de las entradas antiguas no se leen. Se cachea una
+                ventana reciente (p. ej. 800 entradas) y, al llegar al final, se <em>pagina</em> hacia el
+                timeline/almacén. Así el coste de memoria es proporcional a usuarios activos, no a todo el
+                histórico.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo se elige el umbral de "celebridad"?</summary>
+            <div>
+              <p>Es una decisión de ingeniería basada en la distribución de seguidores de tu red. El criterio:
+                por encima del umbral, el coste de push (seguidores × posts) supera lo que quieres pagar por
+                post. Se puede tunear con la carga observada, no es un número mágico. En redes muy
+                asimétricas suele quedar en decenas o cientos de miles.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Esto es consistencia eventual? ¿Se nota?</summary>
+            <div>
+              <p>Sí, el feed es eventualmente consistente: tras publicar, tus seguidores pueden tardar unos
+                segundos (el lag del fan-out) en verlo. Como el requisito del feed no exige frescura
+                instantánea, es un trade-off aceptable a cambio de lecturas rápidas. Para el propio autor, su
+                post aparece de inmediato en su vista (se lee de su timeline).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el worker de fan-out procesa el mismo post dos veces?</summary>
+            <div>
+              <p>Nada malo si el fan-out es <strong>idempotente</strong>: meter la misma <code>post_id</code>
+                dos veces en una bandeja crea un duplicado que se puede deduplicar (por id) al leer o al
+                insertar (si la bandeja es un conjunto/lista con control de duplicados). Como los sistemas de
+                cola entregan <em>at-least-once</em> (Módulo 4), la idempotencia no es opcional.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El ranking se recalcula en cada lectura?</summary>
+            <div>
+              <p>No conviene. Se toma el conjunto de candidatos (los posts recientes ya reunidos) y se puntúa;
+                el resultado se cachea unos minutos por usuario. Recalcular todo en cada apertura, a 70 000
+                lecturas/s, sería carísimo. El ranking es un paso <em>sobre</em> la lista de candidatos, no
+                el origen de la lista.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="01-colas-vs-streams">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Colas vs streams — Módulo 4 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Colas vs streams</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Mensajería y asincronía</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora todos los flujos que hemos diseñado eran <strong>síncronos</strong>: el cliente llama, el servidor responde, y mientras tanto el cliente espera. Ese modelo es directo y fácil de razonar, pero tiene un problema de fondo: <strong>acopla en el tiempo</strong> a quien pide algo con quien lo hace. Si el receptor está lento, caído o no existe todavía, quien llama sufre.</p>
+        <p>La <strong>mensajería asíncrona</strong> rompe ese acoplamiento. Un servicio publica un <em>mensaje</em> en un intermediario (<em>broker</em>) y se olvida; otro servicio lo recoge cuando puede. Entre ambos hay una cola o un log que absorbe los picos, tolera caídas y permite reintentar. Es la diferencia entre «llamo al fontanero y espero de pie en la puerta» y «dejo una nota en su buzón de tareas».</p>
+        <p>Pero dentro de «mensajería» conviven <strong>dos arquetipos con semánticas opuestas</strong> y confundirlos es uno de los errores de diseño más caros:</p>
+        <ul>
+          <li><strong>Cola (queue / task queue):</strong> cada mensaje se entrega a <em>un</em> consumidor y, una vez procesado con éxito, desaparece. Reparte trabajo.</li>
+          <li><strong>Stream (log / event log):</strong> los mensajes se apilan en un registro <em>append-only</em> que se <strong>retiene</strong>; varios consumidores independientes leen a su ritmo y pueden <strong>rebobinar y releer</strong>. Reparte hechos.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque la pregunta «¿cola o stream?» aparece en casi todos los diseños a escala: procesar imágenes, enviar correos, alimentar analítica, reaccionar a pedidos, construir feeds. Elegir mal significa o bien <em>perder eventos</em> que necesitas releer, o bien cargar con la complejidad de un log cuando solo querías repartir tareas. La decisión se toma a partir de una pregunta simple: <em>¿el mensaje es una tarea que se consume una vez, o un hecho que muchos necesitan y quiero poder repetir?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El problema que resuelve la asincronía</h3>
+        <p>Pensemos en un acoplamiento temporal típico: al confirmar un pedido, hay que cobrar, generar factura, avisar por correo y actualizar el almacén. Si esto se hace dentro de la petición HTTP, el usuario espera a que terminen las cuatro cosas y, si el servicio de correo está lento, <strong>todos los pedidos se vuelven lentos aunque el cobro funcione</strong>. La mensajería convierte «hazlo todo ahora y en serie» en «acepta el pedido ya, y que cada pieza lo haga a su ritmo».</p>
+
+        <pre><code class="language-text">SÍNCRONO (acoplado en el tiempo)          ASÍNCRONO (desacoplado por un broker)
+
+  Cliente                                   Cliente
+     |  request                                 |  publish(OrderPlaced)
+     v                                          v
++---------+   espera   +-----------+       +---------+     +----------------+
+|  API    |----------->|  Cobro    |       |  API    |---->|    BROKER      |
+|         |&lt;-----------|  Correo   |       +---------+     |  (cola/log)    |
++---------+   respuesta+-----------+             ^         +----------------+
+     |  (tarda lo que tarde                        |         |        |
+     v    el más lento)                    acuse rápido      v        v
+  Usuario                                   (202 Accepted) +-------+ +-------+
+                                                          |Cobros | |Correo |
+                                                          +-------+ +-------+
+</code></pre>
+
+        <p>En el diagrama de la derecha, la API solo confirma que <em>aceptó</em> la petición (un <code>202 Accepted</code>), no que todo esté hecho. Las piezas consumen a su ritmo. El broker hace de amortiguador: si el cobro va a 100/s y llegan 300/s durante un minuto, la cola crece y el sistema se pone al día sin caerse. Eso se llama <strong>absorber picos</strong> (<em>buffering</em>).</p>
+
+        <h3>Cola: repartir trabajo, consumir una vez</h3>
+        <p>Una <strong>cola</strong> es una estructura FIFO donde cada mensaje está destinado a ser procesado <em>una vez</em> por <em>uno</em> de los muchos consumidores que escuchan. Los consumidores compiten: el broker entrega cada mensaje a uno y espera un <strong>acuse de recibo</strong> (<em>ack</em>). Si el consumidor muere antes de acusar, el mensaje <strong>vuelve a la cola</strong> (tras un <em>visibility timeout</em>) y lo toma otro. Esa es la garantía típica <strong>at-least-once</strong>: puede repetirse, nunca perderse.</p>
+
+        <pre><code class="language-text">COLA — consumidores que compiten (competing consumers)
+
+                    +----------------+
+        +---------->|   Worker 1     |--- ack ---+
+        |           +----------------+            |
++------------+      +----------------+            |
+|   COLA     |----->|   Worker 2     |--- ack ---+--> mensaje ELIMINADO
+| m1 m2 m3.. |      +----------------+            |    (procesado 1 vez)
+|            |----->|   Worker 3     |--- nack --+
++------------+      +----------------+            |
+   ^                  (si no hay ack en el          |
+   |                   timeout, el mensaje          |
+   |                   vuelve a la cola) -----------+
+   |
+ publish()
+</code></pre>
+
+        <p>Propiedades clave de una cola:</p>
+        <ul>
+          <li><strong>Competencia:</strong> añadir consumidores reparte la carga (escalado horizontal del procesamiento).</li>
+          <li><strong>El mensaje se consume:</strong> por defecto no queda copia; no puedes releerlo mañana.</li>
+          <li><strong>Orden:</strong> relativo. Con varios consumidores en paralelo, dos mensajes pueden procesarse fuera de orden. No confíes en el orden salvo que la cola garantice FIFO estricto con <em>un</em> consumidor.</li>
+          <li><strong>Uso típico:</strong> enviar correos, generar miniaturas, cobrar, sincronizar, cualquier «haz esta tarea».</li>
+        </ul>
+
+        <h3>Stream: repartir hechos, retener y rebobinar</h3>
+        <p>Un <strong>stream</strong> (o <em>log distribuido</em>) es un registro <strong>append-only</strong>: los eventos se añaden al final con un número creciente (<em>offset</em>) y <strong>no se borran al leerse</strong>. Cada consumidor avanza su propio puntero (<em>offset</em>) de forma independiente, así que muchos consumidores pueden leer el mismo evento sin pisarse. La retención se mide por tiempo o por tamaño (por ejemplo, 7 días), no por «cuánta gente lo ha leído».</p>
+
+        <pre><code class="language-text">STREAM — log append-only con offsets y varios grupos de consumo
+
+  Partición 0:  [ e0 | e1 | e2 | e3 | e4 | e5 | ... ]----> se sigue escribiendo ->
+                 ^              ^
+                 |              |
+          offset grupo A    offset grupo B
+
+  Grupo A (Correo)      lee e0,e1,e2...   -> su propio offset
+  Grupo B (Analítica)   lee e0,e1,e2...   -> su offset, independiente
+  Grupo C (Almacén)     iba por e3, se cae, reinicia y         RELEE desde donde quiera
+                        reanuda en e3   ---------------------> © replay / rebobinado
+</code></pre>
+
+        <p>Propiedades clave de un stream:</p>
+        <ul>
+          <li><strong>Retención:</strong> los eventos viven N días; puedes <em>reprocesar</em> (replay) el histórico. Clave para analítica, auditoría y para recuperar un consumidor que estuvo caído.</li>
+          <li><strong>Múltiples lectores independientes:</strong> cada grupo de consumo (<em>consumer group</em>) mantiene su offset; añadir un consumidor nuevo <strong>no afecta</strong> a los demás.</li>
+          <li><strong>Particiones:</strong> para escalar, el log se divide en particiones; <strong>el orden solo se garantiza dentro de una partición</strong>. La clave de partición (por ejemplo, <code>user_id</code>) decide en qué partición cae cada evento, así que todos los eventos de un mismo usuario quedan ordenados.</li>
+          <li><strong>Uso típico:</strong> bus de eventos del negocio, ingesta de analítica, alimentar varias proyecciones, <em>change data capture</em> (CDC).</li>
+        </ul>
+
+        <div class="callout callout--analogy">
+          <p><strong>Analogía:</strong> una <em>cola</em> es la bandeja de tareas de una oficina: cada papel lo coge <em>un</em> empleado, lo hace y lo tira. Un <em>stream</em> es el <strong>libro de actas</strong> de esa oficina: cada novedad se apunta al final, nadie borra páginas, y cualquiera puede releer el acta entera cuando quiera. Si lo que necesitas es que alguien haga el trabajo, usa la bandeja; si lo que necesitas es que <em>varios</em> departamentos se enteren y puedan volver a consultarlo, usa el libro.</p>
+        </div>
+
+        <h3>Comparación directa</h3>
+        <table>
+          <thead><tr><th>Aspecto</th><th>Cola (queue)</th><th>Stream (log)</th></tr></thead>
+          <tbody>
+            <tr><td>Unidad mental</td><td>Una <strong>tarea</strong> que hay que hacer</td><td>Un <strong>hecho</strong> que ocurrió</td></tr>
+            <tr><td>Entrega</td><td>A un consumidor; el mensaje se elimina al acusar</td><td>A todos los grupos; el evento se retiene y se relee</td></tr>
+            <tr><td>Replay</td><td>No (por defecto)</td><td>Sí, es su rasgo distintivo</td></tr>
+            <tr><td>Orden</td><td>Débil con varios consumidores</td><td>Garantizado <em>por partición</em></td></tr>
+            <tr><td>Escalado del consumo</td><td>Añadir consumidores reparte trabajo</td><td>Añadir consumidores hasta el nº de particiones por grupo</td></tr>
+            <tr><td>Retención</td><td>Hasta que se procesa</td><td>Por tiempo/tamaño (días, GB)</td></tr>
+            <tr><td>Coste</td><td>Menor: el estado es «pendiente vs hecho»</td><td>Mayor: almacenas todo y gestionas offsets</td></tr>
+            <tr><td>Encaja bien con</td><td>Bucles de trabajo, tareas pesadas, repartir carga</td><td>Event sourcing, analítica, múltiples consumidores</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--note">
+          <p><strong>Ni blanco ni negro.</strong> Los brokers modernos (por ejemplo, los basados en log) permiten emular una cola: un <em>consumer group</em> con varios miembros reparte las particiones entre ellos, y un mensaje lo procesa <em>un</em> miembro del grupo. La diferencia real es de <strong>modelo mental</strong> y de <strong>retención</strong>: ¿quiero releer?</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Escenario:</strong> un servicio que envía correos de confirmación. Mide la carga y decide cuántos consumidores necesita.</p>
+        <p><strong>Supuestos:</strong></p>
+        <ul>
+          <li>Pico de tráfico: <strong>500 correos/s</strong> (una campaña dispara confirmaciones).</li>
+          <li>Cada envío tarda <strong>200 ms</strong> (llamada al proveedor de correo).</li>
+          <li>Se asume que es <em>I/O-bound</em>: el worker espera, no quema CPU.</li>
+        </ul>
+        <p>Concurrencia necesaria por la ley de Little (L = λ · W):</p>
+        <pre><code class="language-text">L = λ · W
+  = 500 correos/s · 0,2 s
+  = 100 correos "en vuelo" a la vez
+
+-> Necesitas ~100 workers concurrentes para sostener el pico sin que la cola crezca.
+</code></pre>
+        <p>Con 100 workers a 200 ms, el sistema procesa 100 / 0,2 = <strong>500 correos/s</strong>: justo el pico. Si el pico sube a 800/s, esos 100 workers no dan abasto y la cola empieza a crecer a <strong>300 mensajes por segundo</strong>; en un minuto son 18.000 pendientes. Aquí se ve el valor de la cola: no hace falta dimensionar para el pico absoluto, la cola <strong>absorbe</strong> el exceso y se drena después.</p>
+        <p>Ahora la pregunta de control: <strong>¿necesitas releer esos mensajes?</strong> No. Un correo enviado no se reenvía; si el worker murió antes del ack, otro lo reintenta. Este caso es <strong>cola</strong>, sin duda.</p>
+        <p>Contraejemplo de la misma empresa: la <strong>analítica</strong> necesita recalcular métricas de los últimos 7 días cada vez que cambia una definición. Ese flujo no es «haz una tarea», es «vuelve a leer los hechos». Con una cola, esos eventos ya se consumieron y se borraron: sería imposible. Ese caso exige un <strong>stream</strong> con retención de 7 días.</p>
+        <div class="callout callout--tip">
+          <p><strong>Regla de bolsillo:</strong> si la frase es «hay que <em>hacer</em> X», es cola. Si es «cuando ocurre X, <em>avisar/derivar/registrar</em> para varios y poder volver a mirarlo», es stream.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Volvamos al caso clásico del curso: el <strong>feed de noticias</strong>. Cuando un usuario publica, hay que (a) avisar a sus seguidores, (b) indexar para búsqueda, (c) contar métricas y (d) quizá moderar contenido. No queremos que la publicación espere a todo eso, ni que un cambio en métricas obligue a reescribir el flujo de publicación.</p>
+        <p><strong>Diseño:</strong> el servicio de publicación escribe un único hecho, <code>PostCreated</code>, en un <strong>stream particionado por <code>author_id</code></strong>. Varios <em>consumer groups</em> reaccionan por separado:</p>
+        <pre><code class="language-text">                         STREAM (particionado por author_id)
+  Publicar  --PostCreated-->  [ P0 | P1 | P2 | P3 ]
+                                  |     |     |
+        +-------------------------+     |     +--------------------------+
+        v                               v                                v
++-----------------+            +-----------------+              +-----------------+
+| Grupo "Feed"    |            | Grupo "Search"  |              | Grupo "Metrics" |
+| fan-out a seg.  |            | indexa post     |              | +1 contadores   |
+| offset propio   |            | offset propio   |              | offset propio   |
++-----------------+            +-----------------+              +-----------------+
+
+  Hecho: cada grupo lee TODO el stream a su ritmo. Añadir "Moderación"
+  mañana = crear un grupo nuevo y leer desde el inicio (o desde N días).
+</code></pre>
+        <p>Por el contrario, la <strong>generación de miniaturas</strong> de las imágenes de esos posts sí es una cola: cada imagen es una tarea que hace <em>un</em> worker, y no hay que releerla. Publicar encola el trabajo; un pool de workers lo consume en paralelo.</p>
+        <p><strong>Números del ejemplo real.</strong> Supón 50 M de posts/día → ~580 de media por segundo, con picos ×4 a 2.300/s. El stream se particiona en, digamos, <strong>32 particiones</strong>: dentro de cada partición el orden se respeta (los posts de un autor van en orden). El grupo «Feed» escala a 32 consumidores como máximo (uno por partición). La retención se fija en <strong>7 días</strong>: suficiente para que un grupo caído se recupere y para reprocesar analítica.</p>
+        <table>
+          <thead><tr><th>Necesidad</th><th>Mecanismo</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Avisar a 4 subsistemas del mismo hecho</td><td>Stream + consumer groups</td><td>Cada uno lee completo e independiente</td></tr>
+            <tr><td>Reprocesar métricas históricas</td><td>Replay del stream por offset</td><td>Los eventos siguen ahí; una cola no los tendría</td></tr>
+            <tr><td>Orden por autor</td><td>Partición por <code>author_id</code></td><td>Mismo autor → misma partición → orden</td></tr>
+            <tr><td>Miniaturas (tarea pesada)</td><td>Cola con competition consumers</td><td>Reparto de carga, no hay que releer</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Trade-off explícito:</strong> el stream te da replay y múltiples lectores, pero <strong>pagas almacenamiento y operación</strong>: hay que gestionar particiones, offsets y retención. Si un solo consumidor necesitara cada evento una sola vez, ese coste sería puro desperdicio. La decisión se justifica con el caso, no con la moda.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Elegir por la pregunta «¿necesito releer?»: no → cola, sí → stream</td>
+              <td>Usar un stream «porque mola» para repartir tareas simples</td>
+              <td>El log añade particiones, offsets y retención que no aportan nada si nadie relee</td>
+            </tr>
+            <tr>
+              <td>Fijar la retención del stream por tiempo/tamaño y vigilarla</td>
+              <td>Retención infinita sin política</td>
+              <td>El disco crece sin límite; la retención es una decisión de coste</td>
+            </tr>
+            <tr>
+              <td>Diseñar la <strong>clave de partición</strong> pensando en el orden que necesitas</td>
+              <td>Particionar por aleatorio y luego esperar orden por usuario</td>
+              <td>El orden solo existe dentro de una partición; la clave lo determina</td>
+            </tr>
+            <tr>
+              <td>Configurar <em>visibility timeout</em> y <em>dead-letter queue</em> en las colas</td>
+              <td>Reintentar para siempre un mensaje «veneno»</td>
+              <td>Un mensaje que siempre falla bloquea o satura el sistema (lo ves en la lección 2)</td>
+            </tr>
+            <tr>
+              <td>Tratar toda entrega como <strong>at-least-once</strong> desde el principio</td>
+              <td>Asumir que un mensaje llega exactamente una vez</td>
+              <td>Los reintentos duplican; el consumidor debe ser idempotente (lección 3)</td>
+            </tr>
+            <tr>
+              <td>Un <em>consumer group</em> por responsabilidad</td>
+              <td>Un único grupo que hace de todo</td>
+              <td>Acopla consumidores y te obliga a reprocesar juntos cosas distintas</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Usar una cola como si fuera un log de eventos</h3>
+        <p>«Quiero que analítica, correo y almacén se enteren del pedido». Si lo modelas como <em>una</em> cola con varios consumidores, cada mensaje lo coge <strong>uno</strong> de ellos y los demás nunca lo ven.</p>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text">Ordenes: [ OrderPlaced ]  -->  una sola cola
+   Worker Correo    consume el mensaje  -> se ELIMINA
+   Worker Analitica nunca lo recibe (ya no está)
+   Worker Almacen   nunca lo recibe
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text">Ordenes: stream [ OrderPlaced ]  -->  log retenido
+   Grupo Correo     lee todo, offset propio
+   Grupo Analitica  lee todo, offset propio
+   Grupo Almacen    lee todo, offset propio
+   (Si un servicio es una tarea de un solo consumidor, ESE va en cola aparte.)
+</code></pre>
+
+        <h3>Confiar en el orden global de una cola con varios consumidores</h3>
+        <p><span class="code-label code-label--wrong">Incorrecto</span></p>
+        <pre><code class="language-text"># Asumir que con 10 workers, "crear cuenta" se procesa antes que "borrar cuenta"
+Cola: [ create(user1), delete(user1) ]
+Worker#7 procesa delete(user1)   -> borra una cuenta que aún no existe
+Worker#3 procesa create(user1)   -> la crea despues (estado incoherente)
+</code></pre>
+        <p><span class="code-label code-label--right">Correcto</span></p>
+        <pre><code class="language-text"># Si necesitas orden POR USUARIO, usa un stream particionado por user_id
+Stream particion P(user1): [ create(user1) -> delete(user1) ]   # un solo lector por particion
+# Los eventos del mismo usuario caen en la misma particion y se leen EN ORDEN.
+</code></pre>
+
+        <h3>Dejar crecer la cola sin límite</h3>
+        <p>Una cola que solo crece (consumidor más lento que productor) no es «tolerancia a picos», es una fuga hacia un pico de latencia. Si el productor mete 800/s y el consumidor saca 500/s, la profundidad sube 300/s y la espera se dispara. Hay que <strong>medir la profundidad</strong> y, si pasa de umbral, escalar consumidores o <strong>aplicar backpressure / descartar</strong> (lección 2).</p>
+
+        <h3>Olvidar el acuse de recibo</h3>
+        <p>Si un consumidor borra/saca el mensaje antes de procesarlo (auto-ack), una caída en medio <strong>pierde</strong> la tarea. El acuse debe ir <em>después</em> de completar el trabajo, no antes. Con <code>at-least-once</code> puede repetirse (y por eso necesitamos idempotencia), pero nunca debe perderse.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> clasificar tres flujos como cola o stream, justificar, y dimensionar el que sea cola. Iremos paso a paso.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Plantea la pregunta de retención.</strong> Para cada flujo, responde: ¿alguien necesitará <em>releer</em> el mensaje, o hay <em>varios</em> interesados independientes?
+            <pre><code class="language-text">A) Enviar un SMS de recordatorio de cita.
+B) Registrar cada transacción para auditoría y analítica.
+C) Redimensionar la foto de perfil que acaba de subir un usuario.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Clasifica.</strong>
+            <ul>
+              <li><strong>A → Cola.</strong> Es una tarea: un SMS se envía <em>una vez</em>; nadie relee. Múltiples workers reparten la carga.</li>
+              <li><strong>B → Stream.</strong> Es un hecho: auditoría e informes quieren el histórico completo y por separado; hay que poder reprocesar.</li>
+              <li><strong>C → Cola.</strong> Es una tarea pesada de CPU; un worker por imagen. No importa releer.</li>
+            </ul>
+          </li>
+          <li>
+            <strong>Paso 3 — Dimensiona la cola de A.</strong> Supuestos: 20 M de citas/día concentradas en la mañana; pico de <strong>1.000 SMS/s</strong>; cada envío tarda <strong>150 ms</strong> contra el proveedor.
+            <pre><code class="language-text">Concurrencia (Ley de Little): L = λ · W = 1.000/s · 0,15 s = 150 workers
+Margen de seguridad x1,5 (por reintentos y fallos del proveedor): ~225 workers
+O, con menos workers, dejar que la cola absorba el pico:
+   50 workers -> 50/0,15 = 333 SMS/s ; el exceso (667/s) espera en cola.
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Decide y documenta.</strong> Elige «150 workers para ir al día» o «50 workers + cola para abaratar». Es un trade-off <em>latencia de envío</em> contra <em>coste de cómputo</em>. Como un SMS de recordatorio admite minutos de retraso, la opción barata (cola profunda) es razonable.
+          </li>
+          <li>
+            <strong>Paso 5 — Verificación.</strong> Comprueba que tu diseño responde:
+            <pre><code class="language-text">[ ] ¿El flujo que necesita replay esta en un stream con retencion definida?
+[ ] ¿El flujo de tareas esta en una cola con ack y DLQ?
+[ ] ¿He justificado el numero de consumidores con supuestos y unidades?
+[ ] ¿He nombrado el trade-off (latencia vs coste)?
+</code></pre>
+          </li>
+        </ol>
+        <p><strong>Resultado esperado:</strong> A y C en cola; B en stream; cola de A dimensionada (~150 workers, o 50 + cola) con el trade-off escrito.</p>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Orden por conversación con reintentos</h3>
+          <p>Diseña la mensajería para un chat. Los mensajes de <em>una misma conversación</em> deben procesarse en orden, pero el sistema debe escalar a decenas de miles de conversaciones concurrentes y sobrevivir a un consumidor que se cae a mitad de un mensaje (reintento).</p>
+          <p>Deja por escrito: (1) ¿cola o stream?, (2) cuál es la clave de partición y por qué, (3) qué pasa con el orden cuando un mensaje se reintenta y se reencola, (4) cómo evitas que el reintento de un mensaje duplique el mensaje enviado al destinatario.</p>
+          <p><em>Pista: piensa «partición por <code>conversation_id</code>», un lector por partición para conservar orden, y por qué el reintento introduce duplicados que solo resuelve la idempotencia (lección 3). No resuelvas aquí el algoritmo de reordenación; solo plantea las decisiones y los trade-offs.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La mensajería asíncrona <strong>desacopla en el tiempo</strong> productor y consumidor y <strong>absorbe picos</strong>.</li>
+          <li><strong>Cola</strong> = repartir trabajo; consumidores que compiten; el mensaje se consume una vez y desaparece; entrega típica at-least-once.</li>
+          <li><strong>Stream</strong> = repartir hechos; log append-only con <strong>retención, offsets y replay</strong>; múltiples grupos de consumo independientes.</li>
+          <li>El <strong>orden</strong> solo se garantiza por partición (stream) o con un único consumidor (cola); la clave de partición decide el orden.</li>
+          <li>La decisión se toma con una pregunta: <em>¿necesito releer o solo hacer una tarea?</em></li>
+          <li>Toda entrega se asume <strong>at-least-once</strong>: puede duplicarse, nunca perderse (idempotencia, lección 3).</li>
+        </ul>
+        <table>
+          <thead><tr><th>Situación</th><th>Opción</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Enviar correos/SMS, generar miniaturas, cobrar</td><td>Cola</td><td>Tarea de un consumidor; no hay que releer</td></tr>
+            <tr><td>Bus de eventos del negocio, analítica, auditoría</td><td>Stream</td><td>Varios lectores + replay del histórico</td></tr>
+            <tr><td>Orden por usuario/conversación</td><td>Stream particionado por esa clave</td><td>Mismo actor → misma partición → orden</td></tr>
+            <tr><td>Reprocesar tras un cambio de lógica</td><td>Replay del stream</td><td>La cola ya borró esos mensajes</td></tr>
+            <tr><td>Repartir carga pesada entre N workers</td><td>Cola con competition consumers</td><td>Añadir workers reparte el trabajo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Un stream no es simplemente una cola que guarda los mensajes más tiempo?</summary>
+            <div>
+              <p>No del todo. La diferencia clave no es la duración, es el <strong>modelo de consumo</strong>: en una cola el mensaje se elimina al acusarse y varios consumidores <em>compiten</em> por él; en un stream el evento permanece y cada <em>consumer group</em> avanza su propio offset leyéndolo <strong>todos</strong>. La retención es la consecuencia, no la definición. Puedes tener un stream con retención de una hora y seguir comportándose como un log (offsets, replay dentro de esa ventana) y no como una cola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si uso un stream, ¿puedo garantizar el orden global de todos los eventos?</summary>
+            <div>
+              <p>No a escala. El orden se garantiza <strong>dentro de cada partición</strong>. El orden global exigiría una sola partición, y una sola partición limita el paralelismo a un consumidor y la capacidad de escritura a un nodo. La solución práctica es elegir una <strong>clave de partición</strong> tal que todo lo que debe ir en orden caiga junto: <code>user_id</code>, <code>conversation_id</code>, <code>order_id</code>. Así obtienes «orden por entidad» sin renunciar al escalado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo es un error usar un stream?</summary>
+            <div>
+              <p>Cuando <em>nadie</em> va a releer y solo hay <em>un</em> tipo de consumidor de cada mensaje. Entonces el log solo te aporta coste: almacenar todo, gestionar particiones y offsets. Una cola simple con acuse y DLQ hace el trabajo con menos piezas. Regla: si el flujo se describe como «hacer», es cola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué profundidad de cola es «demasiada»?</summary>
+            <div>
+              <p>Depende de la <strong>latencia que toleras</strong>. La espera de un mensaje recién encolado es aproximadamente:</p>
+              <pre><code class="language-text">espera ≈ profundidad / (velocidad_consumo - velocidad_llegada)
+
+Ej.: profundidad 6.000, consumo 500/s, llegada 400/s
+     espera ≈ 6.000 / 100 = 60 s   -> probablemente inaceptable para un SMS
+</code></pre>
+              <p>Traduce siempre la profundidad a <em>tiempo de espera</em> (con unidades), y alerta sobre ese número, no solo sobre el tamaño en crudo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué relación tiene esto con la idempotencia?</summary>
+            <div>
+              <p>Directa. Con <code>at-least-once</code> —lo habitual en colas y streams— un mensaje puede entregarse <strong>más de una vez</strong> (reintento tras un timeout, consumidor que muere tras procesar pero antes de acusar). Para que el resultado sea correcto, el consumidor debe ser <strong>idempotente</strong>: procesar dos veces el mismo mensaje produce el mismo efecto que una. Es el tema de la lección 3.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

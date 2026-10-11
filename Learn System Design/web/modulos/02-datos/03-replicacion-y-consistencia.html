@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-replicacion-y-consistencia">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Replicación y consistencia — Módulo 2 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Replicación y consistencia</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Datos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tener los datos en <strong>un solo servidor</strong> es cómodo: hay una única verdad. Pero también es frágil (si cae, cae todo) y limitado (todas las lecturas van al mismo sitio). La solución es <strong>replicar</strong>: mantener copias de los mismos datos en varios servidores. Con ello ganas tres cosas:</p>
+        <ul>
+          <li><strong>Disponibilidad</strong>: si un nodo cae, otro sigue sirviendo.</li>
+          <li><strong>Escala de lectura</strong>: repartes las lecturas entre varias copias.</li>
+          <li><strong>Latencia</strong>: puedes colocar una copia cerca del usuario.</li>
+        </ul>
+        <p>Pero replicar introduce el concepto que vertebra medio curso: la <strong>consistencia</strong>. Con copias en varios sitios, <em>¿cuánto puede tardar una copia en enterarse de un cambio?</em> Si la respuesta es "un poco", entonces existe una ventana en la que dos lecturas devuelven cosas distintas. Aprender a convivir con esa ventana (o a cerrarla) es el objetivo de esta lección.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque el <em>replication lag</em> es la causa número uno de fallos "imposibles": "acabo de guardar y no aparece", "mi comentario se duplicó", "pagué y me dice que no pagué". Casi siempre es un dato que se lee de una réplica que aún no se ha actualizado. Entender la replicación te da el vocabulario para elegir <strong>de dónde leer</strong> en cada momento.</p>
+        </div>
+        <p><strong>Errores típicos:</strong></p>
+        <ul>
+          <li>Repartir <em>todas</em> las lecturas entre réplicas, incluidas las que dependen de una escritura recién hecha.</li>
+          <li>Confundir "replicación asíncrona" con "los datos se pierden siempre".</li>
+          <li>Promover un seguidor en un <em>failover</em> sin pensar en las escrituras que aún no habían llegado.</li>
+          <li>Creer que la replicación es copia de seguridad (no lo es: un <code>DELETE</code> erróneo se replica al instante).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tres topologías de replicación</h3>
+        <table>
+          <thead><tr><th>Topología</th><th>Cómo se escribe</th><th>Ventaja</th><th>Complejidad</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Un líder (leader/follower)</strong></td><td>Todas las escrituras van a un nodo; los demás copian</td><td>Modelo sencillo; sin conflictos de escritura</td><td>Baja. Es la más usada (Postgres, MySQL, MongoDB)</td></tr>
+            <tr><td><strong>Multilíder</strong></td><td>Varios nodos aceptan escrituras y se sincronizan</td><td>Escritura cercana a cada región; tolera particiones de red duras</td><td>Alta: hay que <strong>resolver conflictos</strong> (dos escritores simultáneos)</td></tr>
+            <tr><td><strong>Sin líder (leaderless / quórum)</strong></td><td>Cualquier nodo acepta; se lee/escribe a <em>W</em> y <em>R</em> nodos</td><td>Alta disponibilidad; resistente a fallos</td><td>Media-alta: hay que ajustar <em>W</em>+<em>R</em>&gt;<em>N</em> para leer tu escritura</td></tr>
+          </tbody>
+        </table>
+        <p>Empezaremos por la más común (un líder) porque explica casi todas las decisiones diarias.</p>
+
+        <h3>Líder y seguidores: cómo fluye el dato</h3>
+        <pre><code class="language-text">                       ESCRITURA
+                          │
+                          ▼
+                 ┌────────────────┐
+    LECTURA ────►│     LÍDER      │  ← acepta TODAS las escrituras
+                 │  (primary)     │
+                 └───────┬────────┘
+                         │  replication log (WAL / oplog)
+           ┌─────────────┼─────────────┐
+           ▼             ▼             ▼
+     ┌──────────┐  ┌──────────┐  ┌──────────┐
+     │ SEGUIDOR │  │ SEGUIDOR │  │ SEGUIDOR │  ← sirven LECTURAS
+     │ replica  │  │ replica  │  │ replica  │    (y quedan de repuesto)
+     └──────────┘  └──────────┘  └──────────┘
+          ▲              ▲              ▲
+          └──── LECTURA ─┴──── LECTURA ─┘
+</code></pre>
+        <p>El líder registra cada cambio en un <strong>log de replicación</strong> (WAL en Postgres, <em>binlog</em> en MySQL, <em>oplog</em> en MongoDB). Los seguidores lo consumen y aplican en el mismo orden. Mientras un seguidor va al día, <strong>leer de él da el mismo resultado que leer del líder</strong>.</p>
+
+        <h3>Síncrona vs asíncrona: el trade-off central</h3>
+        <p>La pregunta es: <em>¿cuándo considera el líder que una escritura está "confirmada"?</em></p>
+        <table>
+          <thead><tr><th>Tipo</th><th>El líder confirma…</th><th>Gana</th><th>Pierde</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Asíncrona</strong></td><td>En cuanto escribe localmente; los seguidores copian "cuando pueden"</td><td><strong>Latencia de escritura mínima</strong>; el líder nunca se bloquea por un seguidor</td><td>Si el líder cae, <strong>se pierden las últimas escrituras</strong> no replicadas; hay <em>lag</em></td></tr>
+            <tr><td><strong>Síncrona</strong></td><td>Cuando al menos un seguidor confirma que la tiene</td><td><strong>Durabilidad real</strong>: la escritura está en ≥2 nodos; nunca se pierde</td><td>Latencia de escritura mayor; si el seguidor se cae, el líder puede bloquearse</td></tr>
+            <tr><td><strong>Semiesíncrona</strong></td><td>Cuando <em>uno</em> de los N seguidores confirma</td><td>Durabilidad sin esperar a todos</td><td>El elegido puede volverse el cuello de botella</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <div class="callout__title">La regla que resuelve el 90% de los casos</div>
+          <p><strong>Síncrona para lo crítico (dinero, inventario, "ya está pagado") y asíncrona para todo lo demás.</strong> Muchos motores permiten decidirlo <em>por transacción</em>: el sistema de pagos espera confirmación de réplica, mientras las métricas y vistas sociales no.</p>
+        </div>
+
+        <h3>Replication lag: la ventana incómoda</h3>
+        <p>Con replicación asíncrona, un seguidor puede ir "por detrás": ese retraso es el <strong>replication lag</strong>. Típicamente de milisegundos en redes sanas, pero puede crecer a segundos o minutos si un seguidor está saturado, la red va mal, o hay una operación masiva.</p>
+        <p>El lag produce tres anomalías bien conocidas, cada una con su garantía:</p>
+        <table>
+          <thead><tr><th>Anomalía</th><th>Qué pasa</th><th>Garantía que la elimina</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Lectura de la propia escritura</strong></td><td>Escribo, leo de una réplica y no veo mi cambio</td><td><em>Read-your-writes</em> (leer de donde escribí)</td></tr>
+            <tr><td><strong>Lecturas no monótonas</strong></td><td>Leo de una réplica (dato nuevo), luego de otra más atrasada (dato viejo): "retrocedo en el tiempo"</td><td><em>Monotonic reads</em> (fijar la réplica por sesión)</td></tr>
+            <tr><td><strong>Lecturas inconsistentes de causalidad</strong></td><td>Veo la respuesta a una pregunta antes que la pregunta</td><td><em>Consistent prefix</em> / causal</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Read-your-writes: el patrón que arregla el "no me aparece"</h3>
+        <p>Es la garantía más pedida en la práctica: <em>"si yo escribí, yo lo veo"</em>. La forma más simple de conseguirla: <strong>durante un tiempo, lee del líder</strong> (o de una réplica ya confirmada) todo lo relacionado con esa escritura.</p>
+        <pre><code class="language-text">   1. Alice edita su perfil ──► WRITE al LÍDER  (perfil v2)
+   2. Alice recarga la página ──► ¿de dónde leo?
+        - réplica A: perfil v1  ❌ (aún no ha llegado)   → "¡no se guardó!"
+        - réplica B: perfil v2  ✅ (ya replicado)
+        - líder:     perfil v2  ✅ siempre
+
+   Estrategias (de más simple a más fina):
+   a) Leer del LÍDER lo propio durante N ms tras escribir (p. ej. 1 s).
+   b) Guardar en la sesión la posición del log tras la escritura y leer una
+      réplica que ya haya alcanzado esa posición ("read at least this LSN").
+   c) Fijar la sesión a una réplica (monotonic reads) si no requiere lo propio.
+</code></pre>
+
+        <h3>Failover: promover a un seguidor (y sus trampas)</h3>
+        <p>Cuando el líder falla, un sistema de alta disponibilidad <strong>promueve</strong> a un seguidor. La promoción no es gratis:</p>
+        <ul>
+          <li><strong>Pérdida de escrituras no replicadas</strong>: con asíncrona, lo confirmado en el líder pero no copiado se pierde al promover. Con síncrona, no.</li>
+          <li><strong>Split-brain</strong>: si el líder "viejo" vuelve creyendo que aún manda, hay dos líderes y se corrompe el dato. Se evita con un <strong>quórum</strong> que garantice que solo uno puede ser líder.</li>
+          <li><strong>Timeouts</strong>: ¿cuánto tardo en decidir que el líder murió? Muy corto → <em>failovers</em> espurios por un pico; muy largo → servicio caído. Es un trade-off puro.</li>
+        </ul>
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: la pizarra y las fotocopias</div>
+          <p>El líder es la <strong>pizarra</strong> donde escribe el profesor. Los seguidores son alumnos que sacan fotocopias a intervalos. Leer del álbum de un alumno funciona… salvo si escribiste algo hace un segundo y copiaste del alumno que aún no ha fotocopiado. Y si la pizarra se rompe, elegir a un alumno como nuevo profesor puede perder los últimos renglones que nadie copió.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un foro con 1 líder y 2 réplicas. Replication lag medido: <strong>200 ms</strong> de mediana (asumiendo red interna de 1 ms y seguidor aplicando el log al ritmo de llegada). El usuario publica un comentario y la UI recarga.</p>
+        <pre><code class="language-text">t=0 ms    POST /comments  ──►  LÍDER (guardado)      ✅ 201 Created
+t=0 ms           respuesta al usuario: "comentario publicado"
+
+t=0 ms    LÍDER ──envía log──► réplica A
+t=0 ms    LÍDER ──envía log──► réplica B
+
+t=50 ms   GET /comments (load balancer elige réplica A)
+          réplica A todavía no ha aplicado el log  → devuelve la lista SIN el comentario  ❌
+          El usuario grita: "¡se ha perdido mi comentario!" (no se ha perdido: está en el líder)
+
+t=200 ms  réplica A aplica el log; a partir de aquí ya lo ve
+</code></pre>
+        <p>El comentario nunca se perdió: estaba en el líder y llegó a las réplicas en 200 ms. El fallo es <strong>leer de una réplica en un momento en que el usuario espera ver su propia escritura</strong>.</p>
+
+        <h3>La corrección</h3>
+        <pre><code class="language-text">Lectura "de lo mío" durante 1 s tras escribir   →  rutar al LÍDER (o a réplica fresca)
+Lecturas de otros usuarios, catálogo, histórico →  repartir entre réplicas (asíncrono OK)
+</code></pre>
+        <div class="callout callout--note">
+          <div class="callout__title">Coste de la corrección</div>
+          <p>Enviar "lo mío" al líder concentra ahí algo de tráfico de lectura, pero solo durante un segundo tras cada escritura; el grueso de lecturas sigue repartido. Es un intercambio excelente: <strong>un poco de carga en el líder a cambio de eliminar la clase de bug más irritante para el usuario</strong>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado al <strong>feed de noticias</strong> (Módulo 6), un sistema con 10 000 QPS de lectura y 500 QPS de escritura, con supuestos explícitos:</p>
+        <ul>
+          <li>10 000 QPS de lectura ⇒ un solo nodo no basta ⇒ <strong>réplicas de lectura</strong> (p. ej. 6).</li>
+          <li>500 QPS de escritura ⇒ un líder los absorbe sin problema.</li>
+          <li>Post publicado por un usuario: <em>read-your-writes</em> obligatorio (el autor debe verlo en su perfil al instante).</li>
+          <li>Feed de los demás: 1–2 s de retraso son aceptables (nadie nota si el post de otro tarda un segundo).</li>
+        </ul>
+
+        <pre><code class="language-text">                   ┌─────────────────────────────┐
+   500 QPS writes ─►│            LÍDER             │
+                   │  posts, follows, likes       │
+                   └──────────────┬──────────────┘
+                                  │  WAL (asíncrono, se acepta ~200 ms)
+        ┌──────────┬──────────────┼──────────────┬──────────┐
+        ▼          ▼              ▼              ▼          ▼
+   ┌────────┐ ┌────────┐    ┌────────┐     ┌────────┐ ┌────────┐
+   │ répl 1 │ │ répl 2 │    │ répl 3 │     │ répl 4 │ │ répl 5 │
+   └────────┘ └────────┘    └────────┘     └────────┘ └────────┘
+        ▲          ▲              ▲              ▲          ▲
+        └──────────┴──── 10 000 QPS lecturas ────┴──────────┘
+                          (feed, perfiles ajenos)
+
+   EXCEPCIÓN "LEER LO MÍO" (± 1 s tras escribir)  ──►  va al LÍDER
+   Ej.: "mi perfil", "mis publicaciones", el propio post recién creado.
+</code></pre>
+
+        <h3>Decisiones y su justificación</h3>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th><th>Trade-off aceptado</th></tr></thead>
+          <tbody>
+            <tr><td>Replicación <strong>asíncrona</strong> líder→seguidores</td><td>Latencia de publicación baja; el feed tolera ~200 ms de lag</td><td>Si el líder muere justo ahora, se pueden perder los últimos segundos de posts</td></tr>
+            <tr><td>"Leer lo mío" del <strong>líder</strong> 1 s</td><td>Garantiza <em>read-your-writes</em> al autor, que es quien más lo nota</td><td>Un pequeño extra de lectura en el líder</td></tr>
+            <tr><td>Feed ajeno de <strong>réplicas</strong></td><td>Reparte 10 000 QPS y permite poner réplicas cerca del usuario</td><td>El feed puede mostrar un post ~1 s tarde</td></tr>
+            <tr><td>Fijar la sesión a una réplica</td><td><em>Monotonic reads</em>: evita que el feed "retroceda" al cambiar de réplica</td><td>Menos libertad de balanceo; sesgo si una réplica se satura</td></tr>
+            <tr><td>Escrituras <strong>críticas</strong> (si las hubiera, p. ej. suscripciones de pago) síncronas</td><td>No se pueden perder</td><td>Latencia de escritura algo mayor y dependencia de una réplica sana</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Réplica ≠ backup</div>
+          <p>La replicación protege contra <strong>fallos de hardware</strong>, no contra errores humanos. Un <code>DELETE FROM posts</code> sin <code>WHERE</code> se replica a los seguidores en milisegundos: tendrías el desastre copiado en 7 sitios. Necesitas <strong>backups</strong> (copias históricas que se pueden restaurar a un punto anterior) y <strong>protección</strong> (permisos, confirmaciones). Son dos mecanismos distintos y complementarios.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Decide <strong>por consulta</strong> de dónde leer (líder o réplica)</td><td>Repartir el 100% de lecturas a ciegas</td><td>No todas las lecturas toleran el mismo lag: "lo mío" no, el catálogo sí</td></tr>
+            <tr><td>Implementa <strong>read-your-writes</strong> con una ventana corta hacia el líder</td><td>Asumir que la réplica siempre está al día</td><td>Elimina el bug "no se guardó" sin renunciar al reparto de lecturas</td></tr>
+            <tr><td>Fija la sesión a una réplica (<em>monotonic reads</em>)</td><td>Balancear cada petición de una sesión a una réplica distinta</td><td>Evita que el usuario "viaje en el tiempo" entre lecturas</td></tr>
+            <tr><td>Síncrona para pagos/inventario; asíncrona para el resto</td><td>Todo síncrono (lento) o todo asíncrono (puede perder dinero)</td><td>El trade-off se elige por criticidad del dato</td></tr>
+            <tr><td>Monitoriza el <strong>replication lag</strong> como métrica de primer nivel</td><td>Descubrir el lag cuando ya afecta a usuarios</td><td>El lag crece antes de que el sistema falle; es tu señal temprana</td></tr>
+            <tr><td>Usa <strong>quórum</strong> para elegir líder y evitar split-brain</td><td>Dejar que dos nodos se crean líderes</td><td>Dos líderes = datos divergentes y corrupción</td></tr>
+            <tr><td>Mantén <strong>backups</strong> además de réplicas</td><td>Confiar la recuperación ante errores humanos a las réplicas</td><td>Los errores de borrado se replican; los backups no</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Leer la propia escritura de una réplica con lag</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ Toda lectura va a una réplica aleatoria, incluida la del autor.
+   POST /profile  ───► líder        (perfil v2 guardado)
+   GET  /profile  ───► réplica (lag) → perfil v1  → "¡no se guardó mi cambio!"
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Durante 1 s tras escribir, las lecturas "propias" van al líder
+   (o a una réplica con LSN ≥ el de la escritura).
+   POST /profile  ───► líder
+   GET  /profile  ───► líder (window=1s)  → perfil v2  ✅
+   A partir de ahí: reparto normal entre réplicas.
+</code></pre>
+
+        <h3>Todos síncronos = el líder dejó de ser tolerante a fallos</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ Réplica 100% síncrona obligatoria.
+   Si el seguidor síncrono se cae o la red parpadea,
+   el líder NO CIERRA ninguna escritura → el sistema entero se cae
+   por un problema de una copia.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Semisíncrona o síncrona "de uno entre N":
+   el líder espera a UNA réplica sana de un pool de 3.
+   Si una falla, elige otra y sigue. Y las escrituras no críticas
+   siguen siendo asíncronas.
+</code></pre>
+
+        <h3>Promover sin quórum (split-brain)</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ El sistema detecta que "el líder no responde" y promueve a un seguidor,
+   pero el líder viejo solo estaba en una partición de red y sigue
+   aceptando escrituras. → Dos líderes, datos divergentes.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Solo se promueve con mayoría (quórum &gt; N/2) de nodos de acuerdo.
+   El líder viejo, al quedar en minoría, deja de aceptar escrituras
+   automáticamente. Un solo líder posible en cada momento.
+</code></pre>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ "Consistencia" no es un interruptor</div>
+          <p>La consistencia fuerte (leer siempre el último dato confirmado) se puede conseguir con replicación síncrona, pero a costa de latencia y disponibilidad. La mayoría de sistemas reales <strong>mezclan niveles</strong>: fuerte donde importa, eventual en el resto. El marco formal lo verás en <a href="../03-cache-consistencia/03-teorema-cap.html">El teorema CAP</a> y en <a href="../03-cache-consistencia/04-consistencia-eventual.html">Consistencia eventual</a>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> clasificar los accesos de un sistema de <strong>comercio electrónico</strong> por nivel de consistencia y diseñar la política de lectura (líder vs réplica).</p>
+        <ol class="steps">
+          <li><strong>Paso 1 — lista los accesos y su sensibilidad al lag.</strong>
+            <pre><code class="language-text">A) Ver catálogo de productos             → lag 5 s tolerable
+B) Ver mi carrito tras añadir un producto → lag 0 (read-your-writes estricto)
+C) Pagar el pedido                        → lag 0 (no puede perderse)
+D) Ver "mis pedidos" (histórico)          → lag 1 s tolerable
+E) Recomendaciones y feed de la home      → lag 60 s tolerable
+F) Ver reseñas de un producto             → lag 10 s tolerable
+</code></pre>
+          </li>
+          <li><strong>Paso 2 — asigna nivel de consistencia requerido.</strong>
+            <pre><code class="language-text">A, E, F  → EVENTUAL (eventual)     : réplicas, sin cuidado especial
+D        → READ-YOUR-WRITES débil  : réplicas, salvo ventana tras escribir
+B        → READ-YOUR-WRITES fuerte : leer del líder (o LSN) tras cada cambio de carrito
+C        → FUERTE                  : escritura síncrona al menos en 1 réplica
+</code></pre>
+          </li>
+          <li><strong>Paso 3 — diseña la topología.</strong> Un líder para escrituras, 4–5 réplicas para lecturas. Replicación asíncrona para el grueso, con una política de <strong>síncrona obligatoria</strong> para las transacciones de pago (C).</li>
+          <li><strong>Paso 4 — implementa la política de lectura.</strong>
+            <pre><code class="language-text">regla de enrutado por petición:
+  if ruta in {cart, pay, my_orders} and now - last_write_of_user &lt; 1s:
+       → líder
+  else:
+       → réplica fijada a la sesión (monotonic reads)
+  if ruta in {catalog, reviews, recommendations}:
+       → cualquier réplica (round-robin)
+</code></pre>
+          </li>
+          <li><strong>Paso 5 — define el failover.</strong> Quórum de 3 nodos de control; al perder el líder, promover la réplica con el LSN más alto; aceptar y <strong>avisar</strong> del posible pequeño hueco de escrituras no replicadas (documentar el RPO: <em>recovery point objective</em>, p. ej. &lt;1 s con semisíncrona).</li>
+          <li><strong>Paso 6 — verifica con una métrica.</strong> Instrumenta <code>replication_lag_seconds</code> con alerta si supera 2 s. Ese es tu SLO interno de frescura de lecturas.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>Una tabla de accesos con su nivel de consistencia y una regla de enrutado explícita. Nótese que <strong>solo 2 de 6 accesos exigen ir al líder</strong>: el resto se sirve de réplicas con lag tolerable. Ese reparto es lo que hace que el sistema escale en lectura sin complicar la vida al usuario.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El contador de "likes" que sube y baja</h3>
+          <p>En una red social, cada "like" incrementa un contador global por publicación. Con 10 réplicas de lectura y un líder, los usuarios ven el contador <strong>subir y bajar</strong> al refrescar (lecturas no monótonas), y a veces pierden su propio "like" durante unos segundos (<em>read-your-writes</em>).</p>
+          <p>Diseña una solución que: (1) garantice que <strong>el autor siempre ve su propio like</strong>; (2) evite que el contador retroceda para un mismo usuario; (3) no mande el 100% de las lecturas del contador al líder (sería un hotspot). Estima cuánta carga extra soporta el líder con tu propuesta.</p>
+          <p><em>Pista: separa el "like del usuario" (dato por usuario, pequeño, con read-your-writes) del "contador agregado" (puede ser eventual y monótono si se combina con la versión del usuario). Piensa en leer el estado del usuario y el total como dos cosas distintas, o en incrementos idempotentes (Módulo 4) para no contar dos veces. La clave no es evitar el lag, es hacer que el lag no se note.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Replicar da <strong>disponibilidad, escala de lectura y proximidad</strong>; a cambio introduce el <em>replication lag</em>.</li>
+          <li><strong>Un líder</strong> acepta escrituras; los seguidores copian y sirven lecturas. Es la topología más común.</li>
+          <li><strong>Síncrona</strong> = no se pierde pero más latente y dependiente; <strong>asíncrona</strong> = rápida pero puede perder lo último. Elige por criticidad.</li>
+          <li>El <strong>replication lag</strong> causa anomalías: leer tu escritura, lecturas no monótonas, causalidad rota.</li>
+          <li><strong>Read-your-writes</strong>: leer del líder (o de una réplica fresca) durante una ventana corta tras escribir.</li>
+          <li><strong>Failover</strong> con quórum para evitar split-brain; asume un <strong>RPO</strong> explícito (cuánto se puede perder).</li>
+          <li>La réplica <strong>no es backup</strong>: los errores se replican.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>Replicación síncrona</td><td>Datos críticos que no pueden perderse: pagos, inventario, confirmaciones</td></tr>
+            <tr><td>Replicación asíncrona</td><td>Todo lo tolerante a lag: feeds, métricas, catálogo, analítica</td></tr>
+            <tr><td>Semisíncrona</td><td>Compromiso: durabilidad razonable sin bloquear por un solo seguidor</td></tr>
+            <tr><td>Leer del líder (ventana corta)</td><td>Garantizar read-your-writes para el autor de una escritura reciente</td></tr>
+            <tr><td>Fijar sesión a una réplica</td><td>Evitar lecturas no monótonas sin ir al líder</td></tr>
+            <tr><td>Multilíder / leaderless</td><td>Escritura multi-región y tolerancia a particiones; exige resolver conflictos</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no hago todo síncrono y me olvido del lag?</summary>
+            <div>
+              <p>Porque la sincronía tiene dos costes: <strong>latencia</strong> (cada escritura espera a un viaje de ida y vuelta a la réplica) y <strong>disponibilidad</strong> (si la réplica síncrona falla, el líder no puede cerrar escrituras). Pagar eso en <em>todo</em> el sistema ralentiza y fragiliza sin necesidad. Se paga solo donde el dato no puede perderse.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto lag es aceptable?</summary>
+            <div>
+              <p>Depende del acceso, no hay un número único. "Ver mi propio cambio" tolera <strong>0</strong> (o una ventana al líder); un feed social tolera <strong>segundos</strong>; unas métricas toleran <strong>minutos</strong>. Define el objetivo por acceso y monitoriza el lag como métrica: si crece, sabrás qué usuario lo nota primero. Alarmar a 1–2 s de lag en el sistema operacional es razonable; 5–10 s ya es incidente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo leer de cualquier réplica si fijo la sesión a una?</summary>
+            <div>
+              <p>Sí para el grueso de lecturas no críticas: fijar la sesión da <em>monotonic reads</em> (la lectura nunca retrocede) sin ir al líder. Pero no resuelve <em>read-your-writes</em>: la réplica fijada puede no haber recibido tu última escritura. Para eso necesitas la ventana al líder o leer "al menos en la posición del log" de tu escritura.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La replicación multi-región cómo encaja aquí?</summary>
+            <div>
+              <p>Con un solo líder, las escrituras de todos los continentes viajan al líder (latencia alta) y las réplicas cercanas sirven lecturas (bueno para latencia de lectura). Para escritura cercana en cada región necesitas <strong>multilíder</strong> o <strong>leaderless</strong>, con el coste de resolver conflictos (dos regiones editan el mismo registro). Es un trade-off entre latencia de escritura y complejidad de consistencia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si replico a 6 réplicas, ¿estoy a salvo de perder datos?</summary>
+            <div>
+              <p>De fallos de hardware, bastante. Pero la replicación <strong>no distingue "buen" cambio de "mal" cambio</strong>: un borrado por error, un <em>deploy</em> que escribe mal o un ataque de <em>ransomware</em> se copian a las 6 réplicas en segundos. Para eso están los <strong>backups</strong> (copias históricas) y las protecciones (permisos mínimos, confirmaciones, <em>soft delete</em>). Replicar y respaldar son defensas contra riesgos distintos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-estrategias-de-cache">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Estrategias de caché — Módulo 3 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Estrategias de caché</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Caché y consistencia</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Una <strong>caché</strong> es una copia de datos, más rápida de leer que el original, colocada en el camino entre quien pregunta y quien tiene la verdad. No es magia: es el reconocimiento de que <strong>leer es mucho más frecuente que escribir</strong> y de que, si ya has respondido una pregunta, responderla otra vez desde el mismo sitio rápido es casi gratis.</p>
+        <p>Cachear es probablemente la palanca de rendimiento con mejor relación beneficio/esfuerzo de todo el diseño de sistemas: puede convertir una consulta de 50 ms en 1 ms y descargar la base de datos en un 90%. Pero también es la fuente de la mitad de los bugs raros de producción, porque introduce <strong>copias que pueden discrepar</strong>. Esta lección trata del <strong>dónde</strong> (qué cachear, en qué capa) y del <strong>cómo</strong> (los patrones de lectura/escritura). La parte de invalidación va en <a href="02-invalidacion-y-ttl.html">Invalidación y TTL</a>.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque "poner un Redis delante" se ha convertido en un reflejo automático tan habitual como peligroso. Elegir mal el patrón de caché crea bugs que solo aparecen bajo carga o tras un reinicio. Elegir bien baja latencia, coste y carga de base de datos a la vez. La diferencia está en entender los cuatro o cinco patrones y sus trade-offs.</p>
+        </div>
+        <p><strong>Errores típicos:</strong></p>
+        <ul>
+          <li>Cachear datos que el propio usuario debe ver actualizados al instante (saldo, stock exacto).</li>
+          <li>Usar <em>write-behind</em> en datos críticos y perder escrituras si la caché muere antes de vaciarse.</li>
+          <li>Cachear en la aplicación lo que debería cachear una <strong>CDN</strong> (imágenes, estáticos).</li>
+          <li>No medir el <em>hit ratio</em>: cachear cosas que nunca se repiten es puro coste.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Por qué funciona: la ley de la distribución</h3>
+        <p>Las cargas reales no son uniformes. En casi todos los sistemas, unos pocos elementos concentran la mayoría de los accesos (popularidad, ley de Zipf). Si el 1% de los datos recibe el 50% de las lecturas, cachear ese 1% elimina la mitad de las peticiones a la base.</p>
+        <pre><code class="language-text">   ACCESOS REALES (Zipf)                 OPCIONES DE CACHÉ
+   ┌──────────────────────────────┐      ┌────────────────────────────┐
+   │ ▓▓▓▓▓▓▓▓▓▓ 50% → 1% del dato │      │ caber lo caliente en RAM   │
+   │ ▓▓▓▓▓       30% → 9%         │  ──► │ es barato y acierta mucho  │
+   │ ▓▓          15% → 20%        │      │                            │
+   │ ▓            5% → 70% (cola) │      │ la cola larga: no cachear  │
+   └──────────────────────────────┘      └────────────────────────────┘
+</code></pre>
+        <p>La métrica que lo mide es el <strong>hit ratio</strong>: de cada 100 peticiones, cuántas resuelve la caché.</p>
+
+        <h3>Dónde cachear: cuatro capas, no una</h3>
+        <table>
+          <thead><tr><th>Capa</th><th>Qué cachea</th><th>Latencia típica</th><th>Quién la controla</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cliente</strong> (navegador, móvil)</td><td>Estáticos, respuestas con <code>Cache-Control</code>, datos locales</td><td>~0 ms</td><td>Cabeceras HTTP + app</td></tr>
+            <tr><td><strong>CDN / borde</strong></td><td>Imágenes, JS, CSS, respuestas públicas cacheables</td><td>10–30 ms</td><td>Cabeceras + configuración CDN</td></tr>
+            <tr><td><strong>Aplicación</strong> (memoria o Redis/Memcached)</td><td>Resultados de consultas, objetos, sesiones</td><td>1–5 ms</td><td>Tu código</td></tr>
+            <tr><td><strong>Base de datos</strong></td><td>Páginas e índices en RAM (<em>buffer pool</em>)</td><td>~1 ms (si acierta)</td><td>Configuración + tamaño de RAM</td></tr>
+          </tbody>
+        </table>
+        <p>La <strong>regla de oro</strong>: cachea lo más cerca posible del usuario, pero solo si el dato es <strong>compartido</strong> (mismo para muchos) o <strong>poco cambiante</strong>. Datos privados y muy volátiles (tu carrito, tu saldo) se cachean en la capa de aplicación, con cuidado.</p>
+
+        <h3>Los patrones de caché</h3>
+
+        <h4>1. Cache-aside (lazy loading)</h4>
+        <p>El más común. La aplicación consulta la caché; si falla (<em>miss</em>), lee de la base y <strong>guarda el resultado en la caché</strong>. El control es 100% tuyo.</p>
+        <pre><code class="language-text">   GET key ──► ┌───────────┐  hit   ┌──────────────┐
+               │  CACHÉ    │───────►│ respuesta     │
+               └─────┬─────┘  ~90%  └──────────────┘
+                     │ miss (~10%)
+                     ▼
+               ┌───────────┐
+               │    BD     │──► guarda en caché ──► respuesta
+               └───────────┘
+   ✅ Tolerante a fallos de caché: si la caché cae, va a la BD.
+   ✅ Solo se cachea lo que se pide (no ensucia).
+   ❌ El primer acceso siempre es miss; hay ventana de datos viejos.
+</code></pre>
+        <p>Es el patrón por defecto para casi todo: catálogo, perfiles, resultados de consultas. Verás con detalle su problema de <em>stampede</em> en <a href="02-invalidacion-y-ttl.html">Invalidación y TTL</a>.</p>
+
+        <h4>2. Read-through</h4>
+        <p>Igual que cache-aside, pero la <strong>caché misma</strong> sabe ir a buscar el dato cuando falla: la aplicación solo habla con la caché. Se gana simplicidad en el código, pero exige que la caché conozca la base (un <em>cache provider</em> o un framework que lo haga).</p>
+
+        <h4>3. Write-through</h4>
+        <p>Cada escritura va <strong>a la caché y a la base a la vez</strong> (ambas confirmadas antes de responder). La caché siempre está fresca; el coste es que las escrituras tardan un poco más (dos escrituras) y que se cachean datos que quizá nunca se lean.</p>
+        <pre><code class="language-text">   WRITE ──► ┌───────┐  escribe  ┌──────────┐
+             │ CACHÉ │──────────►│   BD     │   ambas confirmadas
+             └───────┘           └──────────┘
+   ✅ Lecturas siempre frescas (dentro de lo que cubre la caché).
+   ❌ Escritura más lenta; cachea datos fríos; la caché no puede caerse
+      sin ser un problema (o hay que degradar a "escritura directa").
+</code></pre>
+
+        <h4>4. Write-behind (write-back)</h4>
+        <p>La escritura va <strong>solo a la caché</strong> y se "vuelca" a la base en segundo plano, por lotes. Escrituras muy rápidas y absorción de picos enormes; a cambio, si la caché falla antes de volcar, <strong>se pierden escrituras</strong>.</p>
+        <pre><code class="language-text">   WRITE ──►┌───────┐   ...tiempo...   volcado por lotes   ┌──────┐
+            │ CACHÉ │ ─────────────────────────────────────►│  BD  │
+            └───────┘        (asíncrono, en segundo plano)  └──────┘
+   ✅ Escritura casi instantánea; junta muchas en una sola a la BD.
+   ❌ Riesgo de pérdida de datos si la caché muere antes del volcado.
+   ❌ La BD va por detrás: lecturas directas pueden ver datos viejos.
+</code></pre>
+
+        <h4>5. Write-around</h4>
+        <p>La escritura va <strong>directamente a la base</strong> y no toca la caché (o la invalida). Beneficia el rendimiento de escritura y evita cachear datos que se escriben pero no se leen; el coste es un <em>miss</em> en la siguiente lectura.</p>
+
+        <h3>Comparativa</h3>
+        <table>
+          <thead><tr><th>Patrón</th><th>Lecturas</th><th>Escrituras</th><th>Consistencia de la caché</th><th>Riesgo principal</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cache-aside</strong></td><td>Llenado perezoso</td><td>Se escribe la BD; la caché se invalida</td><td>Se puede quedar vieja hasta que se invalide o expire</td><td>Datos viejos si la invalidación falla</td></tr>
+            <tr><td><strong>Read-through</strong></td><td>La caché rellena</td><td>Como cache-aside</td><td>Igual que cache-aside</td><td>Depende del soporte del motor</td></tr>
+            <tr><td><strong>Write-through</strong></td><td>Buena</td><td>Caché + BD</td><td>Fresca</td><td>Latencia de escritura</td></tr>
+            <tr><td><strong>Write-behind</strong></td><td>Buena (si la BD va al día)</td><td>Solo caché</td><td>Puede no reflejar la BD</td><td><strong>Pérdida de escrituras</strong></td></tr>
+            <tr><td><strong>Write-around</strong></td><td>Puede fallar tras escribir</td><td>Solo BD</td><td>Fresca (no hay copia)</td><td>Más <em>misses</em></td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: la nevera y el supermercado</div>
+          <p>La <strong>caché</strong> es la nevera de casa; la <strong>base de datos</strong> es el supermercado. <em>Cache-aside</em> es ir a la nevera y, si no hay leche, bajar al súper y traer dos brick (uno para hoy, uno para la nevera). <em>Write-through</em> es comprar en el súper y a la vez reponer la nevera. <em>Write-behind</em> es apuntar "tengo leche" en la nevera y bajar al súper después… si no se te olvida. <em>Write-around</em> es comprar solo lo que vas a usar hoy y no tocar la nevera.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una consulta de perfil de usuario. Supuestos de latencia (round-trip dentro del mismo centro de datos): <strong>caché = 1 ms</strong>, <strong>base de datos = 10 ms</strong>. La caché tiene un <em>hit ratio</em> <code>h</code>.</p>
+        <pre><code class="language-text">latencia media = h × 1 ms + (1 - h) × (1 ms + 10 ms)
+               = 1 ms + (1 - h) × 10 ms
+
+ h = 0%    → 11 ms   (peor que no cachear: pagas el intento fallido)
+ h = 50%   →  6 ms
+ h = 90%   →  2 ms
+ h = 99%   → 1,1 ms
+</code></pre>
+        <p>Con solo un <strong>90% de hit ratio</strong>, la latencia media cae de 10 ms a 2 ms (5× mejor) y la base de datos recibe <strong>10× menos lecturas</strong>. Ese es todo el valor de una caché.</p>
+
+        <h3>Cache-aside en acción</h3>
+        <div class="code-file">pseudocódigo — cache-aside</div>
+        <pre><code class="language-text">function getPerfil(userId):
+    key = "perfil:" + userId
+    valor = cache.get(key)
+    if valor != null:                  # HIT
+        return valor                   # ~1 ms
+    valor = db.query("SELECT * FROM perfiles WHERE id = ?", userId)   # ~10 ms
+    cache.set(key, valor, ttl = 300s)  # guarda para la próxima (5 min)
+    return valor
+</code></pre>
+        <div class="callout callout--note">
+          <div class="callout__title">Escribir es lo que complica</div>
+          <p>La lectura es fácil. El problema llega cuando el perfil cambia: hay que decidir si <strong>actualizar</strong> la copia o <strong>borrarla</strong>, y en qué orden respecto a la base. Esa decisión (y sus condiciones de carrera) es el corazón de la siguiente lección.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado al <strong>feed de noticias</strong> (Módulo 6) y al <strong>URL shortener</strong>, con capas distintas para problemas distintos. Este es un mapa típico de un sistema real de tres capas de caché.</p>
+
+        <pre><code class="language-text">  USUARIO
+     │
+     ▼
+ ┌──────────────┐   estáticos, imágenes: hit ~95%  (latencia ~20 ms)
+ │  CDN / edge  │◄───────────────────────────────────────────────
+ └──────┬───────┘
+        │ (solo lo no cacheable en borde)
+        ▼
+ ┌──────────────┐   respuestas/objetos: hit ~80-90%  (latencia ~2 ms)
+ │ CACHÉ APLIC. │◄── Redis / Memcached (feed, perfiles, contadores)
+ │  (Redis)     │
+ └──────┬───────┘
+        │ (solo lo que no está en la caché de aplicación)
+        ▼
+ ┌──────────────┐   índices/páginas en RAM (buffer pool)
+ │  BASE DATOS  │
+ └──────────────┘
+</code></pre>
+
+        <h3>Decisiones por capa y su porqué</h3>
+        <table>
+          <thead><tr><th>Dato</th><th>Dónde se cachea</th><th>Patrón</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Avatares e imágenes del feed</td><td><strong>CDN</strong></td><td>Cache-aside con <code>Cache-Control</code></td><td>Estático, compartido, sirve desde el borde; quita el 95% del tráfico</td></tr>
+            <tr><td>Perfil público de un usuario</td><td><strong>Aplicación</strong> (Redis)</td><td>Cache-aside, TTL 5 min</td><td>Se lee muchísimo y cambia poco; tolera segundos de antigüedad</td></tr>
+            <tr><td>Conteo de likes</td><td><strong>Aplicación</strong> (Redis)</td><td>Write-behind o write-through</td><td>Altísimo volumen de incrementos; agregar en memoria y volcar</td></tr>
+            <tr><td>URL corta → URL larga</td><td><strong>Aplicación</strong> + cliente</td><td>Cache-aside, TTL largo</td><td>Inmutable de facto: una vez creada no cambia; hit casi 100%</td></tr>
+            <tr><td>Mi carrito / mi saldo</td><td><strong>Aplicación</strong>, por usuario</td><td>Write-through o sin caché</td><td>Privado y debe reflejar tu última acción: no tolera copias viejas</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--tip">
+          <div class="callout__title">Clave inmutable = caché perfecta</div>
+          <p>El caso del URL shortener es el ejemplo ideal: la relación <code>slug → url</code> <strong>no cambia nunca</strong> una vez creada. Un dato inmutable puede cachearse con TTL muy largo (o sin TTL) y hit ratio cercano al 100%, sin miedo a la invalidación. Cuando puedas hacer inmutable un dato, el caché deja de ser un problema de consistencia y pasa a ser solo rendimiento.</p>
+        </div>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Cachear el feed entero es tentador y frágil</div>
+          <p>Se puede cachear "el feed de cada usuario" (una lista de IDs) para no recomputarlo. Pero la lista cambia con cada post de cada seguido: el TTL debe ser corto (segundos) y la invalidación es complicada. En la práctica suele cacharse <strong>el contenido de los posts</strong> (compartidos entre muchos usuarios) y no la lista personalizada. Cachea lo <em>compartido</em>; lo muy personalizado y volátil, o no lo caches, o hazlo con cuidado.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Cachea lo <strong>compartido, leído mucho y cambiado poco</strong></td><td>Cachear datos privados y muy volátiles sin cuidado</td><td>Maximiza hits y minimiza invalidaciones; el beneficio/coste es mejor</td></tr>
+            <tr><td>Empieza por <strong>cache-aside</strong></td><td>Empezar con write-behind en datos críticos</td><td>Es tolerante a fallos de caché y no pierde datos: el patrón seguro por defecto</td></tr>
+            <tr><td>Diseña la caché como <strong>optimización, no como dependencia</strong></td><td>Asumir que la caché siempre está disponible</td><td>Si la caché cae, el sistema debe seguir (más lento), no caerse</td></tr>
+            <tr><td>Usa <strong>capas</strong> (CDN → app → BD) para problemas distintos</td><td>Meterlo todo en Redis "porque ya está montado"</td><td>Cada capa resuelve su tipo de dato; el borde quita cargas que Redis no debería ver</td></tr>
+            <tr><td>Mide <strong>hit ratio</strong> y latencia p50/p99</td><td>Cachear sin saber si acierta</td><td>Un hit ratio bajo es coste puro: datos que se piden una vez y nunca se repiten</td></tr>
+            <tr><td>Haz <strong>valores inmutables</strong> cuando puedas</td><td>Guardar en caché datos que cambian cada minuto</td><td>Lo inmutable se cachea infinito y sin riesgo de incoherencia</td></tr>
+            <tr><td>Ponle <strong>límite de tamaño y política de evicción</strong> (LRU)</td><td>Dejar que la caché crezca sin control</td><td>Sin límite, la caché se llena, consume RAM y expulsa lo útil</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Cachear sin límite ni evicción</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ cache.set(key, valor)  # sin TTL, sin límite
+   La caché crece hasta agotar la RAM del servidor; el sistema se cae
+   por falta de memoria (y con claves que nadie volverá a pedir).
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ cache.set(key, valor, ttl = 300s)   # expira
+   ✅ cache con política LRU y tamaño máximo (p. ej. 2 GB)
+   Los datos calientes se quedan; el resto se expulsa y se rellena si vuelve.
+</code></pre>
+
+        <h3>Tratar la caché como fuente de verdad</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ Escribir SOLO en la caché y asumir que ahí queda.
+   Si la caché se reinicia (o expira la clave), el dato "existe" solo en RAM
+   y se pierde para siempre. La base de datos nunca lo supo.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ La BASE DE DATOS es la fuente de verdad; la caché es una copia
+   reconstruible. Con write-behind, la caché debe persistir el volcado
+   pendiente (durable queue) para no perderlo al reiniciar.
+</code></pre>
+
+        <h3>Cachear la propia respuesta de error</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-text">❌ cache.set("perfil:77", null, ttl = 3600s)   # "no existe" cacheado 1 h
+   Un dato que aún no había llegado (o un error transitorio) queda
+   "congelado" como negativo durante una hora.
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-text">✅ Distingue "no existe de verdad" (cachea negativo con TTL corto)
+   de "error transitorio" (NO cachees; deja que se recupere).
+   TTL corto (p. ej. 30 s) para negativos: protege sin congelar el error.
+</code></pre>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ La caché es un sistema distribuido (y puede fallar)</div>
+          <p>Una caché compartida (Redis) es un servicio más: puede caer, ir lenta o perder datos. Un sistema bien diseñado, si la caché desaparece de golpe, <strong>degrada</strong> (todo va a la base, más lento) pero <strong>no cae</strong>. Ese es el requisito de diseño: la caché nunca debe ser un punto único de fallo del que dependa la corrección del sistema. La protección contra el "todos a la vez a la base" cuando la caché se vacía se llama <em>stampede</em> y se ve en la siguiente lección.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> diseñar la estrategia de caché de un <strong>catálogo de e-commerce</strong> y justificar cada decisión con números.</p>
+        <ol class="steps">
+          <li><strong>Paso 1 — perfila los accesos.</strong>
+            <pre><code class="language-text">A) Ver ficha de producto            → 40 000/s  (40 M del catálogo, 1% = 90% del tráfico)
+B) Listar categoría (con filtros)   → 10 000/s  (resultados varían por filtro)
+C) Mostrar imágenes del producto    → 200 000/s (estáticos)
+D) Ver stock exacto antes de pagar  →   500/s   (debe ser exacto)
+</code></pre>
+          </li>
+          <li><strong>Paso 2 — asigna capa y patrón.</strong>
+            <pre><code class="language-text">A) ficha de producto  → CACHÉ APP (Redis), cache-aside, TTL 5 min
+B) listado categoría  → CACHÉ APP (Redis), cache-aside, TTL 30 s (más volátil)
+C) imágenes           → CDN, Cache-Control: public, max-age=1 año (inmutables)
+D) stock exacto       → SIN CACHÉ (o write-through por artículo), leer de la BD
+</code></pre>
+          </li>
+          <li><strong>Paso 3 — estima el efecto.</strong> Ficha de producto: hit ratio 90% ⇒ 40 000/s → 4 000/s a la base (10× menos) y latencia de 12 ms a ~2 ms. Imágenes: 200 000/s desde el borde ⇒ la aplicación casi nunca las ve.</li>
+          <li><strong>Paso 4 — elige el patrón de escritura.</strong> Cuando un producto cambia (precio, descripción), el admin actualiza la base y la caché se <strong>invalida</strong> (<em>write-around</em> + borrado de clave). No se hace write-through de todo: solo se borra la ficha para que se relea fresca.</li>
+          <li><strong>Paso 5 — protege el arranque en frío.</strong> Tras un reinicio de Redis, todas las fichas se piden a la vez: añade <em>single-flight</em> (una sola carga por clave) y TTL con <em>jitter</em>. Eso se ve en detalle en <a href="02-invalidacion-y-ttl.html">Invalidación y TTL</a>.</li>
+          <li><strong>Paso 6 — declara el modelo mental.</strong> "La BD es la fuente de verdad; Redis es reconstruible; el CDN sirve estáticos inmutables. Si Redis se cae, la tienda funciona más lenta." Ese es el ADR.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>Cada acceso con su capa, su patrón y su TTL, y el sistema declarado como "caché = optimización, no dependencia". Nótese que <strong>el 80% del tráfico de imágenes sale por el CDN</strong> y que el único dato que no se cachea (stock) es justo el que no puede tolerarlo.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El contador de visitas que nadie quiere perder</h3>
+          <p>Una web recibe <strong>500 000 visitas/segundo</strong> y quiere mostrar el contador de "visitas en la última hora" en su portada, además de guardar el histórico por página. Actualizarlo directamente en la base (un <code>UPDATE</code> por visita) es inviable a esa escala.</p>
+          <p>Diseña la estrategia de caché y escritura: dónde vive el contador caliente, con qué patrón (¿write-behind?), cómo se evita perder el conteo si la caché se reinicia, y cómo se sirve la portada sin ir a la base. Estima cuántas escrituras por segundo llegan finalmente a la base y qué pierdes si la caché muere en el peor momento.</p>
+          <p><em>Pista: los contadores son el caso canónico de <strong>agregar en memoria</strong> e ir volcando por lotes (write-behind) — pero el volcado debe ser duradero para no perder conteos. Piensa en el contador como un delta que se acumula y se descarga, y en la portada como una lectura cacheada con TTL de segundos. Y decide explícitamente el trade-off: ¿es trágico perder 1 segundo de conteos? Si sí, síncrono; si no, write-behind.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <strong>caché</strong> es una copia rápida para lecturas repetidas; funciona gracias a que los accesos están <strong>sesgados</strong> (pocos datos, muchas lecturas).</li>
+          <li>Se cachea en <strong>cuatro capas</strong>: cliente, CDN/borde, aplicación y base de datos (buffer pool).</li>
+          <li>El <strong>hit ratio</strong> manda: una mejora de 0% a 90% multiplica la latencia por 5 y descarga la base ×10.</li>
+          <li><strong>Cache-aside</strong> es el patrón por defecto; <strong>read-through</strong> delega el relleno en la caché.</li>
+          <li><strong>Write-through</strong> mantiene la caché fresca a costa de latencia; <strong>write-behind</strong> es rápido pero puede perder escrituras.</li>
+          <li>La <strong>base de datos es la fuente de verdad</strong>; la caché es una optimización reconstruible, nunca una dependencia crítica.</li>
+          <li>Lo <strong>inmutable</strong> (slug→url, imágenes) se cachea casi perfecto; lo privado y volátil, con cuidado o sin caché.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>CDN / borde</td><td>Estáticos y respuestas públicas compartidas; lo más cercano al usuario</td></tr>
+            <tr><td>Cache-aside</td><td>Patrón por defecto: lecturas frecuentes que toleran algo de antigüedad</td></tr>
+            <tr><td>Read-through</td><td>Cuando el framework/motor puede rellenar la caché por ti</td></tr>
+            <tr><td>Write-through</td><td>Datos que deben estar frescos y se leen mucho</td></tr>
+            <tr><td>Write-behind</td><td>Absorber picos de escritura y pérdida tolerable (contadores, métricas)</td></tr>
+            <tr><td>Write-around / sin caché</td><td>Datos que cambian mucho y se leen poco, o que exigen exactitud</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué hit ratio necesito para que valga la pena?</summary>
+            <div>
+              <p>Depende de la diferencia de latencia y del coste de un <em>miss</em>. Con caché de 1 ms y base de 10 ms, incluso un 50% de hits ya mejora la media. Pero el umbral real está en el <strong>coste de mantener la caché y de la invalidación</strong>: si cacheas cosas que casi nunca se repiten (hit bajo), pagas RAM, complejidad y riesgo de datos viejos a cambio de poco. Regla: si el hit ratio es &lt;50% para un dato, probablemente no merezca la pena cachearlo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Redis o Memcached?</summary>
+            <div>
+              <p>Ambos son cachés en memoria. La decisión fina depende de las funciones que necesites (estructuras de datos, persistencia, pub/sub, capacidad de ser un servicio gestionado). Lo importante aquí <strong>no es el producto, es el patrón</strong>: la misma decisión de cache-aside vs write-behind aplica a cualquiera. Elige el que mejor encaje con tu operación y no conviertas la lección en una comparativa de marcas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cachear respuestas personalizadas por usuario?</summary>
+            <div>
+              <p>Sí, pero con cuidado: son privadas (no pueden ir a una CDN compartida) y suelen cambiar con las acciones del usuario. Si se cachean, que sea con TTL corto y clave por usuario. Y recuerda la lección de replicación: el usuario <strong>debe ver su propia acción</strong>, así que un dato personalizado recién escrito suele ir directo a la fuente, no a la caché.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo NO debo usar caché?</summary>
+            <div>
+              <p>Cuando el dato cambia con cada lectura (contadores en tiempo real para decisiones), cuando la exactitud es imprescindible (saldo, stock antes de cobrar), cuando el hit ratio sería bajísimo, o cuando el sistema aún es pequeño y la base responde sin problema. Meter caché antes de necesitarla añade complejidad y modos de fallo sin beneficios. Primero mide; cachea cuando haya un número que lo pida.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La caché no me protege también de fallos de la base?</summary>
+            <div>
+              <p>En parte: mientras la caché tiene datos frescos, un corte de la base pasa desapercibido para las lecturas que aciertan. Pero es una protección <strong>parcial y engañosa</strong>: las escrituras y los <em>misses</em> siguen necesitando la base, y la caché no garantiza frescura. No la diseñes como plan de continuidad; diséñala como optimización que hace que, si la base sufre, el sistema aguante algo mejor.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

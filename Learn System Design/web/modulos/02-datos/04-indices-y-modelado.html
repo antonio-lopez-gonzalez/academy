@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-indices-y-modelado">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Índices y modelado a escala — Módulo 2 · Curso System Design</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('sysd-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Índices y modelado a escala</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Datos</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya elegiste motor (<a href="01-sql-vs-nosql.html">SQL vs NoSQL</a>), repartiste los datos (<a href="02-particionado-y-sharding.html">Particionado</a>) y los copiaste (<a href="03-replicacion-y-consistencia.html">Replicación</a>). Aun así, una consulta puede seguir tardando 3 segundos. Casi siempre la causa es la misma: <strong>el dato está bien repartido, pero mal modelado o sin el índice que la consulta necesita</strong>.</p>
+        <p>Esta lección cierra el Módulo 2 con las dos palancas que más rendimiento dan por unidad de esfuerzo: <strong>índices</strong> (encontrar rápido lo que buscas) y <strong>modelado por consulta</strong> (guardar el dato en la forma en que lo vas a leer). Y con su precio: cada índice acelera las lecturas y <strong>encarece las escrituras</strong>; desnormalizar acelera las lecturas y crea <strong>duplicación que hay que mantener coherente</strong>.</p>
+        <div class="callout callout--why">
+          <div class="callout__title">¿Por qué existe esta lección?</div>
+          <p>Porque el 80% de los "problemas de base de datos a escala" se resuelven con un índice bien puesto o un modelo bien pensado, y el otro 20% se empeora con índices mal puestos. Aprender el coste real de un índice evita tanto el sistema lento (sin índices) como el sistema que escribe a 200/s (con 30 índices).</p>
+        </div>
+        <p><strong>Errores típicos:</strong></p>
+        <ul>
+          <li>Indexar <em>todas</em> las columnas "por si acaso", y luego escribir lento.</li>
+          <li>Poner un índice en columnas de <strong>baja cardinalidad</strong> (p. ej. un booleano) y no usarlo.</li>
+          <li>Filtrar con una función sobre la columna indexada (<code>WHERE year(fecha) = 2026</code>) y anular el índice.</li>
+          <li>Modelar por entidad (como enseñan los libros de normalización) en vez de por consulta.</li>
+          <li>Desnormalizar sin decidir <strong>quién manda</strong> cuando el dato duplicado se contradice.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué es un índice (y por qué acelera)</h3>
+        <p>Sin índice, una consulta por un campo no clave obliga a un <strong>recorrido completo</strong> (<em>full scan</em>): el motor lee <em>todas</em> las filas y comprueba la condición en cada una. Con 1 000 M de filas, eso es leer 1 000 M de filas por consulta. Un índice es una estructura aparte, ordenada, que permite <strong>saltar directamente</strong> a las filas que cumplen la condición — como el índice alfabético de un libro.</p>
+        <pre><code class="language-text">   SIN ÍNDICE (full scan)                 CON ÍNDICE (B-tree)
+   ┌───────────────────────────────┐     ┌──────────────┐
+   │ fila 1  ✗                      │     │ índice email │  ── busca "ana@x.com"
+   │ fila 2  ✗                      │     │  … ordenado… │     en un árbol log(N)
+   │ …                              │     │ ana@x.com ───┼──► fila 842  ✅
+   │ fila 842 ✅  ← la encuentro al final│  └──────────────┘
+   │ …                              │     coste ≈ log₂(1 000 000 000) ≈ 30 pasos
+   │ fila 1 000 000 000 ✗           │
+   └───────────────────────────────┘
+   coste ≈ 1 000 000 000 pasos          vs    ~30 pasos + leer la fila
+</code></pre>
+
+        <h3>El coste que casi nadie cuenta: la escritura</h3>
+        <p>Un índice no es gratis. Cada <code>INSERT</code>, <code>UPDATE</code> o <code>DELETE</code> debe <strong>actualizar también todos los índices</strong> que tocan esa fila. Ese trabajo oculto se llama <em>write amplification</em>.</p>
+        <div class="callout callout--tip">
+          <div class="callout__title">Estima antes de indexar</div>
+          <p>Regla práctica: una tabla con <strong>K índices</strong> paga aproximadamente <strong>K+1 escrituras</strong> por cada modificación (la fila + un apunte en cada índice). Si tu tabla recibe 20 000 escrituras/s y le pones 8 índices, el motor hace del orden de <strong>160 000+ actualizaciones de estructura/s</strong>. Ese es el motivo por el que una tabla con demasiados índices "deja de escribir".</p>
+        </div>
+        <table>
+          <thead><tr><th>Efecto</th><th>Sin índice</th><th>Con índice</th></tr></thead>
+          <tbody>
+            <tr><td>Lectura por ese campo</td><td>Lenta (<em>full scan</em>)</td><td>Rápida (búsqueda en árbol)</td></tr>
+            <tr><td>Escritura de esa fila</td><td>Rápida</td><td>Más lenta (hay que mantener el índice)</td></tr>
+            <tr><td>Espacio en disco</td><td>Menor</td><td>Mayor (el índice ocupa)</td></tr>
+            <tr><td>RAM</td><td>Menos</td><td>Más (los índices calientes quieren caber en memoria)</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Tipos de índice que conviene conocer</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Sirve para</th><th>Nota</th></tr></thead>
+          <tbody>
+            <tr><td><strong>B-tree</strong></td><td>Igualdad y <strong>rangos</strong> (<code>=</code>, <code>&lt;</code>, <code>BETWEEN</code>, <code>ORDER BY</code>)</td><td>El índice por defecto; el más versátil</td></tr>
+            <tr><td><strong>Hash</strong></td><td>Solo igualdad exacta</td><td>No sirve para rangos; rara vez necesario frente al B-tree</td></tr>
+            <tr><td><strong>Compuesto</strong></td><td>Consultas con varias columnas; el <strong>orden importa</strong></td><td><code>(a, b)</code> sirve para <code>a</code> y para <code>a AND b</code>, pero no solo para <code>b</code></td></tr>
+            <tr><td><strong>Parcial / filtrado</strong></td><td>Un subconjunto pequeño (p. ej. solo filas activas)</td><td>Más pequeño y rápido: indexa solo lo que consultas</td></tr>
+            <tr><td><strong>Cobertura</strong></td><td>La propia consulta: no hay que ir a la fila</td><td>Incluye las columnas necesarias; muy rápido a cambio de más espacio</td></tr>
+            <tr><td><strong>Invertido</strong></td><td>Texto y búsqueda</td><td>Base de los buscadores (Módulo 2, familia "búsqueda")</td></tr>
+          </tbody>
+        </table>
+
+        <h3>El orden de un índice compuesto: la regla de las columnas</h3>
+        <p>En un índice compuesto <code>(user_id, created_at)</code>, el motor ordena primero por <code>user_id</code> y, dentro de cada usuario, por <code>created_at</code>. Por eso sirve a las consultas que filtran por <code>user_id</code> y opcionalmente ordenan por fecha, pero <strong>no</strong> a las que filtran solo por <code>created_at</code>.</p>
+        <pre><code class="language-text">   índice (user_id, created_at)  →  ordenado así por dentro:
+
+   user_id=1 │ 10:00  ←
+   user_id=1 │ 10:05  │  "últimos 3 de user 1" → un rango contiguo ✅
+   user_id=1 │ 10:09  ←
+   user_id=2 │ 09:58
+   user_id=2 │ 10:20
+   ...
+
+   "todos los eventos de las 10:00 (cualquier usuario)"  → NO aprovecha el índice ❌
+   (created_at está disperso entre usuarios; habría un índice aparte)
+</code></pre>
+        <div class="callout callout--analogy">
+          <div class="callout__title">Analogía: la guía telefónica vs. el listín por fecha</div>
+          <p>La guía telefónica ordena <strong>por apellido y luego por nombre</strong>: encontrar "Pérez, Ana" es instantáneo; encontrar "todos los que nacieron en marzo" es imposible con esa guía. Necesitarías otro listín ordenado por fecha. Un índice compuesto es una guía con un <strong>orden principal</strong>: solo puede ser realmente rápido para las consultas que empiezan por ese orden.</p>
+        </div>
+
+        <h3>Modelado por consulta</h3>
+        <p>El modelado relacional clásico enseña a <strong>normalizar</strong>: cada dato una vez, sin redundancia, modelando <em>entidades</em>. Es correcto y cómodo cuando el sistema es pequeño y flexible. Pero a escala, el acceso dominante cambia la ecuación: <strong>se modela la tabla para la consulta que la va a leer</strong>, aunque eso implique duplicar datos.</p>
+        <pre><code class="language-text">   MODELADO POR ENTIDAD              MODELADO POR CONSULTA
+   (normalizado, joins en cada       (tabla ya "lista para pintar",
+    lectura)                          lecturas de un solo golpe)
+
+   products(id, name, brand_id)      feed_items(user_id, ts,
+   brands(id, name)                    post_id, post_text,
+   posts(id, author_id, text, …)       author_name, author_avatar)
+   likes(post_id, user_id)
+   users(id, name, avatar_url)       ← se lee la pantalla con UNA query,
+                                       a cambio de duplicar name y avatar
+   Leer el feed = 4-5 joins por      y de actualizarlos cuando cambian
+   prenda, caro a 50 000 QPS
+</code></pre>
+        <p>Duplicar (desnormalizar) no es "hacerlo mal": es un <strong>trade-off</strong> explícito. Ganas velocidad de lectura y simplicidad de código; pierdes integridad automática y pagas el coste de mantener las copias al día.</p>
+
+        <h3>Desnormalizar: cuándo sí y cómo no arruinarlo</h3>
+        <table>
+          <thead><tr><th>Sí desnormaliza</th><th>No desnormalices</th></tr></thead>
+          <tbody>
+            <tr><td>Campos que se leen juntos y cambian rara vez (nombre de autor, título de producto)</td><td>Datos que cambian a cada segundo y donde la copia siempre va a estar mal</td></tr>
+            <tr><td>Contadores agregados (nº de likes, seguidores) mantenidos al escribir</td><td>Operaciones donde la exactitud instantánea es obligatoria (saldo bancario)</td></tr>
+            <tr><td>Cuando el coste de un join/rango es tu cuello de botella medido</td><td>Cuando no puedes responder "quién manda" si la copia se contradice</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Desnormalizar exige decidir la fuente de verdad</div>
+          <p>Si copias <code>author_name</code> en 500 M de filas del feed, cuando el autor cambie de nombre tienes dos opciones: (1) actualizar las 500 M (carísimo) o (2) reconstruir el feed poco a poco desde la fuente de verdad. <strong>Elige la fuente de verdad antes de copiar</strong>: el dato original (tabla de usuarios) manda; la copia es un cache que se puede regenerar. Sin esta decisión, la desnormalización se vuelve un pantano de incoherencias.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una tabla <code>orders</code> con <strong>50 M de filas</strong>. Consulta típica: "los últimos 20 pedidos de un usuario". Comparemos sin y con el índice correcto (supuesto: cada fila pesa ~200 bytes; una lectura secuencial de disco lee ~500 MB/s).</p>
+
+        <h3>Sin índice</h3>
+        <pre><code class="language-text">SELECT * FROM orders WHERE user_id = 77 ORDER BY created_at DESC LIMIT 20;
+sin índice → full scan de 50 M filas ≈ 10 GB recorridos
+   → ~20 s por consulta (y el CPU de todos los usuarios sufre)
+   → e incluso así, hay que ORDENAR 50 M filas para quedarse con 20
+</code></pre>
+
+        <h3>Con índice compuesto <code>(user_id, created_at)</code></h3>
+        <pre><code class="language-sql">-- El orden de columnas importa: primero user_id (igualdad), luego created_at (orden)
+CREATE INDEX idx_orders_user_time ON orders (user_id, created_at DESC);
+
+SELECT * FROM orders WHERE user_id = 77 ORDER BY created_at DESC LIMIT 20;
+-- → el motor salta a user_id=77 y lee las 20 primeras en orden descendente.
+-- → ~1 ms en vez de ~20 s (20 000× más rápido en este escenario)
+</code></pre>
+        <p><strong>Coste del índice:</strong> ocupa ~<code>50 M × (8 + 8) bytes ≈ 800 MB</code> (clave + puntero, sin contar overhead) y cada <code>INSERT</code> de pedido mantiene un apunte más. Con 2 formularios de escritura por pedido, el coste es despreciable comparado con leer 20 s. <strong>Decisión ganadora clara.</strong></p>
+
+        <h3>La variante que anula el índice</h3>
+        <pre><code class="language-sql">-- ❌ La función sobre la columna impide usar el índice de created_at
+SELECT * FROM orders WHERE date(created_at) = '2026-10-11';
+
+-- ✅ Reescribe como un RANGO: el índice de created_at sí sirve
+SELECT * FROM orders
+WHERE created_at &gt;= '2026-10-11' AND created_at &lt; '2026-10-12';
+</code></pre>
+        <div class="callout callout--note">
+          <div class="callout__title">Lección de una línea</div>
+          <p>Un índice solo ayuda si la consulta está escrita de forma que <strong>pueda usarlo</strong>. Envolver la columna en una función (fecha, <code>LOWER()</code>, <code>CAST()</code>) es la forma más común de tirar un índice a la basura sin darse cuenta.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Aplicado al <strong>feed de noticias</strong> (Módulo 6): 30 M de usuarios activos, cada uno sigue a ~200 cuentas, y cada usuario carga su feed varias veces al día. Supuestos: 50 000 lecturas de feed/s en pico, 5 000 posts/s creados.</p>
+
+        <h3>El modelo "de entidad" y su coste real</h3>
+        <p>Si modelas por entidades (normalizado) y construyes el feed en la consulta, cada carga es un <em>join</em> de follows + posts + autores, ordenado por fecha y limitado a 50. A 50 000 QPS, eso es un join enorme multiplicado por la frecuencia: <strong>inviable</strong>. La lectura es el acceso dominante, así que se modela para ella.</p>
+
+        <h3>El modelo "por consulta": el timeline precomputado</h3>
+        <pre><code class="language-text">   ESCRITURA (fan-out on write, 5 000 posts/s)
+   post creado ──► insertar una fila en el timeline de cada seguidor
+                   (200 seguidores de media → 1 M inserciones/s… ¡cuidado!)
+
+   LEER el feed (50 000/s)
+   SELECT post_id, post_text, author_name, author_avatar
+   FROM feed_items WHERE user_id = 77 ORDER BY ts DESC LIMIT 50;
+   → UNA partición, UN rango de índice, CERO joins   ✅
+</code></pre>
+        <table>
+          <thead><tr><th>Decisión</th><th>Qué se gana</th><th>Trade-off</th></tr></thead>
+          <tbody>
+            <tr><td>Tabla <code>feed_items</code> desnormalizada (nombre+avatar del autor copiados)</td><td>Leer el feed = 1 query, sin joins, a 50 000 QPS</td><td>Al cambiar el nombre del autor, la copia queda vieja hasta regenerarla</td></tr>
+            <tr><td>Clave de partición <code>user_id</code>, orden <code>ts DESC</code></td><td><strong>1 partición</strong> por lectura de feed</td><td>El fan-out de escritura crea millones de filas por post</td></tr>
+            <tr><td>Contadores agregados (likes, comentarios) mantenidos al escribir</td><td>El feed no calcula <code>COUNT(*)</code> en cada carga</td><td>Hay que mantenerlos correctos con escrituras idempotentes (Módulo 4)</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ El fan-out tiene su propio muro</div>
+          <p>Con la media de 200 seguidores, un post genera 200 inserciones. Pero una cuenta con <strong>50 M de seguidores</strong> (un famoso) generaría 50 M de inserciones por un solo post: un hotspot brutal. La solución híbrida del módulo de casos: <strong>fan-out on write</strong> para la mayoría y <strong>fan-out on read</strong> (mezclar en la lectura) para las cuentas gigantes. Modelar por consulta no significa "copiar siempre": significa <strong>decidir dónde se paga el coste</strong> (al escribir o al leer).</p>
+        </div>
+
+        <h3>Cómo mantener la copia viva sin actualizar 500 M de filas</h3>
+        <p>Cuando el autor cambia su avatar, no se reescriben las 500 M de filas del timeline. Se deja que la <strong>fuente de verdad</strong> (tabla de usuarios) mande y las lecturas <strong>frescas</strong> de un perfil usen el valor actual. El timeline viejo muestra el avatar antiguo durante un tiempo y se corrige por regeneración perezosa (<em>lazy</em>) o por un flujo de eventos (Módulo 4). <strong>Se acepta inconsistencia temporal a cambio de no reescribir el mundo.</strong></p>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Indexa para las <strong>consultas reales</strong> (las del <em>perfil de carga</em>)</td><td>Indexar "por si acaso" cada columna</td><td>Cada índice encarece cada escritura; paga solo lo que se usa</td></tr>
+            <tr><td>Ordena las columnas del índice compuesto por <strong>igualdad → orden</strong></td><td>Poner <code>(fecha, user_id)</code> cuando filtras por <code>user_id</code></td><td>El índice solo acelera las consultas que empiezan por su primer orden</td></tr>
+            <tr><td>Usa índices <strong>parciales</strong> y de <strong>cobertura</strong> cuando aplique</td><td>Crear un índice gigante para consultar un 1% de las filas</td><td>Un índice pequeño cabe en RAM y es mucho más rápido</td></tr>
+            <tr><td>Monitoriza las consultas lentas y añade el índice que falta con datos</td><td>Añadir índices por intuición</td><td>El índice se justifica con una consulta que lo necesita, medida</td></tr>
+            <tr><td>Modela la tabla <strong>como la lees</strong> en el camino caliente</td><td>Hacer 5 joins en el camino caliente a 50k QPS</td><td>Las lecturas dominan; el modelo debe servirlas en un golpe</td></tr>
+            <tr><td>Decide la <strong>fuente de verdad</strong> antes de duplicar</td><td>Desnormalizar sin dueño del dato</td><td>Sin fuente de verdad, la copia incoherente no se puede arreglar</td></tr>
+            <tr><td>Pagina con <strong>cursor</strong> (clave+orden), no con <code>OFFSET</code></td><td><code>LIMIT 20 OFFSET 1000000</code></td><td>El <code>OFFSET</code> recorre y descarta millones de filas; el cursor salta por índice</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Anular el índice con una función</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-sql">-- ❌ date(created_at) impide usar el índice sobre created_at (full scan)
+SELECT * FROM events WHERE date(created_at) = '2026-10-11';
+-- ❌ LOWER(email) impide usar el índice sobre email
+SELECT * FROM users WHERE LOWER(email) = 'ana@x.com';
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-sql">-- ✅ Rango, para que el índice de created_at se aproveche
+SELECT * FROM events
+WHERE created_at &gt;= '2026-10-11' AND created_at &lt; '2026-10-12';
+
+-- ✅ O un índice funcional explícito si necesitas la función
+CREATE INDEX idx_users_email_lower ON users (LOWER(email));
+SELECT * FROM users WHERE LOWER(email) = 'ana@x.com';
+</code></pre>
+
+        <h3>Índice en columna de baja cardinalidad</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-sql">-- ❌ status tiene 3 valores ('new','paid','shipped'); filtrar por 'new'
+--    devuelve el 40% de la tabla → el planificador preferirá el full scan
+CREATE INDEX idx_orders_status ON orders (status);
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-sql">-- ✅ Índice PARCIAL: solo la minoría que se consulta siempre
+CREATE INDEX idx_orders_pending ON orders (created_at) WHERE status = 'new';
+-- El índice es diminuto (solo pedidos nuevos) y rapidísimo.
+</code></pre>
+
+        <h3>Paginación con OFFSET a escala</h3>
+        <div class="code-label code-label--wrong">Así no</div>
+        <pre><code class="language-sql">-- ❌ Página 50 000: el motor recorre y descarta 1 000 000 de filas
+SELECT * FROM feed_items WHERE user_id = 77
+ORDER BY ts DESC LIMIT 20 OFFSET 1000000;
+</code></pre>
+        <div class="code-label code-label--right">Así sí</div>
+        <pre><code class="language-sql">-- ✅ Cursor/keyset: salta directamente por el índice (user_id, ts DESC)
+SELECT * FROM feed_items
+WHERE user_id = 77 AND ts &lt; :last_seen_ts
+ORDER BY ts DESC LIMIT 20;
+</code></pre>
+
+        <div class="callout callout--warning">
+          <div class="callout__title">⚠️ Más índices ≠ más rápido</div>
+          <p>Un sistema con 12 índices en una tabla de alta escritura puede ser <strong>más lento en escritura que uno con 2</strong> y no mucho más rápido en lectura (porque el planificador elige entre muchos y el caché se reparte). Los índices se justifican uno a uno, con la consulta que los usa y el coste de escritura que añaden.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> modelar e indexar la tabla de <strong>mensajes de chat</strong> para su acceso real y estimar el coste.</p>
+        <ol class="steps">
+          <li><strong>Paso 1 — escribe la consulta real.</strong> Es la que corre 50 000 veces/s:
+            <pre><code class="language-sql">SELECT sender, body, sent_ts
+FROM messages
+WHERE conversation_id = 427
+ORDER BY sent_ts DESC
+LIMIT 50;
+</code></pre>
+          </li>
+          <li><strong>Paso 2 — diseña el índice.</strong> La consulta filtra por igualdad (<code>conversation_id</code>) y ordena por un campo (<code>sent_ts</code>): exactamente el patrón "igualdad → orden".
+            <pre><code class="language-sql">CREATE INDEX idx_msg_conv_time ON messages (conversation_id, sent_ts DESC);
+</code></pre>
+          </li>
+          <li><strong>Paso 3 — estima el coste.</strong> Supón 500 M de mensajes y una fila de ~300 bytes:
+            <pre><code class="language-text">Lectura:  1 rango por (conversation_id, sent_ts) → ~1 ms
+Índice:   500 M × (16 + 8) bytes ≈ 12 GB  → cabe en RAM+SSD de un nodo grande
+          (por eso la clave de partición llega a ser por conversation_id, M2-02)
+</code></pre>
+          </li>
+          <li><strong>Paso 4 — evita el segundo índice innecesario.</strong> ¿Necesitas "buscar por texto del mensaje"? Eso no es un B-tree: es el acceso 4 del caso, que va a un <strong>motor de búsqueda</strong> (M2-01), no a otro índice en la tabla operacional.</li>
+          <li><strong>Paso 5 — modela la lista de conversaciones.</strong> El acceso "mis conversaciones y su último mensaje" es otro acceso, con otra clave (<code>user_id</code>). Se resuelve con una tabla aparte <code>conversation_list(user_id, conv_id, last_body, last_ts)</code>, actualizada al escribir (desnormalización controlada), para leerla con <strong>una sola query</strong>.</li>
+          <li><strong>Paso 6 — decide la fuente de verdad.</strong> <code>messages</code> manda; <code>conversation_list.last_body</code> es una copia. Si difieren, se puede reconstruir desde <code>messages</code>. Anótalo: es el ADR de tu modelo.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <div class="callout__title">Resultado esperado</div>
+          <p>Dos accesos, dos tablas, dos claves, un índice por acceso (no más) y una copia con fuente de verdad declarada. La regla que lo resume: <strong>una tabla por patrón de acceso caliente, un índice por consulta, y una fuente de verdad</strong>.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El buscador de pedidos que se volvió lento</h3>
+          <p>Una tienda tiene la tabla <code>orders(id, customer_id, status, city, created_at, total_cents)</code> con 200 M de filas y 3 000 escrituras/s. El panel de administración permite <strong>filtrar por combinaciones arbitrarias</strong>: por estado, por ciudad, por rango de fechas y por importe, en cualquier orden, y ordenar por fecha o por importe.</p>
+          <p>Han creado <strong>11 índices</strong> (uno por cada columna y varias combinaciones) y ahora las escrituras van lentas y el panel sigue fallando en combinaciones concretas. Rediseña la solución: decide qué índices de verdad valen su coste, y para las combinaciones arbitrarias propón una estrategia que <strong>no</strong> consista en "un índice por combinación".</p>
+          <p><em>Pista: el número de combinaciones posibles crece como 2<sup>n</sup>: no se indexa la potencia, se separa el problema. Piensa en un <strong>almacén de búsqueda</strong> (índice invertido) alimentado desde la tabla operacional, que es exactamente para lo que sirve (M2-01 y Módulo 4). Cuantifica: ¿cuánto cuesta hoy mantener 11 índices a 3 000 escrituras/s? ¿Qué gana quitando 8?</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un <strong>índice</strong> convierte un <em>full scan</em> (miles de millones de filas) en una búsqueda logarítmica de decenas de pasos.</li>
+          <li>Todo índice <strong>encarece la escritura</strong> (<em>write amplification</em>): K índices ≈ K+1 escrituras por fila modificada.</li>
+          <li>En un índice <strong>compuesto</strong>, el orden manda: <em>igualdad primero, luego rango/orden</em>.</li>
+          <li>Índices <strong>parciales</strong>, de <strong>cobertura</strong> y funcionales resuelven casos que un índice normal no cubre bien.</li>
+          <li><strong>Modela por consulta</strong>: en el camino caliente, la tabla debe leerse en un solo golpe, sin joins costosos.</li>
+          <li><strong>Desnormalizar</strong> intercambia velocidad de lectura por duplicación y mantenimiento; exige declarar la <strong>fuente de verdad</strong>.</li>
+          <li>Página con <strong>cursor/keyset</strong>, nunca con <code>OFFSET</code> grande; y no envuelvas columnas indexadas en funciones.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Opción</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td>Índice B-tree simple</td><td>Filtro por igualdad o rango sobre una columna muy consultada</td></tr>
+            <tr><td>Índice compuesto</td><td>Consultas que filtran por varias columnas / ordenan; orden por selectividad</td></tr>
+            <tr><td>Índice parcial</td><td>Se consulta siempre un subconjunto pequeño (activos, pendientes)</td></tr>
+            <tr><td>Índice de cobertura</td><td>Consulta muy caliente que no debe tocar la fila</td></tr>
+            <tr><td>Índice invertido (buscador)</td><td>Filtros combinables arbitrarios y búsqueda de texto</td></tr>
+            <tr><td>Desnormalizar / tabla por acceso</td><td>Lecturas dominantes a gran QPS donde un join es el cuello de botella</td></tr>
+            <tr><td>Ninguno / reconstruir</td><td>Cuando el coste de mantener el índice o la copia supera el beneficio</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos índices puedo poner por tabla?</summary>
+            <div>
+              <p>No hay un número fijo, hay un balance: <strong>tantos como consultas calientes necesiten</strong>, no más. En tablas de lectura intensiva puede haber bastantes; en tablas de escritura intensiva (miles de escrituras/s) cada índice extra se nota. La forma de decidir es medir: cuánto ayuda el índice a la lectura frente a cuánto cuesta a la escritura. Si una tabla recibe 20 000 escrituras/s, 10 índices es casi siempre demasiado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si el motor está usando mi índice?</summary>
+            <div>
+              <p>Con el plan de ejecución. En la mayoría de motores se obtiene con <code>EXPLAIN</code> (y <code>EXPLAIN ANALYZE</code> para ver el tiempo real). Busca que aparezca <strong>Index Scan / Index Seek</strong> en lugar de <strong>Seq Scan / Table Scan</strong>. Y comprueba que el número de filas examinadas es parecido al de filas devueltas: si examina millones para devolver 20, el índice no se está aprovechando.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿No es mejor normalizar siempre y evitar desnormalizar?</summary>
+            <div>
+              <p>Normalizar es un excelente punto de partida y lo correcto mientras no haya presión de lectura. Desnormalizar se justifica cuando el coste del join o del cálculo <strong>se mide</strong> y aparece en el camino caliente a gran escala. El error no es desnormalizar, sino hacerlo sin fuente de verdad ni plan de mantenimiento. Regla: empieza normalizado; desnormaliza con un número delante.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo mantengo actualizado un contador desnormalizado?</summary>
+            <div>
+              <p>Se actualiza <strong>en la operación de escritura</strong> que lo cambia (al insertar un "like", incrementa el contador). El peligro es contar dos veces (reintentos): por eso las actualizaciones deben ser <strong>idempotentes</strong> (Módulo 4) — p. ej. guardar quién dio el like y usar una clave única, o aplicar un incremento con una marca de evento ya procesada. También conviene poder <strong>reconstruir</strong> el contador desde la fuente de verdad periódicamente, para corregir derivas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Modelar por consulta significa duplicar datos por todas partes?</summary>
+            <div>
+              <p>No. Significa que <strong>el camino caliente se sirve en una sola lectura</strong>, duplicando solo lo imprescindible para eso y aceptando que hay una fuente de verdad. No se duplica "todo en todos lados": se eligen pocos accesos dominantes y se modela para ellos. Los accesos raros y los reportes pueden seguir leyendo el modelo normalizado, aunque tarden un poco más.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
