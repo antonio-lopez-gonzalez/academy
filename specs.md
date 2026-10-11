@@ -170,6 +170,8 @@ Las skills son **reutilizables y compartidas**; viven en la raíz, no duplicadas
 ```text
 Academy/.agents/skills/
 ├── academy-course/           ← mecánica común de cualquier curso Academy (esta spec en forma de how-to)
+├── academy-course-add/       ← playbook para añadir un curso nuevo (Fase 0 → 5)
+├── academy-verify/           ← verificar que un curso cumple el contrato (script verify.mjs)
 ├── documentation/            ← consultar documentación oficial vía Context7 antes de afirmar APIs
 ├── frontend-design/          ← identidad visual propia (prohibidos los defaults genéricos de IA)
 ├── python-course/            ← dominio del curso Learn Python (contenido fiel)
@@ -177,7 +179,8 @@ Academy/.agents/skills/
 ```
 
 - Cada curso referencia las skills por ruta relativa: `../.agents/skills/<skill>/SKILL.md`.
-- Skills de **mecánica/transversales**: `academy-course`, `documentation`, `frontend-design`.
+- Skills de **mecánica/transversales**: `academy-course`, `academy-course-add`, `academy-verify`,
+  `documentation`, `frontend-design`.
 - Skills de **dominio**: solo tienen sentido para su curso (`python-course` → Learn Python,
   `spec-driven-development` → Learn SDD). El resto de cursos vuelcan su dominio en su propia spec.
 - Si una skill de dominio y la spec del curso discrepan, **gana la spec del curso** y se señala el choque.

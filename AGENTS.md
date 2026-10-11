@@ -12,8 +12,10 @@ La **Academy**: cursos independientes en `Learn <Curso>/`, todos construidos com
 2. `.agents/skills/academy-course/SKILL.md` — **cómo** se construye cualquier web de Academy (mapa, anatomía HTML de 10 secciones, SITE_BASE, claves de tema, verificación).
 3. `.agents/skills/documentation/SKILL.md` — consultar documentación oficial vía Context7 antes de afirmar APIs, comandos o versiones.
 4. `.agents/skills/frontend-design/SKILL.md` — identidad visual propia (prohibidos los defaults genéricos de IA).
-5. La spec del curso que vayas a tocar (`Learn <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
-6. Skills de dominio cuando existan: `.agents/skills/python-course/SKILL.md` (Learn Python), `.agents/skills/spec-driven-development/SKILL.md` (Learn SDD).
+5. `.agents/skills/academy-verify/SKILL.md` — **verificar** que un curso cumple el contrato antes de terminarlo (script `verify.mjs`).
+6. `.agents/skills/academy-course-add/SKILL.md` — **playbook** para añadir un curso nuevo de punta a punta.
+7. La spec del curso que vayas a tocar (`Learn <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
+8. Skills de dominio cuando existan: `.agents/skills/python-course/SKILL.md` (Learn Python), `.agents/skills/spec-driven-development/SKILL.md` (Learn SDD).
 
 ## Estructura
 
