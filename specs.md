@@ -79,7 +79,8 @@ Aprende <Curso>/
 │   ├── index.html            ← portada + hero + #module-list
 │   ├── assets/{css,js,fonts,favicon.svg}
 │   ├── modulos/XX-slug/      ← una carpeta por módulo, NN-leccion.html
-│   └── recursos/             ← cheatsheet.html, glosario.html, faq.html
+│   ├── recursos/             ← cheatsheet.html, glosario.html, faq.html
+│   └── descargas/            ← <slug>.zip del proyecto (descarga directa, ver §7.1)
 ├── scripts/serve-web.mjs
 └── proyectos/<proyecto>/     ← proyecto ejecutable real (si aplica)
 ```
@@ -221,9 +222,23 @@ Academy/
 ├── opencode.json             ← Context7 MCP (único para toda la Academy)
 ├── index.html                ← portada: tarjetas de acceso a cada curso
 ├── .gitignore                ← node_modules/, dist/, bin/, obj/, __pycache__/, .env, …
+├── .nojekyll                 ← desactiva Jekyll en GitHub Pages
+├── tools/build-zips.mjs      ← regenera los ZIP de proyectos/ejemplos (ver §7.1)
 ├── .agents/skills/           ← skills compartidas (ver §5)
-└── Aprende <Curso>/            ← un curso por carpeta (ver §4.1)
+└── Aprende <Curso>/          ← un curso por carpeta (ver §4.1)
 ```
+
+## 7.1. Descargas (ZIP de recursos)
+
+- Cada curso con `proyectos/` y/o `ejemplos/` tiene su ZIP **commiteado** en
+  `Aprende <Curso>/web/descargas/Aprende-<Curso>.zip`, con **solo** ese código (nunca las lecciones),
+  excluyendo `node_modules`, `obj`, `bin`, `dist`, `__pycache__`, etc.
+- En la portada del curso (`web/index.html`, dentro de `.hero__actions`) hay un botón de
+  **descarga directa**:
+  `<a class="btn" href="./descargas/Aprende-<Curso>.zip" download>⬇ Descargar código (.zip)</a>`.
+- Se regeneran, tras cambiar el código, con `node tools/build-zips.mjs` desde la raíz. El script parte
+  de `git ls-files` y usa un escritor ZIP propio con `node:zlib` (sin dependencias).
+- Al ser archivos estáticos, se sirven en GitHub Pages y con el `npm run serve` de cada curso.
 
 ---
 

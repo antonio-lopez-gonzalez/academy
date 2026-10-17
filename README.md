@@ -52,6 +52,18 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 
 ---
 
+## Descargas (ZIP de proyectos)
+
+Cada curso con `proyectos/` y/o `ejemplos/` ofrece en su portada un botón **«⬇ Descargar código (.zip)»**
+con **solo** ese código (nunca las lecciones):
+
+- El ZIP está **commiteado** en `Aprende <Curso>/web/descargas/Aprende-<Curso>.zip` y se descarga
+  directamente desde la portada del curso.
+- Se regenera con `node tools/build-zips.mjs` (desde la raíz) después de cambiar el código.
+- Se sirve como cualquier archivo estático (GitHub Pages o `npm run serve` del curso).
+
+---
+
 ## Estructura del repositorio
 
 ```text
@@ -61,7 +73,8 @@ Academy/
 ├── README.md           ← este archivo
 ├── opencode.json       ← MCP de Context7 (único para toda la Academy)
 ├── index.html          ← portada: una tarjeta por curso
-├── .gitignore
+├── .gitignore / .nojekyll
+├── tools/build-zips.mjs           ← regenera los ZIP de proyectos/ejemplos
 ├── .agents/skills/     ← skills COMPARTIDAS (no duplicar por curso)
 │   ├── academy-course/           mecánica de cualquier curso Academy
 │   ├── documentation/            consultar docs oficiales vía Context7
@@ -77,7 +90,8 @@ Academy/
     │   ├── index.html
     │   ├── assets/{css,js,fonts,favicon.svg}
     │   ├── modulos/XX-slug/NN-leccion.html
-    │   └── recursos/{cheatsheet,glosario,faq}.html
+    │   ├── recursos/{cheatsheet,glosario,faq}.html
+    │   └── descargas/<slug>.zip  ZIP del proyecto (descarga directa)
     ├── scripts/serve-web.mjs     servidor estático local (cuando aplica)
     └── proyectos/<proyecto>/     proyecto(s) real(es) y ejecutable(s)
 ```
