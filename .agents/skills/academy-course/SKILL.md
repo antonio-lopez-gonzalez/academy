@@ -127,6 +127,8 @@ Per-course keys and specs (keep this table in sync when a course is added):
 | Aprende SDD | `sdd-*` | `spec.md` | `proyectos/lumen` |
 | Aprende Tailwind | `tw-*` | `AGENTS.md` | `proyectos/m06-landing-completa`, `m09-dashboard` |
 | Aprende TypeScript | `ts-*` | `AGENTS.md` | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| Aprende System Design | `sysd-*` | `spec.md` | `proyectos/case-studies` |
+| Aprende Git | `git-*` | `spec.md` | `proyectos/laboratorio` |
 
 ## 5. Cover (web/index.html)
 

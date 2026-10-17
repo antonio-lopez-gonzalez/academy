@@ -47,6 +47,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Aprende DevOps` | CI/CD y DevOps (Actions, IaC) | 8 | 32 | `proyectos/pipeline` |
 | `Aprende Cloud` | Cloud (Azure / AWS, Terraform) | 8 | 32 | `proyectos/infra-cloud` |
 | `Aprende System Design` | System Design (arquitectura a escala) | 8 | 32 | `proyectos/case-studies` |
+| `Aprende Git` | Git (modelo, ramas, deshacer, rescate) | 8 | 32 | `proyectos/laboratorio` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
