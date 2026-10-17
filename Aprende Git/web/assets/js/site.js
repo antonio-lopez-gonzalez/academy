@@ -89,9 +89,8 @@
       <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
-        <svg class="topbar__logo" viewBox="0 0 100 100" aria-hidden="true">
-          <rect x="4" y="4" width="92" height="92" rx="18"/>
-          <text x="50" y="70" font-family="Arial, Helvetica, sans-serif" font-size="42" font-weight="800" text-anchor="middle">GT</text>
+        <svg class="topbar__logo" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M23.546 10.93L13.067.452c-.604-.603-1.582-.603-2.188 0L8.708 2.627l2.76 2.76c.645-.215 1.379-.07 1.889.441.516.515.658 1.258.438 1.9l2.658 2.66c.645-.223 1.387-.078 1.9.435.72.72.72 1.884 0 2.604-.719.719-1.881.719-2.6 0-.539-.541-.675-1.317-.423-1.975l-2.472-2.471v6.505c.176.086.342.203.489.35.72.719.72 1.881 0 2.6-.72.719-1.881.719-2.6 0-.719-.719-.719-1.879 0-2.598.18-.18.391-.311.617-.4V7.634c-.227-.09-.438-.223-.618-.404-.543-.542-.677-1.324-.419-1.985L5.859 5.474.452 10.881c-.604.604-.604 1.58 0 2.188l10.48 10.477c.603.603 1.581.603 2.187 0l10.427-10.426c.604-.604.604-1.581 0-2.187"/>
         </svg>
         <span>${COURSE.title}</span>
       </a>
