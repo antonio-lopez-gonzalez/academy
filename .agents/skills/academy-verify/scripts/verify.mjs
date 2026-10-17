@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Verificador estructural de cursos de la Academy.
-// Uso: node verify.mjs ["Learn X"] [--root <raiz>]
+// Uso: node verify.mjs ["Aprende X"] [--root <raiz>]
 import fs from "node:fs";
 import path from "node:path";
 
@@ -20,7 +20,7 @@ for (let i = 0; i < args.length; i++) {
 
 const courses = fs
   .readdirSync(root, { withFileTypes: true })
-  .filter((d) => d.isDirectory() && d.name.startsWith("Learn "))
+  .filter((d) => d.isDirectory() && d.name.startsWith("Aprende "))
   .map((d) => d.name)
   .filter((n) => only.length === 0 || only.includes(n));
 

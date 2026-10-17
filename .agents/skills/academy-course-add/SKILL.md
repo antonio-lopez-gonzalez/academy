@@ -1,24 +1,24 @@
 ---
 name: academy-course-add
-description: Use when adding a new `Learn *` course to the Academy, or scaffolding/registering one. Playbook for the full lifecycle (Fase 0 spec → Fase 5 registration), the files to create, the per-course theme key and identity, and the steps to wire it into the landing and docs. Pairs with `academy-course` (mechanics) and `academy-verify` (verification).
+description: Use when adding a new `Aprende *` course to the Academy, or scaffolding/registering one. Playbook for the full lifecycle (Fase 0 spec → Fase 5 registration), the files to create, the per-course theme key and identity, and the steps to wire it into the landing and docs. Pairs with `academy-course` (mechanics) and `academy-verify` (verification).
 ---
 
 # Academy — añadir un curso nuevo
 
-Playbook para crear un curso `Learn <Tema>` de punta a punta de forma consistente.
+Playbook para crear un curso `Aprende <Tema>` de punta a punta de forma consistente.
 Cada curso es el **mismo artefacto** (web estática sin build, navegada desde
 `course-data.js`). Detalles mecánicos en `academy-course`; verificación en `academy-verify`.
 
 ## Antes de empezar
 
 1. Lee `Academy/specs.md` (contrato general) y elige la **identidad del curso**:
-   - **carpeta**: `Learn <Tema>` (sin `/` en el nombre).
+   - **carpeta**: `Aprende <Tema>` (sin `/` en el nombre).
    - **clave de progreso**: corta y única, p. ej. `py`, `dk`, `fastapi` → `<clave>-theme`, `<clave>-progress`.
    - **color/paleta** propia (no reutilices la de otro curso).
    - **firma de portada** específica (terminal, conversación, pipeline, despliegue…).
    - **proyecto conductor** en `proyectos/` (runnable) o justifícalo si no aplica.
-2. Copia como base un curso **reciente** con el mismo runtime: `Learn Docker/`,
-   `Learn Python/`, `Learn IA/`, `Learn DevOps/` o `Learn Cloud/`.
+2. Copia como base un curso **reciente** con el mismo runtime: `Aprende Docker/`,
+   `Aprende Python/`, `Aprende IA/`, `Aprende DevOps/` o `Aprende Cloud/`.
 
 ## Fases
 

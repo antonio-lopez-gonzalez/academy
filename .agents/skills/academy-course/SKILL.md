@@ -1,11 +1,11 @@
 ---
 name: academy-course
-description: Use when building or editing ANY Academy course website (Learn Astro, Docker, Dotnet, Javascript, NewRelic, Python, React, Redis, SDD, Tailwind, TypeScript). Covers the static-web contract that every Academy course shares: course-data.js as the single source of truth, lesson HTML anatomy, SITE_BASE rules, per-course storage keys, shared CSS classes, scaffold layout, and how to verify before finishing. This is the MECHANICS skill; each course's own spec and AGENTS.md define the CONTENT.
+description: Use when building or editing ANY Academy course website (Aprende Astro, Docker, Dotnet, Javascript, NewRelic, Python, React, Redis, SDD, Tailwind, TypeScript). Covers the static-web contract that every Academy course shares: course-data.js as the single source of truth, lesson HTML anatomy, SITE_BASE rules, per-course storage keys, shared CSS classes, scaffold layout, and how to verify before finishing. This is the MECHANICS skill; each course's own spec and AGENTS.md define the CONTENT.
 ---
 
 # Academy Course Construction (shared skill)
 
-Every `Learn *` folder in this Academy is the **same kind of artefact**: a hand-written static
+Every `Aprende *` folder in this Academy is the **same kind of artefact**: a hand-written static
 website with **no build step**, whose chrome (topbar, sidebar, prev/next, progress, light/dark theme,
 search) is generated at runtime from a single map file. This skill is the source of truth for the
 **mechanics**. Each course's own spec (`<course>/specs.md` or `<course>/spec.md`) and its
@@ -18,7 +18,7 @@ When this skill and a course spec disagree, the course spec wins — flag the co
 ## 1. Repository layout (target, per course)
 
 ```text
-Learn <Course>/
+Aprende <Course>/
 ├── specs.md | spec.md         ← content spec (DO NOT contradict it)
 ├── AGENTS.md | agents.md      ← short pointer to the spec + agent rules
 ├── package.json               ← "serve": "node scripts/serve-web.mjs"
@@ -40,7 +40,7 @@ Learn <Course>/
 └── proyectos/<sample>/        ← real, runnable sample project (when the course has one)
 ```
 
-Reference implementation to copy from: `Learn Docker/` (newest), fallback `Learn Javascript/`.
+Reference implementation to copy from: `Aprende Docker/` (newest), fallback `Aprende Javascript/`.
 The skills themselves are **centralised at the Academy root** (`.agents/skills/`), not per course.
 The `opencode.json` with the Context7 MCP is also **unique and lives at the Academy root**
 (`Academy/opencode.json`); courses do not ship their own copy.
@@ -116,17 +116,17 @@ Per-course keys and specs (keep this table in sync when a course is added):
 
 | Course | Theme / progress key | Spec file | Sample project |
 |---|---|---|---|
-| Learn Astro | `astro-*` | `AGENTS.md` | — |
-| Learn Docker | `dk-*` | `specs.md` | `proyectos/harbortasks` |
-| Learn Dotnet | `dn8-*` | `AGENTS.md` | `proyectos/m*-cms-*` (CMS) |
-| Learn Javascript | `js-*` | `AGENTS.md` | — |
-| Learn NewRelic | `nr-*` | `AGENTS.md` | `proyectos/newrelic-ws-demo` |
-| Learn Python | `py-*` | `specs.md` | `proyectos/biblioteca` |
-| Learn React | `rc19-*` | `agents.md` | `proyectos/m*`, `proyecto-final/` |
-| Learn Redis | `redis-*` | `AGENTS.md` | `proyectos/redis-ws-hub` |
-| Learn SDD | `sdd-*` | `spec.md` | `proyectos/lumen` |
-| Learn Tailwind | `tw-*` | `AGENTS.md` | `proyectos/m06-landing-completa`, `m09-dashboard` |
-| Learn TypeScript | `ts-*` | `AGENTS.md` | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| Aprende Astro | `astro-*` | `AGENTS.md` | — |
+| Aprende Docker | `dk-*` | `specs.md` | `proyectos/harbortasks` |
+| Aprende Dotnet | `dn8-*` | `AGENTS.md` | `proyectos/m*-cms-*` (CMS) |
+| Aprende Javascript | `js-*` | `AGENTS.md` | — |
+| Aprende NewRelic | `nr-*` | `AGENTS.md` | `proyectos/newrelic-ws-demo` |
+| Aprende Python | `py-*` | `specs.md` | `proyectos/biblioteca` |
+| Aprende React | `rc19-*` | `agents.md` | `proyectos/m*`, `proyecto-final/` |
+| Aprende Redis | `redis-*` | `AGENTS.md` | `proyectos/redis-ws-hub` |
+| Aprende SDD | `sdd-*` | `spec.md` | `proyectos/lumen` |
+| Aprende Tailwind | `tw-*` | `AGENTS.md` | `proyectos/m06-landing-completa`, `m09-dashboard` |
+| Aprende TypeScript | `ts-*` | `AGENTS.md` | `proyectos/08-typescript-react`, `09-proyecto-final` |
 
 ## 5. Cover (web/index.html)
 
@@ -163,7 +163,7 @@ Escape `<` as `&lt;` inside code blocks (`a < b`, generics, etc.).
    `data-lesson`, all 10 section ids, correct `SITE_BASE`, the course theme key, and the three scripts.
 3. Serve: `node scripts/serve-web.mjs` (ports are assigned per course, e.g. Python 3001) and fetch
    `/`, one lesson per module, and all `recursos/` — expect HTTP 200.
-4. `Academy/index.html`: the course card links to `Learn <Course>/web/index.html`; the footer course
+4. `Academy/index.html`: the course card links to `Aprende <Course>/web/index.html`; the footer course
    count is correct.
 
 ## 8. What NOT to do

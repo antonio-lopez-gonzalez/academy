@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-mcp-servidores">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Servidores MCP — Módulo 6 · Curso IA</title>
+  <meta name="description" content="Qué es el Model Context Protocol, por qué estandariza las tools y cómo montar un servidor MCP en Python con transporte stdio que expone las tools del Copiloto.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('ia-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Servidores MCP</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Extensibilidad: MCP, skills y plugins</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora las tools del Copiloto vivían encerradas en su propio proceso: tú declarabas el esquema, el modelo elegía una tool y tu código la ejecutaba. Funciona, pero tiene dos problemas. El primero: esa tool solo existe para <em>tu</em> agente. Si mañana quieres usar <code>search_lessons</code> desde tu editor, desde otro agente o desde una app distinta, tienes que volver a escribir la lógica y el esquema. El segundo: si quieres usar una tool que ya existe en otro sitio (leer un repositorio Git, consultar Postgres, navegar la web), tienes que copiarla dentro de tu proyecto.</p>
+        <p>Esto es el clásico <strong>problema N×M</strong>: cada aplicación (N) necesita conectar con cada herramienta (M) y acabas escribiendo N×M integraciones distintas, todas incompatibles entre sí. Es exactamente lo que pasó con los cargadores de móvil antes del USB-C.</p>
+        <p><strong>MCP</strong> (<em>Model Context Protocol</em>) es el estándar abierto que resuelve ese problema para las herramientas de los LLM. Define <strong>cómo un servidor expone capacidades</strong> (tools, y alguna cosa más) y <strong>cómo un cliente las descubre y las llama</strong>, con un protocolo común. Con MCP, la misma tool la puede usar cualquier host que hable el protocolo, y tu agente puede usar cualquier servidor que hable el protocolo. Es «USB-C para las herramientas del modelo».</p>
+        <p>En esta lección montamos un <strong>servidor MCP real</strong> en Python que expone las tools del Copiloto y lo ejecutamos por <strong>stdio</strong>, que es el transporte local por defecto. La idea central es sencilla: tus tools dejan de ser código privado de tu agente y pasan a ser un <em>servicio</em> interoperable.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué existe esta lección?</strong> Porque «darle tools a un agente» y «saber empaquetarlas» son dos cosas distintas. El tool calling del módulo 2 te enseña a ejecutar una tool; MCP te enseña a <em>publicar</em> esa tool para que la consuman otros. Separar <em>qué hace</em> la tool de <em>quién la usa</em> es lo que convierte una app cerrada en un ecosistema: integras una vez, reutilizas en todas partes.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La analogía: el enchufe universal</h3>
+        <div class="callout callout--analogy">
+          <p>Antes del USB-C, cada dispositivo tenía su conector y cada cable servía para un solo aparato: cargar el móvil, conectar el monitor, pasar fotos… eran tres cables. El USB-C impone un <strong>contrato físico común</strong>: mientras un extremo sea USB-C, da igual quién fabricó el cable ni quién fabricó el aparato. MCP hace eso mismo con las herramientas: el <strong>servidor</strong> es el aparato que ofrece capacidades y el <strong>cliente</strong> es el aparato que las usa; el «conector» es el protocolo. No importa quién escribió el servidor: si habla MCP, tu agente lo entiende. Y no importa quién es el agente: si habla MCP, puede usar tu servidor.</p>
+        </div>
+
+        <h3>El problema N×M y la solución MCP</h3>
+        <pre class="diagram">
+  SIN MCP (N apps × M tools, cada una con su integracion)
+
+   agente A ──┐   ┌── tool Git
+   editor B ──┼───┼── tool Postgres      → N×M conectores a medida
+   app C    ──┘   └── tool web
+
+  CON MCP (N + M conectores, todos iguales)
+
+   agente A ──┐                    ┌── servidor Git
+   editor B ──┼── protocolo MCP ───┼── servidor Postgres
+   app C    ──┘                    └── servidor web
+        </pre>
+        <p>En el primer esquema cada flecha es código nuevo, acoplado y frágil. En el segundo, un cliente MCP habla con <em>cualquier</em> servidor MCP, y un servidor MCP sirve a <em>cualquier</em> cliente. El número de integraciones baja de N×M a N+M: escritas una vez, reutilizadas siempre.</p>
+
+        <h3>Host, cliente y servidor</h3>
+        <p>MCP se apoya en tres roles. Conviene no confundirlos:</p>
+        <ul>
+          <li><strong>Host</strong>: la aplicación con IA (el Copiloto, un IDE, un chat). Es dueño de la conversación y decide qué consiente.</li>
+          <li><strong>Cliente</strong>: la mitad que habla MCP dentro del host. Se conecta a un servidor, descubre sus capacidades y las invoca. Un host puede tener varios clientes, uno por servidor.</li>
+          <li><strong>Servidor</strong>: lo que <em>tú</em> construyes. Expone capacidades (tools, resources, prompts) y las ejecuta. No sabe nada del modelo ni de la conversación: solo responde peticiones.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>Regla mnemotécnica: el <strong>host</strong> es la app, el <strong>cliente</strong> es su intérprete de MCP y el <strong>servidor</strong> es tu código. En esta lección escribimos el tercero; el host y su cliente ya existen (tu editor, el Copiloto, un SDK).</p>
+        </div>
+
+        <h3>El protocolo: JSON-RPC</h3>
+        <p>Por debajo, MCP no es más que mensajes <strong>JSON-RPC 2.0</strong>: peticiones con un <code>method</code>, unos <code>params</code> y una respuesta con <code>result</code> o <code>error</code>. Métodos que verás una y otra vez: <code>initialize</code> (negociar versión y capacidades), <code>tools/list</code> y <code>tools/call</code>, <code>resources/list</code> y <code>resources/read</code>, <code>prompts/list</code> y <code>prompts/get</code>. Cada capacidad se anuncia en el <code>initialize</code>: el cliente solo pide lo que el servidor <strong>declara</strong>. Si tu servidor no expone resources, el cliente ni intenta listarlos.</p>
+        <div class="callout callout--tip">
+          <p>El SDK crea <strong>todo el JSON por ti</strong>. Tú escribes funciones Python con tipos y docstrings; el SDK deriva de ahí el nombre, la descripción y el JSON Schema de los argumentos. Nunca escribas JSON-RPC a mano salvo para depurar.</p>
+        </div>
+
+        <h3>Transportes: stdio y HTTP</h3>
+        <p>El protocolo es el mismo, pero viaja por canales distintos según dónde viva el servidor:</p>
+        <table>
+          <thead><tr><th>Transporte</th><th>Cómo funciona</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>stdio</strong></td>
+              <td>El host <em>lanza</em> el servidor como subproceso y habla por su <code>stdin</code>/<code>stdout</code></td>
+              <td>Servidores <strong>locales</strong>, una sola sesión, procesos de confianza. Es el defecto y lo que usamos aquí.</td>
+            </tr>
+            <tr>
+              <td><strong>Streamable HTTP</strong></td>
+              <td>El servidor escucha en una URL; varios clientes se conectan por HTTP</td>
+              <td>Servidores <strong>remotos</strong>, compartidos, con autenticación</td>
+            </tr>
+            <tr>
+              <td><strong>SSE</strong></td>
+              <td>HTTP con <em>server-sent events</em></td>
+              <td>Variante heredada de HTTP; prefiere Streamable HTTP en proyectos nuevos</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Con <strong>stdio</strong> no hay puertos, ni red, ni autenticación: el host controla el ciclo de vida del proceso. Por eso es el transporte ideal para el Copiloto, que corre en la misma máquina. Su gran trampa la veremos en <em>Errores habituales</em>: <code>stdout</code> es el canal del protocolo, así que cualquier <code>print()</code> tuyo lo corrompe.</p>
+
+        <h3>MCP frente a llamar tools «a mano»</h3>
+        <table>
+          <thead><tr><th>Aspecto</th><th>Tool calling directo (módulo 2)</th><th>Servidor MCP</th></tr></thead>
+          <tbody>
+            <tr><td>Alcance</td><td>Un solo agente, en su proceso</td><td>Cualquier host que hable MCP</td></tr>
+            <tr><td>Formato</td><td>Esquema propio de cada proveedor</td><td>Un protocolo común</td></tr>
+            <tr><td>Reutilización</td><td>Copiar y pegar</td><td>Conectar el servidor</td></tr>
+            <tr><td>Descubrimiento</td><td>Tú declaras la lista cada vez</td><td>El cliente lista lo que el servidor declara</td></tr>
+            <tr><td>Aislamiento</td><td>Todo en tu proceso</td><td>El servidor vive (y falla) aparte</td></tr>
+          </tbody>
+        </table>
+        <p>No son excluyentes: el Copiloto puede seguir usando sus tools internas en el bucle y, además, exponerlas por MCP para que otros hosts las consuman. MCP es una capa de <strong>interoperabilidad</strong>, no un sustituto del bucle agentic.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El servidor MCP más pequeño posible: <strong>una sola tool</strong> que suma dos números. No tiene lógica de negocio; lo importante es ver que publicar una tool es declarar una función con tipos y un docstring.</p>
+        <div class="code-file">server.py</div>
+        <pre><code class="language-python"># server.py — un servidor MCP minimo con una sola tool.
+# Instalacion:  uv init mcp-demo &amp;&amp; cd mcp-demo &amp;&amp; uv add "mcp&gt;=2"
+from mcp.server import MCPServer   # en la v1 del SDK esto se llamaba FastMCP
+
+
+mcp = MCPServer("demo")            # el nombre identifica el servidor
+
+
+@mcp.tool()                        # el decorador publica `add` como tool
+def add(a: int, b: int) -&gt; int:
+    """Suma dos enteros."""        # el docstring es la descripcion que ve el modelo
+    return a + b
+
+
+if __name__ == "__main__":
+    mcp.run()                      # transporte por defecto: stdio
+</code></pre>
+        <p>Eso es todo. Fíjate en que <strong>no escribimos JSON, ni esquemas, ni rutas</strong>: el SDK lee de la función el nombre (<code>add</code>), la descripción (<code>add two numbers</code>… aquí, el docstring) y el esquema de argumentos a partir de los type hints (<code>a: int</code>, <code>b: int</code>). La función se convierte en una tool MCP.</p>
+        <p>Ahora la probamos <strong>en memoria</strong>, sin arrancar ningún subproceso ni puerto. El cliente se conecta directamente al objeto servidor:</p>
+        <div class="code-file">test_demo.py</div>
+        <pre><code class="language-python"># test_demo.py — conecta un cliente al servidor en memoria y llama a la tool.
+import asyncio
+
+from mcp import Client
+from server import mcp
+
+
+async def main() -&gt; None:
+    async with Client(mcp) as client:           # sesion MCP lista
+        tools = await client.list_tools()        # descubrimiento
+        print("tools:", [t.name for t in tools.tools])
+        result = await client.call_tool("add", {"a": 2, "b": 3})
+        print("resultado:", result.content)
+
+
+asyncio.run(main())
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">tools: ['add']
+resultado: [TextContent(type='text', text='5')]
+</code></pre>
+        <p>Línea por línea:</p>
+        <ul>
+          <li><strong><code>@mcp.tool()</code></strong>: registra la función como tool. El cliente la descubrirá con <code>tools/list</code>.</li>
+          <li><strong>Type hints + docstring</strong>: de ahí salen el esquema y la descripción. Sin ellos, el modelo no sabría qué argumentos pasar ni para qué sirve la tool.</li>
+          <li><strong><code>mcp.run()</code></strong>: arranca el bucle del servidor por <strong>stdio</strong>. Cuando escribimos «el host lanza el servidor como subproceso», esto es el servidor esperando peticiones por su entrada estándar.</li>
+          <li><strong><code>Client(mcp)</code></strong>: un cliente en memoria. Perfecto para tests y para entender el protocolo sin la fricción de arrancar procesos.</li>
+          <li><strong><code>tools.tools</code></strong>: la respuesta viene envuelta; las tools están en <code>.tools</code>. Lo mismo pasa con <code>resources</code> y <code>prompts</code>.</li>
+        </ul>
+        <div class="callout callout--tip">
+          <p>Si tu versión del SDK aún es la v1, el mismo código funciona cambiando la importación: <code>from mcp.server.fastmcp import FastMCP</code> y <code>mcp = FastMCP("demo")</code>. Todo lo demás (decoradores, cliente) es idéntico. En la v2 el nombre <code>FastMCP</code> se renombró a <code>MCPServer</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>El Copiloto.</strong> Ahora exponemos las tools que ya construimos en los módulos 2 y 5 como un servidor MCP, para que cualquier host —el editor, un IDE, otro agente— pueda usarlas. El servidor no reimplementa nada: <strong>reutiliza las funciones</strong> de <code>copiloto.tools</code> que ya conocemos.</p>
+        <div class="code-file">proyectos/copiloto/src/copiloto/mcp_server.py</div>
+        <pre><code class="language-python">"""Servidor MCP del Copiloto.
+
+Expone las tools del Copiloto a cualquier host que hable MCP.
+No contiene logica de negocio: reutiliza `copiloto.tools`.
+"""
+from mcp.server import MCPServer          # v2; en v1 era `from mcp.server.fastmcp import FastMCP`
+
+from copiloto.tools import buscar_lecciones, abrir_modulo, contar_progreso
+
+mcp = MCPServer("copiloto")
+
+
+@mcp.tool()
+def search_lessons(query: str, k: int = 4) -&gt; list[dict]:
+    """Busca fragmentos relevantes en las lecciones de la Academy."""
+    return buscar_lecciones(query, k=k)
+
+
+@mcp.tool()
+def open_module(course: str, module: str) -&gt; str:
+    """Devuelve el indice de lecciones de un modulo de un curso."""
+    return abrir_modulo(course, module)
+
+
+@mcp.tool()
+def count_progress(course: str) -&gt; dict:
+    """Cuenta lecciones completadas y pendientes de un curso."""
+    return contar_progreso(course)
+
+
+def main() -&gt; None:
+    # stdio: el host lanza este proceso y habla por su stdin/stdout.
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+        <p>Y así lo registra un host. El host no importa Python: solo sabe que debe <em>lanzar un comando</em> que habla MCP. Este es el fichero de configuración típico (adaptado del que usan los IDEs y los clientes MCP):</p>
+        <div class="code-file">mcp.json</div>
+        <pre><code class="language-json">{
+  "mcpServers": {
+    "copiloto": {
+      "command": "uv",
+      "args": ["run", "--directory", "proyectos/copiloto", "copiloto-mcp"]
+    }
+  }
+}
+</code></pre>
+        <p>Con <code>"command": "uv"</code> y esos argumentos, el host ejecuta el servidor como subproceso y se comunica por stdio. <code>copiloto-mcp</code> es un <em>console script</em> que declaras en <code>pyproject.toml</code>:</p>
+        <div class="code-file">proyectos/copiloto/pyproject.toml (fragmento)</div>
+        <pre><code class="language-toml">[project.scripts]
+copiloto = "copiloto.cli:main"
+copiloto-mcp = "copiloto.mcp_server:main"
+</code></pre>
+        <p>Decisiones y porqués:</p>
+        <ul>
+          <li><strong>Reutilizar <code>copiloto.tools</code></strong>: una sola fuente de verdad para la lógica. Si mejoras <code>buscar_lecciones</code>, mejora a la vez el agente y el servidor MCP.</li>
+          <li><strong>Docstrings claros</strong>: son la documentación que el modelo lee al elegir tool. Un docstring vago («busca cosas») produce malas llamadas.</li>
+          <li><strong><code>-&gt; list[dict]</code> y <code>-&gt; dict</code></strong>: tipos serializables. Devolver objetos raros (una conexión, un objeto con estado) rompería la conversión a respuesta MCP.</li>
+          <li><strong>stdio</strong>: servidor local en la misma máquina, sin auth ni puertos. El host controla el proceso.</li>
+          <li><strong>Punto de entrada separado</strong> (<code>copiloto-mcp</code>): el host no necesita saber nada del resto del Copiloto; solo ejecuta ese comando.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p>En el módulo 5 el Copiloto llamaba a estas tools <em>desde dentro</em> de su bucle. Aquí las sacamos a un proceso aparte. Son dos formas del mismo concepto: <strong>una tool es una capacidad; MCP es su envoltorio para compartirla</strong>. Puedes tener las dos cosas a la vez.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Una tool por acción concreta, con nombre verbo+sustantivo</td>
+              <td>Una tool «hazlo todo» con muchos parámetros opcionales</td>
+              <td>El modelo elige mejor entre tools pequeñas y claras</td>
+            </tr>
+            <tr>
+              <td>Docstring que explique <em>qué hace y cuándo usarla</em></td>
+              <td>Dejar el docstring vacío o copiar el nombre</td>
+              <td>El docstring es la descripción que guía la elección del modelo</td>
+            </tr>
+            <tr>
+              <td>Type hints precisos en todos los argumentos</td>
+              <td>Argumentos sin tipo (esquema vacío)</td>
+              <td>Sin esquema, el modelo no sabe qué pasar y alucina el formato</td>
+            </tr>
+            <tr>
+              <td>Devolver tipos serializables (str, dict, list)</td>
+              <td>Devolver objetos con estado o conexiones abiertas</td>
+              <td>La respuesta MCP viaja como JSON; lo no serializable falla</td>
+            </tr>
+            <tr>
+              <td>Registrar logs a <code>stderr</code></td>
+              <td>Usar <code>print()</code> (va a <code>stdout</code>)</td>
+              <td>En stdio, <code>stdout</code> es el canal del protocolo</td>
+            </tr>
+            <tr>
+              <td>Probar con el cliente en memoria antes de conectar el host</td>
+              <td>Depurar dentro del IDE a ciegas</td>
+              <td>Aíslas el fallo del servidor del fallo del host</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>6.1. Escribir en <code>stdout</code> y corromper el protocolo</h3>
+        <p>El error número uno de stdio. Un <code>print()</code> de depuración se mezcla con el JSON-RPC y el host recibe basura; el síntoma es un error de parseo incomprensible que no menciona tu <code>print</code>.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ print() escribe en stdout, el mismo canal del protocolo.
+@mcp.tool()
+def search_lessons(query: str) -&gt; list[dict]:
+    print(f"Buscando {query}...")      # corrompe la respuesta JSON-RPC
+    return buscar_lecciones(query)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Los logs van a stderr: el protocolo se queda limpio en stdout.
+import sys
+
+@mcp.tool()
+def search_lessons(query: str) -&gt; list[dict]:
+    print(f"Buscando {query}...", file=sys.stderr)
+    return buscar_lecciones(query)
+</code></pre>
+
+        <h3>6.2. Argumentos sin tipo (esquema vacío)</h3>
+        <p>Si no declaras los tipos, el SDK no puede construir el JSON Schema y el modelo no sabe cómo llamar la tool. La tool «existe», pero es inutilizable.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Sin type hints, el esquema de argumentos queda vacio.
+@mcp.tool()
+def search_lessons(query, k=4):
+    """Busca lecciones."""
+    return buscar_lecciones(query, k)
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Los tipos generan el esquema; el docstring, la descripcion.
+@mcp.tool()
+def search_lessons(query: str, k: int = 4) -&gt; list[dict]:
+    """Busca fragmentos relevantes en las lecciones de la Academy."""
+    return buscar_lecciones(query, k=k)
+</code></pre>
+
+        <h3>6.3. Devolver objetos no serializables</h3>
+        <p>La respuesta MCP viaja como contenido serializable. Devolver una conexión a base de datos o un generador produce un error en tiempo de ejecución.</p>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre class="code-wrong"><code class="language-python"># ❌ Un objeto con estado no se puede serializar a la respuesta MCP.
+@mcp.tool()
+def db_connection() -&gt; object:
+    """Devuelve la conexion abierta."""
+    return get_connection()            # conexion viva = fallo
+</code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre class="code-right"><code class="language-python"># ✅ Devuelve datos serializables; la conexion es un detalle interno.
+@mcp.tool()
+def db_status() -&gt; dict:
+    """Devuelve el estado de la base de datos."""
+    return {"ok": True, "tables": 12}
+</code></pre>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un servidor MCP con una tool que cuenta las lecciones de la Academy, probarlo en memoria y, después, conectarte a él por <strong>stdio</strong> como lo haría un host real.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — prepara el proyecto.</strong> Crea una carpeta y añade el SDK:
+            <pre><code class="language-bash">uv init copiloto-mcp &amp;&amp; cd copiloto-mcp
+uv add "mcp&gt;=2"
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — el servidor.</strong> Una tool que recibe un directorio raíz y cuenta los archivos <code>.html</code> de lecciones:
+            <pre><code class="language-python"># server.py — servidor MCP que cuenta lecciones de la Academy.
+from pathlib import Path
+
+from mcp.server import MCPServer
+
+mcp = MCPServer("academy-index")
+
+
+@mcp.tool()
+def count_lessons(root: str) -&gt; int:
+    """Cuenta las lecciones (.html) bajo &lt;root&gt;/Aprende */web/modulos/."""
+    base = Path(root)
+    lessons = list(base.glob("Aprende */web/modulos/*/*.html"))
+    return len(lessons)
+
+
+if __name__ == "__main__":
+    mcp.run()          # stdio
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — pruébalo en memoria.</strong> Antes de tocar el host, confirma que la tool responde:
+            <pre><code class="language-python"># test_server.py
+import asyncio
+from mcp import Client
+from server import mcp
+
+async def main() -&gt; None:
+    async with Client(mcp) as client:
+        print("tools:", [t.name for t in (await client.list_tools()).tools])
+        result = await client.call_tool("count_lessons", {"root": ".."})
+        print("lecciones:", result.content)
+
+asyncio.run(main())
+</code></pre>
+            <p>Ejecuta <code>uv run test_server.py</code>. Esperado: <code>tools: ['count_lessons']</code> y un número (según los cursos presentes).</p>
+          </li>
+          <li>
+            <strong>Paso 4 — conéctate por stdio.</strong> Ahora levanta el servidor como subproceso, igual que un host:
+            <pre><code class="language-python"># cliente.py — lanza el servidor por stdio y llama a la tool.
+import asyncio
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+async def main() -&gt; None:
+    params = StdioServerParameters(command="uv", args=["run", "server.py"])
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()                 # negocia capacidades
+            tools = await session.list_tools()
+            print("tools:", [t.name for t in tools.tools])
+            result = await session.call_tool("count_lessons", {"root": ".."})
+            print("lecciones:", result.content)
+
+
+asyncio.run(main())
+</code></pre>
+            <p>Ejecuta <code>uv run cliente.py</code>. La diferencia con el paso 3 es enorme: ahora hay un <strong>proceso aparte</strong> hablando JSON-RPC por <code>stdin</code>/<code>stdout</code>. Esto es exactamente lo que hace un IDE al conectar tu servidor.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — provoca el error de stdout.</strong> Añade un <code>print("debug")</code> dentro de <code>count_lessons</code>, vuelve a correr <code>cliente.py</code> y observa cómo se rompe. Quita el <code>print</code> y comprueba que se arregla. Acabas de ver, en carne propia, por qué los logs van a <code>stderr</code>.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p>Si tu host no ve la tool, la primera comprobación es siempre la misma: ejecuta el <strong>paso 3</strong> (cliente en memoria). Si ahí funciona, el problema está en la configuración del host (comando, ruta o argumentos), no en tu servidor.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El servidor del Copiloto, por HTTP y con token</h3>
+          <p>Parte del servidor del ejemplo real (las tres tools del Copiloto) y da el salto de local a <strong>remoto</strong>. Requisitos:</p>
+          <ul>
+            <li>Arranca el servidor con transporte <strong>Streamable HTTP</strong> (parámetro <code>transport</code> de <code>run()</code>) en lugar de stdio.</li>
+            <li>Conéctate con el cliente MCP a la URL del servidor y llama a <code>search_lessons</code> desde un proceso aparte.</li>
+            <li>Añade un <strong>token</strong> compartido: el servidor rechaza cualquier petición sin él. Piensa dónde va el token (cabecera, entorno) y por qué <em>nunca</em> debe ir en el repositorio.</li>
+            <li>Explica en un comentario por qué <code>print()</code> deja de ser peligroso con HTTP pero el token introduce un riesgo nuevo.</li>
+          </ul>
+          <p><em>Pista: <code>mcp.run(transport="streamable-http")</code> y el cliente se conecta con la URL (<code>Client("http://localhost:8000/mcp")</code>). Para el token, consulta las opciones de autenticación del SDK y guárdalo en una variable de entorno; en la v1 el mismo cambio se hace pasando <code>transport="streamable-http"</code> a <code>FastMCP.run()</code>. No lo dejes «para que funcione»: decide explícitamente qué endpoints quedan expuestos.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>MCP</strong> es un protocolo abierto que estandariza cómo un <strong>servidor</strong> expone capacidades y cómo un <strong>cliente</strong> las descubre y las usa. Resuelve el problema N×M bajándolo a N+M.</li>
+          <li>Tres roles: <strong>host</strong> (la app con IA), <strong>cliente</strong> (su mitad MCP) y <strong>servidor</strong> (tu código, lo que construyes).</li>
+          <li>Por debajo es <strong>JSON-RPC</strong>: <code>initialize</code>, <code>tools/list</code>, <code>tools/call</code>… El SDK lo genera todo a partir de tus funciones.</li>
+          <li>El SDK deriva <strong>nombre, descripción y esquema</strong> del <em>nombre de la función, el docstring y los type hints</em>. Escribir tipos no es opcional.</li>
+          <li><strong>stdio</strong> es el transporte local por defecto: el host lanza el servidor como subproceso y habla por <code>stdin</code>/<code>stdout</code>. <strong>Nunca</strong> escribas a <code>stdout</code>; usa <code>stderr</code> para logs.</li>
+          <li>El Copiloto expone sus tools con un <strong>punto de entrada separado</strong> (<code>copiloto-mcp</code>) que reutiliza <code>copiloto.tools</code>: una sola fuente de verdad.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Herramienta del Copiloto</th></tr></thead>
+          <tbody>
+            <tr><td>Servidor MCP</td><td><code>MCPServer("copiloto")</code> (<code>mcp.server</code>)</td></tr>
+            <tr><td>Publicar una tool</td><td><code>@mcp.tool()</code> sobre una función tipada</td></tr>
+            <tr><td>Transporte local</td><td><code>mcp.run()</code> → stdio</td></tr>
+            <tr><td>Prueba en memoria</td><td><code>Client(mcp)</code></td></tr>
+            <tr><td>Conexión como host</td><td><code>stdio_client(StdioServerParameters(...))</code></td></tr>
+            <tr><td>Configuración del host</td><td><code>mcp.json</code> con <code>command</code> y <code>args</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿MCP sustituye al tool calling que vi en el módulo 2?</summary>
+            <div>
+              <p>No. El tool calling es cómo <em>un</em> modelo pide que se ejecute una función; MCP es cómo <em>publicas</em> esa función para que la consuma cualquier host. Son complementarias: por dentro, el agente sigue usando tool calling; MCP es la capa estándar que permite que la misma tool la usen otros. El modelo nunca «habla MCP»: habla el host, que traduce.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿stdio o Streamable HTTP?</summary>
+            <div>
+              <p>stdio cuando el servidor corre en tu máquina, en una sola sesión y es de confianza (el caso del Copiloto). HTTP cuando el servidor es remoto, lo comparten varios usuarios o necesitas autenticación. Empieza por stdio: menos partes móviles, sin puertos ni red. Migrar después es cambiar el transporte de <code>run()</code> y la forma de conectar el cliente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi host dice que el servidor «falló al iniciar»?</summary>
+            <div>
+              <p>Casi siempre es una de estas tres: (1) el <code>command</code> no existe en el <code>PATH</code> del host; (2) la ruta del proyecto en <code>args</code> es incorrecta; (3) hay un <code>print()</code> en <code>stdout</code> corrompiendo el protocolo. Aísla ejecutando el <strong>cliente en memoria</strong>: si ahí funciona, el fallo está en la configuración del host, no en el servidor.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo exponer la misma tool interna y por MCP?</summary>
+            <div>
+              <p>Sí, y es lo recomendable. La lógica vive una sola vez en <code>copiloto.tools</code>; el bucle del agente la importa directamente y el servidor MCP la envuelve con <code>@mcp.tool()</code>. Así el Copiloto sigue siendo autónomo y, además, otras apps pueden usar sus capacidades sin duplicar código.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué versión del SDK debo instalar?</summary>
+            <div>
+              <p>La v2 estable del SDK de Python (<code>uv add "mcp&gt;=2"</code>), donde la clase de alto nivel se llama <code>MCPServer</code> (importada de <code>mcp.server</code>). En la v1 se llamaba <code>FastMCP</code> (<code>from mcp.server.fastmcp import FastMCP</code>); muchos tutoriales siguen usando ese nombre. Consulta siempre la documentación oficial antes de fijar una versión, porque la API de transporte y de tipos cambió entre ambas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

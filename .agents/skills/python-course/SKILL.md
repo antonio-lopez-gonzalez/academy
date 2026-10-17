@@ -1,11 +1,11 @@
 ---
 name: python-course
-description: Use when writing Learn Python lesson content or the Biblioteca sample project. Defines the Python teaching stance (why indentation, everything is an object, dynamic typing, mutability, LEGB, generators, GIL/async), the per-module focus, the Biblioteca contract, and the anti-patterns to teach. Companion to Learn Python/specs.md.
+description: Use when writing Aprende Python lesson content or the Biblioteca sample project. Defines the Python teaching stance (why indentation, everything is an object, dynamic typing, mutability, LEGB, generators, GIL/async), the per-module focus, the Biblioteca contract, and the anti-patterns to teach. Companion to Aprende Python/specs.md.
 ---
 
 # Python course (domain skill)
 
-You are writing a course that teaches **idiomatic Python 3.12+** to developers who already program in another language. The method is in `Learn Python/specs.md`; this skill is the domain companion. If they disagree, the spec wins — flag the conflict, don't guess.
+You are writing a course that teaches **idiomatic Python 3.12+** to developers who already program in another language. The method is in `Aprende Python/specs.md`; this skill is the domain companion. If they disagree, the spec wins — flag the conflict, don't guess.
 
 ## 1. Teaching stance (non-negotiable)
 

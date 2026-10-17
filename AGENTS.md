@@ -1,10 +1,10 @@
 # Academy — instrucciones para agentes
 
-Este `AGENTS.md` es un **puntero corto**. La fuente de verdad común es **`specs.md`** (raíz del repositorio). Léelo entero antes de tocar nada. El *contenido* de cada curso vive en su propia spec (`Learn <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
+Este `AGENTS.md` es un **puntero corto**. La fuente de verdad común es **`specs.md`** (raíz del repositorio). Léelo entero antes de tocar nada. El *contenido* de cada curso vive en su propia spec (`Aprende <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
 
 ## Qué es este repositorio
 
-La **Academy**: cursos independientes en `Learn <Curso>/`, todos construidos como el mismo artefacto (web estática sin build, navegada desde `web/assets/js/course-data.js`). La portada es `index.html` (raíz).
+La **Academy**: cursos independientes en `Aprende <Curso>/`, todos construidos como el mismo artefacto (web estática sin build, navegada desde `web/assets/js/course-data.js`). La portada es `index.html` (raíz).
 
 ## Orden de lectura obligatorio
 
@@ -14,8 +14,8 @@ La **Academy**: cursos independientes en `Learn <Curso>/`, todos construidos com
 4. `.agents/skills/frontend-design/SKILL.md` — identidad visual propia (prohibidos los defaults genéricos de IA).
 5. `.agents/skills/academy-verify/SKILL.md` — **verificar** que un curso cumple el contrato antes de terminarlo (script `verify.mjs`).
 6. `.agents/skills/academy-course-add/SKILL.md` — **playbook** para añadir un curso nuevo de punta a punta.
-7. La spec del curso que vayas a tocar (`Learn <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
-8. Skills de dominio cuando existan: `.agents/skills/python-course/SKILL.md` (Learn Python), `.agents/skills/spec-driven-development/SKILL.md` (Learn SDD).
+7. La spec del curso que vayas a tocar (`Aprende <Curso>/specs.md` | `spec.md` | `AGENTS.md`).
+8. Skills de dominio cuando existan: `.agents/skills/python-course/SKILL.md` (Aprende Python), `.agents/skills/spec-driven-development/SKILL.md` (Aprende SDD).
 
 ## Estructura
 
@@ -27,7 +27,7 @@ Academy/
 ├── index.html          ← portada: una tarjeta por curso
 ├── .gitignore
 ├── .agents/skills/     ← skills COMPARTIDAS (no duplicar por curso)
-└── Learn <Curso>/      ← un curso por carpeta (web/, proyectos/, scripts/, su spec y su AGENTS.md)
+└── Aprende <Curso>/      ← un curso por carpeta (web/, proyectos/, scripts/, su spec y su AGENTS.md)
 ```
 
 ## Reglas

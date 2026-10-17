@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-artefactos-y-cobertura">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Artefactos y cobertura: gates de calidad — Módulo 2 · Curso DevOps</title>
+  <meta name="description" content="Publica cobertura y artefactos del CI del Copiloto con upload-artifact, compártelos entre jobs con download-artifact y define gates de calidad con umbrales que bloquean la fusión.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('devops-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Artefactos y cobertura: gates de calidad</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Integración continua</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un CI que solo dice «verde/rojo» se queda corto. Dos preguntas más hacen que el pipeline sea de verdad útil: <strong>¿qué produjo este run?</strong> (el informe de cobertura, los resultados de test, el paquete construido) y <strong>¿es eso suficiente para fusionar?</strong> (¿el 80 % de cobertura es un requisito o una cifra decorativa?).</p>
+        <p>En esta lección cerramos el Módulo 2 con las dos piezas que responden a esas preguntas: los <strong>artefactos</strong>, que son los resultados que un run deja para que otros los usen (el siguiente job, una persona revisando, o un despliegue posterior), y los <strong>gates de calidad</strong>, que son comprobaciones con umbral que convierten una métrica en una puerta que bloquea o deja pasar.</p>
+        <div class="callout callout--why">
+          <p><strong>¿Por qué separar «caché» de «artefacto»?</strong> Porque se parecen (ambos guardan archivos entre runs) pero tienen contratos opuestos. La <strong>caché</strong> es un atajo de rendimiento, opcional y descartable: si desaparece, el pipeline debe seguir funcionando igual. El <strong>artefacto</strong> es un resultado con vida propia: informes, paquetes, binarios. El artefacto que pruebas es el que despliegas (trazabilidad); la caché nunca es el artefacto.</p>
+        </div>
+        <p>Errores típicos: subir artefactos gigantes sin retención, usar el mismo <code>name</code> en todos los jobs de una matriz (colisión en <code>upload-artifact</code> v4), poner un umbral de cobertura que nadie mira porque se puede fusionar igual, o confundir «el run terminó» con «el artefacto está listo y es el correcto».</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Artefactos: la salida tangible de un run</h3>
+        <p>Un <strong>artefacto</strong> es un conjunto de archivos que se adjunta a un run de workflow y queda disponible para descargar (desde la UI, la CLI <code>gh run download</code>, o desde otro job del mismo run). Los casos de uso canónicos:</p>
+        <table>
+          <thead><tr><th>Tipo de artefacto</th><th>Ejemplo en el Copiloto</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Informe de cobertura</strong></td><td><code>coverage.xml</code> / <code>htmlcov/</code></td><td>Ver qué líneas cubren los tests; subirlo a un panel o dejarlo para revisión.</td></tr>
+            <tr><td><strong>Resultados de test</strong></td><td><code>junit.xml</code></td><td>Que la UI muestre qué test falló, no solo «el job falló».</td></tr>
+            <tr><td><strong>Artefacto desplegable</strong></td><td><code>dist/*.whl</code>, la imagen Docker</td><td><strong>Es</strong> el producto: lo mismo que se prueba se despliega (Módulos 3 y 7).</td></tr>
+            <tr><td><strong>Evidencias/logs</strong></td><td>capturas, trazas, SBOM</td><td>Auditoría y depuración posterior del run.</td></tr>
+          </tbody>
+        </table>
+        <div class="diagram">
+job: test                     job: publish
+─────────────                 ─────────────
+pytest --cov ──► coverage.xml  │
+       │                        ▼
+       ▼                   download-artifact
+upload-artifact  ══════►  (recibe coverage.xml y el wheel)
+  name: cobertura             │
+  path: coverage.xml          ▼
+                          usa el MISMO artefacto ya probado
+        </div>
+        <p>La regla de oro de la trazabilidad: <strong>el artefacto que se prueba es el que se despliega</strong>. Si el job de test genera un wheel, ese wheel es el que debe llegar al entorno, no uno reconstruido con las prisas en el job de deploy. Los artefactos son el mecanismo que hace posible esa promesa.</p>
+
+        <h3>upload-artifact y download-artifact</h3>
+        <p>Dos actions, <code>upload</code> y <code>download</code>, forman el canal. La subida declara un <strong>nombre</strong> (la identidad del artefacto), una <strong>ruta</strong> (qué archivos) y, opcionalmente, cuántos días se guarda:</p>
+        <div class="code-file">.github/workflows/ci.yml (subida)</div>
+        <pre><code class="language-yaml">- name: Subir el informe de cobertura
+  uses: actions/upload-artifact@v7
+  with:
+    name: cobertura            # la identidad del artefacto
+    path: coverage.xml         # qué se incluye (admite patrones y exclusiones)
+    # retention-days: 5        # por defecto, el límite del repositorio
+    if-no-files-found: error   # falla si la ruta no genera nada (red de seguridad)
+        </code></pre>
+        <p>Y la bajada, en otro job con <code>needs</code>:</p>
+        <div class="code-file">.github/workflows/ci.yml (bajada)</div>
+        <pre><code class="language-yaml">- name: Descargar la cobertura del job de tests
+  uses: actions/download-artifact@v8
+  with:
+    name: cobertura            # sin name, descarga TODOS los artefactos
+    path: cobertura/           # dónde dejarlos (si no, el directorio actual)
+        </code></pre>
+        <div class="callout callout--warning">
+          <p><strong>El fallo clásico de la v4: nombres duplicados.</strong> En <code>upload-artifact@v4</code> el <strong>nombre del artefacto ya no admite colisiones</strong>: si dos jobs suben un artefacto con el mismo <code>name</code>, el segundo falla con <code>an artifact with this name already exists</code>. En una matriz, incluye el eje en el nombre (<code>cobertura-3.12</code>) o sube todo de golpe con <code>pattern</code>. Los artefactos tampoco se pueden <em>sobrescribir</em>: cada subida debe tener nombre único.</p>
+        </div>
+
+        <h3>Qué es un gate de calidad y por qué un umbral no basta</h3>
+        <p>Un <strong>gate</strong> (puerta de calidad) es una comprobación que <em>bloquea el avance</em> si no se cumple. La forma más simple de gate en CI es un paso que falla si una métrica no llega a un umbral:</p>
+        <div class="code-file">.github/workflows/ci.yml (gate de cobertura)</div>
+        <pre><code class="language-yaml">- name: Tests con umbral de cobertura
+  # --cov-fail-under=80: si la cobertura global baja de 80 %, pytest
+  # sale con código ≠ 0 y el job falla ⇒ el check del PR se pone rojo.
+  run: uv run --frozen pytest --cov=app --cov-report=xml --cov-fail-under=80
+        </code></pre>
+        <p>Pero un gate es más que un número: para que <em>de verdad</em> bloquee, el check debe ser <strong>obligatorio</strong> en la configuración de protección de la rama (Módulo 1, lección 02). Un umbral en un workflow no obligatorio es una recomendación, no una puerta.</p>
+        <table>
+          <thead><tr><th>Métrica</th><th>Gate razonable</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td>Cobertura de líneas</td><td>No bajar del umbral (p. ej. 80 %)</td><td><code>pytest-cov --cov-fail-under</code></td></tr>
+            <tr><td>Tests que pasan</td><td>100 % (cero fallos)</td><td>Código de salida de <code>pytest</code></td></tr>
+            <tr><td>Lint/tipos</td><td>0 errores</td><td><code>ruff</code>, <code>mypy</code></td></tr>
+            <tr><td>Vulnerabilidades</td><td>0 críticas/altas</td><td>Escáneres (Módulo 3/7)</td></tr>
+            <tr><td>Tiempo del pipeline</td><td>Por debajo de un presupuesto</td><td>Métricas del run (Módulo 7)</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Cobertura: úsala como suelo, no como objetivo.</strong> La cobertura mide <em>qué</em> líneas se ejecutan, no <em>qué</em> se verifica. Un <code>assert</code> débil ejecuta la línea y sigue contando. El gate sirve para impedir que la cobertura <em>caiga</em>, no para premiar subirla a base de tests vacíos. Combínala siempre con criterio humano en la revisión del PR.</p>
+        </div>
+
+        <h3>Cobertura: qué se mide y cómo se publica</h3>
+        <p><code>pytest-cov</code> ejecuta los tests midiendo qué líneas se recorren y puede emitir el informe en varios formatos: <code>term</code> (consola), <code>xml</code> (para herramientas, <code>coverage.xml</code>), <code>html</code> (navegable) y <code>lcov</code>. El flujo completo del Copiloto:</p>
+        <ol>
+          <li>El job de <code>test</code> ejecuta <code>pytest --cov</code> y genera <code>coverage.xml</code> y <code>junit.xml</code>.</li>
+          <li>Sube ambos como artefactos (con nombres únicos por versión de Python).</li>
+          <li>El job de <code>build</code> o un job <code>coverage-gate</code> descarga el informe y aplica el umbral, o el propio <code>pytest --cov-fail-under</code> ya lo aplica.</li>
+          <li>Opcionalmente, un bot comenta el porcentaje en el PR para que la revisión lo vea sin abrir artefactos.</li>
+        </ol>
+        <p>En "Aprende DevOps" no necesitamos herramientas SaaS: con artefactos y un umbral en el propio test tenemos cobertura publicada y <em>gate</em> real. Servicios como Codecov añaden comentarios en el PR y comparación contra la base, pero el mecanismo subyacente es exactamente este.</p>
+        <div class="callout callout--note">
+          <p><strong>¿Por qué subir el XML <em>y</em> aplicar el umbral?</strong> Porque son cosas distintas: el umbral decide el veredicto (<em>gate</em>), y el artefacto deja la evidencia para quien quiera investigar un PR concreto semanas después. Un run sin artefacto es un run que no puedes auditar; un run sin <em>gate</em> es un run que no decide nada.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Dos jobs: uno <strong>produce</strong> un archivo y lo sube; el otro lo <strong>descarga</strong> y lo usa. Nada más: es el canal de artefactos en su mínima expresión.</p>
+        <div class="code-file">.github/workflows/artifacts.yml</div>
+        <pre><code class="language-yaml">name: Artefactos mínimos
+
+on: [push]
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear un archivo de resultado
+        run: echo "cobertura: 82%" &gt; resultado.txt
+
+      - name: Subirlo como artefacto
+        uses: actions/upload-artifact@v7
+        with:
+          name: resultado
+          path: resultado.txt
+          if-no-files-found: error    # si no existe, falla: red de seguridad
+
+  consume:
+    # needs garantiza que el artefacto YA existe cuando este job empieza.
+    needs: produce
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el artefacto
+        uses: actions/download-artifact@v8
+        with:
+          name: resultado
+
+      - name: Usarlo
+        run: |
+          cat resultado.txt
+          echo "Leído correctamente desde el artefacto"
+        </code></pre>
+        <p>Fíjate en lo esencial:</p>
+        <ul>
+          <li>El <strong><code>needs</code></strong> no es opcional aquí: sin él, el job <code>consume</code> podría arrancar antes de que exista el artefacto y fallar. Los artefactos <em>no</em> son canales sincronizados: tú decides el orden con <code>needs</code>.</li>
+          <li><code>if-no-files-found: error</code> convierte un artefacto vacío (ruta mal escrita, paso que no generó nada) en un fallo ruidoso en vez de un artefacto silenciosamente vacío.</li>
+          <li><code>download-artifact</code> deja el archivo en el directorio de trabajo por defecto (o en <code>path</code> si lo indicas).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El CI del Copiloto al completo: la matriz de tests genera cobertura y resultados, los sube como artefactos, y un job final <code>calidad</code> aplica el <em>gate</em> y prepara el paquete. Solo este último será <strong>obligatorio</strong> para fusionar.</p>
+        <div class="code-file">proyectos/pipeline/.github/workflows/ci.yml</div>
+        <pre><code class="language-yaml">name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # TESTS + COBERTURA (matriz) — producen los artefactos.
+  # ============================================================
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen --all-extras
+
+      - name: Ejecutar tests con cobertura y umbral
+        # Genera DOS informes:
+        #   --cov-report=xml   -> coverage.xml (herramientas / artefacto)
+        #   --junitxml=...     -> junit.xml (UI de tests / artefacto)
+        # --cov-fail-under=80 -> el gate de cobertura más simple posible.
+        run: |
+          uv run --frozen pytest -q \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            --junitxml=junit.xml
+
+      - name: Subir cobertura
+        # El nombre incluye el eje de la matriz: en v4 los nombres
+        # NO pueden repetirse entre jobs del mismo run.
+        uses: actions/upload-artifact@v7
+        with:
+          name: cobertura-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Subir resultados de test
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.python-version }}
+          path: junit.xml
+          retention-days: 7
+          if-no-files-found: error
+
+  # ============================================================
+  # LINT — un job, sin matriz.
+  # ============================================================
+  lint:
+    name: Lint y tipos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy app
+
+  # ============================================================
+  # BUILD — genera el artefacto DESPLEGABLE del Copiloto.
+  # ============================================================
+  build:
+    name: Build del paquete
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+
+      - name: Construir el wheel y el sdist
+        run: uv build
+
+      - name: Prueba de humo del artefacto real
+        run: |
+          uv run --isolated --no-project --with dist/*.whl \
+            python -c "import app; print(app.__version__)"
+
+      - name: Publicar el paquete como artefacto
+        # ESTE es el artefacto que en el Módulo 3 se convertirá en imagen
+        # Docker y que, en el Módulo 7, se desplegará SIN reconstruir.
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ============================================================
+  # CALIDAD — el único check OBLIGATORIO. Consume los artefactos
+  # y deja una vista del run en el "summary" del workflow.
+  # ============================================================
+  calidad:
+    name: Calidad (gate)
+    # always() para que corra aunque algún test haya fallado y podamos
+    # reportar; luego decidimos con el resultado de los needs.
+    if: always()
+    needs: [test, lint, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar TODOS los artefactos
+        uses: actions/download-artifact@v8
+        with:
+          path: artefactos/         # sin name ⇒ baja todo el run
+
+      - name: Listar lo recibido
+        run: |
+          find artefactos -type f | sort
+
+      - name: Comprobar que los jobs obligatorios pasaron
+        # needs.X.result puede ser success / failure / cancelled / skipped.
+        run: |
+          echo "test=${{ needs.test.result }}"
+          echo "lint=${{ needs.lint.result }}"
+          echo "build=${{ needs.build.result }}"
+          test "${{ needs.test.result }}" = "success"
+          test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.build.result }}" = "success"
+
+      - name: Resumen en la interfaz del workflow
+        # GitHub renderiza Markdown en el resumen de cada run.
+        run: |
+          {
+            echo "## Resultado del CI"
+            echo ""
+            echo "| Job | Estado |"
+            echo "| --- | --- |"
+            echo "| test | ${{ needs.test.result }} |"
+            echo "| lint | ${{ needs.lint.result }} |"
+            echo "| build | ${{ needs.build.result }} |"
+          } &gt;&gt; "$GITHUB_STEP_SUMMARY"
+        </code></pre>
+        <p>Las decisiones que hacen que este pipeline sea <em>útil</em> y no solo <em>verde</em>:</p>
+        <ul>
+          <li><strong>El gate de cobertura vive en el propio <code>pytest</code></strong> (<code>--cov-fail-under=80</code>): es el gate más rápido y no necesita un job aparte. El job <code>calidad</code> añade la puerta «todas las dependencias pasaron».</li>
+          <li><strong>Los artefactos llevan nombres únicos por matriz</strong> (<code>cobertura-3.12</code>): si los dos jobs de la matriz subieran <code>cobertura</code>, el segundo fallaría.</li>
+          <li><strong>El artefacto <code>wheel</code></strong> es el producto desplegable. En el Módulo 3 se convertirá en imagen Docker; en el Módulo 7 llegará al entorno sin reconstruirse. Ahí está la trazabilidad.</li>
+          <li><strong>Un solo check obligatorio (<code>calidad</code>)</strong> simplifica la protección de rama: en lugar de exigir seis checks, exiges uno. Es una estrategia habitual para matrices grandes; su precio es que, si <code>calidad</code> falla, el motivo está en los logs de un job anterior.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p><strong>¿Y el <code>if: always()</code>?</strong> Sirve para que <code>calidad</code> corra aunque un test haya fallado: así siempre obtienes el resumen y la lista de artefactos, y el gate decide al final. Sin <code>always()</code>, si el test falla, <code>calidad</code> se saltaría y perderías la evidencia agregada. Ojo: <code>always()</code> no convierte el fallo en éxito; el <code>test</code> sigue en rojo y el workflow también.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Nombres de artefacto <strong>únicos por matriz</strong></td>
+              <td><code>name: cobertura</code> en todos los jobs</td>
+              <td>En <code>upload-artifact@v4</code> los nombres no colisionan: el segundo falla con «artifact already exists».</td>
+            </tr>
+            <tr>
+              <td><code>retention-days</code> ajustado a lo que necesitas</td>
+              <td>Guardar todo hasta el límite del repositorio</td>
+              <td>Los artefactos ocupan almacenamiento y tienen coste; un informe de test de hace un mes rara vez hace falta.</td>
+            </tr>
+            <tr>
+              <td>Sube lo pequeño y útil (XML, wheel)</td>
+              <td>Subir <code>node_modules</code>, <code>.venv</code>, <code>htmlcov/</code> entero sin motivo</td>
+              <td>Los artefactos se descargan y consumen cuota; cachea lo repetible y sube solo lo que aporta evidencia.</td>
+            </tr>
+            <tr>
+              <td><code>if-no-files-found: error</code></td>
+              <td>Dejar por defecto (<code>warn</code>)</td>
+              <td>Un artefacto vacío por una ruta mal escrita es un fallo silencioso; mejor que reviente.</td>
+            </tr>
+            <tr>
+              <td>Gate de cobertura como <strong>check obligatorio</strong></td>
+              <td>Umbral en un workflow que nadie exige</td>
+              <td>Un gate que no bloquea es documentación, no una puerta. La protección de rama es la que lo hace real.</td>
+            </tr>
+            <tr>
+              <td>El artefacto probado es el desplegado</td>
+              <td>Reconstruir el paquete en el job de deploy</td>
+              <td>Reconstruir introduce variabilidad: lo que pruebas deja de ser lo que despliegas. Trazabilidad rota.</td>
+            </tr>
+            <tr>
+              <td>Nunca artefactos con secretos</td>
+              <td>Subir <code>.env</code>, tokens, <code>kubeconfig</code></td>
+              <td>Los artefactos son descargables por cualquiera con acceso al repo: puede ser una fuga de credenciales.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>Nombres de artefacto duplicados en la matriz</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-yaml"># ❌ Dos jobs de la matriz suben el mismo nombre.
+#    El segundo muere: "an artifact with this name already exists".
+uses: actions/upload-artifact@v7
+with:
+  name: cobertura
+  path: coverage.xml
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-yaml"># ✅ Un nombre por combinación.
+uses: actions/upload-artifact@v7
+with:
+  name: cobertura-${{ matrix.python-version }}
+  path: coverage.xml
+        </code></pre>
+
+        <h3>Intentar usar el artefacto sin esperarlo</h3>
+        <div class="code-label code-label--wrong">Incorrecto</div>
+        <pre><code class="language-yaml">jobs:
+  publish:
+    runs-on: ubuntu-latest   # ❌ sin needs: puede arrancar antes que test
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel            # …y no existir todavía
+        </code></pre>
+        <div class="code-label code-label--right">Correcto</div>
+        <pre><code class="language-yaml">jobs:
+  publish:
+    needs: build             # ✅ el artefacto YA existe cuando empieza
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel
+        </code></pre>
+
+        <h3>Umbral de cobertura que no bloquea nada</h3>
+        <pre><code class="language-yaml"># ❌ El umbral existe, pero el check no es obligatorio en la rama:
+#    la cobertura baja, el job se pone rojo... y se fusiona igual.
+- run: pytest --cov-fail-under=80
+
+# ✅ Además del umbral, marca "Calidad (gate)" como check requerido
+#    en la protección de rama (Settings → Branches). El código decide
+#    el veredicto; la configuración de la rama lo hace vinculante.
+        </code></pre>
+
+        <h3>Confundir caché con artefacto (y viceversa)</h3>
+        <pre><code class="language-yaml"># ❌ Guardar el informe de cobertura en la caché para leerlo después.
+- uses: actions/cache@v6
+  with:
+    path: coverage.xml
+    key: cobertura           # puede no existir: la caché es "best effort"
+
+# ❌ …o cachear el .venv como si fuera un artefacto reutilizable.
+- uses: actions/upload-artifact@v7
+  with:
+    name: venv
+    path: .venv              # entorno con rutas absolutas: inútil en otro run
+
+# ✅ Caché = rendimiento (almacén de descargas). Artefacto = resultado
+#    (coverage.xml, wheel). Cada uno en su sitio.
+        </code></pre>
+
+        <h3>Rutas que no coinciden con donde se generó el archivo</h3>
+        <pre><code class="language-yaml"># ❌ pytest escribió el XML en app/coverage.xml, no en la raíz.
+- uses: actions/upload-artifact@v7
+  with:
+    name: cobertura
+    path: coverage.xml          # no existe ⇒ artefacto vacío silencioso
+    # (sin if-no-files-found: error, esto pasa desapercibido)
+
+# ✅ Usa la ruta real, o un patrón; y pon la red de seguridad.
+- uses: actions/upload-artifact@v7
+  with:
+    name: cobertura
+    path: '**/coverage.xml'
+    if-no-files-found: error
+        </code></pre>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO GUIADO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> publicar cobertura y resultados de test como artefactos, aplicar un umbral del 80 % y comprobar que el CI bloquea cuando la cobertura baja.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Añade cobertura y umbral en local.</strong>
+            <pre><code class="language-bash">cd ~/proyectos/copiloto-api
+uv run --frozen pytest -q \
+  --cov=app --cov-report=term-missing --cov-report=xml \
+  --cov-fail-under=80 --junitxml=junit.xml
+# Mira la tabla de cobertura: te dirá qué módulos van justos.
+ls coverage.xml junit.xml      # ambos informes generados
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Actualiza el workflow.</strong> Sustituye el job <code>test</code> del ejemplo real (con los <code>upload-artifact</code>) y añade el job <code>calidad</code>. Ponte en una rama corta.
+            <pre><code class="language-bash">git checkout -b ci/coverage-artifacts
+git commit -am "ci: cobertura, artefactos y gate de calidad"
+git push -u origin ci/coverage-artifacts
+gh pr create --fill
+gh pr checks --watch
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 3 — Descarga un artefacto con la CLI.</strong>
+            <pre><code class="language-bash"># Toma el ID del último run del PR:
+gh run list --limit 1
+# Descarga los artefactos (los de la matriz llegarán en carpetas):
+gh run download &lt;run-id&gt;
+ls cobertura-3.12/ junit-3.12/ wheel/
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 4 — Rompe el gate a propósito.</strong> Elige un módulo con tests y coméntalos, o crea una función nueva sin test, hasta bajar del umbral.
+            <pre><code class="language-bash"># Ejemplo: comenta los tests de /modules en tests/test_health.py
+git commit -am "test: bajar la cobertura por debajo del umbral"
+git push
+gh pr checks --watch
+# Esperado: "Test (Python 3.12)" ❌ con mensaje de --cov-fail-under.
+# Y "Calidad (gate)" ❌ con "test=failure": el job obligatorio bloquea.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Recupera el umbral y revisa el resumen.</strong>
+            <pre><code class="language-bash">git checkout -- tests/test_health.py
+git commit -am "test: restaurar los tests"
+git push
+gh run view --log | Select-String "Resultado del CI"
+# En la web, la pestaña del run muestra el "Summary" con la tabla de
+# estados generada en $GITHUB_STEP_SUMMARY.
+            </code></pre>
+          </li>
+          <li>
+            <strong>Paso 6 — Hazlo obligatorio y verifica.</strong>
+            <pre><code class="language-bash"># En GitHub: Settings → Branches → regla de proteccion de main:
+#   exige el check "Calidad (gate)".
+gh pr checks
+# Esperado: todos ✅ y, con la rama protegida, el botón de fusionar
+# deshabilitado si el gate no está verde. Fusiona:
+gh pr merge --squash
+            </code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p><strong>Verificación conceptual:</strong> si el paso 4 pone el test en rojo pero el PR se pudiera fusionar igual, el gate <em>no</em> es obligatorio: ve a la protección de rama. Si el <code>download-artifact</code> no encuentra nada, revisa que el job consumidor tenga <code>needs</code> y que los nombres no colisionen. Y si <code>coverage.xml</code> aparece vacío, añade <code>if-no-files-found: error</code> para que la próxima vez falle en voz alta.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cobertura que no baje (y que se vea)</h3>
+          <p>Convierte la cobertura en una señal viva del PR, sin depender de servicios externos:</p>
+          <ul>
+            <li>Calcula la cobertura <strong>de la rama base</strong> (<code>main</code>) y la de la rama del PR. El gate no debe ser un número fijo, sino <strong>«no bajar respecto a la base»</strong>: si <code>main</code> tiene 86 %, el PR debe mantener al menos 86 %.</li>
+            <li>Publica un comentario en el PR con el porcentaje y la diferencia (por ejemplo, «cobertura: 87,2 % (+1,1 %)»), usando <code>gh pr comment</code> con <code>GITHUB_TOKEN</code>.</li>
+            <li>En una matriz, agrega los informes (<code>coverage.xml</code> de 3.12 y 3.13) en <strong>un solo</strong> resultado antes de decidir el gate.</li>
+          </ul>
+          <p><em>Pistas:</em> <code>actions/download-artifact@v8</code> sin <code>name</code> baja todo y puedes fusionar los XML con <code>coverage combine</code>; el permiso <code>pull-requests: write</code> es necesario para comentar en el PR (y recuerda que ampliar permisos es una decisión de seguridad: Módulo 4); para comparar contra la base, un <code>git worktree</code> o un checkout de <code>main</code> en un job aparte te da la cifra de referencia.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un <strong>artefacto</strong> es un resultado con vida propia (informe, wheel): se sube con <code>upload-artifact</code> y se consume con <code>download-artifact</code> + <code>needs</code>.</li>
+          <li>La <strong>caché</strong> es rendimiento descartable; el <strong>artefacto</strong> es evidencia. No los mezcles.</li>
+          <li>En <code>upload-artifact@v4</code> los nombres son <strong>únicos</strong>: en matriz, incluye el eje en el nombre.</li>
+          <li><code>if-no-files-found: error</code> convierte artefactos vacíos en fallos visibles.</li>
+          <li>Un <strong>gate</strong> es una comprobación que bloquea; un umbral se vuelve gate de verdad cuando el check es <strong>obligatorio</strong> en la rama.</li>
+          <li>La <strong>cobertura</strong> es un suelo, no un objetivo: mide líneas ejecutadas, no intención de verificar.</li>
+          <li>El artefacto que se prueba es el que se despliega: construye una vez, promueve el mismo artefacto.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Objetivo</th><th>YAML / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Subir un artefacto</td><td><code>uses: actions/upload-artifact@v7</code> + <code>name</code>, <code>path</code></td></tr>
+            <tr><td>Bajar un artefacto</td><td><code>uses: actions/download-artifact@v8</code> + <code>name</code></td></tr>
+            <tr><td>Retención</td><td><code>retention-days: 7</code></td></tr>
+            <tr><td>Fallar si no hay archivos</td><td><code>if-no-files-found: error</code></td></tr>
+            <tr><td>Cobertura en XML</td><td><code>pytest --cov=app --cov-report=xml</code></td></tr>
+            <tr><td>Gate de cobertura</td><td><code>pytest --cov-fail-under=80</code></td></tr>
+            <tr><td>Resumen del run</td><td><code>echo ... &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></td></tr>
+            <tr><td>Descargar con la CLI</td><td><code>gh run download &lt;run-id&gt;</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Los artefactos se pueden sobrescribir?</summary>
+            <div>
+              <p>No con <code>upload-artifact@v4</code>: cada subida crea un artefacto nuevo y el nombre debe ser único dentro del run. Si necesitas «actualizar» un artefacto, sube otro con nombre distinto o reconstruye el resultado. Este cambio respecto a versiones antiguas es deliberado: hace los artefactos <strong>inmutables</strong>, lo que refuerza la trazabilidad (sabes exactamente qué se subió).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo se guardan los artefactos por defecto?</summary>
+            <div>
+              <p>El valor por defecto lo fija el repositorio (habitualmente 90 días), y puedes acortarlo por artefacto con <code>retention-days</code>. Nunca puedes excederlo. Para informes de test de una PR, 7 días suele bastar; para un SBOM o un binario que auditas, quizá quieras el máximo permitido. Recuerda que el almacenamiento de artefactos cuenta para la cuota de Actions.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un umbral de cobertura global o por archivo?</summary>
+            <div>
+              <p>Lo habitual es un umbral global (<code>--cov-fail-under</code>) como suelo del proyecto, más uno o dos módulos críticos con umbral propio (seguridad, pagos, lógica de dominio) — porque en esos el 80 % global puede esconder un 10 %. Empieza por el global para no bloquear al equipo, y endurece donde de verdad importa. Un umbral mal calibrado se acaba ignorando; uno razonable se respeta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el mismo artefacto de test debe llegar al deploy?</summary>
+            <div>
+              <p>Porque construir dos veces produce dos cosas potencialmente distintas: un wheel con otra dependencia transitiva, un binario con otro timestamp. La promesa del pipeline es «lo que se prueba es lo que se despliega». Si el job de CD descarga el mismo artefacto del job de CI (en lugar de reconstruir), eliminas toda la variabilidad entre el veredicto y el despliegue. Es la base del despliegue por promoción que verás en el Módulo 4.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar la cobertura para bloquear un PR entero?</summary>
+            <div>
+              <p>Sí, y es justo el mecanismo de gate: si <code>pytest --cov-fail-under=80</code> falla, el job falla; si ese job es obligatorio en la protección de rama, el PR no se puede fusionar. La advertencia profesional: no lo pongas tan alto que el equipo invente tests vacíos para pasarlo, ni tan bajo que no cambie nada. Un buen gate se nota cuando <em>no</em> salta y molesta cuando de verdad detecta una regresión.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

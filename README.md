@@ -1,10 +1,10 @@
 # Academy
 
-Centro de conocimiento: **cursos independientes** (`Learn <Curso>/`) que comparten una misma forma
+Centro de conocimiento: **cursos independientes** (`Aprende <Curso>/`) que comparten una misma forma
 de construirse y entregarse. La portada [`index.html`](./index.html) es el punto de entrada único.
 
 - **Contrato común (mecánica):** [`specs.md`](./specs.md) + la skill `academy-course`.
-- **Contenido de cada curso:** su propia spec (`Learn <Curso>/specs.md` | `spec.md`) y su `AGENTS.md`.
+- **Contenido de cada curso:** su propia spec (`Aprende <Curso>/specs.md` | `spec.md`) y su `AGENTS.md`.
 - **Instrucciones para agentes:** [`AGENTS.md`](./AGENTS.md).
 - **MCP de Context7:** [`opencode.json`](./opencode.json) (único, en la raíz).
 
@@ -31,22 +31,22 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 
 | Curso | Tema | Módulos | Lecciones | Proyecto de ejemplo |
 |---|---|---|---|---|
-| `Learn Astro` | Astro 5+, islands, content-driven | 10 | 39 | — |
-| `Learn Docker` | Docker y Kubernetes (kind, Helm) | 10 | 43 | `proyectos/harbortasks` |
-| `Learn Dotnet` | .NET 8 + C# 12 (de cero a arquitecto) | 19 | 128 | `proyectos/m*-cms-*` (CMS) |
-| `Learn Javascript` | JavaScript moderno (ES2024+) | 10 | 44 | — |
-| `Learn NewRelic` | Observabilidad New Relic para .NET | 9 | 35 | `proyectos/newrelic-ws-demo` |
-| `Learn Python` | Python 3.12+ (de cero a paquete) | 10 | 45 | `proyectos/biblioteca` |
-| `Learn React` | React 19 + Vite | 16 | 102 | `proyectos/m*`, `proyecto-final/` |
-| `Learn Redis` | Redis para .NET (hub + caché) | 9 | 34 | `proyectos/redis-ws-hub` |
-| `Learn SDD` | Spec-Driven Development | 8 | 32 | `proyectos/lumen` |
-| `Learn Tailwind` | Tailwind CSS v4 | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
-| `Learn TypeScript` | TypeScript profesional | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
-| `Learn IA` | IA aplicada (LLM, RAG, agentes, MCP) | 9 | 36 | `proyectos/copiloto` |
-| `Learn FastAPI` | FastAPI (APIs modernas en Python) | 8 | 32 | `proyectos/copiloto-api` |
-| `Learn DevOps` | CI/CD y DevOps (Actions, IaC) | 8 | 32 | `proyectos/pipeline` |
-| `Learn Cloud` | Cloud (Azure / AWS, Terraform) | 8 | 32 | `proyectos/infra-cloud` |
-| `Learn System Design` | System Design (arquitectura a escala) | 8 | 32 | `proyectos/case-studies` |
+| `Aprende Astro` | Astro 5+, islands, content-driven | 10 | 39 | — |
+| `Aprende Docker` | Docker y Kubernetes (kind, Helm) | 10 | 43 | `proyectos/harbortasks` |
+| `Aprende Dotnet` | .NET 8 + C# 12 (de cero a arquitecto) | 19 | 128 | `proyectos/m*-cms-*` (CMS) |
+| `Aprende Javascript` | JavaScript moderno (ES2024+) | 10 | 44 | — |
+| `Aprende NewRelic` | Observabilidad New Relic para .NET | 9 | 35 | `proyectos/newrelic-ws-demo` |
+| `Aprende Python` | Python 3.12+ (de cero a paquete) | 10 | 45 | `proyectos/biblioteca` |
+| `Aprende React` | React 19 + Vite | 16 | 102 | `proyectos/m*`, `proyecto-final/` |
+| `Aprende Redis` | Redis para .NET (hub + caché) | 9 | 34 | `proyectos/redis-ws-hub` |
+| `Aprende SDD` | Spec-Driven Development | 8 | 32 | `proyectos/lumen` |
+| `Aprende Tailwind` | Tailwind CSS v4 | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
+| `Aprende TypeScript` | TypeScript profesional | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| `Aprende IA` | IA aplicada (LLM, RAG, agentes, MCP) | 9 | 36 | `proyectos/copiloto` |
+| `Aprende FastAPI` | FastAPI (APIs modernas en Python) | 8 | 32 | `proyectos/copiloto-api` |
+| `Aprende DevOps` | CI/CD y DevOps (Actions, IaC) | 8 | 32 | `proyectos/pipeline` |
+| `Aprende Cloud` | Cloud (Azure / AWS, Terraform) | 8 | 32 | `proyectos/infra-cloud` |
+| `Aprende System Design` | System Design (arquitectura a escala) | 8 | 32 | `proyectos/case-studies` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
@@ -66,9 +66,9 @@ Academy/
 │   ├── academy-course/           mecánica de cualquier curso Academy
 │   ├── documentation/            consultar docs oficiales vía Context7
 │   ├── frontend-design/          identidad visual propia
-│   ├── python-course/            dominio de Learn Python
-│   └── spec-driven-development/  dominio de Learn SDD
-└── Learn <Curso>/
+│   ├── python-course/            dominio de Aprende Python
+│   └── spec-driven-development/  dominio de Aprende SDD
+└── Aprende <Curso>/
     ├── specs.md | spec.md        spec de contenido (fuente de verdad)
     ├── AGENTS.md | agents.md     puntero corto a la spec + reglas
     ├── package.json              "serve": node scripts/serve-web.mjs (cuando aplica)
@@ -97,7 +97,7 @@ start index.html          # Windows (PowerShell)
 # xdg-open index.html     # Linux
 ```
 
-> La portada enlaza con rutas relativas a `Learn <Curso>/web/index.html`. Si tu navegador bloquea
+> La portada enlaza con rutas relativas a `Aprende <Curso>/web/index.html`. Si tu navegador bloquea
 > recursos locales, usa un servidor estático (abajo).
 
 ### Servir un curso con su propio servidor
@@ -105,7 +105,7 @@ start index.html          # Windows (PowerShell)
 Cada curso que lo necesita incluye `scripts/serve-web.mjs`. Desde la carpeta del curso:
 
 ```bash
-cd "Learn Docker"
+cd "Aprende Docker"
 npm run serve             # o: node scripts/serve-web.mjs
 # → http://localhost:3001
 ```
@@ -122,7 +122,7 @@ PORT=3002 npm run serve
 ### Alternativa genérica
 
 ```bash
-npx serve "Learn Python/web"
+npx serve "Aprende Python/web"
 ```
 
 ---
@@ -130,9 +130,9 @@ npx serve "Learn Python/web"
 ## Requisitos
 
 - **Node.js 20+** y **pnpm 11** (para los proyectos Vite/TS/JS y los servidores estáticos).
-- **.NET 8 SDK** para `Learn Dotnet`, `Learn NewRelic`, `Learn Redis` y el backend de `Learn React`.
-- **Python 3.12+** para `Learn Python`.
-- **Docker / kind / kubectl / Helm** para `Learn Docker`.
+- **.NET 8 SDK** para `Aprende Dotnet`, `Aprende NewRelic`, `Aprende Redis` y el backend de `Aprende React`.
+- **Python 3.12+** para `Aprende Python`.
+- **Docker / kind / kubectl / Helm** para `Aprende Docker`.
 - Context7 MCP para agentes: se instala solo (`npx -y @upstash/context7-mcp`) al arrancar OpenCode.
 
 ---

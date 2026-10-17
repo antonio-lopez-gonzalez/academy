@@ -1,15 +1,15 @@
 # Academy — Especificación general (spec unificada)
 
-## Centro de conocimiento: cursos `Learn *` bajo un mismo contrato
+## Centro de conocimiento: cursos `Aprende *` bajo un mismo contrato
 
 ---
 
 # 1. Objetivo
 
 Este repositorio es la **Academy**: una colección de cursos independientes, cada uno en su carpeta
-`Learn <Tema>/`, que comparten **una misma forma de construirse y entregarse**. La portada
+`Aprende <Tema>/`, que comparten **una misma forma de construirse y entregarse**. La portada
 `index.html` (raíz) es el punto de entrada único: lista un curso por tarjeta y cada tarjeta enlaza a
-`Learn <Tema>/web/index.html`.
+`Aprende <Tema>/web/index.html`.
 
 Este documento es la **spec general unificada**: define el contrato común a todos los cursos (qué es
 un curso, cómo se estructura, cómo se navega, cómo se verifica). **No sustituye** a la spec de cada
@@ -35,22 +35,22 @@ curso y en su `AGENTS.md`.
 
 | Curso | Tema | Spec del curso | Claves localStorage | Módulos | Lecciones | Proyecto de ejemplo |
 |---|---|---|---|---|---|---|
-| `Learn Astro` | Astro 5+, islands, content-driven | `AGENTS.md` | `astro-theme/progress` | 10 | 39 | — |
-| `Learn Docker` | Docker y Kubernetes (kind, Helm) | `specs.md` | `dk-theme/progress` | 10 | 43 | `proyectos/harbortasks` |
-| `Learn Dotnet` | .NET 8 + C# 12 (de cero a arquitecto) | `AGENTS.md` | `dn8-theme/progress` | 19 | 128 | `proyectos/m*-cms-*` (CMS) |
-| `Learn Javascript` | JavaScript moderno (ES2024+) | `AGENTS.md` | `js-theme/progress` | 10 | 44 | — |
-| `Learn NewRelic` | Observabilidad New Relic para .NET | `AGENTS.md` | `nr-theme/progress` | 9 | 35 | `proyectos/newrelic-ws-demo` |
-| `Learn Python` | Python 3.12+ (de cero a paquete) | `specs.md` | `py-theme/progress` | 10 | 45 | `proyectos/biblioteca` |
-| `Learn React` | React 19 + Vite | `agents.md` | `rc19-theme/progress` | 16 | 102 | `proyectos/m*`, `proyecto-final/` |
-| `Learn Redis` | Redis para .NET (hub + caché) | `AGENTS.md` | `redis-theme/progress` | 9 | 34 | `proyectos/redis-ws-hub` |
-| `Learn SDD` | Spec-Driven Development | `spec.md` | `sdd-theme/progress` | 8 | 32 | `proyectos/lumen` |
-| `Learn Tailwind` | Tailwind CSS v4 | `AGENTS.md` | `tw-theme/progress` | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
-| `Learn TypeScript` | TypeScript profesional | `AGENTS.md` | `ts-theme/progress` | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
-| `Learn IA` | IA aplicada: LLM, RAG, agentes, MCP, evals | `spec.md` | `ia-theme/progress` | 9 | 36 | `proyectos/copiloto` |
-| `Learn FastAPI` | FastAPI: APIs modernas en Python | `spec.md` | `fapi-theme/progress` | 8 | 32 | `proyectos/copiloto-api` |
-| `Learn DevOps` | CI/CD y DevOps: GitHub Actions, IaC | `spec.md` | `devops-theme/progress` | 8 | 32 | `proyectos/pipeline` |
-| `Learn Cloud` | Cloud: Azure/AWS con Terraform | `spec.md` | `cloud-theme/progress` | 8 | 32 | `proyectos/infra-cloud` |
-| `Learn System Design` | System Design: arquitectura a escala | `spec.md` | `sysd-theme/progress` | 8 | 32 | `proyectos/case-studies` |
+| `Aprende Astro` | Astro 5+, islands, content-driven | `AGENTS.md` | `astro-theme/progress` | 10 | 39 | — |
+| `Aprende Docker` | Docker y Kubernetes (kind, Helm) | `specs.md` | `dk-theme/progress` | 10 | 43 | `proyectos/harbortasks` |
+| `Aprende Dotnet` | .NET 8 + C# 12 (de cero a arquitecto) | `AGENTS.md` | `dn8-theme/progress` | 19 | 128 | `proyectos/m*-cms-*` (CMS) |
+| `Aprende Javascript` | JavaScript moderno (ES2024+) | `AGENTS.md` | `js-theme/progress` | 10 | 44 | — |
+| `Aprende NewRelic` | Observabilidad New Relic para .NET | `AGENTS.md` | `nr-theme/progress` | 9 | 35 | `proyectos/newrelic-ws-demo` |
+| `Aprende Python` | Python 3.12+ (de cero a paquete) | `specs.md` | `py-theme/progress` | 10 | 45 | `proyectos/biblioteca` |
+| `Aprende React` | React 19 + Vite | `agents.md` | `rc19-theme/progress` | 16 | 102 | `proyectos/m*`, `proyecto-final/` |
+| `Aprende Redis` | Redis para .NET (hub + caché) | `AGENTS.md` | `redis-theme/progress` | 9 | 34 | `proyectos/redis-ws-hub` |
+| `Aprende SDD` | Spec-Driven Development | `spec.md` | `sdd-theme/progress` | 8 | 32 | `proyectos/lumen` |
+| `Aprende Tailwind` | Tailwind CSS v4 | `AGENTS.md` | `tw-theme/progress` | 10 | 43 | `proyectos/m06-landing-completa`, `m09-dashboard` |
+| `Aprende TypeScript` | TypeScript profesional | `AGENTS.md` | `ts-theme/progress` | 13 | 51 | `proyectos/08-typescript-react`, `09-proyecto-final` |
+| `Aprende IA` | IA aplicada: LLM, RAG, agentes, MCP, evals | `spec.md` | `ia-theme/progress` | 9 | 36 | `proyectos/copiloto` |
+| `Aprende FastAPI` | FastAPI: APIs modernas en Python | `spec.md` | `fapi-theme/progress` | 8 | 32 | `proyectos/copiloto-api` |
+| `Aprende DevOps` | CI/CD y DevOps: GitHub Actions, IaC | `spec.md` | `devops-theme/progress` | 8 | 32 | `proyectos/pipeline` |
+| `Aprende Cloud` | Cloud: Azure/AWS con Terraform | `spec.md` | `cloud-theme/progress` | 8 | 32 | `proyectos/infra-cloud` |
+| `Aprende System Design` | System Design: arquitectura a escala | `spec.md` | `sysd-theme/progress` | 8 | 32 | `proyectos/case-studies` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.
@@ -69,7 +69,7 @@ se genera en tiempo de ejecución a partir de **un único fichero mapa**.
 ## 4.1. Layout de un curso
 
 ```text
-Learn <Curso>/
+Aprende <Curso>/
 ├── specs.md | spec.md        ← spec de contenido del curso (fuente de verdad)
 ├── AGENTS.md | agents.md     ← puntero corto a la spec + reglas para agentes
 ├── package.json              ← "serve": "node scripts/serve-web.mjs"
@@ -159,7 +159,7 @@ El **reto nunca se resuelve** en el HTML (solo pista, `.challenge`).
    curso y los tres scripts.
 3. Servir con `node scripts/serve-web.mjs` y pedir `/`, una lección por módulo y todos los recursos
    → HTTP 200.
-4. En `Academy/index.html`, la tarjeta del curso enlaza a `Learn <Curso>/web/index.html` y el
+4. En `Academy/index.html`, la tarjeta del curso enlaza a `Aprende <Curso>/web/index.html` y el
    contador de cursos del pie es correcto.
 
 ---
@@ -175,15 +175,15 @@ Academy/.agents/skills/
 ├── academy-verify/           ← verificar que un curso cumple el contrato (script verify.mjs)
 ├── documentation/            ← consultar documentación oficial vía Context7 antes de afirmar APIs
 ├── frontend-design/          ← identidad visual propia (prohibidos los defaults genéricos de IA)
-├── python-course/            ← dominio del curso Learn Python (contenido fiel)
-└── spec-driven-development/  ← dominio del curso Learn SDD (contenido fiel)
+├── python-course/            ← dominio del curso Aprende Python (contenido fiel)
+└── spec-driven-development/  ← dominio del curso Aprende SDD (contenido fiel)
 ```
 
 - Cada curso referencia las skills por ruta relativa: `../.agents/skills/<skill>/SKILL.md`.
 - Skills de **mecánica/transversales**: `academy-course`, `academy-course-add`, `academy-verify`,
   `documentation`, `frontend-design`.
-- Skills de **dominio**: solo tienen sentido para su curso (`python-course` → Learn Python,
-  `spec-driven-development` → Learn SDD). El resto de cursos vuelcan su dominio en su propia spec.
+- Skills de **dominio**: solo tienen sentido para su curso (`python-course` → Aprende Python,
+  `spec-driven-development` → Aprende SDD). El resto de cursos vuelcan su dominio en su propia spec.
 - Si una skill de dominio y la spec del curso discrepan, **gana la spec del curso** y se señala el choque.
 
 ---
@@ -222,7 +222,7 @@ Academy/
 ├── index.html                ← portada: tarjetas de acceso a cada curso
 ├── .gitignore                ← node_modules/, dist/, bin/, obj/, __pycache__/, .env, …
 ├── .agents/skills/           ← skills compartidas (ver §5)
-└── Learn <Curso>/            ← un curso por carpeta (ver §4.1)
+└── Aprende <Curso>/            ← un curso por carpeta (ver §4.1)
 ```
 
 ---
@@ -272,7 +272,7 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 
 # 12. Página principal (`index.html` de la raíz)
 
-- Portada tipo grid de `.card`; cada tarjeta enlaza a `Learn <Curso>/web/index.html`.
+- Portada tipo grid de `.card`; cada tarjeta enlaza a `Aprende <Curso>/web/index.html`.
 - Cada tarjeta muestra el **progreso** del curso: lee la clave `<clave>-progress` de `localStorage`
   (con `data-key` y `data-lessons`) y pinta una barra. Requiere navegar desde el **mismo origen**
   (servir la Academy desde una raíz común); si el origen se aísla, se muestra "sin empezar".

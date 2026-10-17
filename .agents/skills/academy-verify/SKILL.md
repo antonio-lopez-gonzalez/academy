@@ -1,11 +1,11 @@
 ---
 name: academy-verify
-description: Use when you have edited or added any Academy course and need to check it conforms to the shared contract before finishing. Runs a fast structural verification (lesson anatomy, section ids, theme key, scripts, orphans) across one or all `Learn *` courses, plus the manual checks (node --check, HTTP 200, landing registration).
+description: Use when you have edited or added any Academy course and need to check it conforms to the shared contract before finishing. Runs a fast structural verification (lesson anatomy, section ids, theme key, scripts, orphans) across one or all `Aprende *` courses, plus the manual checks (node --check, HTTP 200, landing registration).
 ---
 
 # Academy — verificación de un curso
 
-Comprueba que un curso `Learn *` cumple el **contrato** de la Academy (ver
+Comprueba que un curso `Aprende *` cumple el **contrato** de la Academy (ver
 `Academy/specs.md` y la skill `academy-course`). Úsala siempre antes de dar por
 terminado un cambio en cualquier curso.
 
@@ -16,7 +16,7 @@ terminado un cambio en cualquier curso.
 node .agents/skills/academy-verify/scripts/verify.mjs
 
 # Un curso concreto (por nombre de carpeta)
-node .agents/skills/academy-verify/scripts/verify.mjs "Learn FastAPI"
+node .agents/skills/academy-verify/scripts/verify.mjs "Aprende FastAPI"
 
 # Si lo ejecutas desde otra ruta
 node .agents/skills/academy-verify/scripts/verify.mjs --root "C:/Desarrollo/Academy"

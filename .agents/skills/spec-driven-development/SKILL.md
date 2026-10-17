@@ -1,11 +1,11 @@
 ---
 name: spec-driven-development
-description: Use when writing Learn SDD lesson content or the Lumen sample project. Defines the SDD vocabulary, the specify-plan-implement-verify loop, and the templates for specs, acceptance criteria, ADRs, skills and delta-specs. Lesson content must stay faithful to Learn SDD/spec.md — this skill is the domain companion to it, not a replacement.
+description: Use when writing Aprende SDD lesson content or the Lumen sample project. Defines the SDD vocabulary, the specify-plan-implement-verify loop, and the templates for specs, acceptance criteria, ADRs, skills and delta-specs. Lesson content must stay faithful to Aprende SDD/spec.md — this skill is the domain companion to it, not a replacement.
 ---
 
 # Spec-Driven Development (domain skill)
 
-You are writing a course that teaches developers to work **spec-first with coding agents**. The method, not any single vendor tool, is the subject. When the course spec (`Learn SDD/spec.md`) and this skill disagree, the spec wins — flag the conflict instead of guessing.
+You are writing a course that teaches developers to work **spec-first with coding agents**. The method, not any single vendor tool, is the subject. When the course spec (`Aprende SDD/spec.md`) and this skill disagree, the spec wins — flag the conflict instead of guessing.
 
 ## 1. Core vocabulary (use these exact meanings in lessons)
 
