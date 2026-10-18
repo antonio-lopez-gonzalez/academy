@@ -86,7 +86,7 @@
     const topbar = document.createElement("header");
     topbar.className = "topbar";
     topbar.innerHTML = `
-      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
+      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver a la biblioteca" aria-label="Volver a la biblioteca"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg></a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
         <svg class="topbar__logo" viewBox="0 0 24 24" fill="#00CEB9" aria-hidden="true"><path d="M8.0015 14.3091v7.384L12.0008 24V12.0008L1.6078 5.9996v4.6167ZM12.0008 0 2.8232 5.2976 6.8209 7.606l5.1799-2.9893 6.3936 3.6913v7.384l-5.1783 2.9908v4.6167l9.176-5.2991V5.9996Z"/></svg>

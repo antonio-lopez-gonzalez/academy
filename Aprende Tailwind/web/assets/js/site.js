@@ -86,7 +86,7 @@
     const topbar = document.createElement("header");
     topbar.className = "topbar";
     topbar.innerHTML = `
-      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver al índice de Academy">← Academy</a>
+      <a class="topbar__btn" href="${BASE}../../index.html" title="Volver a la biblioteca" aria-label="Volver a la biblioteca"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg></a>
       <button class="topbar__btn hamburger" aria-label="Abrir índice" data-hamburger>☰</button>
       <a class="topbar__brand" href="${BASE}index.html">
         <svg class="topbar__logo" viewBox="0 0 24 24" fill="#06B6D4" aria-hidden="true"><path d="M12.001,4.8c-3.2,0-5.2,1.6-6,4.8c1.2-1.6,2.6-2.2,4.2-1.8c0.913,0.228,1.565,0.89,2.288,1.624 C13.666,10.618,15.027,12,18.001,12c3.2,0,5.2-1.6,6-4.8c-1.2,1.6-2.6,2.2-4.2,1.8c-0.913-0.228-1.565-0.89-2.288-1.624 C16.337,6.182,14.976,4.8,12.001,4.8z M6.001,12c-3.2,0-5.2,1.6-6,4.8c1.2-1.6,2.6-2.2,4.2-1.8c0.913,0.228,1.565,0.89,2.288,1.624 c1.177,1.194,2.538,2.576,5.512,2.576c3.2,0,5.2-1.6,6-4.8c-1.2,1.6-2.6,2.2-4.2,1.8c-0.913-0.228-1.565-0.89-2.288-1.624 C10.337,13.382,8.976,12,6.001,12z"/></svg>
