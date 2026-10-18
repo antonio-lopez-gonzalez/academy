@@ -35,7 +35,7 @@
   }
   function updateThemeIcon() {
     const btn = document.querySelector("[data-theme-toggle]");
-    if (btn) btn.textContent = html.dataset.theme === "light" ? "☀ Oscuro" : "☾ Claro";
+    if (btn) btn.textContent = html.dataset.theme === "light" ? "☀" : "☾";
   }
 
   /* ==================================================================
@@ -92,9 +92,6 @@
         <svg class="topbar__logo" viewBox="0 0 24 24" aria-hidden="true"><path fill="#F59E0B" d="M7 2h8l5 5v13a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z"/><path d="M15 2v4a1 1 0 0 0 1 1h4" fill="none" stroke="#171a21" stroke-width="2" stroke-linecap="round"/><path d="m7.5 13 2.5 2.5 5.5-6" fill="none" stroke="#171a21" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>${COURSE.title}</span>
       </a>
-      <div class="topbar__search">
-        <input type="search" placeholder="buscar lección…" data-search aria-label="Buscar lección">
-      </div>
       <div class="topbar__progress" title="Lecciones completadas">
         <div class="topbar__progress-bar"><div class="topbar__progress-fill" data-progress-fill></div></div>
         <span data-progress-label></span>
@@ -107,7 +104,6 @@
     topbar.querySelector("[data-hamburger]").addEventListener("click", () => {
       document.body.classList.toggle("sidebar-open");
     });
-    topbar.querySelector("[data-search]").addEventListener("input", onSearch);
     updateThemeIcon();
     renderProgress();
   }
