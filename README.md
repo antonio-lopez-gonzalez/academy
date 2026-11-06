@@ -50,6 +50,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Aprende Git` | Git (modelo, ramas, deshacer, rescate) | 8 | 32 | `proyectos/laboratorio` |
 | `Aprende RabbitMQ` | RabbitMQ (AMQP, patrones, DLQ, quorum) | 8 | 32 | `proyectos/job-queue` |
 | `Aprende MinIO` | MinIO (S3, buckets, lifecycle, operación) | 8 | 32 | `proyectos/document-store` |
+| `Aprende AI-DLC con Cursor y Claude` | AI-DLC (Cursor + Claude, gates, auditoría) | 8 | 32 | `proyectos/aidlc-lite` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 

@@ -131,6 +131,7 @@ Per-course keys and specs (keep this table in sync when a course is added):
 | Aprende Git | `git-*` | `spec.md` | `proyectos/laboratorio` |
 | Aprende RabbitMQ | `rmq-*` | `spec.md` | `proyectos/job-queue` |
 | Aprende MinIO | `minio-*` | `spec.md` | `proyectos/document-store` |
+| Aprende AI-DLC con Cursor y Claude | `aidlc-*` | `spec.md` | `proyectos/aidlc-lite` |
 
 ## 5. Cover (web/index.html)
 

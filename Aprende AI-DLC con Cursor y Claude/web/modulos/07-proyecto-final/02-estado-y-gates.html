@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-estado-y-gates">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Estado y gates — Módulo 7 · Curso AI-DLC</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('aidlc-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Estado y gates</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El corazón de aidlc-lite cabe en dos archivos: <code>state.mjs</code>, que decide cómo se mueve una intención, y <code>gates.mjs</code>, que traduce una decisión humana en avance o retención. Todo lo demás —el CLI, la auditoría, las reglas— existe alrededor de esa máquina. Si el estado se corrompe o el gate se salta, el resto del proyecto da igual.</p>
+        <p>La máquina es deliberadamente pequeña: una intención tiene un perfil con etapas, un índice de etapa actual y un estado global <code>in_progress</code> o <code>completed</code>. Aprobar avanza; rechazar mantiene la etapa y registra el motivo. No hay hilos, no hay base de datos y no hay reintentos automáticos. Esa simplicidad permite ver con claridad las decisiones que en un motor grande quedan enterradas bajo capas de abstracción.</p>
+        <p>El gate no es un booleano. <code>gates.mjs</code> define cuatro decisiones: <code>approve</code>, <code>request_changes</code>, <code>skip</code> y <code>reject</code>. Dos avanzan y dos retienen. El CLI solo expone <code>approve</code> y <code>reject</code>; las otras dos existen en la política y en los tests, y esa asimetría es una lección en sí misma: lo que el motor soporta y lo que la interfaz ofrece no siempre coinciden.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué el estado es puro</p>
+          <p><code>state.mjs</code> no lee ni escribe archivos. Recibe un objeto, lo transforma y lo devuelve. Esa pureza permite probar todos los casos límite con fechas fijas y sin tocar disco. La persistencia vive en <code>engine.mjs</code>, que decide cuándo guardar y cuándo auditar. Separar ambas cosas es lo que hace testeable la máquina.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Anatomía del estado</h3>
+        <pre><code class="language-json">{
+  "version": 1,
+  "intent": "API de inventario",
+  "profile": "express",
+  "createdAt": "2026-11-06T10:00:00.000Z",
+  "updatedAt": "2026-11-06T10:12:44.018Z",
+  "currentStage": 1,
+  "status": "in_progress",
+  "stages": [
+    { "id": "intent", "title": "Intent capture", "status": "approved",
+      "approvedAt": "2026-11-06T10:12:44.018Z", "note": "ok" },
+    { "id": "build", "title": "Code generation", "status": "in_progress",
+      "approvedAt": null, "note": null },
+    { "id": "test", "title": "Build and test", "status": "pending",
+      "approvedAt": null, "note": null }
+  ],
+  "history": [
+    { "at": "2026-11-06T10:12:44.018Z", "type": "gate.approved",
+      "stage": "intent", "note": "ok" }
+  ]
+}</code></pre>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué significa</th><th>Invariante</th></tr></thead>
+          <tbody>
+            <tr><td><code>version</code></td><td>Versión del esquema de estado.</td><td>Hoy siempre 1; permite migraciones futuras.</td></tr>
+            <tr><td><code>profile</code></td><td>Perfil elegido al crear la intención.</td><td>Debe existir en <code>PROFILES</code>.</td></tr>
+            <tr><td><code>currentStage</code></td><td>Índice de la etapa activa.</td><td>Entre 0 y <code>stages.length - 1</code>.</td></tr>
+            <tr><td><code>status</code></td><td>Estado global.</td><td><code>in_progress</code> o <code>completed</code>.</td></tr>
+            <tr><td><code>stages[]</code></td><td>Etapas con su estado individual.</td><td>Una sola <code>in_progress</code> mientras no esté completada.</td></tr>
+            <tr><td><code>history[]</code></td><td>Decisiones registradas dentro del estado.</td><td>Se añade, no se reescribe.</td></tr>
+          </tbody>
+        </table>
+        <h3>La máquina en cuatro funciones</h3>
+        <pre><code class="language-javascript">// src/state.mjs (extracto real)
+export function createIntent({ profile, intent, now = new Date() }) {
+  const definition = getProfile(profile);
+  if (!intent || !intent.trim()) {
+    throw new Error("la intención no puede estar vacía");
+  }
+  const timestamp = now.toISOString();
+  return {
+    version: 1,
+    intent: intent.trim(),
+    profile,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    currentStage: 0,
+    status: "in_progress",
+    stages: definition.stages.map((stage, index) => ({
+      ...stage,
+      status: index === 0 ? "in_progress" : "pending",
+      approvedAt: null,
+      note: null,
+    })),
+    history: [],
+  };
+}</code></pre>
+        <p>Crear una intención valida dos cosas antes de construir el objeto: que el perfil exista —<code>getProfile</code> lanza si no— y que la intención no esté vacía. El resto es derivar: la primera etapa queda <code>in_progress</code>, las demás <code>pending</code>, y el historial arranca vacío. No hay estado «inicial» separado: la primera etapa ya está activa.</p>
+        <pre><code class="language-javascript">export function approveCurrent(state, { note = "", now = new Date() } = {}) {
+  if (state.status === "completed") {
+    throw new Error("la intención ya está completada");
+  }
+  const stage = state.stages[state.currentStage];
+  if (!stage) throw new Error("no hay una etapa activa");
+
+  stage.status = "approved";
+  stage.approvedAt = now.toISOString();
+  stage.note = note || null;
+  state.history.push({
+    at: now.toISOString(), type: "gate.approved",
+    stage: stage.id, note: note || null,
+  });
+
+  state.currentStage += 1;
+  if (state.currentStage >= state.stages.length) {
+    state.currentStage = state.stages.length - 1;
+    state.status = "completed";
+    state.stages[state.currentStage].status = "approved";
+  } else {
+    state.stages[state.currentStage].status = "in_progress";
+  }
+  state.updatedAt = now.toISOString();
+  return state;
+}</code></pre>
+        <p>La aprobación tiene un caso límite importante: al aprobar la última etapa, el índice no puede avanzar fuera del array. El código lo deja en la última posición, marca el estado global como <code>completed</code> y vuelve a marcar la etapa como aprobada. Esa segunda marca es redundante, pero evita que un lector encuentre una etapa «aprobada» con estado global completado y otra «in_progress» residual.</p>
+        <pre><code class="language-javascript">export function rejectCurrent(state, { note = "", now = new Date() } = {}) {
+  if (state.status === "completed") {
+    throw new Error("la intención ya está completada");
+  }
+  const stage = state.stages[state.currentStage];
+  if (!stage) throw new Error("no hay una etapa activa");
+
+  stage.note = note || null;
+  state.history.push({
+    at: now.toISOString(), type: "gate.rejected",
+    stage: stage.id, note: note || null,
+  });
+  state.updatedAt = now.toISOString();
+  return state;
+}</code></pre>
+        <p>Rechazar no cambia <code>currentStage</code> ni el estado de la etapa: la deja activa y guarda el motivo en <code>note</code>. Esa es la diferencia operativa entre aprobar y rechazar en este motor: una mueve el cursor, la otra lo deja donde estaba y añade información para la siguiente iteración.</p>
+        <h3>Las cuatro decisiones del gate</h3>
+        <pre><code class="language-javascript">// src/gates.mjs (completo)
+export const GATE_DECISIONS = ["approve", "request_changes", "skip", "reject"];
+const ADVANCE = new Set(["approve", "skip"]);
+const HOLD = new Set(["request_changes", "reject"]);
+
+export function applyGate(state, decision, { note = "", now = new Date() } = {}) {
+  if (ADVANCE.has(decision)) {
+    return { state: approveCurrent(state, { note, now }), advanced: true };
+  }
+  if (HOLD.has(decision)) {
+    return { state: rejectCurrent(state, { note, now }), advanced: false };
+  }
+  throw new Error(
+    `decisión de gate desconocida: ${decision}. Válidas: ${GATE_DECISIONS.join(", ")}`
+  );
+}</code></pre>
+        <table>
+          <thead><tr><th>Decisión</th><th>Efecto</th><th>Historial</th><th>Uso previsto</th></tr></thead>
+          <tbody>
+            <tr><td><code>approve</code></td><td>Avanza a la siguiente etapa.</td><td><code>gate.approved</code></td><td>El artefacto es aceptable.</td></tr>
+            <tr><td><code>request_changes</code></td><td>Mantiene la etapa y guarda el motivo.</td><td><code>gate.rejected</code></td><td>Falta algo concreto; se corrige y se reintenta.</td></tr>
+            <tr><td><code>skip</code></td><td>Avanza sin el artefacto.</td><td><code>gate.approved</code></td><td>La etapa no aplica o ya existe fuera del ciclo.</td></tr>
+            <tr><td><code>reject</code></td><td>Mantiene la etapa y guarda el motivo.</td><td><code>gate.rejected</code></td><td>La propuesta no sigue por este camino.</td></tr>
+          </tbody>
+        </table>
+        <p>Hay una simplificación que conviene ver: <code>skip</code> se registra como <code>gate.approved</code> y <code>request_changes</code> como <code>gate.rejected</code>. El estado distingue el efecto —avanzar o no— pero la auditoría no distingue el matiz. Si el equipo necesita saber si una etapa se aprobó o se saltó, la nota debe decirlo. Es una deuda consciente del motor didáctico que la lección de audit trail permite discutir.</p>
+        <h3>El CLI solo expone dos de las cuatro</h3>
+        <p>Los comandos reales son <code>approve</code> y <code>reject</code>. No hay un comando <code>request-changes</code> ni <code>skip</code>, aunque <code>applyGate</code> los soporte y los tests los cubran. Esa asimetría no es un olvido: el CLI prioriza el flujo más común y deja las otras decisiones como API para una extensión. Si quieres usarlas desde la terminal, tendrías que añadir el comando y su test; el motor ya está preparado.</p>
+        <pre><code class="language-bash">node src/cli.mjs approve --dir .demo --note "revisado"
+node src/cli.mjs reject  --dir .demo --note "faltan NFRs"
+# no existe: node src/cli.mjs skip
+# no existe: node src/cli.mjs request-changes</code></pre>
+        <h3>Persistencia: state.json y audit.jsonl</h3>
+        <p><code>engine.mjs</code> guarda el estado con <code>saveState</code> y añade eventos con <code>appendAudit</code>. El orden real es:</p>
+        <pre><code class="language-javascript">// src/engine.mjs (extracto de approve)
+const state = loadState(dir);
+const before = currentStage(state);
+const result = applyGate(state, "approve", { note });
+saveState(dir, result.state);
+appendAudit(dir, {
+  type: "gate.approved",
+  intent: result.state.intent,
+  stage: before?.id ?? null,
+  note: note || null,
+  status: result.state.status,
+});
+return result.state;</code></pre>
+        <p>Se guarda primero el estado y después el evento. Si el proceso muere entre ambas operaciones, el estado avanza pero la auditoría no registra la aprobación. Un motor de producción invertiría el orden o escribiría ambos de forma transaccional; aquí lo dejamos visible porque el ejercicio de la última lección pide razonar sobre esa ventana de inconsistencia.</p>
+        <pre><code class="language-json">{"at":"2026-11-06T10:01:00.000Z","type":"intent.started","intent":"API de inventario","profile":"express","stages":3}
+{"at":"2026-11-06T10:12:44.018Z","type":"gate.approved","intent":"API de inventario","stage":"intent","note":"ok","status":"in_progress"}
+{"at":"2026-11-06T10:20:00.000Z","type":"gate.rejected","intent":"API de inventario","stage":"build","note":"faltan pruebas"}</code></pre>
+        <p>La auditoría no tiene <code>seq</code>: el orden es el de las líneas. Para el proyecto didáctico es suficiente, pero significa que no puedes detectar un borrado ni ordenar eventos de forma independiente del archivo. La lección 07/04 propone cómo añadir secuencia y verificación sin cambiar el resto del motor.</p>
+        <h3>Estado, historial y auditoría: tres registros</h3>
+        <table>
+          <thead><tr><th>Registro</th><th>Dónde vive</th><th>Qué guarda</th><th>Se puede reconstruir</th></tr></thead>
+          <tbody>
+            <tr><td><code>state</code></td><td><code>.aidlc-lite/state.json</code></td><td>Foto actual y etapas.</td><td>Sí, desde historia/auditoría.</td></tr>
+            <tr><td><code>history</code></td><td>Dentro del estado</td><td>Decisiones de esta intención.</td><td>Se pierde si se edita el estado.</td></tr>
+            <tr><td><code>audit</code></td><td><code>.aidlc-lite/audit.jsonl</code></td><td>Eventos append-only del proyecto.</td><td>No; es la fuente.</td></tr>
+          </tbody>
+        </table>
+        <p>El historial duplica parte de la auditoría. Esa duplicación es cómoda para leer el estado sin abrir dos archivos, pero también es un riesgo: si alguien edita <code>history</code> y no la auditoría, los dos registros discrepan. El doctor actual no compara ambos; solo valida la forma del estado. Saber qué comprueba y qué no es parte de entender el motor.</p>
+        <h3>Qué valida <code>validateState</code></h3>
+        <ul>
+          <li>Que el estado sea un objeto y tenga <code>intent</code>, <code>profile</code>, <code>stages</code> y <code>currentStage</code>.</li>
+          <li>Que <code>stages</code> sea un array no vacío y <code>currentStage</code> un número dentro de rango.</li>
+          <li>No valida que las etapas coincidan con el perfil, ni que haya una sola <code>in_progress</code>, ni que el historial sea coherente.</li>
+        </ul>
+        <p>Esa validación parcial es suficiente para detectar un archivo corrupto o un índice fuera de rango, pero no para garantizar la consistencia semántica. Un motor real añadiría comprobaciones de perfil, estados permitidos por etapa y relación con la auditoría. El proyecto didáctico deja esas mejoras como extensión.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Rechazar no es retroceder</p>
+          <p>En aidlc-lite, <code>reject</code> mantiene la etapa actual: no vuelve a la anterior ni reinicia el perfil. Si el equipo necesita volver a una etapa previa, tendrá que crear una intención nueva o editar el estado con un evento que lo justifique. Confundir «rechazar» con «retroceder» es el error más común al leer la máquina.</p>
+        </div>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Crear una intención <code>express</code>, aprobar la primera etapa y rechazar la segunda. Tres llamadas y un estado resultante.</p>
+        <pre><code class="language-javascript">import { createIntent } from "./src/state.mjs";
+import { applyGate } from "./src/gates.mjs";
+
+const now = new Date("2026-11-06T10:00:00Z");
+const state = createIntent({ profile: "express", intent: "demo", now });
+
+applyGate(state, "approve", { note: "ok", now });
+applyGate(state, "reject", { note: "faltan pruebas", now });
+
+console.log(state.currentStage); // 1
+console.log(state.status);       // in_progress
+console.log(state.stages.map((s) =&gt; s.status));
+// [ "approved", "in_progress", "pending" ]
+console.log(state.history.map((h) =&gt; h.type));
+// [ "gate.approved", "gate.rejected" ]</code></pre>
+        <p>Qué ha pasado:</p>
+        <ul>
+          <li><code>createIntent</code> dejó la etapa 0 en <code>in_progress</code> y las demás en <code>pending</code>.</li>
+          <li><code>approve</code> marcó la etapa 0 como <code>approved</code> y movió el cursor a la 1.</li>
+          <li><code>reject</code> no movió el cursor: la etapa 1 sigue <code>in_progress</code> y guarda la nota.</li>
+          <li>El historial tiene dos entradas, una por decisión, con la fecha inyectada.</li>
+        </ul>
+        <p>Si apruebas la última etapa, el estado pasa a <code>completed</code> y un segundo <code>approve</code> lanza <code>la intención ya está completada</code>. Esa excepción es la garantía de que no se puede seguir avanzando después del final.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El flujo completo con el CLI real sobre un perfil <code>feature</code>. Observa que <code>run</code> no ejecuta etapas: solo crea la intención y la deja en la primera. Cada aprobación es un comando humano.</p>
+        <pre><code class="language-bash">node src/cli.mjs init --dir .demo --harness both
+node src/cli.mjs run --dir .demo --profile feature --intent "API de inventario"
+# ✓ intención creada
+# Intención : API de inventario
+# Perfil    : feature
+# Estado    : in_progress
+# Etapa     : intent — Intent capture (1/7)
+# Gate      : pendiente (approve | reject)
+
+node src/cli.mjs approve --dir .demo --note "alcance revisado"
+# ✓ gate aprobado
+# Etapa     : requirements — Requirements (2/7)
+
+node src/cli.mjs reject --dir .demo --note "faltan NFRs"
+# ✗ gate rechazado; la etapa sigue activa
+# Etapa     : requirements — Requirements (2/7)
+
+node src/cli.mjs approve --dir .demo --note "NFRs añadidos"
+# ✓ gate aprobado
+# Etapa     : design — Design (3/7)</code></pre>
+        <p>El estado después de la primera aprobación y el rechazo:</p>
+        <pre><code class="language-json">{
+  "intent": "API de inventario",
+  "profile": "feature",
+  "currentStage": 1,
+  "status": "in_progress",
+  "stages": [
+    { "id": "intent", "status": "approved", "note": "alcance revisado" },
+    { "id": "requirements", "status": "in_progress", "note": "faltan NFRs" },
+    { "id": "design", "status": "pending", "note": null }
+  ],
+  "history": [
+    { "at": "...", "type": "gate.approved", "stage": "intent", "note": "alcance revisado" },
+    { "at": "...", "type": "gate.rejected", "stage": "requirements", "note": "faltan NFRs" }
+  ]
+}</code></pre>
+        <p>La auditoría correspondiente mantiene el orden real de los comandos:</p>
+        <pre><code class="language-json">{"at":"...","type":"intent.started","intent":"API de inventario","profile":"feature","stages":7}
+{"at":"...","type":"gate.approved","intent":"API de inventario","stage":"intent","note":"alcance revisado","status":"in_progress"}
+{"at":"...","type":"gate.rejected","intent":"API de inventario","stage":"requirements","note":"faltan NFRs"}
+{"at":"...","type":"gate.approved","intent":"API de inventario","stage":"requirements","note":"NFRs añadidos","status":"in_progress"}</code></pre>
+        <p>Hay dos detalles que un revisor atento debería ver. El primero: el evento <code>gate.rejected</code> no lleva <code>status</code>, porque <code>reject</code> no cambia el estado global. El segundo: la etapa rechazada conserva la nota hasta que se vuelve a aprobar; entonces <code>approveCurrent</code> la sobrescribe con la nueva nota. La historia completa queda en <code>history</code> y en la auditoría, pero la foto actual solo muestra la última nota.</p>
+        <div class="callout callout--analogy">
+          <p class="callout__title">La analogía del semáforo</p>
+          <p>El estado es el semáforo: dice si puedes avanzar. El gate es la mano que pulsa el botón. <code>approve</code> pone verde y mueve el cursor; <code>reject</code> deja el rojo y escribe por qué. El semáforo no decide por ti ni cambia solo porque haya pasado el tiempo.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar <code>applyGate</code> en lugar de mutar el estado a mano.</td><td>Cambiar <code>currentStage</code> directamente.</td><td>La función mantiene la coherencia entre etapa, historial y estado global.</td></tr>
+            <tr><td>Inyectar <code>now</code> en tests y usar el reloj real solo en el borde.</td><td>Comparar fechas generadas dentro de la lógica.</td><td>Los tests se vuelven deterministas y los errores se reproducen.</td></tr>
+            <tr><td>Registrar una nota en cada rechazo.</td><td>Rechazar sin decir qué falta.</td><td>La nota es la única información que la siguiente iteración tiene para corregir.</td></tr>
+            <tr><td>Comprobar <code>status === "completed"</code> antes de aprobar.</td><td>Asumir que siempre hay una etapa siguiente.</td><td>El caso límite de la última etapa es donde aparecen los índices fuera de rango.</td></tr>
+            <tr><td>Tratar <code>history</code> como un registro de decisiones, no como un log de depuración.</td><td>Guardar mensajes internos o datos temporales.</td><td>El historial se versiona con el estado y se lee en auditorías.</td></tr>
+            <tr><td>Validar el estado al cargarlo.</td><td>Confiar en que el JSON siempre está bien.</td><td>Un archivo editado a mano o truncado debe fallar con un mensaje claro.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Tratar «rechazar» como «volver atrás»</h3>
+        <span class="code-label code-label--wrong">Mal — se espera retroceder</span>
+        <pre><code class="language-javascript">rejectCurrent(state, { note: "faltan NFRs" });
+// ❌ se asume que currentStage vuelve a 0
+assert.equal(state.currentStage, 0); // el test falla si estaba en 1</code></pre>
+        <span class="code-label code-label--right">Bien — rechazar mantiene la etapa</span>
+        <pre><code class="language-javascript">rejectCurrent(state, { note: "faltan NFRs" });
+assert.equal(state.currentStage, 1);       // sigue en requirements
+assert.equal(state.status, "in_progress");
+assert.equal(state.history.at(-1).type, "gate.rejected");</code></pre>
+        <p>El motor no tiene una operación de retroceso. Si el equipo necesita volver a una etapa anterior, debe crear un intento nuevo o añadir una operación explícita con su evento. Asumir que rechazar rebobina produce tests que fallan y expectativas equivocadas.</p>
+        <h3>2. Avanzar el índice sin pasar por el gate</h3>
+        <span class="code-label code-label--wrong">Mal — el estado se mueve solo</span>
+        <pre><code class="language-javascript">// ❌ no hay decisión, no hay historial, no hay evento
+state.currentStage += 1;
+state.stages[state.currentStage].status = "in_progress";</code></pre>
+        <span class="code-label code-label--right">Bien — una función, un registro</span>
+        <pre><code class="language-javascript">const result = applyGate(state, "approve", { note: "ok" });
+saveState(dir, result.state);
+appendAudit(dir, { type: "gate.approved", stage: before.id, note: "ok" });</code></pre>
+        <p>Mutar el estado a mano rompe la relación con <code>history</code> y con la auditoría. Aunque el resultado parezca correcto, la decisión desaparece del registro. La regla es simple: si avanza, pasa por <code>applyGate</code>; si se guarda, pasa por <code>engine</code>.</p>
+        <h3>3. Suponer que <code>skip</code> y <code>request_changes</code> quedan diferenciados en la auditoría</h3>
+        <span class="code-label code-label--wrong">Mal — el tipo de evento no basta</span>
+        <pre><code class="language-json">{"type":"gate.approved","stage":"design","note":null}
+// ¿se aprobó o se saltó? La auditoría no lo dice.</code></pre>
+        <span class="code-label code-label--right">Bien — la nota explicita la decisión</span>
+        <pre><code class="language-json">{"type":"gate.approved","stage":"design","note":"skip: el diseño ya existe en ADR-07"}
+{"type":"gate.rejected","stage":"build","note":"request_changes: añadir test de 409"}</code></pre>
+        <p>El motor didáctico colapsa <code>skip</code> en <code>gate.approved</code> y <code>request_changes</code> en <code>gate.rejected</code>. Si el equipo necesita distinguirlos, la nota debe hacerlo explícito o el esquema debe evolucionar con un campo <code>decision</code>. Ignorar esa limitación hace que la auditoría pierda matiz.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> recorrer la máquina con un perfil corto, provocar los casos límite y comprobar cómo quedan el estado y la auditoría.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea una intención <code>poc</code>:</strong>
+            <pre><code class="language-bash">cd proyectos/aidlc-lite
+node src/cli.mjs init --dir .lab
+node src/cli.mjs run --dir .lab --profile poc --intent "prueba de estado"</code></pre>
+            <p><code>poc</code> tiene tres etapas: <code>intent</code>, <code>build</code> y <code>test</code>. La etapa 1/3 debe ser <code>intent</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Aprueba dos veces:</strong>
+            <pre><code class="language-bash">node src/cli.mjs approve --dir .lab --note "primera"
+node src/cli.mjs approve --dir .lab --note "segunda"</code></pre>
+            <p>Tras la segunda, la etapa es <code>test</code> (3/3) y el estado sigue <code>in_progress</code>. Abre <code>.lab/.aidlc-lite/state.json</code> y comprueba que <code>currentStage</code> es 2.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Rechaza la última etapa:</strong>
+            <pre><code class="language-bash">node src/cli.mjs reject --dir .lab --note "falta el test de regresión"</code></pre>
+            <p>El estado no cambia de etapa; la nota aparece en <code>stages[2].note</code> y en el último elemento de <code>history</code>. La auditoría añade un <code>gate.rejected</code> sin <code>status</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Aprueba la última etapa:</strong>
+            <pre><code class="language-bash">node src/cli.mjs approve --dir .lab --note "regresión añadida"
+node src/cli.mjs status --dir .lab</code></pre>
+            <p>Ahora <code>status</code> debe mostrar <code>Estado: completed</code> y <code>Etapa: test — Build and test (3/3)</code>. Un <code>approve</code> más debe fallar con «la intención ya está completada».</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Inspecciona la auditoría:</strong>
+            <pre><code class="language-bash">cat .lab/.aidlc-lite/audit.jsonl</code></pre>
+            <p>Cuenta los eventos: <code>project.initialized</code>, <code>intent.started</code>, tres <code>gate.approved</code> y un <code>gate.rejected</code>. Comprueba que el orden coincide con los comandos.</p>
+          </li>
+          <li>
+            <strong>Paso 6 — Escribe un test de caso límite:</strong>
+            <pre><code class="language-javascript">test("aprobar una intención completada falla", () =&gt; {
+  const state = createIntent({ profile: "poc", intent: "demo" });
+  for (let i = 0; i &lt; state.stages.length; i += 1) approveCurrent(state);
+  assert.equal(state.status, "completed");
+  assert.throws(() =&gt; approveCurrent(state), /completada/);
+});</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Resultado esperado</p>
+          <p>Un estado con <code>completed</code>, un historial con las cuatro decisiones y una auditoría con el mismo orden. Si el número de eventos no cuadra con los comandos, revisa si algún comando falló antes de escribir.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El gate que se puede auditar</h3>
+          <p>El estado actual no guarda quién aprobó ni qué decisión exacta se tomó: solo el tipo <code>gate.approved</code> o <code>gate.rejected</code>. <code>skip</code> y <code>request_changes</code> se confunden con las decisiones principales. El equipo quiere poder responder «quién aprobó la etapa 3, cuándo y con qué decisión» sin abrir el historial del chat.</p>
+          <p>Diseña el cambio: ¿añades <code>actor</code>, <code>decision</code> y <code>gateId</code> al historial, a la auditoría o a ambos? ¿Cómo migras los estados existentes sin romper <code>validateState</code>? ¿Qué pasa con los eventos antiguos que no tienen esos campos? ¿Cómo evitas que el CLI acepte un <code>--actor</code> inventado? ¿Qué test demuestra que <code>skip</code> y <code>request_changes</code> ya no se confunden?</p>
+          <p><em>Pista: el actor no puede ser un flag libre; si el CLI lo acepta, cualquiera puede escribir cualquier nombre. En un motor real vendría de la identidad del proceso o de una configuración firmada. Para el proyecto didáctico, al menos haz que sea obligatorio, que no pueda ser «agent» y que quede en el evento además de en el estado.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>state.mjs</code> es una máquina pura: crea, aprueba, rechaza y valida sin tocar disco.</li>
+          <li>El estado guarda intención, perfil, índice de etapa, estado global, etapas e historial.</li>
+          <li><code>approveCurrent</code> avanza; en la última etapa marca <code>completed</code> y no permite avanzar más.</li>
+          <li><code>rejectCurrent</code> mantiene la etapa activa y registra el motivo; no retrocede.</li>
+          <li><code>gates.mjs</code> define cuatro decisiones: <code>approve</code>, <code>request_changes</code>, <code>skip</code> y <code>reject</code>; el CLI solo expone dos.</li>
+          <li><code>skip</code> se registra como aprobación y <code>request_changes</code> como rechazo: el matiz debe ir en la nota.</li>
+          <li><code>validateState</code> comprueba forma y rango, no la coherencia semántica con el perfil ni la auditoría.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Función</th><th>Efecto</th><th>Registro</th></tr></thead>
+          <tbody>
+            <tr><td><code>createIntent</code></td><td>Crea la intención y activa la primera etapa.</td><td><code>intent.started</code></td></tr>
+            <tr><td><code>approveCurrent</code></td><td>Avanza o completa.</td><td><code>gate.approved</code></td></tr>
+            <tr><td><code>rejectCurrent</code></td><td>Mantiene la etapa y guarda nota.</td><td><code>gate.rejected</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué el CLI no tiene un comando para <code>skip</code>?</summary>
+            <div>
+              <p>Porque el flujo más común es aprobar o rechazar, y el proyecto prefiere una interfaz pequeña a una completa. <code>applyGate</code> ya soporta <code>skip</code> y los tests lo cubren; añadir el comando es una extensión de una línea en el <code>switch</code> y su test. Lo importante es que el motor no confunda «saltar» con «aprobar» al registrar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Se puede reanudar después de cerrar la terminal?</summary>
+            <div>
+              <p>Sí. El estado está en <code>.aidlc-lite/state.json</code> y la auditoría en <code>audit.jsonl</code>. Al ejecutar <code>status</code> o <code>approve</code>, el motor lee el archivo y continúa desde la etapa actual. No hay estado en memoria que se pierda.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el estado y la auditoría no coinciden?</summary>
+            <div>
+              <p>El motor actual no lo detecta automáticamente: <code>doctor</code> valida la forma del estado y cuenta eventos, pero no compara la secuencia. Si sospechas una inconsistencia, revisa <code>state.json</code> y <code>audit.jsonl</code> a mano. Una mejora razonable es añadir un <code>seq</code> y una comprobación de continuidad, como se propone en la lección de audit trail.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
