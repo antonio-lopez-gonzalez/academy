@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-procesado-y-antivirus">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Procesado y antivirus — Módulo 6 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Procesado y antivirus</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Integración</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un almacén de documentos que acepta archivos de usuarios no puede limitarse a guardarlos. Necesita comprobar que el archivo llegó completo, detectar malware, generar derivados (miniaturas, texto extraído) y dejar rastro de lo que hizo. Si metes todo eso en la petición de subida, el usuario espera, la conexión caduca y un PDF de 80 MB bloquea un worker durante minutos.</p>
+        <p>La solución es un <strong>pipeline asíncrono guiado por eventos</strong>: MinIO avisa de que un objeto apareció, un worker lo recoge, lo procesa y escribe el veredicto. El objeto existe antes de estar «aprobado»; el estado vive en etiquetas y en un catálogo. Esta lección construye ese pipeline con ClamAV, cuarentena y estados idempotentes, y explica por qué un evento no es una transacción.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque «subir y luego escanear» es fácil de escribir y difícil de operar. Los fallos no están en la llamada a ClamAV: están en los timeouts, en los eventos duplicados, en los archivos gigantes y en los estados que se escriben antes de tiempo. Aquí los tratamos como parte del diseño.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El pipeline, de extremo a extremo</h3>
+        <pre><code class="language-text">  navegador                MinIO                     worker
+      |                       |                         |
+      | PUT (presigned)       |                         |
+      +----------------------&gt;| documentos/_incoming/   |
+                              |                         |
+                              | notificación put        |
+                              +------------------------&gt;| 1. valida evento
+                                                        | 2. descarga stream
+                                                        | 3. escanea (clamd)
+                                                        |
+                              +-------------------------+---------+
+                              |                                   |
+                        veredicto clean                    veredicto infected
+                              |                                   |
+                              v                                   v
+                  tag scan=clean                    copia a cuarentena
+                  catálogo: aprobado                tag scan=infected
+                              |                    catálogo: bloqueado
+                              v
+                  copia a documentos/{clave final}
+</code></pre>
+        <p>El objeto aterriza primero en un prefijo o bucket temporal. El worker decide si merece pasar al bucket final. Esa separación es la que permite cuarentena, reprocesado y borrado seguro de subidas abandonadas.</p>
+        <h3>Por qué asíncrono y no en la subida</h3>
+        <p>Escanear antes de responder da al cliente el resultado al instante, pero paga latencia, timeouts y workers ocupados por archivos grandes. Hacerlo en el mismo proceso ahorra piezas, pero si el proceso muere el objeto queda sin estado y nadie lo reintenta. Evento más worker desacopla, reintenta y permite cuarentena; el precio es idempotencia, observabilidad y reconciliación.</p>
+        <p>El sistema pasa a ser <em>eventualmente consistente</em>: durante unos segundos el archivo existe pero aún no está aprobado. La aplicación debe mostrar «en análisis», no «listo», y la descarga debe comprobar el estado.</p>
+        <h3>Eventos: al menos una vez, no exactamente una</h3>
+        <p>MinIO entrega notificaciones a un webhook, a una cola o a un topic. La entrega es <strong>at-least-once</strong>: un reintento, un reinicio o una configuración duplicada pueden producir el mismo evento dos veces. Además, el orden no está garantizado entre objetos distintos. Por tanto:</p>
+        <ul>
+          <li>El worker debe poder procesar el mismo objeto dos veces sin efectos distintos.</li>
+          <li>La clave de idempotencia debe incluir bucket, clave y una huella del contenido (<code>ETag</code> o checksum).</li>
+          <li>Un evento perdido no debe dejar el sistema ciego: un job de reconciliación lista objetos sin estado y los encola.</li>
+          <li>El estado se escribe <strong>después</strong> de la acción, nunca antes.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p class="callout__title">El evento no es la fuente de verdad</p>
+          <p>Si el target de notificaciones está caído y la cola se llena, MinIO puede descartar eventos. No diseñes un sistema donde la única prueba de que un archivo existe sea un mensaje. El bucket y el catálogo son la verdad; los eventos son el empujón para procesar.</p>
+        </div>
+        <h3>Máquina de estados</h3>
+        <pre><code class="language-text">  pending ──&gt; scanning ──&gt; clean
+     ^            |
+     |            +──────&gt; infected ──&gt; quarantined
+     |            |
+     +────────────+──────&gt; failed ──&gt; (reintento) ──&gt; dead_letter
+</code></pre>
+        <p>Cada transición debe ser explícita y quedar registrada. «Clean» no es el estado por defecto: es el resultado de un escaneo correcto. Un objeto sin etiqueta está pendiente, y la API lo trata como no descargable. La lección <a href="../07-proyecto-final/04-eventos-y-pruebas.html">Eventos y pruebas</a> conecta este estado con el document store.</p>
+        <h3>Cuarentena y reversibilidad</h3>
+        <p>Un archivo infectado no se borra: se aísla. La cuarentena es un bucket privado, con política restringida, lifecycle largo y, si el caso lo requiere, object lock. Borrarlo destruye la evidencia y hace imposible investigar un falso positivo. El objeto original puede eliminarse del prefijo de entrada, pero la copia de cuarentena se conserva según la política de retención.</p>
+        <p>La copia debe preservar metadatos y tipo de contenido. Un <code>CopyObject</code> con directiva <code>COPY</code> conserva ambos; si reconstruyes el objeto a mano, puedes perder el <code>Content-Type</code> y romper la descarga.</p>
+        <h3>Límites, timeouts y reintentos</h3>
+        <table>
+          <thead><tr><th>Control</th><th>Dónde</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Tamaño máximo</td><td>Antes de descargar (<code>statObject</code>)</td><td>Evita descargar 5 GB para descubrir que no lo procesas.</td></tr>
+            <tr><td>Timeout de escaneo</td><td>Socket con clamd y job global</td><td>Un archivo corrupto no debe bloquear un worker para siempre.</td></tr>
+            <tr><td>Reintentos</td><td>Cola, con backoff y jitter</td><td>Un fallo transitorio no debe convertirse en pérdida.</td></tr>
+            <tr><td>Dead letter</td><td>Cola aparte tras N intentos</td><td>Permite inspeccionar lo que falla siempre sin bloquear la cola.</td></tr>
+            <tr><td>Límites de ClamAV</td><td><code>StreamMaxLength</code>, <code>MaxScanSize</code></td><td>Protege al antivirus de bombas de descompresión.</td></tr>
+          </tbody>
+        </table>
+        <p>Un reintento con backoff exponencial y jitter evita la estampida: si cien workers fallan a la vez, no vuelven todos en el mismo segundo. Y si el fallo es determinista —un formato que ClamAV no entiende—, reintentar diez veces solo gasta CPU: por eso existe la cola de descartes.</p>
+        <h3>Outbox: cuando el catálogo y el evento deben coincidir</h3>
+        <p>El patrón <em>outbox</em> resuelve el problema de escribir en dos sistemas sin transacción distribuida. En la misma transacción que actualiza el catálogo, insertas una fila en una tabla <code>outbox</code>. Un publicador lee esa tabla y envía el mensaje; si falla, lo reintenta. Así no existe el caso «guardé el documento pero nunca se encoló». El orden es: transición de estado + fila outbox, publicación, y marca de enviado.</p>
+        <p>Si usas RabbitMQ, el worker hace <em>ack</em> solo después de escribir el veredicto. Si el proceso muere antes, el mensaje vuelve a la cola. La entrega sigue siendo al menos una vez; la idempotencia sigue siendo tu responsabilidad. Puedes enlazar este diseño con <a href="../04-ciclo-de-vida/03-notificaciones-eventos.html">Notificaciones de eventos</a>.</p>
+      </section>
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El corazón del worker es hablar con <code>clamd</code> por su protocolo <code>INSTREAM</code>: se envía el stream sin guardarlo en disco y se lee el veredicto. Este módulo de ~30 líneas es suficiente para entenderlo:</p>
+        <pre><code class="language-javascript">import net from "node:net";
+export function scanStream(readable, {
+  host = process.env.CLAMD_HOST ?? "127.0.0.1",
+  port = Number(process.env.CLAMD_PORT ?? 3310),
+  timeoutMs = 120_000,
+} = {}) {
+  return new Promise((resolve, reject) =&gt; {
+    const socket = net.createConnection({ host, port });
+    let response = "";
+    const timer = setTimeout(() =&gt; {
+      socket.destroy();
+      reject(new Error("clamd timeout"));
+    }, timeoutMs);
+    socket.on("connect", async () =&gt; {
+      try {
+        socket.write("zINSTREAM\0");
+        for await (const chunk of readable) {
+          const header = Buffer.alloc(4);
+          header.writeUInt32BE(chunk.length, 0);
+          socket.write(header);
+          socket.write(chunk);
+        }
+        socket.end(Buffer.alloc(4)); // terminador: longitud 0
+      } catch (err) {
+        clearTimeout(timer);
+        socket.destroy();
+        reject(err);
+      }
+    });
+    socket.on("data", (chunk) =&gt; { response += chunk.toString("utf8"); });
+    socket.on("end", () =&gt; {
+      clearTimeout(timer);
+      const line = response.trim();
+      if (line.endsWith("OK")) return resolve({ clean: true, detail: line });
+      if (line.includes("FOUND")) return resolve({ clean: false, detail: line });
+      reject(new Error(`respuesta inesperada de clamd: ${line}`));
+    });
+    socket.on("error", (err) =&gt; {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+</code></pre>
+        <p>Las piezas del protocolo:</p>
+        <ul>
+          <li><code>zINSTREAM\0</code> es la orden: <code>z</code> indica terminación en cero, <code>INSTREAM</code> pide escanear un stream.</li>
+          <li>Cada trozo se precede de su longitud en 4 bytes big-endian; el receptor sabe cuántos bytes leer.</li>
+          <li>Cuatro bytes a cero marcan el final del stream.</li>
+          <li>La respuesta es una línea: <code>stream: OK</code> o <code>stream: &lt;firma&gt; FOUND</code>.</li>
+          <li>El timeout es obligatorio: sin él, un clamd colgado deja el worker esperando indefinidamente.</li>
+        </ul>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El worker del document store recibe el evento, comprueba si ya está procesado, escanea y deja el objeto en el estado correcto. Este es el flujo completo, con las decisiones marcadas:</p>
+        <pre><code class="language-javascript">import * as Minio from "minio";
+import { scanStream } from "./clamd.mjs";
+const client = new Minio.Client({
+  endPoint: process.env.S3_HOST ?? "localhost",
+  port: Number(process.env.S3_PORT ?? 9000),
+  useSSL: process.env.S3_TLS === "true",
+  accessKey: process.env.S3_ACCESS_KEY,
+  secretKey: process.env.S3_SECRET_KEY,
+});
+const BUCKET = "documentos";
+const QUARANTINE = "documentos-cuarentena";
+const MAX_BYTES = 50 * 1024 * 1024;
+export async function handleEvent(event) {
+  const record = event.Records?.[0];
+  if (!record) return { skipped: "sin registros" };
+  if (!record.eventName.startsWith("s3:ObjectCreated:")) {
+    return { skipped: "evento no relevante" };
+  }
+  const bucket = record.s3.bucket.name;
+  const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+  if (bucket !== BUCKET || !key.startsWith("_incoming/")) {
+    return { skipped: "fuera del ámbito" };
+  }
+  const tags = await client.getObjectTagging(bucket, key).catch(() =&gt; ({}));
+  if (tags["scan-status"] === "clean" || tags["scan-status"] === "infected") {
+    return { skipped: "ya procesado" }; // idempotencia por estado final
+  }
+  const stat = await client.statObject(bucket, key);
+  if (stat.size &gt; MAX_BYTES) {
+    await client.setObjectTagging(bucket, key, {
+      "scan-status": "failed",
+      "scan-reason": "too-large",
+    });
+    return { skipped: "demasiado grande" };
+  }
+  await client.setObjectTagging(bucket, key, { "scan-status": "scanning" });
+  try {
+    const stream = await client.getObject(bucket, key);
+    const verdict = await scanStream(stream, { timeoutMs: 120_000 });
+    if (verdict.clean) {
+      await client.setObjectTagging(bucket, key, {
+        "scan-status": "clean",
+        "scan-engine": "clamav",
+        "scan-at": new Date().toISOString(),
+      });
+      return { status: "clean", key };
+    }
+    // Copia a cuarentena conservando metadatos; no se borra la evidencia.
+    await client.copyObject(QUARANTINE, key, `${BUCKET}/${key}`);
+    await client.setObjectTagging(QUARANTINE, key, {
+      "scan-status": "infected",
+      "scan-signature": verdict.detail.slice(0, 200),
+      "scan-at": new Date().toISOString(),
+    });
+    await client.setObjectTagging(bucket, key, {
+      "scan-status": "infected",
+      "quarantine-key": key,
+    });
+    return { status: "infected", key, detail: verdict.detail };
+  } catch (err) {
+    await client.setObjectTagging(bucket, key, {
+      "scan-status": "failed",
+      "scan-error": String(err.message).slice(0, 200),
+    });
+    throw err; // que la cola decida el reintento
+  }
+}
+</code></pre>
+        <p>El filtro por bucket y prefijo, la etiqueta como guardia de idempotencia, el <code>statObject</code> previo, el estado <code>scanning</code> antes de llamar, la copia a cuarentena y el <code>failed</code> con relanzamiento no son accidentales: cada uno tapa un fallo concreto del pipeline.</p>
+        <p>Dos workers podrían escanear el mismo objeto a la vez: el coste es CPU duplicada, no datos corruptos. Si necesitas exclusión estricta, usa una cola con visibilidad o un lock en el catálogo; con versionado, guarda el <code>versionId</code> que escaneaste.</p>
+      </section>
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Procesar desde un prefijo temporal</td><td>Escanear directamente el objeto final</td><td>Puedes aislar, rechazar y expirar sin afectar a lo publicado.</td></tr>
+            <tr><td>Guardar el estado final en una etiqueta y en el catálogo</td><td>Confiar solo en un log o en la memoria del worker</td><td>El estado debe sobrevivir a reinicios y ser consultable.</td></tr>
+            <tr><td>Limitar tamaño antes de descargar</td><td>Descargar primero y comprobar después</td><td>Un archivo enorme puede tumbar el worker o agotar el disco.</td></tr>
+            <tr><td>Usar timeout y backoff con jitter</td><td>Reintentos inmediatos en bucle</td><td>Evita estampidas y distingue fallos transitorios de permanentes.</td></tr>
+            <tr><td>Preservar el objeto infectado en cuarentena</td><td>Borrar en cuanto se detecta</td><td>La evidencia permite investigar falsos positivos y auditorías.</td></tr>
+            <tr><td>Reconciliar listando objetos sin estado</td><td>Suponer que todos los eventos llegan</td><td>Las notificaciones no son un registro transaccional.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Escanear dentro de la petición de subida</h3>
+        <span class="code-label code-label--wrong">Mal — el cliente espera al antivirus</span>
+        <pre><code class="language-javascript">app.post("/upload", async (req, res) =&gt; {
+  await client.putObject("documentos", key, req);
+  const verdict = await scanStream(req); // 80 MB después...
+  res.json(verdict);
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — aceptar, avisar y procesar aparte</span>
+        <pre><code class="language-javascript">app.post("/upload", async (req, res) =&gt; {
+  await client.putObject("documentos", `_incoming/${key}`, req);
+  res.status(202).json({ status: "pending_scan", key });
+});
+// el worker escucha el evento y actualiza el estado
+</code></pre>
+        <p>La subida debe ser rápida y tolerante a clientes lentos. El escaneo es un trabajo de fondo con su propio timeout y su propia escala.</p>
+        <h3>2. Ignorar los eventos duplicados</h3>
+        <span class="code-label code-label--wrong">Mal — cada entrega vuelve a copiar y a etiquetar</span>
+        <pre><code class="language-javascript">async function onEvent(event) {
+  await scanAndCopy(event); // sin comprobar estado previo
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — estado final como guardia</span>
+        <pre><code class="language-javascript">const tags = await client.getObjectTagging(bucket, key);
+if (["clean", "infected"].includes(tags["scan-status"])) return;
+await scanAndCopy(event);
+</code></pre>
+        <p>La entrega es al menos una vez. Sin idempotencia, un reintento puede duplicar objetos en cuarentena o reabrir un caso ya cerrado.</p>
+        <h3>3. Descargar el objeto entero en memoria</h3>
+        <span class="code-label code-label--wrong">Mal — <code>Buffer.concat</code> con archivos de usuario</span>
+        <pre><code class="language-javascript">const chunks = [];
+for await (const c of stream) chunks.push(c);
+const buffer = Buffer.concat(chunks); // OOM con un archivo grande
+</code></pre>
+        <span class="code-label code-label--right">Bien — stream con límite y contador</span>
+        <pre><code class="language-javascript">let total = 0;
+for await (const chunk of stream) {
+  total += chunk.length;
+  if (total &gt; MAX_BYTES) throw new Error("too-large");
+  // enviar el chunk a clamd, sin acumular
+}
+</code></pre>
+        <p>El tamaño de un objeto lo decide quien sube, no tu worker. El límite debe aplicarse también al leer, no solo al hacer <code>statObject</code>.</p>
+      </section>
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar el pipeline, comprobar un veredicto limpio, aislar un archivo de prueba y verificar que un evento duplicado no reprocesa.</p>
+        <ol class="steps">
+          <li>
+            <strong>Levanta MinIO y ClamAV:</strong>
+            <pre><code class="language-bash">docker network create docs-net
+docker run -d --name minio-scan --network docs-net \
+  -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  -v minio-scan-data:/data \
+  quay.io/minio/minio server /data --console-address ":9001"
+docker run -d --name clamav --network docs-net \
+  -p 3310:3310 clamav/clamav:stable
+</code></pre>
+            <p>ClamAV tarda en cargar las firmas. Comprueba con <code>docker logs -f clamav</code> hasta ver que el daemon está listo; el puerto 3310 debe aceptar conexiones.</p>
+          </li>
+          <li>
+            <strong>Crea los buckets y el prefijo de entrada:</strong>
+            <pre><code class="language-bash">mc alias set local http://localhost:9000 minioadmin minioadmin
+mc mb local/documentos local/documentos-cuarentena
+printf 'documento limpio\n' &gt; limpio.txt
+mc cp limpio.txt local/documentos/_incoming/limpio.txt
+</code></pre>
+          </li>
+          <li>
+            <strong>Configura el webhook y la suscripción:</strong>
+            <pre><code class="language-bash">mc admin config set local notify_webhook:1 \
+  endpoint="http://worker:3000/events/minio" \
+  auth_token="un-token-largo"
+mc admin service restart local
+mc event add local/documentos arn:minio:sqs::1:webhook \
+  --event put --prefix "_incoming/"
+mc event list local/documentos
+</code></pre>
+            <p>El <code>auth_token</code> viaja como <code>Authorization: Bearer …</code>. El worker debe rechazar cualquier petición sin ese token.</p>
+          </li>
+          <li>
+            <strong>Arranca el worker en la red docs-net</strong> con <code>S3_HOST=minio-scan</code> y <code>CLAMD_HOST=clamav</code> (o usa <code>host.docker.internal</code> si corre en el host). Sube otro archivo limpio y espera:
+            <pre><code class="language-bash">mc cp limpio.txt local/documentos/_incoming/limpio-2.txt
+mc tag list local/documentos/_incoming/limpio-2.txt
+</code></pre>
+            <pre><code class="language-text">scan-status=clean
+scan-engine=clamav
+scan-at=2026-11-05T10:15:00.000Z</code></pre>
+          </li>
+          <li>
+            <strong>Prueba el infectado y la entrega duplicada:</strong> descarga el fichero de prueba estándar EICAR desde <code>https://www.eicar.org/download-anti-malware-testfile/</code> (algunos navegadores y antivirus locales lo bloquean; es inofensivo). Súbelo como <code>_incoming/eicar.txt</code>, espera y comprueba:
+            <pre><code class="language-bash">mc tag list local/documentos/_incoming/eicar.txt
+mc ls local/documentos-cuarentena/_incoming/
+</code></pre>
+            <p>El original debe quedar con <code>scan-status=infected</code> y la cuarentena debe contener una copia con la firma detectada. Después, reenvía el JSON del evento con <code>curl</code>: el worker debe responder 200 y registrar <code>skipped: ya procesado</code>, sin crear una segunda copia. No borres la copia: es la evidencia.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Detén el worker, sube un archivo y vuelve a arrancarlo. Con la reconciliación activa, el objeto pendiente debe acabar procesado aunque el evento se haya perdido. Si no ocurre, todavía dependes del mensaje como única fuente de verdad.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un pipeline con dos etapas y reprocesado</h3>
+          <p>Amplía el worker para que, tras un veredicto limpio, genere una miniatura o extraiga texto y la guarde en un bucket de derivados. Define estados para cada etapa (<code>scanning</code>, <code>clean</code>, <code>derived</code>, <code>failed</code>), de modo que puedas reprocesar solo los derivados sin volver a escanear. Añade una forma de solicitar el reprocesado de un documento concreto y explica cómo evitas que dos peticiones simultáneas dupliquen el trabajo.</p>
+          <p>Incluye métricas: objetos pendientes, tiempo medio de escaneo, infectados por día y tamaño de la cola de descartes. Y decide qué pasa si el antivirus cambia de versión de firmas: ¿reprocesas todo o solo lo nuevo?</p>
+          <p><em>Pista: separa el estado del escaneo del estado de los derivados en etiquetas distintas. Un solo campo <code>status</code> no puede representar dos etapas que fallan por motivos diferentes.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El procesado va después de la subida, en un worker guiado por eventos, no dentro de la petición.</li>
+          <li>La entrega es al menos una vez: la idempotencia se apoya en el estado final del objeto.</li>
+          <li>El estado se escribe después de la acción y sobrevive en etiquetas y catálogo.</li>
+          <li>ClamAV se consulta por <code>INSTREAM</code>, con timeout, límite de tamaño y respuesta <code>OK</code>/<code>FOUND</code>.</li>
+          <li>Un infectado se copia a cuarentena con sus metadatos; no se borra la evidencia.</li>
+          <li>El patrón outbox evita perder el mensaje cuando el catálogo ya cambió; la reconciliación lista objetos sin estado.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>s3:ObjectCreated:*</code></td><td>Evento que dispara el procesado de un objeto nuevo</td></tr>
+            <tr><td><code>scan-status</code></td><td>Etiqueta con el veredicto y guardia de idempotencia</td></tr>
+            <tr><td><code>statObject</code></td><td>Tamaño, ETag y metadatos antes de descargar</td></tr>
+            <tr><td><code>setObjectTagging</code></td><td>Estado consultable y filtrable</td></tr>
+            <tr><td><code>copyObject</code></td><td>Copia a cuarentena conservando metadatos</td></tr>
+            <tr><td><code>notify_webhook</code></td><td>Target de MinIO para entregar eventos por HTTP</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo escanear con ClamAV en el mismo contenedor que la API?</summary>
+            <div>
+              <p>Puedes, pero no es recomendable. El antivirus consume CPU y memoria y actualiza firmas con frecuencia; aislarlo permite escalarlo, reiniciarlo y limitar su impacto. En Compose, un servicio <code>clamav</code> separado y un worker que lo consume por TCP es el mínimo razonable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si ClamAV no responde?</summary>
+            <div>
+              <p>El objeto queda en <code>scanning</code> o <code>failed</code>, nunca en <code>clean</code>. La cola reintenta con backoff; si se agota, va a la cola de descartes y se alerta. La API debe impedir la descarga mientras el estado no sea aprobado, y el reconciliador debe reintentar los atascados.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los eventos de MinIO se pueden perder?</summary>
+            <div>
+              <p>Sí. La notificación es un mecanismo de entrega, no un log transaccional. Si el destino no está disponible y la cola interna se llena, se pueden descartar eventos. Por eso el diseño incluye reconciliación por listado y un catálogo que registra el estado esperado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo borrar el archivo original después de enviarlo a cuarentena?</summary>
+            <div>
+              <p>Depende de tu política. Puedes eliminarlo del prefijo de entrada para que nadie lo descargue, pero conserva la copia de cuarentena con retención suficiente. Si el bucket tiene versionado, un borrado normal crea un delete marker, no elimina la versión: eso también es útil como evidencia.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-prioridad-y-retraso">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prioridad y entrega retardada — Módulo 4 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Prioridad y entrega retardada</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Patrones</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Dos necesidades distintas se confunden a menudo. La primera: «las facturas de clientes premium deben salir antes que las demás». La segunda: «este recordatorio debe enviarse dentro de 30 minutos, ni antes ni después». La primera es <strong>prioridad</strong>; la segunda es <strong>retraso</strong>. RabbitMQ las resuelve con mecanismos diferentes y con garantías diferentes.</p>
+        <p>La prioridad no adelanta trabajo ya entregado: reordena los mensajes <em>listos</em> en la cola. Si todos los consumidores están ocupados con mensajes de baja prioridad, el mensaje urgente espera a que terminen. El retraso, en cambio, oculta un mensaje hasta un instante futuro; no compite por consumidores hasta que llega su hora.</p>
+        <p>Esta lección cubre las tres formas de retrasar un mensaje en RabbitMQ 4.4 —<strong>TTL + DLX</strong>, el plugin <code>rabbitmq_delayed_message_exchange</code> y el <strong>reintento retardado nativo</strong> de las quorum queues— y explica cuándo cada una es la herramienta correcta. También advierte de los dos fallos clásicos: crear una cola con 255 prioridades y creer que la prioridad garantiza un SLA.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque «urgente» y «dentro de 30 minutos» parecen requisitos de negocio sencillos, pero implementarlos mal llena el broker de colas, rompe el orden y produce picos de CPU. La diferencia entre un patrón y un parche está en saber qué garantiza cada mecanismo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Prioridad: dos implementaciones que no se parecen</h3>
+        <p>La prioridad se expresa en la propiedad <code>priority</code> del mensaje. Cómo la interpreta el broker depende del <strong>tipo de cola</strong>:</p>
+        <table>
+          <thead><tr><th></th><th>Classic queue</th><th>Quorum queue</th></tr></thead>
+          <tbody>
+            <tr><td>Declaración</td><td><code>x-max-priority</code> (1–255)</td><td>No se declara; siempre hay 32 niveles</td></tr>
+            <tr><td>Rango efectivo</td><td>0 hasta <code>x-max-priority</code></td><td>0–31 (se recorta)</td></tr>
+            <tr><td>Sin propiedad <code>priority</code></td><td>Prioridad 0</td><td>Prioridad 4</td></tr>
+            <tr><td>Reparto entre niveles</td><td>Round-robin por sub-colas: evita inanición</td><td>Estricto: primero todo lo alto</td></tr>
+            <tr><td>Coste</td><td>Una sub-cola por nivel; más CPU y memoria</td><td>Sin sub-colas; el log ordena por prioridad</td></tr>
+            <tr><td>Disponible desde</td><td>Siempre</td><td>RabbitMQ 4.3</td></tr>
+          </tbody>
+        </table>
+        <p>En una classic queue, declarar <code>x-max-priority: 10</code> crea internamente once sub-colas (0 a 10). El broker atiende primero la más alta, pero va rotando para que las bajas no mueran de hambre. En una quorum queue de 4.3+ hay prioridad <strong>estricta</strong>: un flujo sostenido de prioridad 10 retrasa indefinidamente a la 1. La documentación recomienda, por eso, <strong>colas separadas por clase</strong> cuando necesitas una cuota garantizada para lo urgente y lo normal.</p>
+        <pre><code class="language-text">CLASSIC con x-max-priority = 3        QUORUM 4.3+ (estricta)
+
+sub-cola 3: [premium]                 log ordenado por prioridad
+sub-cola 2: [normal]                  [31][31][9][4][4][0]
+sub-cola 1: [lento]                   ^ se entrega todo lo alto antes
+sub-cola 0: [basura]
+                                      sin turnos: la prioridad 0 puede
+turnos: 3, 2, 1, 0, 3, 2, 1, 0...     esperar para siempre</code></pre>
+
+        <h3>Lo que la prioridad no hace</h3>
+        <ul>
+          <li><strong>No interrumpe una entrega.</strong> Un mensaje ya enviado a un consumidor no se puede reordenar; con <code>prefetch</code> alto, el worker puede tener cinco mensajes normales en vuelo cuando llega el urgente.</li>
+          <li><strong>No reserva capacidad.</strong> Si todos los workers están ocupados, la prioridad solo decide cuál es el siguiente, no cuándo hay un hueco.</li>
+          <li><strong>No garantiza un SLA.</strong> Para «premium en menos de un minuto» necesitas capacidad dedicada (cola y workers separados), no una etiqueta.</li>
+          <li><strong>No funciona igual en quorum.</strong> El argumento <code>x-max-priority</code> se ignora en quorum queues; si vienes de classic, tu configuración no se traslada.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p class="callout__title">El número de prioridades se paga</p>
+          <p>En classic queues, <code>x-max-priority: 255</code> crea 256 sub-colas por cola. Con cien colas son 25 600 estructuras y un consumo de CPU notable por cada publicación. La recomendación oficial es usar <strong>de 2 a 4 prioridades</strong>; casi ningún negocio necesita más de tres clases.</p>
+        </div>
+
+        <h3>Retraso con TTL + DLX</h3>
+        <p>Un mensaje con TTL vive en una cola hasta que caduca; al caducar, el broker lo <em>dead-letterea</em> al exchange configurado. Si ese exchange lo enruta a la cola de trabajo, obtienes una entrega retardada. Es el patrón más antiguo y el más predecible.</p>
+        <pre><code class="language-text">publicar en recordatorios.30m
+        |
+        v
++---------------------------+     TTL 1 800 000 ms
+| recordatorios.30m         |------------------------+
+| x-message-ttl: 1800000    |   al caducar           |
+| x-dead-letter-exchange:   |   dead-letter          |
+|   taller.jobs             |                        v
+| x-dead-letter-routing-key:|              taller.jobs (direct)
+|   recordatorios.enviar    |                        |
++---------------------------+                        v
+                                          +----------------------+
+                                          | recordatorios.enviar |
+                                          | worker de envío      |
+                                          +----------------------+</code></pre>
+        <p>El retraso es <strong>por cola</strong>, no por mensaje: todos los mensajes de <code>recordatorios.30m</code> esperan 30 minutos. Para varios plazos, creas varias colas (<code>.5m</code>, <code>.1h</code>, <code>.24h</code>) y publicas en la que corresponda. Es barato, funciona con quorum queues y sobrevive a reinicios si la cola es durable.</p>
+        <p>Dos matices importantes:</p>
+        <ul>
+          <li>El TTL se evalúa cuando el mensaje llega a la <strong>cabeza</strong> de la cola (en colas clásicas). Un mensaje con TTL corto detrás de uno con TTL largo espera al primero; por eso el patrón fiable usa <strong>TTL de cola</strong>, no TTL por mensaje mezclado.</li>
+          <li>La cola de espera acumula mensajes que <em>no</em> son trabajo pendiente. Su profundidad no mide backlog de negocio; métrela como «programados», no como «sin procesar».</li>
+        </ul>
+
+        <h3>Retraso con el plugin de exchange retardado</h3>
+        <p><code>rabbitmq_delayed_message_exchange</code> añade un tipo de exchange, <code>x-delayed-message</code>, que retiene cada mensaje el tiempo indicado en la cabecera <code>x-delay</code> (milisegundos) antes de enrutarlo. Permite un retraso <strong>distinto por mensaje</strong> sin crear una cola por plazo.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_delayed_message_exchange</code></pre>
+        <pre><code class="language-javascript">await ch.assertExchange('taller.retraso', 'x-delayed-message', {
+  durable: true,
+  arguments: { 'x-delayed-type': 'direct' },   // enruta como un direct al vencer
+});
+await ch.bindQueue('recordatorios.enviar', 'taller.retraso', 'recordatorio');
+
+ch.publish('taller.retraso', 'recordatorio', body, {
+  persistent: true,
+  headers: { 'x-delay': 30 * 60 * 1000 },      // 30 minutos
+});</code></pre>
+        <p>El mensaje no está en una cola mientras espera: vive en el exchange. Por eso no aparece en <code>messages_ready</code> de ninguna cola y no se puede purgar con <code>purge_queue</code>. Es cómodo para recordatorios y reintentos con backoff, pero conviene conocer sus límites: el plugin debe estar habilitado en <strong>todos los nodos</strong>, los mensajes retenidos consumen recursos del nodo, y no es un sustituto de una cola durable para plazos críticos de días. Para programación de largo plazo, guarda el evento en tu base de datos y publica cuando toque.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Alternativas según la edición</p>
+          <p>VMware Tanzu RabbitMQ 4.3+ incluye el plugin <code>rabbitmq_delayed_queue</code>, una cola retardada replicada con Ra y RocksDB, pensada para sustituir al exchange retardado en cargas altas. No está en la imagen comunitaria <code>rabbitmq:4-management</code>. Si no usas Tanzu, tus opciones son TTL + DLX o el exchange retardado.</p>
+        </div>
+
+        <h3>Reintento retardado nativo (quorum, 4.3+)</h3>
+        <p>Para <strong>reintentos</strong>, las quorum queues de RabbitMQ 4.3 incorporan <em>delayed retry</em>: cuando un mensaje se rechaza o se devuelve, la cola lo retiene un tiempo calculado con backoff lineal antes de reentregarlo. Se configura con una política:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_policy qq-retry "^facturas\." \
+  '{"delayed-retry-type":"failed","delayed-retry-min":1000,"delayed-retry-max":30000}' \
+  --priority 10 --apply-to quorum_queues</code></pre>
+        <p>Evita el ciclo «cola de espera + DLX» para reintentos y no reescribe el mensaje. No sirve para programar un recordatorio a una hora concreta: su propósito es el backoff tras un fallo. La lección <a href="../03-fiabilidad/04-idempotencia-y-reintentos.html">Idempotencia y reintentos</a> desarrolla el diseño completo.</p>
+
+        <h3>Tabla de decisión</h3>
+        <table>
+          <thead><tr><th>Necesitas…</th><th>Mecanismo</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>2-4 clases de urgencia en una cola</td><td>Classic con <code>x-max-priority</code></td><td>Barato y con turnos que evitan inanición; si la cola es durable de negocio, usa quorum 4.3+ o colas separadas.</td></tr>
+            <tr><td>Urgente con capacidad garantizada</td><td>Colas y workers separados</td><td>La prioridad no reserva CPU ni workers</td></tr>
+            <tr><td>Prioridad en una quorum queue (4.3+)</td><td><code>priority</code> 0–31, sin <code>x-max-priority</code></td><td>Soporte nativo, pero estricto: valora colas separadas</td></tr>
+            <tr><td>Un plazo fijo, volumen alto, sin plugin</td><td>TTL de cola + DLX</td><td>Durable, replicable y fácil de medir</td></tr>
+            <tr><td>Plazos distintos por mensaje, volumen moderado</td><td><code>x-delayed-message</code></td><td>Un solo exchange, <code>x-delay</code> por mensaje</td></tr>
+            <tr><td>Reintento tras fallo con backoff</td><td>Delayed retry nativo (quorum)</td><td>Sin colas extra ni reescritura del mensaje</td></tr>
+            <tr><td>Días o semanas, o fecha exacta</td><td>Base de datos + planificador</td><td>El broker no es un calendario; no cargues su memoria con eso</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una classic queue con cuatro niveles de prioridad. <strong>Garantía:</strong> los mensajes listos se entregan en orden de prioridad, con turnos entre niveles; si el consumidor está ocupado, la prioridad no adelanta nada.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertQueue('soporte', {
+  durable: true,
+  arguments: { 'x-max-priority': 4 },   // classic: 0..4
+});
+await ch.prefetch(1);
+
+for (const [texto, prioridad] of [
+  ['normal-1', 1],
+  ['premium-1', 4],
+  ['normal-2', 1],
+  ['premium-2', 4],
+]) {
+  ch.sendToQueue('soporte', Buffer.from(texto), { persistent: true, priority: prioridad });
+}
+
+await ch.consume('soporte', (msg) =&gt; {
+  if (!msg) return;
+  console.log(msg.content.toString(), 'priority=', msg.properties.priority);
+  ch.ack(msg);
+}, { noAck: false });</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">premium-1 priority= 4
+premium-2 priority= 4
+normal-1 priority= 1
+normal-2 priority= 1</code></pre>
+        <p>Los premium se publicaron intercalados, pero se consumen primero. Cambia <code>prefetch(1)</code> por <code>prefetch(4)</code> y publica con el consumidor ya conectado: los cuatro pueden salir en orden de llegada, porque el broker los entregó antes de poder reordenarlos. La prioridad solo actúa sobre lo que aún está en la cola.</p>
+        <p>El mismo mensaje en una quorum queue de 4.3+ no necesita <code>x-max-priority</code>:</p>
+        <pre><code class="language-javascript">await ch.assertQueue('soporte.qq', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },   // 32 niveles, 0..31
+});
+ch.sendToQueue('soporte.qq', Buffer.from('premium'), { priority: 31 });</code></pre>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller necesita dos cosas: priorizar la facturación de clientes premium y enviar un recordatorio de carrito abandonado a los 30 minutos. Son mecanismos distintos y se implementan por separado.</p>
+        <p><strong>Prioridad con capacidad garantizada</strong>: en lugar de confiar en la etiqueta, el taller usa dos colas y dos pools de workers. El enrutador decide por el plan del cliente.</p>
+        <pre><code class="language-text">taller.jobs (direct)
+   | routing key facturas.premium  -&gt; facturas.premium  -&gt; workers premium (2)
+   | routing key facturas.normal   -&gt; facturas.normal   -&gt; workers normal  (6)
+
+Un pico de normales no puede consumir la capacidad de premium.</code></pre>
+        <p><strong>Recordatorio a 30 minutos con TTL + DLX</strong>:</p>
+        <pre><code class="language-javascript">await ch.assertExchange('taller.jobs', 'direct', { durable: true });
+
+await ch.assertQueue('recordatorios.30m', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-message-ttl': 30 * 60 * 1000,
+    'x-dead-letter-exchange': 'taller.jobs',
+    'x-dead-letter-routing-key': 'recordatorios.enviar',
+  },
+});
+
+await ch.assertQueue('recordatorios.enviar', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum', 'x-delivery-limit': 5 },
+});
+await ch.bindQueue('recordatorios.enviar', 'taller.jobs', 'recordatorios.enviar');
+
+// el carrito se abandona: programa el aviso
+ch.publish('taller.jobs', 'recordatorios.programar', body, {
+  persistent: true,
+  messageId: carritoId,
+  expiration: String(30 * 60 * 1000),   // opcional; el TTL de cola ya lo hace
+});</code></pre>
+        <p>El binding <code>recordatorios.programar</code> lleva a la cola de espera; al caducar, el dead-letter exchange la reenvía con la routing key <code>recordatorios.enviar</code>, que sí apunta a la cola de trabajo. Es un patrón de <strong>dos colas con la misma DLX</strong>: una retiene, la otra procesa.</p>
+        <p>Si el negocio pide «recordar a los 30 minutos, pero si el carrito se recupera antes, cancelar», el mensaje programado ya no sirve: hay que consultar el estado del carrito al enviar y descartar si ya se compró. No intentes borrar un mensaje concreto de la cola de espera; no existe una operación para eso. La cancelación se hace en el consumidor, comprobando el estado actual.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Programar no es lo mismo que retener</p>
+          <p>La cola de espera no es un backlog de trabajo: es una agenda. Si su profundidad crece, no significa que falten workers, sino que hay muchos avisos programados. Alerta con umbrales distintos y no la incluyas en el mismo panel que <code>facturas.generar</code>.</p>
+        </div>
+        <p><strong>Variante con el plugin</strong>: si los plazos fueran 10 min, 2 h y 3 días según el cliente, crear tres colas empieza a ser rígido. El exchange retardado permite publicar el mismo evento con <code>x-delay</code> distinto y una sola cola de envío. A cambio, pierdes la visibilidad de la cola de espera y dependes de que el plugin esté en todos los nodos.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar 2–4 niveles de prioridad</td> <td><code>x-max-priority: 255</code></td> <td>Cada nivel adicional crea una sub-cola y consume CPU en cada publicación.</td></tr>
+            <tr><td>Separar colas cuando el SLA es real</td> <td>Confiar en la prioridad para garantizar tiempos</td> <td>La prioridad ordena, no reserva workers ni CPU.</td></tr>
+            <tr><td>TTL de cola para plazos fijos</td> <td>Mezclar TTL por mensaje con plazos distintos en la misma cola</td> <td>El TTL por mensaje se evalúa en la cabeza y bloquea a los que van detrás.</td></tr>
+            <tr><td>Una cola por bucket de retraso</td> <td>Un bucket gigante con <code>x-message-ttl</code> variable</td> <td>El TTL de cola es uniforme; para plazos distintos, colas distintas o plugin.</td></tr>
+            <tr><td>Habilitar el plugin en todos los nodos</td> <td>Habilitarlo solo en el nodo donde pruebas</td> <td>Un exchange retardado en un nodo sin plugin no se puede declarar en los demás.</td></tr>
+            <tr><td>Medir los mensajes retenidos del exchange</td> <td>Asumir que el retraso es gratis</td> <td>Los mensajes esperando ocupan memoria; el exchange no es una cola en disco.</td></tr>
+            <tr><td>Revalidar el estado al vencer el plazo</td> <td>Ejecutar el aviso sin comprobar si sigue teniendo sentido</td> <td>Entre la programación y el envío, el mundo cambió; el mensaje no lo sabe.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Prioridad en una quorum queue con <code>x-max-priority</code></h3>
+        <span class="code-label code-label--wrong">Mal — argumento ignorado</span>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum', 'x-max-priority': 10 },
+});   // x-max-priority no hace nada en quorum</code></pre>
+        <span class="code-label code-label--right">Bien — usar la propiedad y 0–31</span>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+ch.sendToQueue('facturas', body, { priority: 9, persistent: true });</code></pre>
+        <p>En quorum queues el rango es fijo 0–31 y el argumento se ignora. Si esperabas el comportamiento de classic, no obtienes error: obtienes silencio y un orden distinto al que creías.</p>
+
+        <h3>2. Creer que la prioridad adelanta trabajo entregado</h3>
+        <span class="code-label code-label--wrong">Mal — <code>prefetch</code> alto y urgencia tardía</span>
+        <pre><code class="language-javascript">await ch.prefetch(100);
+// el worker tiene 100 mensajes normales en vuelo; el urgente espera</code></pre>
+        <span class="code-label code-label--right">Bien — ventana pequeña o cola dedicada</span>
+        <pre><code class="language-javascript">await ch.prefetch(2);
+// o mejor: cola facturas.premium con sus propios workers</code></pre>
+        <p>La prioridad solo reordena lo que sigue en la cola. Un mensaje ya entregado no se puede «devolver» para adelantar a otro. Si el requisito es de tiempo, la capacidad dedicada es la única respuesta honesta.</p>
+
+        <h3>3. Mezclar TTL por mensaje en la misma cola</h3>
+        <span class="code-label code-label--wrong">Mal — TTL variable en una sola cola</span>
+        <pre><code class="language-javascript">ch.sendToQueue('recordatorios', body1, { expiration: '60000' });    // 1 min
+ch.sendToQueue('recordatorios', body2, { expiration: '86400000' }); // 24 h
+// body1 detrás de body2 no caduca hasta que body2 sale de la cabeza</code></pre>
+        <span class="code-label code-label--right">Bien — TTL de cola por bucket</span>
+        <pre><code class="language-javascript">await ch.assertQueue('recordatorios.1m', {
+  durable: true,
+  arguments: { 'x-message-ttl': 60_000, 'x-dead-letter-exchange': 'taller.jobs' },
+});
+await ch.assertQueue('recordatorios.24h', {
+  durable: true,
+  arguments: { 'x-message-ttl': 86_400_000, 'x-dead-letter-exchange': 'taller.jobs' },
+});</code></pre>
+        <p>El TTL por mensaje solo se comprueba cuando el mensaje llega a la cabeza. Un mensaje corto detrás de uno largo se queda más tiempo del previsto. Con TTL de cola, todos los mensajes comparten el mismo plazo y el cálculo es simple.</p>
+
+        <h3>4. Usar el exchange retardado como agenda de semanas</h3>
+        <span class="code-label code-label--wrong">Mal — retener 30 días en memoria</span>
+        <pre><code class="language-javascript">ch.publish('taller.retraso', 'aviso', body, {
+  headers: { 'x-delay': 30 * 24 * 60 * 60 * 1000 },   // 30 días
+});</code></pre>
+        <span class="code-label code-label--right">Bien — persistir el plan y publicar al vencer</span>
+        <pre><code class="language-text">tabla recordatorios(fecha_envio, estado)
+  -&gt; job periódico cada minuto
+  -&gt; publica solo los que vencen ahora
+  -&gt; el broker retiene minutos, no semanas</code></pre>
+        <p>El exchange guarda los mensajes retenidos en su propio almacenamiento (tablas Mnesia), no en una cola. Miles de avisos a 30 días cargan el nodo y no tienen las mismas garantías que una quorum queue. Para plazos largos, la base de datos es el calendario y RabbitMQ solo transporta el aviso cuando ya toca.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comparar el orden de una priority queue con y sin <code>prefetch</code>, y medir un retraso real con TTL + DLX.</p>
+        <ol class="steps">
+          <li>
+            <strong>Declara la cola clásica con prioridad</strong> usando el ejemplo mínimo. Comprueba sus argumentos:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name type arguments | grep soporte</code></pre>
+            <pre><code class="language-text">soporte  classic  [{"x-max-priority",4}]</code></pre>
+          </li>
+          <li>
+            <strong>Publica con el consumidor desconectado</strong> (solo el productor). Después arranca el consumidor con <code>prefetch(1)</code> y anota el orden: deben salir primero los <code>priority=4</code>.
+          </li>
+          <li>
+            <strong>Repite con el consumidor conectado y <code>prefetch(4)</code>.</strong> Publica los mismos cuatro mensajes con 100 ms de separación. Anota el orden: probablemente sea el de llegada. Explica por qué la prioridad no cambió el resultado.</li>
+          <li>
+            <strong>Baja a <code>prefetch(1)</code></strong> y repite con el consumidor conectado. Compara de nuevo. La diferencia entre los dos experimentos es la ventana de mensajes en vuelo, no la configuración de la cola.
+          </li>
+          <li>
+            <strong>Prueba TTL + DLX:</strong> declara <code>recordatorios.10s</code> con <code>x-message-ttl: 10000</code> y DLX a <code>taller.jobs</code> con routing key <code>recordatorios.enviar</code>. Publica un mensaje y cronometra cuánto tarda en aparecer en la cola de destino.
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged</code></pre>
+            <p>Salida esperada: durante 10 s el mensaje está en <code>recordatorios.10s</code>; después, en <code>recordatorios.enviar</code>.</p>
+          </li>
+          <li>
+            <strong>Habilita el plugin y repite con <code>x-delay: 10000</code></strong> en un exchange <code>x-delayed-message</code>. Observa que no hay mensaje en ninguna cola durante la espera: está retenido en el exchange. Compara la visibilidad operativa con la del paso anterior.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Qué comparar</p>
+          <p>TTL + DLX: visible en <code>messages_ready</code>, durable, replicable, pero un plazo por cola. Exchange retardado: plazo por mensaje, invisible en las colas, dependiente del plugin. Ninguno es «mejor» en abstracto; la tabla de decisión es la respuesta.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Recordatorios a 1 hora, 24 horas y 7 días</h3>
+          <p>Diseña el sistema de recordatorios de carrito abandonado con tres plazos por cliente, cancelación si el carrito se recupera y garantía de que un reinicio del broker no pierde ningún aviso. Debes elegir entre TTL + DLX, exchange retardado y base de datos + planificador, y justificar la elección con números: cuántos mensajes retenidos esperas, cuánta memoria ocupan y qué pasa si el broker se reinicia.</p>
+          <p>Implementa la topología y el worker, y añade una métrica que distinga «avisos programados» de «avisos pendientes de enviar». Después simula la cancelación de un carrito y demuestra que el aviso no se envía.</p>
+          <p><em>Pista: la cancelación no se implementa borrando el mensaje, sino comprobando el estado al enviar. Para los tres plazos, piensa si un único exchange retardado escala mejor que tres colas de espera, y dónde vive la verdad del estado del carrito.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Prioridad</strong> reordena mensajes listos; no interrumpe entregas ni reserva capacidad.</li>
+          <li>Classic usa <code>x-max-priority</code> con turnos; quorum 4.3+ usa 0–31 con prioridad estricta y <strong>riesgo de inanición</strong>.</li>
+          <li>Para un SLA real, <strong>colas y workers separados</strong>; la etiqueta de prioridad no es capacidad.</li>
+          <li><strong>TTL + DLX</strong> da un plazo fijo por cola, durable y visible; ideal para buckets de espera.</li>
+          <li>El <strong>exchange retardado</strong> da un plazo por mensaje, pero retiene en el exchange y exige el plugin en todos los nodos.</li>
+          <li>El <strong>delayed retry nativo</strong> de quorum 4.3+ es para reintentos con backoff, no para citas del calendario.</li>
+          <li>Plazos de días o semanas pertenecen a una base de datos y un planificador, no a la memoria del broker.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>x-max-priority</code></td><td>Niveles de prioridad en una classic queue (recomendado 2–4)</td></tr>
+            <tr><td><code>priority</code></td><td>Propiedad del mensaje que indica su nivel (0–31 en quorum)</td></tr>
+            <tr><td><code>x-message-ttl</code></td><td>Tiempo de vida de los mensajes de una cola</td></tr>
+            <tr><td><code>x-dead-letter-exchange</code></td><td>Exchange al que se reenvía un mensaje caducado o rechazado</td></tr>
+            <tr><td><code>x-delayed-message</code></td><td>Tipo de exchange del plugin que retrasa según <code>x-delay</code></td></tr>
+            <tr><td><code>rabbitmq-plugins enable</code></td><td>Habilita el plugin del exchange retardado en un nodo</td></tr>
+            <tr><td><code>delayed-retry-type</code></td><td>Política de backoff nativo en quorum queues 4.3+</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué mi mensaje urgente no se procesa antes?</summary>
+            <div>
+              <p>Porque ya estaba entregado a un consumidor cuando llegó, o porque todos los workers están ocupados. La prioridad solo afecta a los mensajes que siguen en la cola. Revisa el <code>prefetch</code> y, si el requisito es de tiempo, dedica capacidad separada.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar <code>x-max-priority</code> en una cola existente?</summary>
+            <div>
+              <p>No en caliente. Los argumentos forman parte de la identidad de la cola: una redeclaración con otro valor devuelve <code>PRECONDITION_FAILED</code>. Hay que crear una cola nueva, mover los mensajes y cambiar los consumidores. Planea las prioridades antes de producir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El TTL de cola borra los mensajes o los reenvía?</summary>
+            <div>
+              <p>Los considera <em>dead-lettered</em>. Si la cola tiene <code>x-dead-letter-exchange</code>, se reenvían según el binding; si no, se descartan. Para el patrón de retraso, la DLX es obligatoria: sin ella, el mensaje caduca y desaparece.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde veo los mensajes retenidos por el exchange retardado?</summary>
+            <div>
+              <p>En ningún <code>messages_ready</code>: no están en una cola. La management UI muestra el exchange, pero no el número de mensajes retenidos con el detalle de una cola. Si necesitas esa visibilidad para operar, TTL + DLX es más transparente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo combinar prioridad y retraso?</summary>
+            <div>
+              <p>Sí, pero con cuidado: un mensaje retenido no tiene prioridad hasta que entra en la cola de destino, y una cola de espera con prioridad solo reordena los mensajes que ya vencieron. Si el requisito es «premium a los 30 minutos y normal a las 2 horas», modela dos colas de espera y deja que la prioridad actúe en la cola de proceso, no en la agenda.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

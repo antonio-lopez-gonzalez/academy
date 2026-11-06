@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-presigned-urls">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Presigned URLs — Módulo 3 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Presigned URLs</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya las has usado en el <a href="../02-sdk/02-subidas-directas.html">módulo 2</a> para subir desde el navegador. Ahora toca mirarlas por dentro: qué firma exactamente, cuánto dura ese permiso, qué se puede cambiar en la URL sin romperla y —lo más importante— qué <strong>no</strong> se puede hacer con ellas. Porque la pregunta que todo el mundo hace tarde o temprano es «¿cómo revoco este enlace?», y la respuesta incómoda es: no puedes revocar uno solo.</p>
+        <p>Una presigned URL no es un token guardado en el servidor. Es una <strong>firma calculada</strong> sobre el método, la ruta, el host, la fecha y la expiración. El servidor no recuerda haberla emitido: solo recalcula la firma y comprueba que la fecha siga dentro de la ventana. Esa naturaleza sin estado es lo que la hace barata y lo que la hace imposible de revocar individualmente.</p>
+        <p>Entender ese trade-off cambia cómo la diseñas: expiraciones cortas, una URL por objeto, credenciales dedicadas y ningún registro del enlace completo. Y, cuando de verdad necesitas un uso único, te obliga a poner algo delante —una API con estado— en lugar de forzar la firma a hacer algo que no hace.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Una URL firmada es una capability</p>
+          <p>Quien la tiene puede ejercer el permiso, sin cuenta y sin contraseña, hasta que expire. Trátala como una contraseña temporal: no se comparte por canales inseguros, no se pega en un ticket y no se registra en logs.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué hay dentro de la firma</h3>
+        <pre><code class="language-text">GET /documentos/acme/2026/11/informe.pdf
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &amp;X-Amz-Credential=app-documentos%2F20261105%2Fus-east-1%2Fs3%2Faws4_request
+  &amp;X-Amz-Date=20261105T101500Z
+  &amp;X-Amz-Expires=300
+  &amp;X-Amz-SignedHeaders=host
+  &amp;X-Amz-Signature=4f1c9d2e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d
+
+Lo que se firma (canonical request):
+  GET                                  <- método
+  /documentos/acme/2026/11/informe.pdf <- ruta
+  X-Amz-Algorithm=...&amp;X-Amz-Expires=... <- query ordenada
+  host:minio.example.com                <- cabeceras firmadas
+  host
+  UNSIGNED-PAYLOAD
+
+Firma = HMAC en cadena con la secretKey del usuario que firma.
+El servidor la recalcula; no guarda nada.</code></pre>
+        <p>Cambiar el método, la ruta, el host, la fecha, la expiración o cualquier parámetro <code>X-Amz-*</code> invalida la firma. Añadir un parámetro nuevo después de firmar también la invalida, porque la cadena canónica cambia. Por eso <code>response-content-disposition</code> hay que pasarlo <em>al firmar</em>, no al usarla.</p>
+
+        <h3>El alcance real de una URL</h3>
+        <table>
+          <thead><tr><th>Elemento</th><th>¿Lo fija la firma?</th><th>Consecuencia</th></tr></thead>
+          <tbody>
+            <tr><td>Método HTTP</td><td>Sí</td><td>Una URL de descarga no sirve para subir</td></tr>
+            <tr><td>Bucket y clave</td><td>Sí</td><td>No se puede reapuntar a otro objeto</td></tr>
+            <tr><td>Host</td><td>Sí</td><td>No vale contra otro servidor</td></tr>
+            <tr><td>Fecha y expiración</td><td>Sí</td><td>No se puede alargar la vida</td></tr>
+            <tr><td>Cabeceras firmadas</td><td>Solo las incluidas</td><td>Las no firmadas se pueden cambiar</td></tr>
+            <tr><td>Identidad</td><td>Sí, vía <code>Credential</code></td><td>Si se deshabilita el usuario, la URL muere</td></tr>
+            <tr><td>Número de usos</td><td>No</td><td>Se puede reutilizar hasta expirar</td></tr>
+            <tr><td>Origen o IP</td><td>No</td><td>Cualquiera con la URL puede usarla</td></tr>
+          </tbody>
+        </table>
+        <p>La última fila es la clave de seguridad: la firma no dice «esta persona», dice «quien presente esto». Si el enlace se filtra, el filtrador tiene el mismo permiso que el destinatario.</p>
+
+        <h3>Expiración: corta por diseño</h3>
+        <p><code>X-Amz-Expires</code> se expresa en segundos y tiene un máximo de <code>604800</code> (7 días). El servidor compara <code>X-Amz-Date + X-Amz-Expires</code> con su reloj. Si el reloj del cliente está desviado, la URL puede nacer inválida o morir antes de lo previsto; mantén NTP en los servidores y en las máquinas que firman.</p>
+        <table>
+          <thead><tr><th>Caso</th><th>Duración razonable</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Descarga inmediata tras autorizar</td><td>60–300 s</td><td>El usuario ya está en la página; no necesita más.</td></tr>
+            <tr><td>Subida desde formulario</td><td>300–900 s</td><td>Cubre elegir el archivo y subirlo en una conexión normal.</td></tr>
+            <tr><td>Enlace enviado por email</td><td>1–24 h</td><td>Hay latencia humana; aun así, no abuses.</td></tr>
+            <tr><td>Job nocturno</td><td>Minutos</td><td>El job puede firmar en el momento, no antes.</td></tr>
+            <tr><td>Enlace «permanente»</td><td>No existe</td><td>Máximo 7 días; para más, usa una API que firme al vuelo.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Siete días no es «para siempre», pero casi</p>
+          <p>Una URL filtrada a un grupo de chat puede circular durante una semana. Si el objeto es sensible, la expiración debe medirse en minutos, no en días. Y si el enlace se envía por email, asume que quedará reenviado.</p>
+        </div>
+
+        <h3>Cómo se generan</h3>
+        <table>
+          <thead><tr><th>Herramienta</th><th>Llamada</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td><code>minio-js</code></td><td><code>presignedGetObject(bucket, key, expires)</code></td><td>URL de descarga</td></tr>
+            <tr><td><code>minio-js</code></td><td><code>presignedPutObject(bucket, key, expires)</code></td><td>URL de subida simple</td></tr>
+            <tr><td><code>minio-js</code></td><td><code>presignedPostPolicy(policy)</code></td><td>URL y campos de formulario con condiciones</td></tr>
+            <tr><td><code>minio-js</code></td><td><code>presignedUrl(method, bucket, key, expires, params)</code></td><td>Método arbitrario y parámetros extra</td></tr>
+            <tr><td><code>mc</code></td><td><code>mc share download --expire 1h ALIAS/BUCKET/KEY</code></td><td>URL de descarga para probar</td></tr>
+            <tr><td><code>mc</code></td><td><code>mc share upload --expire 1h ALIAS/BUCKET/KEY</code></td><td>URL y campos para un POST</td></tr>
+          </tbody>
+        </table>
+        <p>Para depurar, <code>mc share</code> es perfecto. Para producción, firma desde la aplicación con un usuario dedicado: así la URL queda asociada a una identidad que puedes deshabilitar y auditar.</p>
+
+        <h3>Casos de uso</h3>
+        <table>
+          <thead><tr><th>Caso</th><th>Método</th><th>Duración típica</th></tr></thead>
+          <tbody>
+            <tr><td>Descargar un documento tras autorizar</td><td><code>GET</code></td><td>2–5 minutos</td></tr>
+            <tr><td>Subir desde un formulario</td><td><code>PUT</code> o <code>POST</code></td><td>10–15 minutos</td></tr>
+            <tr><td>Compartir un informe por email</td><td><code>GET</code></td><td>Horas, no días</td></tr>
+            <tr><td>Entregar un export a un job externo</td><td><code>GET</code></td><td>Minutos, firmada al arrancar</td></tr>
+            <tr><td>Incrustar una imagen en una web</td><td><code>GET</code></td><td>Horas; o mejor, objeto público acotado</td></tr>
+          </tbody>
+        </table>
+        <p>El abuso tiene la misma forma que el uso: reutilizar el enlace, ampliar la ventana, firmar con una identidad demasiado potente o dejar la URL en un log. La diferencia entre un caso legítimo y un incidente suele ser la duración y el alcance, no la tecnología.</p>
+
+        <h3>Revocación: lo que sí funciona</h3>
+        <p>No existe una lista de URLs emitidas, así que no existe «revocar esta». Lo que sí puedes hacer es invalidar la credencial que las firma o eliminar el recurso:</p>
+        <table>
+          <thead><tr><th>Necesitas</th><th>Mecanismo</th><th>Efecto</th></tr></thead>
+          <tbody>
+            <tr><td>Matar una URL concreta</td><td>No es posible</td><td>Espera la expiración o borra el objeto</td></tr>
+            <tr><td>Matar todas las de un usuario</td><td>Rotar su secreto</td><td>Invalida todas sus firmas, incluidas las de otros servicios</td></tr>
+            <tr><td>Matar todas las de un job</td><td>Deshabilitar o borrar su service account</td><td>Inmediato y acotado al job</td></tr>
+            <tr><td>Quitar el objeto del alcance</td><td>Borrar o mover el objeto</td><td>La URL sigue siendo válida pero ya no encuentra nada</td></tr>
+            <tr><td>Bloquear por origen</td><td>Condición <code>aws:SourceIp</code> en la política</td><td>Afecta a todas las peticiones del usuario, no a una URL</td></tr>
+          </tbody>
+        </table>
+        <p>La conclusión de diseño: si necesitas revocación individual, no uses una URL firmada como mecanismo único. Pon una API que valide un identificador de compartición en tu base de datos y redirija a una URL firmada de vida muy corta. La revocación vive en tu base de datos; la firma solo transporta el permiso.</p>
+
+        <h3>Riesgos concretos</h3>
+        <ul>
+          <li><strong>Fuga por logs</strong>: la URL completa contiene la firma. Un log de acceso, un APM o un error handler pueden guardarla durante meses.</li>
+          <li><strong>Fuga por <code>Referer</code></strong>: si el enlace se abre desde una página, el navegador puede enviar la URL como referrer a terceros. Usa <code>Referrer-Policy: no-referrer</code>.</li>
+          <li><strong>Firma con root</strong>: una URL de descarga firmada con root puede convertirse en una capacidad sobre todo el servidor si el método o la ruta se manipulan mal.</li>
+          <li><strong>Sobrescritura</strong>: una URL PUT reutilizable permite reemplazar el objeto varias veces dentro de la ventana.</li>
+          <li><strong>Abuso de cuota</strong>: una URL PUT filtrada permite subir datos a tu costa hasta que expire.</li>
+          <li><strong>Enumeración</strong>: no puedes adivinar la firma de otra clave, pero sí puedes listar si la política lo permite. La URL no sustituye a una política de listado restrictiva.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Firmar una descarga de cinco minutos con un nombre de archivo forzado.</p>
+        <pre><code class="language-javascript">// firmar-get.mjs
+import * as Minio from 'minio'
+
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+})
+
+const key = 'acme/2026/11/informe.pdf'
+const url = await client.presignedGetObject('documentos', key, 300, {
+  'response-content-disposition': 'attachment; filename="informe-acme.pdf"',
+  'response-content-type': 'application/pdf',
+})
+console.log(url)</code></pre>
+        <pre><code class="language-bash">node --env-file=.env firmar-get.mjs
+curl -sD - -o /dev/null "http://localhost:9000/documentos/acme/2026/11/informe.pdf?X-Amz-Algorithm=..."</code></pre>
+        <pre><code class="language-text">HTTP/1.1 200 OK
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="informe-acme.pdf"
+Content-Length: 20480
+ETag: "9c1e0b2a4d5f60718293a4b5c6d7e8f9"</code></pre>
+        <ul>
+          <li><code>300</code> son segundos: cinco minutos desde <code>X-Amz-Date</code>.</li>
+          <li><code>response-content-disposition</code> y <code>response-content-type</code> van firmados como parámetros; si los añades a la URL después, la firma deja de cuadrar.</li>
+          <li><code>curl -sD - -o /dev/null</code> hace un <code>GET</code> y descarta el cuerpo: así compruebas las cabeceras sin descargar el objeto entero.</li>
+          <li>El <code>ETag</code> permite al cliente cachear y revalidar sin volver a descargar.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API del almacén emite una URL solo después de comprobar que el usuario puede ver el documento. La respuesta incluye la expiración, para que el cliente sepa cuándo pedir otra.</p>
+        <pre><code class="language-javascript">// src/share.mjs
+import express from 'express'
+import * as Minio from 'minio'
+import { randomUUID } from 'node:crypto'
+
+const TTL_SECONDS = 120
+const client = new Minio.Client({ /* configuración */ })
+const app = express()
+
+app.get('/api/documents/:id/download', async (req, res) =&gt; {
+  const doc = await findDocument(req.params.id)          // base de datos
+  if (!doc) return res.status(404).json({ error: 'no existe' })
+  if (!(await canRead(req.user, doc))) {
+    return res.status(403).json({ error: 'sin permiso' })
+  }
+
+  const url = await client.presignedGetObject('documentos', doc.key, TTL_SECONDS, {
+    'response-content-disposition': `attachment; filename="${doc.filename}"`,
+  })
+
+  // Auditoría: la clave y el solicitante, nunca la URL
+  logger.info({ event: 'share.download', docId: doc.id, user: req.user.id, ttl: TTL_SECONDS })
+
+  res.json({
+    url,
+    expiresAt: new Date(Date.now() + TTL_SECONDS * 1000).toISOString(),
+  })
+})</code></pre>
+        <p>El patrón importante: la autorización ocurre <strong>antes</strong> de firmar. Una vez emitida la URL, MinIO no vuelve a preguntar por el usuario; solo comprueba la firma. Si tu comprobación de permisos está en el cliente, no existe.</p>
+        <pre><code class="language-javascript">// Para descargas que deben caducar solas, no guardes la URL:
+// guarda el identificador del documento y firma en cada petición.
+const { url } = await fetch(`/api/documents/${id}/download`).then((r) =&gt; r.json())
+location.assign(url)</code></pre>
+        <p>Y para una compartición con estado —un enlace que se pueda revocar— la API añade una capa propia:</p>
+        <pre><code class="language-javascript">app.post('/api/shares', async (req, res) =&gt; {
+  const { documentId, ttlHours = 24 } = req.body
+  const doc = await findDocument(documentId)
+  if (!(await canShare(req.user, doc))) return res.status(403).end()
+
+  const token = randomUUID()
+  await shares.insert({
+    token, documentId, createdBy: req.user.id,
+    expiresAt: new Date(Date.now() + ttlHours * 3600 * 1000),
+    revokedAt: null,
+  })
+  res.status(201).json({ link: `https://app.example.com/s/${token}` })
+})
+
+app.get('/s/:token', async (req, res) =&gt; {
+  const share = await shares.findByToken(req.params.token)
+  if (!share || share.revokedAt || share.expiresAt &lt; new Date()) {
+    return res.status(410).end()  // Gone
+  }
+  const doc = await findDocument(share.documentId)
+  const url = await client.presignedGetObject('documentos', doc.key, 60)
+  res.redirect(302, url)
+})</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">La revocación vive en tu base de datos</p>
+          <p>El enlace <code>/s/&lt;token&gt;</code> se puede revocar con un <code>UPDATE</code>. La URL de MinIO que se genera detrás dura 60 segundos y nadie la guarda. Esa combinación —estado propio más firma efímera— es la forma correcta de tener enlaces revocables sin renunciar a S3.</p>
+        </div>
+
+        <h3>La misma firma desde <code>mc</code></h3>
+        <pre><code class="language-bash">mc share download --expire 1h local/documentos/acme/2026/11/informe.pdf</code></pre>
+        <pre><code class="language-text">Share: http://localhost:9000/documentos/acme/2026/11/informe.pdf?X-Amz-Algorithm=...
+Expire: 1 hours 0 minutes 0 seconds</code></pre>
+        <p><code>mc share</code> usa las credenciales del alias. Si el alias apunta a root, la URL queda firmada por root. Para probar está bien; para emitir enlaces a terceros, crea un alias con el usuario acotado.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Firmar con un usuario de mínimo privilegio</td><td>Firmar con root</td><td>La URL hereda los permisos del firmante; root hereda todos.</td></tr>
+            <tr><td>Una URL por objeto y por operación</td><td>Una URL «comodín» reutilizada para todo</td><td>Acota el daño de una filtración a un recurso concreto.</td></tr>
+            <tr><td>Expiración en minutos cuando sea posible</td><td>7 días por comodidad</td><td>La ventana de abuso es exactamente la duración de la URL.</td></tr>
+            <tr><td>Registrar clave, usuario y expiración</td><td>Registrar la URL completa</td><td>La query contiene la firma; el log se convierte en una credencial.</td></tr>
+            <tr><td>Servir siempre por HTTPS</td><td>Firmar por HTTP fuera de local</td><td>La URL viaja en claro y cualquiera en la red la reutiliza.</td></tr>
+            <tr><td>Firmar <code>response-content-disposition</code> si lo necesitas</td><td>Añadirlo después a la URL</td><td>Los parámetros no firmados rompen la firma o se ignoran.</td></tr>
+            <tr><td>Usar un token propio para enlaces revocables</td><td>Prometer revocación que S3 no ofrece</td><td>La firma es sin estado; la revocación requiere estado.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Firmar con root</h3>
+        <span class="code-label code-label--wrong">Mal — la URL hereda permisos totales</span>
+        <pre><code class="language-bash">mc alias set prod https://minio.example.com minio-root "$ROOT_PASSWORD"
+mc share download --expire 24h prod/documentos/informe.pdf</code></pre>
+        <span class="code-label code-label--right">Bien — un usuario que solo puede leer ese prefijo</span>
+        <pre><code class="language-bash">mc alias set shares https://minio.example.com share-bot "$SHARE_SECRET"
+mc share download --expire 1h shares/documentos/acme/2026/11/informe.pdf</code></pre>
+        <p>Aunque la URL PUT de root no permita listar por sí sola, el firmante es root: cualquier error al construir la ruta o al elegir el método amplía el alcance. Un usuario acotado convierte un error en un 403.</p>
+
+        <h3>2. Guardar la URL en los logs</h3>
+        <span class="code-label code-label--wrong">Mal — el log se convierte en una credencial</span>
+        <pre><code class="language-javascript">console.log(`descarga: ${url}`) // ❌ incluye X-Amz-Signature</code></pre>
+        <span class="code-label code-label--right">Bien — identificar sin exponer</span>
+        <pre><code class="language-javascript">logger.info({ key, userId, expiresIn: 120 }, 'url de descarga emitida')</code></pre>
+        <p>Un agregador de logs suele tener más gente con acceso que el propio bucket. Si la URL está allí, la expiración es tu única defensa.</p>
+
+        <h3>3. Prometer que el enlace se puede revocar</h3>
+        <span class="code-label code-label--wrong">Mal — no hay lista de URLs emitidas</span>
+        <pre><code class="language-javascript">// ❌ no existe una API para invalidar una presigned URL concreta
+await client.revokePresignedUrl(url)</code></pre>
+        <span class="code-label code-label--right">Bien — token propio y firma efímera</span>
+        <pre><code class="language-javascript">await shares.update({ token }, { revokedAt: new Date() })
+// el endpoint /s/:token deja de redirigir; la URL de MinIO ya expiró</code></pre>
+        <p>Si el producto exige «revocar enlace», la solución no está en MinIO: está en tu base de datos. La firma solo se emite después de validar el token y dura lo que tarda el navegador en seguir la redirección.</p>
+
+        <h3>4. Alargar la expiración tocando la URL</h3>
+        <span class="code-label code-label--wrong">Mal — cambiar <code>X-Amz-Expires</code> invalida la firma</span>
+        <pre><code class="language-text">...&amp;X-Amz-Expires=300&amp;X-Amz-Signature=abc...
+                ^^^
+        cambiar a 604800 -> SignatureDoesNotMatch</code></pre>
+        <span class="code-label code-label--right">Bien — volver a firmar con la duración deseada</span>
+        <pre><code class="language-javascript">const url = await client.presignedGetObject('documentos', key, 3600)</code></pre>
+        <p>La expiración está dentro de la cadena firmada. No es un parámetro decorativo: es parte del permiso.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar qué partes de una URL están firmadas, cómo caduca y cómo se invalida al rotar la credencial.</p>
+        <ol class="steps">
+          <li>
+            <strong>Firma una descarga de 120 segundos:</strong>
+            <pre><code class="language-javascript">const url = await client.presignedGetObject('documentos', key, 120)
+console.log(url)</code></pre>
+            <p>Copia la URL y separa sus parámetros. Deben aparecer <code>X-Amz-Algorithm</code>, <code>X-Amz-Credential</code>, <code>X-Amz-Date</code>, <code>X-Amz-Expires</code>, <code>X-Amz-SignedHeaders</code> y <code>X-Amz-Signature</code>.</p>
+          </li>
+          <li>
+            <strong>Descarga con <code>curl</code> y comprueba el código:</strong>
+            <pre><code class="language-bash">curl -s -o /dev/null -w '%{http_code}\n' "$URL"
+# 200</code></pre>
+          </li>
+          <li>
+            <strong>Manipula la ruta:</strong> cambia <code>informe.pdf</code> por <code>otro.pdf</code> manteniendo la query. Debe devolver <code>403 SignatureDoesNotMatch</code>. Prueba también a cambiar el método a <code>PUT -T nota.txt</code>: la misma URL no autoriza escritura.</li>
+          <li>
+            <strong>Espera a que expire:</strong> usa una URL de 10 segundos, espera 15 y vuelve a pedirla. La respuesta debe ser <code>403</code> con un mensaje de petición expirada. Anota el código exacto que devuelve tu versión.</li>
+          <li>
+            <strong>Firma con <code>response-content-disposition</code>:</strong> genera la URL con el parámetro y comprueba con <code>curl -sD - -o /dev/null</code> que la cabecera <code>Content-Disposition</code> aparece. Después intenta añadir el parámetro a una URL ya firmada: la firma se rompe.</li>
+          <li>
+            <strong>Rota la credencial y observa:</strong> firma una URL de 10 minutos, rota el secreto del usuario con <code>mc admin user add</code> y vuelve a usarla antes de que expire. Debe fallar. Conclusión: rotar el secreto invalida todas las URLs emitidas por esa identidad.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Haz una tabla con cuatro columnas: cambio aplicado, resultado, código HTTP y explicación. Los cuatro experimentos —ruta, método, tiempo y credencial— cubren todo el alcance de la firma.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Enlaces de un solo uso</h3>
+          <p>Diseña un sistema de compartición donde un enlace solo pueda canjearse una vez, caduque a las 24 horas y se pueda revocar antes de usarse. La descarga real debe seguir viniendo de MinIO, no de tu API. Explica qué pasa si dos peticiones llegan a la vez con el mismo token, y cómo lo resuelves sin carreras.</p>
+          <p>Añade auditoría de cada canje —quién, cuándo, desde qué IP— y una forma de que el propietario vea si el enlace ya se usó. Después analiza el coste: ¿qué pasa si alguien abre el enlace y no completa la descarga? ¿Se considera canjeado?</p>
+          <p><em>Pista: un <code>UPDATE ... WHERE used_at IS NULL RETURNING *</code> es atómico; comprobar y luego actualizar no lo es. Para la descarga, la URL firmada puede durar menos que el token.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una presigned URL es una firma sin estado, no un token almacenado.</li>
+          <li>Firma método, ruta, host, fecha, expiración y las cabeceras incluidas.</li>
+          <li>No se puede revocar individualmente; se invalida rotando la credencial o borrando el objeto.</li>
+          <li>Se puede reutilizar y usar desde cualquier origen hasta que expire.</li>
+          <li>El máximo es 7 días; para enlaces humanos, minutos u horas.</li>
+          <li>La autorización debe ocurrir antes de firmar: después, MinIO solo valida la firma.</li>
+          <li>Para revocación real, añade un token propio y firma una URL efímera al canjearlo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Duda</th><th>Respuesta corta</th></tr></thead>
+          <tbody>
+            <tr><td>¿Puedo cambiar la expiración?</td><td>No sin volver a firmar</td></tr>
+            <tr><td>¿Puedo cambiar el objeto?</td><td>No: la ruta está firmada</td></tr>
+            <tr><td>¿Puedo usarla desde otra IP?</td><td>Sí, salvo que la política lo impida</td></tr>
+            <tr><td>¿Puedo usarla dos veces?</td><td>Sí, hasta que expire</td></tr>
+            <tr><td>¿Puedo revocarla?</td><td>No individualmente; rota la credencial</td></tr>
+            <tr><td>¿Debo loguearla?</td><td>Nunca completa</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no puedo revocar una sola URL?</summary>
+            <div>
+              <p>Porque el servidor no guarda un registro de las URLs emitidas: solo verifica la firma con la clave del usuario. Sin estado no hay lista que borrar. Para revocar una, rota la credencial (afecta a todas) o elimina el objeto; para revocación selectiva, usa un token propio en tu base de datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La URL caduca antes de lo que pone?</summary>
+            <div>
+              <p>Suele ser desfase de reloj. La validez se calcula desde <code>X-Amz-Date</code>, que firma el cliente. Si el cliente va atrasado, la URL nace con menos vida; si va adelantado, el servidor puede rechazarla por fecha futura. Sincroniza con NTP los servidores y las máquinas que firman.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo restringir la URL a una IP?</summary>
+            <div>
+              <p>La firma no incluye la IP. Puedes añadir una condición <code>aws:SourceIp</code> en la política del usuario, pero afecta a todas sus peticiones, no solo a esa URL. Si necesitas algo por enlace, vuelve al patrón de token propio y valida el origen en tu API antes de redirigir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si uso HTTPS, ¿la URL es segura?</summary>
+            <div>
+              <p>HTTPS protege el tránsito, no el almacenamiento posterior. La URL puede acabar en el historial del navegador, en un log, en una captura o en el <code>Referer</code>. Trátala como un secreto temporal y reduce su vida al mínimo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Sirve una URL de descarga para subir?</summary>
+            <div>
+              <p>No. El método HTTP forma parte de la firma. Una URL firmada para <code>GET</code> no autoriza <code>PUT</code>; recibirás <code>SignatureDoesNotMatch</code>. Genera una URL por operación con <code>presignedPutObject</code> o una POST policy.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

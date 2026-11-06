@@ -1,6 +1,6 @@
 ---
 name: academy-course
-description: Use when building or editing ANY Academy course website (Aprende Astro, Docker, Dotnet, Javascript, NewRelic, Python, React, Redis, SDD, Tailwind, TypeScript). Covers the static-web contract that every Academy course shares: course-data.js as the single source of truth, lesson HTML anatomy, SITE_BASE rules, per-course storage keys, shared CSS classes, scaffold layout, and how to verify before finishing. This is the MECHANICS skill; each course's own spec and AGENTS.md define the CONTENT.
+description: Use when building or editing ANY Academy course website (Aprende Astro, Docker, Dotnet, Javascript, MinIO, NewRelic, Python, RabbitMQ, React, Redis, SDD, Tailwind, TypeScript). Covers the static-web contract that every Academy course shares: course-data.js as the single source of truth, lesson HTML anatomy, SITE_BASE rules, per-course storage keys, shared CSS classes, scaffold layout, and how to verify before finishing. This is the MECHANICS skill; each course's own spec and AGENTS.md define the CONTENT.
 ---
 
 # Academy Course Construction (shared skill)
@@ -129,6 +129,8 @@ Per-course keys and specs (keep this table in sync when a course is added):
 | Aprende TypeScript | `ts-*` | `AGENTS.md` | `proyectos/08-typescript-react`, `09-proyecto-final` |
 | Aprende System Design | `sysd-*` | `spec.md` | `proyectos/case-studies` |
 | Aprende Git | `git-*` | `spec.md` | `proyectos/laboratorio` |
+| Aprende RabbitMQ | `rmq-*` | `spec.md` | `proyectos/job-queue` |
+| Aprende MinIO | `minio-*` | `spec.md` | `proyectos/document-store` |
 
 ## 5. Cover (web/index.html)
 

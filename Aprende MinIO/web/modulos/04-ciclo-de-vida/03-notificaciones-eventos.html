@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="03-notificaciones-eventos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Notificaciones de eventos — Módulo 4 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Notificaciones de eventos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Ciclo de vida</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Cuando un documento llega al bucket, la aplicación necesita enterarse: extraer texto, generar un thumbnail, pasarlo por el antivirus, indexarlo o avisar al equipo. Hay dos formas de saberlo. La mala es preguntar cada pocos segundos con un <code>LIST</code> y comparar contra una base de datos. La buena es que el almacenamiento <strong>emita un evento</strong> cuando algo cambia.</p>
+        <p>MinIO implementa las <strong>notificaciones de eventos</strong> de S3: el servidor observa las operaciones sobre un bucket y publica un mensaje JSON en un destino configurado. El destino puede ser un webhook HTTP, una cola AMQP (RabbitMQ), Kafka, NATS, MQTT, Redis o una base de datos. La aplicación deja de hacer <em>polling</em> y reacciona a hechos.</p>
+        <p>El patrón parece simple —«sube un archivo, llega un JSON»— y esconde tres decisiones que separan una integración sólida de una que pierde documentos en silencio:</p>
+        <ul>
+          <li><strong>La entrega no es exactamente una vez.</strong> Un reintento puede duplicar un evento; tu consumidor tiene que ser idempotente.</li>
+          <li><strong>La cola es finita.</strong> Si el destino está caído y la cola se llena, MinIO descarta eventos nuevos. La notificación no es un registro de auditoría.</li>
+          <li><strong>El evento no es el dato.</strong> El mensaje dice «existe esta clave y esta versión»; el contenido hay que leerlo del bucket, y puede haber cambiado.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué esta lección se conecta con RabbitMQ</p>
+          <p>MinIO emite eventos, pero no es un broker: no tiene enrutado por tópicos, ni colas duraderas por consumidor, ni <em>dead letter queues</em>. Cuando el pipeline crece, el patrón habitual es MinIO → RabbitMQ → workers. El curso <a href="../../../../Aprende RabbitMQ/web/index.html">Aprende RabbitMQ</a> cubre la parte que MinIO deliberadamente no hace.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Qué eventos existen</h3>
+        <p>MinIO agrupa los eventos por familia. Los nombres que se pasan a <code>mc event add</code> son cortos; el mensaje usa el nombre S3 completo.</p>
+        <table>
+          <thead><tr><th>Nombre corto</th><th>Evento S3</th><th>Cuándo se emite</th></tr></thead>
+          <tbody>
+            <tr><td><code>put</code></td><td><code>s3:ObjectCreated:*</code></td><td>Al crear o sobrescribir un objeto (incluye multipart completado y copia).</td></tr>
+            <tr><td><code>get</code></td><td><code>s3:ObjectAccessed:Get</code></td><td>Al leer un objeto. Genera mucho volumen; úsalo con cuidado.</td></tr>
+            <tr><td><code>delete</code></td><td><code>s3:ObjectRemoved:*</code></td><td>Al borrar una versión o crear un delete marker.</td></tr>
+            <tr><td><code>replica</code></td><td><code>s3:Replication:*</code></td><td>Cambios de estado de replicación.</td></tr>
+            <tr><td><code>ilm</code></td><td><code>s3:LifecycleTransition</code></td><td>Cuando lifecycle transiciona o expira un objeto.</td></tr>
+            <tr><td><code>scan</code></td><td><code>s3:ObjectRestore:*</code></td><td>Eventos del scanner/restauración, según versión.</td></tr>
+          </tbody>
+        </table>
+        <p>Para un pipeline de documentos, <code>put,delete</code> es el 90 % de los casos. Añadir <code>get</code> multiplica el tráfico y suele ser una decisión de analítica, no de procesado.</p>
+        <h3>Destinos: no todos sirven para lo mismo</h3>
+        <table>
+          <thead><tr><th>Destino</th><th>Config</th><th>Cuándo elegirlo</th></tr></thead>
+          <tbody>
+            <tr><td>Webhook HTTP</td><td><code>notify_webhook</code></td><td>Prototipos, servicios pequeños, integraciones sin broker.</td></tr>
+            <tr><td>AMQP 0-9-1 (RabbitMQ)</td><td><code>notify_amqp</code></td><td>Enrutado, colas duraderas, reintentos y DLQ gestionados por el broker.</td></tr>
+            <tr><td>Kafka</td><td><code>notify_kafka</code></td><td>Alto volumen, log particionado, varios consumidores independientes.</td></tr>
+            <tr><td>PostgreSQL / MySQL</td><td><code>notify_postgres</code> / <code>notify_mysql</code></td><td>Registro transaccional en una base existente.</td></tr>
+          </tbody>
+        </table>
+        <p>Todos comparten la misma mecánica: se declara un <strong>target</strong> con un identificador, se reinicia el servidor y se asocia el target a un bucket con un <strong>ARN</strong>. Cambiar de webhook a RabbitMQ no cambia el modelo, solo el destino y el consumidor. También existen destinos NATS, MQTT, Redis y Elasticsearch con el mismo esquema.</p>
+        <h3>El ARN: cómo se conecta todo</h3>
+        <pre><code class="language-text">configuración del servidor              asociación al bucket
++-----------------------------+         +--------------------------------------+
+| notify_webhook:1            |         | mc event add myminio/documentos      |
+|   endpoint=http://...       |  ARN    |   arn:minio:sqs::1:webhook           |
+|   queue_dir=/opt/events     |--------&gt;|   --event put,delete                 |
++-----------------------------+         +--------------------------------------+
+         ^                                          |
+         |                                          v
+   identificador "1"                    eventos publicados en el endpoint</code></pre>
+        <p>La forma del ARN es <code>arn:minio:sqs::&lt;ID&gt;:&lt;TIPO&gt;</code>. El identificador debe coincidir <strong>exactamente</strong> con el que pusiste tras los dos puntos en <code>notify_webhook:1</code>. Un desajuste es la causa número uno de «la configuración está puesta pero no llega nada».</p>
+        <h3>El payload</h3>
+        <p>El mensaje sigue el formato de notificaciones de S3. Un <code>PUT</code> produce algo así:</p>
+        <pre><code class="language-json">{
+  "EventName": "s3:ObjectCreated:Put",
+  "Key": "documentos/2026/acta.pdf",
+  "Records": [{
+    "eventTime": "2026-11-05T09:12:44.123Z",
+    "s3": {
+      "bucket": { "name": "documentos" },
+      "object": {
+        "key": "2026/acta.pdf", "size": 48213,
+        "eTag": "9f2b1c4d8e7a...", "versionId": "01J9Z8K3M4N5...",
+        "contentType": "application/pdf",
+        "userMetadata": { "tenant": "acme" }
+      }
+    }
+  }]
+}</code></pre>
+        <p>Qué mirar: <code>EventName</code> distingue creación de borrado; <code>versionId</code> es la <strong>clave de idempotencia</strong> natural (dos reintentos comparten versión); y <code>eTag</code> identifica contenido, pero en multipart no es el MD5 del archivo. El evento no lleva el PDF: el worker debe hacer <code>getObject</code> con clave y versión, y esa versión sigue siendo legible aunque el objeto se haya sobrescrito.</p>
+        <h3>Entrega: al menos una vez, nunca exactamente una</h3>
+        <p>MinIO mantiene una <strong>cola por destino</strong>. En modo asíncrono (el de por defecto) envía el evento y continúa; si el destino falla, reintenta. Ese diseño prioriza el rendimiento y produce dos efectos que debes asumir:</p>
+        <table>
+          <thead><tr><th>Efecto</th><th>Por qué ocurre</th><th>Cómo se mitiga</th></tr></thead>
+          <tbody>
+            <tr><td>Duplicados</td><td>El destino recibió el evento pero el ACK se perdió; MinIO reintenta.</td><td>Idempotencia por <code>bucket + key + versionId + eventName</code>.</td></tr>
+            <tr><td>Pérdidas</td><td>La cola se llenó o el proceso se reinició sin <code>queue_dir</code> persistente.</td><td><code>queue_dir</code> en disco, <code>queue_limit</code> suficiente y reconciliación periódica.</td></tr>
+          </tbody>
+        </table>
+        <p>La cola por defecto admite 100 000 eventos. Cuando se llena, <strong>MinIO descarta los nuevos</strong>. Subir el límite ayuda, pero no convierte la notificación en un log duradero. Si necesitas garantías fuertes, el patrón es:</p>
+        <pre><code class="language-text">MinIO --evento--&gt; RabbitMQ/Kafka (durable, con DLQ) --&gt; workers
+   |                                                        |
+   +---- queue_dir persistente (buffer ante caídas) --------+
+                                                            |
+              reconciliación periódica: LIST del bucket vs. índice de procesados</code></pre>
+        <p>El modo síncrono (<code>MINIO_API_SYNC_EVENTS=on</code> o <code>api.sync_events=on</code>) espera el ACK antes de continuar. Reduce pérdidas a costa de bajar el ritmo de envío y llenar la cola antes. No lo actives «por seguridad» sin medir: puedes convertir un pico de subidas en un cuello de botella.</p>
+        <h3>Idempotencia: el contrato del consumidor</h3>
+        <p>Un consumidor correcto responde rápido (valida y encola; el trabajo pesado va a un worker), registra la clave de idempotencia antes de actuar (tabla con restricción única o Redis con TTL) y reconcilia una vez al día listando el bucket. Los eventos son la vía rápida, no la única fuente de verdad.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un webhook local que imprime los eventos del prefijo <code>documentos/</code>. Primero el receptor en Node.js 22 ESM:</p>
+        <pre><code class="language-javascript">// webhook.mjs — receptor mínimo, sin dependencias
+import { createServer } from "node:http";
+createServer(async (req, res) =&gt; {
+  if (req.method !== "POST") return res.writeHead(405).end();
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  const event = JSON.parse(body);
+  const { key, versionId } = event.Records?.[0]?.s3?.object ?? {};
+  console.log(event.EventName, key, versionId);
+  res.writeHead(200).end("ok");
+}).listen(8080, () =&gt; console.log("webhook escuchando en :8080"));
+</code></pre>
+        <p>Ahora la configuración de MinIO:</p>
+        <pre><code class="language-bash">mc admin config set myminio notify_webhook:1 \
+  endpoint="http://127.0.0.1:8080/events" \
+  auth_token="$WEBHOOK_TOKEN" \
+  queue_dir="/opt/minio/events" \
+  queue_limit="10000"
+mc admin service restart myminio
+mc event add myminio/documentos \
+  arn:minio:sqs::1:webhook \
+  --event put,delete \
+  --prefix "documentos/"
+</code></pre>
+        <p>Qué hace cada línea:</p>
+        <ul>
+          <li><code>notify_webhook:1</code>: declara el target con identificador <code>1</code>. Ese <code>1</code> es el que aparece en el ARN.</li>
+          <li><code>endpoint</code>: URL que recibirá los <code>POST</code>. Debe ser alcanzable <em>desde el contenedor de MinIO</em>; <code>localhost</code> dentro del contenedor no es tu máquina.</li>
+          <li><code>auth_token</code>: token que MinIO envía para que el receptor distinga peticiones legítimas.</li>
+          <li><code>queue_dir</code>: buffer en disco para eventos no entregados. Sin esto, un reinicio pierde la cola en memoria.</li>
+          <li><code>queue_limit</code>: tamaño máximo. Si se llena, se descartan eventos nuevos.</li>
+          <li><code>mc admin service restart</code>: los cambios de <code>notify_*</code> requieren reinicio. No lo omitas.</li>
+          <li><code>--prefix "documentos/"</code>: solo ese prefijo; el resto del bucket no genera mensajes.</li>
+        </ul>
+        <p>Verifica y prueba:</p>
+        <pre><code class="language-bash">mc event list myminio/documentos
+printf 'contenido de prueba\n' | mc pipe myminio/documentos/documentos/2026/prueba.txt
+</code></pre>
+        <pre><code class="language-text">s3:ObjectCreated:Put documentos/2026/prueba.txt 01J9Z8K3M4N5P6Q7R8S9T0V1W2
+</code></pre>
+        <p>Si no llega nada, el orden de comprobación es siempre el mismo: target configurado → servidor reiniciado → ARN con el identificador correcto → endpoint alcanzable desde MinIO → prefijo coincide.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos necesita procesar cada PDF que llega: extraer texto, contar páginas y escribir un JSON derivado en <code>derivados/</code>. El pipeline es asíncrono y tolera reintentos.</p>
+        <pre><code class="language-text">PUT documentos/2026/acta.pdf
+          |
+          v
+   MinIO --s3:ObjectCreated:Put--&gt; webhook --200 OK--&gt; cola
+                                                        |
+                                                        v
+                                    worker PDF --escribe--&gt; derivados/2026/acta.json</code></pre>
+        <p>El receptor no procesa: valida, deduplica y encola.</p>
+        <pre><code class="language-javascript">// receptor.mjs — deduplicación persistente en un log append-only
+import { createServer } from "node:http";
+import { readFile, appendFile } from "node:fs/promises";
+
+const RUTA = "./procesados.log";
+const procesados = new Set(
+  (await readFile(RUTA, "utf8").catch(() =&gt; "")).split("\n").filter(Boolean)
+);
+
+async function registrar(id) {
+  if (procesados.has(id)) return false;
+  procesados.add(id);
+  await appendFile(RUTA, `${id}\n`);
+  return true;
+}
+
+createServer(async (req, res) =&gt; {
+  if (req.method !== "POST") return res.writeHead(405).end();
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  let event;
+  try { event = JSON.parse(body); } catch { return res.writeHead(400).end("json inválido"); }
+  const record = event.Records?.[0];
+  const bucket = record?.s3?.bucket?.name;
+  const object = record?.s3?.object;
+  if (!bucket || !object?.key) return res.writeHead(400).end("evento incompleto");
+  const id = `${bucket}/${object.key}@${object.versionId}:${event.EventName}`;
+  if (!(await registrar(id))) return res.writeHead(200).end("duplicado");
+  console.log("nuevo trabajo", id); // aquí solo se encola
+  res.writeHead(200).end("aceptado");
+}).listen(8080);
+</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">Un log sirve para un proceso, no para un clúster</p>
+          <p>El ejemplo evita dependencias y funciona con Node.js 22, pero el <code>Set</code> y el archivo no resisten varios receptores en paralelo. En producción usa una tabla con restricción <code>UNIQUE</code> sobre la clave de idempotencia o Redis con <code>SET NX</code>; la idea es la misma, la garantía es atómica.</p>
+        </div>
+        <p>El worker descarga siempre por <strong>versión</strong>, no por la clave actual. Si llegan dos eventos de la misma clave con versiones distintas, cada uno procesa su contenido; si llega el mismo evento dos veces, la tabla lo corta.</p>
+        <pre><code class="language-javascript">// worker.mjs — descarga la versión exacta del evento
+import { Client } from "minio";
+const minio = new Client({
+  endPoint: process.env.MINIO_ENDPOINT, port: 9000, useSSL: true,
+  accessKey: process.env.MINIO_ACCESS_KEY, secretKey: process.env.MINIO_SECRET_KEY,
+});
+export async function procesar({ bucket, key, versionId }) {
+  const stream = await minio.getObject(bucket, key, versionId);
+  // ...extraer texto, escribir derivados/&lt;key&gt;.json...
+  return stream;
+}
+</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Depurar sin adivinar</p>
+          <p><code>mc watch myminio/documentos --prefix "documentos/" --event put,delete</code> muestra los eventos que MinIO emite, sin depender de tu webhook. Si <code>mc watch</code> los ve y tu receptor no, el problema está en la configuración del target o en la red, no en el bucket.</p>
+        </div>
+        <p>Cuando el volumen crece, el webhook deja de ser el destino adecuado: no tiene ACK duradero, ni reintentos con backoff gestionados, ni DLQ. El salto natural es publicar en RabbitMQ y que los workers consuman de una cola durable. La lógica de idempotencia no cambia; solo cambia el transporte.</p>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Responder 200 en milisegundos y encolar</td>
+              <td>Extraer el PDF dentro del handler HTTP</td>
+              <td>El timeout de MinIO provoca reintentos y multiplica el trabajo.</td>
+            </tr>
+            <tr>
+              <td>Clave de idempotencia con <code>versionId</code></td>
+              <td>Deduplicar por nombre de archivo</td>
+              <td>La misma clave puede tener varias versiones legítimas.</td>
+            </tr>
+            <tr>
+              <td><code>queue_dir</code> persistente y <code>queue_limit</code> dimensionado</td>
+              <td>Confiar en la cola en memoria</td>
+              <td>Un reinicio o un pico puede perder eventos sin aviso.</td>
+            </tr>
+            <tr>
+              <td>Autenticar el webhook con <code>auth_token</code> y HTTPS</td>
+              <td>Endpoint público sin autenticación</td>
+              <td>Cualquiera podría inyectar trabajos falsos.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. El identificador del target no coincide con el ARN</h3>
+        <span class="code-label code-label--wrong">Mal — configurar uno y suscribir otro</span>
+        <pre><code class="language-bash">mc admin config set myminio notify_webhook:primary endpoint="http://api:8080/events"
+mc event add myminio/documentos arn:minio:sqs::1:webhook --event put
+# ❌ El ARN apunta al target "1"; el configurado se llama "primary". Nunca llega nada.
+</code></pre>
+        <span class="code-label code-label--right">Bien — el mismo identificador en ambos lados</span>
+        <pre><code class="language-bash">mc admin config set myminio notify_webhook:1 endpoint="http://api:8080/events"
+mc admin service restart myminio
+mc event add myminio/documentos arn:minio:sqs::1:webhook --event put,delete
+mc event list myminio/documentos
+</code></pre>
+        <h3>2. Procesar en el handler y provocar duplicados</h3>
+        <span class="code-label code-label--wrong">Mal — trabajo pesado dentro del webhook</span>
+        <pre><code class="language-javascript">app.post("/events", async (req, res) =&gt; {
+  await extraerTexto(req.body);   // ❌ 30 s; MinIO reintenta y llega otra vez
+  await escribirDerivado(req.body);
+  res.sendStatus(200);
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — aceptar, deduplicar y encolar</span>
+        <pre><code class="language-javascript">app.post("/events", async (req, res) =&gt; {
+  const id = idempotencyKey(req.body);
+  const nuevo = await registro.insertarSiNoExiste(id);
+  if (!nuevo) return res.sendStatus(200);
+  await cola.publicar(req.body);  // vuelve en milisegundos
+  res.sendStatus(202);
+});
+</code></pre>
+        <h3>3. Apuntar el webhook a <code>localhost</code> desde el contenedor</h3>
+        <span class="code-label code-label--wrong">Mal — mezclar el espacio de red del host y del contenedor</span>
+        <pre><code class="language-bash">mc admin config set myminio notify_webhook:1 endpoint="http://localhost:8080/events"
+# ❌ Dentro del contenedor, localhost es el propio MinIO. Connection refused en bucle.
+</code></pre>
+        <span class="code-label code-label--right">Bien — usar el nombre del servicio o el host alcanzable</span>
+        <pre><code class="language-bash">mc admin config set myminio notify_webhook:1 \
+  endpoint="http://api:8080/events"   # nombre del servicio en la red de Compose
+</code></pre>
+        <p>En local con Compose, el receptor y MinIO deben compartir red. Si el receptor corre en el host, usa <code>host.docker.internal</code> (Docker Desktop) o la IP del bridge.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> recibir eventos reales, comprobar el payload y verificar que un duplicado no se procesa dos veces.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el receptor mínimo</strong> en una terminal y deja que escuche:
+            <pre><code class="language-bash">node webhook.mjs
+# webhook escuchando en :8080
+</code></pre>
+            <p>Si usas Compose, copia <code>webhook.mjs</code> al servicio <code>api</code> y expón el puerto 8080.</p>
+          </li>
+          <li>
+            <strong>Configura el target y reinicia:</strong>
+            <pre><code class="language-bash">mc admin config set myminio notify_webhook:1 \
+  endpoint="http://api:8080/events" \
+  auth_token="dev-token" \
+  queue_dir="/opt/minio/events" \
+  queue_limit="10000"
+mc admin service restart myminio
+mc admin info myminio
+</code></pre>
+            <p>Salida esperada: el servidor vuelve a estar <code>online</code> y <code>mc admin info</code> responde.</p>
+          </li>
+          <li>
+            <strong>Suscribe el bucket a <code>put</code> y <code>delete</code>:</strong>
+            <pre><code class="language-bash">mc event add myminio/documentos \
+  arn:minio:sqs::1:webhook \
+  --event put,delete \
+  --prefix "documentos/"
+mc event list myminio/documentos
+</code></pre>
+            <p>Debe aparecer una línea con el ARN, los eventos y el prefijo.</p>
+          </li>
+          <li>
+            <strong>Genera un evento y lee el payload:</strong>
+            <pre><code class="language-bash">printf 'acta\n' | mc pipe myminio/documentos/documentos/2026/acta.txt
+mc stat myminio/documentos/documentos/2026/acta.txt
+</code></pre>
+            <p>En la terminal del receptor verás <code>s3:ObjectCreated:Put documentos/2026/acta.txt &lt;versionId&gt;</code>. Compara el <code>versionId</code> con el de <code>mc stat</code>.</p>
+          </li>
+          <li>
+            <strong>Provoca un duplicado y limpia:</strong> envía dos veces el mismo JSON al receptor con <code>curl</code>; la segunda respuesta debe ser <code>duplicado</code>. Después retira la suscripción con <code>mc event remove myminio/documentos arn:minio:sqs::1:webhook</code> y comprueba que <code>mc event list</code> ya no muestra eventos.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Ejecuta <code>mc watch myminio/documentos --event put,delete</code> en otra terminal y sube un objeto. Si <code>mc watch</code> lo muestra pero el webhook no, el fallo está en el target o en la red. Si tampoco lo muestra, revisa el prefijo y el nombre del evento.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un pipeline que sobrevive a la caída del consumidor</h3>
+          <p>Construye un pipeline que procese los PDF de <code>documentos/</code> y escriba un JSON en <code>derivados/</code>. Debe cumplir: el receptor responde en menos de 200 ms, mata el worker a mitad de un trabajo y no se pierde nada, y si el mismo evento llega tres veces solo se genera un derivado.</p>
+          <p>Después apaga el receptor durante dos minutos, sube diez documentos y vuelve a arrancarlo. ¿Cuántos derivados aparecen? ¿Qué habría pasado sin <code>queue_dir</code>? Documenta el resultado con evidencia, no con suposiciones.</p>
+          <p><em>Pista: separa aceptación, encolado y procesado. La clave de idempotencia debe vivir fuera de la memoria del proceso; el <code>versionId</code> del evento es tu mejor candidato.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El flujo tiene tres piezas: <strong>target</strong> (<code>notify_*</code>), <strong>ARN</strong> (<code>arn:minio:sqs::ID:TIPO</code>) y <strong>suscripción</strong> (<code>mc event add</code>).</li>
+          <li>Los eventos útiles para un pipeline son <code>put</code> y <code>delete</code>; <code>get</code> multiplica el volumen.</li>
+          <li>La entrega es <strong>al menos una vez</strong> en el mejor caso: puede duplicar, desordenar y —si la cola se llena— descartar. El consumidor debe ser idempotente.</li>
+          <li><code>versionId</code> es la clave natural de idempotencia; el evento no contiene el objeto, solo sus metadatos.</li>
+          <li><code>queue_dir</code> y <code>queue_limit</code> son la diferencia entre un buffer y una promesa falsa.</li>
+          <li>Para garantías fuertes, MinIO publica en RabbitMQ/Kafka y el broker aporta durabilidad, reintentos y DLQ.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc admin config set ALIAS notify_webhook:ID</code></td><td>Declara un destino webhook</td></tr>
+            <tr><td><code>mc admin service restart ALIAS</code></td><td>Aplica la configuración de notificaciones</td></tr>
+            <tr><td><code>mc event add ALIAS/BUCKET ARN</code></td><td>Suscribe el bucket al destino</td></tr>
+            <tr><td><code>mc event list ALIAS/BUCKET</code></td><td>Muestra las suscripciones activas</td></tr>
+            <tr><td><code>mc event remove ALIAS/BUCKET ARN</code></td><td>Elimina la suscripción</td></tr>
+            <tr><td><code>mc watch ALIAS/BUCKET</code></td><td>Muestra eventos en vivo para depurar</td></tr>
+            <tr><td><code>mc admin config get ALIAS notify_webhook</code></td><td>Revisa la configuración del target</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿MinIO garantiza entrega exactamente una vez?</summary>
+            <div>
+              <p>No. En modo asíncrono puede reintentar tras un ACK perdido y puede descartar si la cola se llena; en modo síncrono reduce las pérdidas pero no elimina los duplicados. Diseña siempre consumidores idempotentes y añade una reconciliación periódica con el bucket.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo tener varios destinos para el mismo bucket?</summary>
+            <div>
+              <p>Sí. Puedes declarar varios targets y añadir varias suscripciones con ARN distintos. Cada una mantiene su propia cola y su propio consumo. Úsalo con criterio: cada destino multiplica el trabajo de emisión y el riesgo de configuraciones divergentes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los eventos incluyen los borrados por lifecycle?</summary>
+            <div>
+              <p>Depende del tipo de evento que suscribas. Los eventos <code>ilm</code> cubren transiciones y expiraciones del ciclo de vida; <code>delete</code> cubre borrados iniciados por un cliente. Si necesitas reaccionar a limpiezas automáticas, suscribe <code>ilm</code>, no <code>delete</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no simplemente hago polling con <code>LIST</code>?</summary>
+            <div>
+              <p>Porque escala mal: cada consulta recorre claves y compites con el tráfico real. Además introduces latencia y necesitas estado para saber qué ya procesaste. El polling es aceptable como reconciliación diaria, no como mecanismo principal.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

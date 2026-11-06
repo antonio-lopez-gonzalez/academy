@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-kubernetes-operator">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kubernetes Operator — Módulo 6 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Kubernetes Operator</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Integración</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Docker Compose te dio un MinIO de un solo proceso para desarrollar. Pero un clúster distribuido no se levanta con un <code>docker compose up</code>: necesita varios nodos, discos independientes, arranque ordenado, certificados y una forma de crecer sin perder datos. En Kubernetes eso se hace con el <strong>MinIO Operator</strong>.</p>
+        <p>El Operator no es «MinIO en un pod». Es un controlador que entiende un recurso propio, el <code>Tenant</code>, y se encarga de crear los <em>StatefulSets</em>, los servicios, los PVC y la configuración de TLS para que el clúster exista y se repare. Tú declaras el estado deseado; el Operator lo reconcilia.</p>
+        <p>Esta lección explica el modelo, muestra un Tenant mínimo y otro realista, y deja claros los límites: el modo distribuido soportado es Kubernetes o baremetal, nunca Compose; y un tenant que nace de un solo servidor no se convierte en distribuido cambiando un número.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque «tenemos Kubernetes» no significa «tenemos almacenamiento de objetos». El Operator es la pieza que convierte Kubernetes en una plataforma capaz de operar MinIO con erasure coding, actualizaciones controladas y certificados. Sin entender el CRD, un <code>kubectl apply</code> se convierte en una caja negra que nadie se atreve a tocar.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El patrón Operator en una frase</h3>
+        <p>Un Operator es un controlador que ejecuta un bucle de reconciliación: lee el estado deseado de un recurso personalizado (CRD), compara con el estado real y actúa hasta que coinciden. En MinIO el recurso se llama <code>Tenant</code>, vive en el grupo <code>minio.min.io/v2</code> y describe la imagen, las credenciales, los <em>pools</em> de servidores y el almacenamiento.</p>
+        <pre><code class="language-text">kubectl apply -f tenant.yaml
+          |
+          v
++----------------------+        +---------------------------+
+| Kubernetes API       | &lt;----&gt; | MinIO Operator            |
+| Tenant (minio.min.io)|        | reconcile loop            |
++----------------------+        +-------------+-------------+
+                                             |
+              +------------------------------+---------------------------+
+              v                              v                           v
+      StatefulSet minio            Services (S3, console, hl)     PVCs por servidor
+      pods myminio-pool-0-{0..3}   myminio / myminio-console      4 por pod, RWO
+</code></pre>
+        <h3>Qué crea exactamente un Tenant</h3>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué controla</th><th>Consecuencia</th></tr></thead>
+          <tbody>
+            <tr><td><code>spec.image</code></td><td>Imagen y versión de MinIO</td><td>Cambiarla dispara una actualización gradual.</td></tr>
+            <tr><td><code>spec.configuration</code></td><td>Secret con <code>config.env</code> (root, opciones)</td><td>Sin él, el tenant no arranca con credenciales válidas.</td></tr>
+            <tr><td><code>spec.pools[].servers</code></td><td>Pods de MinIO en ese pool</td><td>4 o más para distribuido; 1 es standalone.</td></tr>
+            <tr><td><code>spec.pools[].volumesPerServer</code></td><td>Discos por servidor</td><td>Más discos, más erasure coding y más paralelismo.</td></tr>
+            <tr><td><code>spec.pools[].volumeClaimTemplate</code></td><td>Tamaño y StorageClass de cada PVC</td><td>Define capacidad, IOPS y tolerancia a fallos.</td></tr>
+            <tr><td><code>spec.mountPath</code> / <code>subPath</code></td><td>Dónde se montan los datos</td><td>No se cambian después: partirías los datos en dos rutas.</td></tr>
+            <tr><td><code>spec.requestAutoCert</code></td><td>TLS automático vía API de certificados</td><td>Alternativa: <code>externalCertSecret</code> con cert-manager.</td></tr>
+            <tr><td><code>spec.features.bucketDNS</code></td><td>Acceso <code>bucket.tenant.ns.svc</code></td><td>Útil, pero exige DNS y comodines correctos.</td></tr>
+          </tbody>
+        </table>
+        <h3>Pools: la unidad de crecimiento</h3>
+        <p>Un clúster MinIO se compone de uno o más <em>pools</em>. Cada pool aporta un conjunto de servidores y discos; los datos se distribuyen entre todos. Para crecer se <strong>añade un pool</strong>, no se redimensiona el existente. El nombre del pool debe ser único y conviene que sea secuencial (<code>pool-0</code>, <code>pool-1</code>).</p>
+        <p>Cada servidor de un pool debe tener al menos un volumen, y lo habitual son cuatro. Con <code>servers: 4</code> y <code>volumesPerServer: 4</code> tienes 16 discos; MinIO calcula la paridad sobre ellos. Si el StorageClass entrega discos del mismo nodo físico, la tolerancia teórica no te salva de perder ese nodo: la topología importa tanto como el número.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">El modo no se cambia en caliente</p>
+          <p>El Operator no soporta convertir un tenant standalone (<code>servers: 1</code>) en distribuido. Si necesitas alta disponibilidad, crea el tenant desde el principio con cuatro o más servidores y migra los datos con <code>mc mirror</code> o réplica. Cambiar <code>servers</code> en un pool existente no es una operación de escalado válida.</p>
+        </div>
+        <h3>Almacenamiento: el punto donde fallan los laboratorios</h3>
+        <p>MinIO está diseñado para discos directos o volúmenes de bloque, con un sistema de archivos local (XFS recomendado). No uses NFS ni un volumen compartido entre pods para los datos: el erasure coding asume que cada disco falla de forma independiente, y compartir el mismo backend convierte un fallo en una pérdida global.</p>
+        <ul>
+          <li><strong>Cloud:</strong> StorageClass de bloque (EBS, PD, Azure Disk) con <code>ReadWriteOnce</code>.</li>
+          <li><strong>Baremetal:</strong> discos locales con un provisioner como local-path o OpenEBS, y anti-affinity para repartir pods.</li>
+          <li><strong>Laboratorio:</strong> <code>local-path</code> en un clúster de un nodo sirve para aprender, no para afirmar alta disponibilidad.</li>
+        </ul>
+        <h3>TLS, consola y acceso</h3>
+        <p>Con <code>requestAutoCert: true</code>, el Operator solicita certificados al API de Kubernetes y los renueva. En producción es más común desactivarlo y usar cert-manager: creas un <code>Certificate</code>, y referencias el secret resultante en <code>spec.externalCertSecret</code> con tipo <code>kubernetes.io/tls</code>.</p>
+        <p>El tenant expone dos servicios: la API S3 y la consola. El Operator, además, tiene su propia consola para administrar tenants. Para un acceso puntual, <code>kubectl port-forward</code> es suficiente; para usuarios, publica la API detrás de un Ingress con TLS y no expongas la consola sin autenticación adicional.</p>
+        <h3>Actualizaciones y capacidad</h3>
+        <p>Cambiar <code>spec.image</code> inicia una actualización gradual de los pods. El Operator espera a que el clúster esté sano antes de continuar; aun así, una actualización es un cambio de versión de datos y merece backup, ventana y un plan de vuelta atrás. Añadir un pool es la forma soportada de ampliar capacidad; después puedes lanzar un rebalanceo para redistribuir datos antiguos. Cambiar <code>mountPath</code> o convertir un standalone en distribuido no son operaciones de escalado: son migraciones.</p>
+        <h3>Límites que conviene decir en voz alta</h3>
+        <table>
+          <thead><tr><th>Límite</th><th>Detalle</th></tr></thead>
+          <tbody>
+            <tr><td>Licencia</td><td>MinIO Community es AGPLv3. Revisa obligaciones antes de ofrecerlo como servicio.</td></tr>
+            <tr><td>Distribuido</td><td>Soportado en Kubernetes (Operator) y baremetal. Compose es solo un nodo de desarrollo.</td></tr>
+            <tr><td>Storage</td><td>Discos directos o block storage; NFS y volúmenes compartidos no son una base válida.</td></tr>
+            <tr><td>Escalado</td><td>Se añaden pools; no se redimensiona un pool ni se cambia el modo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Instala el Operator y comprueba que el CRD existe. En producción fija una versión; aquí usamos la referencia principal para el laboratorio:</p>
+        <pre><code class="language-bash">kubectl apply -k "github.com/minio/operator"
+kubectl get pods -n minio-operator
+kubectl get crd tenants.minio.min.io
+</code></pre>
+        <pre><code class="language-text">NAME                              READY   STATUS    RESTARTS   AGE
+minio-operator-7d9f8c6b5d-abcde   1/1     Running   0          42s
+console-6f7c9d8b4f-xyz12          1/1     Running   0          42s
+
+NAME                    CREATED AT
+tenants.minio.min.io    2026-11-05T10:00:00Z</code></pre>
+        <p>El Tenant más pequeño posible necesita credenciales y un pool. Este es el esqueleto, sin recursos ni TLS, para un laboratorio de un solo servidor:</p>
+        <pre><code class="language-yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: storage-configuration
+  namespace: storage
+type: Opaque
+stringData:
+  config.env: |
+    export MINIO_ROOT_USER=minioadmin
+    export MINIO_ROOT_PASSWORD=cambia-esto
+---
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: myminio
+  namespace: storage
+spec:
+  image: quay.io/minio/minio:latest
+  configuration:
+    name: storage-configuration
+  mountPath: /export
+  requestAutoCert: true
+  pools:
+    - name: pool-0
+      servers: 1
+      volumesPerServer: 4
+      volumeClaimTemplate:
+        metadata:
+          name: data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+</code></pre>
+        <p>Qué hace cada pieza:</p>
+        <ul>
+          <li><code>config.env</code> es el formato que espera MinIO para variables de entorno; el secret se monta en los pods.</li>
+          <li><code>namespace: storage</code> debe existir antes de aplicar; el Operator no lo crea por ti.</li>
+          <li><code>servers: 1</code> produce un standalone: útil para probar el CRD, sin tolerancia a fallos.</li>
+          <li><code>volumesPerServer: 4</code> crea cuatro PVC por pod, aunque haya un solo pod.</li>
+          <li><code>requestAutoCert: true</code> activa TLS automático; el cliente deberá confiar en el certificado o usar <code>--insecure</code> en el laboratorio.</li>
+        </ul>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos necesita un tenant distribuido, con discos separados, TLS de cert-manager y límites de recursos. Este manifiesto es el que llevarías a un clúster de producción (ajustando StorageClass, tamaños y dominios):</p>
+        <pre><code class="language-yaml">apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: documentos
+  namespace: storage
+spec:
+  image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+  configuration:
+    name: documentos-configuration
+  mountPath: /export
+  requestAutoCert: false
+  externalCertSecret: [{ name: documentos-tls, type: kubernetes.io/tls }]
+  pools:
+    - name: pool-0
+      servers: 4
+      volumesPerServer: 4
+      resources:
+        requests: { cpu: "2", memory: 8Gi }
+        limits: { memory: 8Gi }
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: fast-block
+          resources: { requests: { storage: 500Gi } }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  v1.min.io/tenant: documentos
+              topologyKey: kubernetes.io/hostname
+</code></pre>
+        <p>Las decisiones importantes, una a una:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>4 servidores × 4 discos</td><td>Distribuido real, con paridad y tolerancia a fallos de disco y de pod.</td></tr>
+            <tr><td>Imagen fijada</td><td>Una actualización no ocurre por sorpresa; el cambio es explícito y revisable.</td></tr>
+            <tr><td>Anti-affinity por hostname</td><td>Evita que los cuatro pods caigan en el mismo nodo y compartan destino.</td></tr>
+            <tr><td>cert-manager</td><td>Rotación y emisión fuera del Operator, con el mismo flujo que el resto de servicios.</td></tr>
+            <tr><td><code>storageClassName: fast-block</code></td><td>El rendimiento y la durabilidad dependen del disco, no del YAML.</td></tr>
+          </tbody>
+        </table>
+        <p>El flujo de despliegue completo:</p>
+        <pre><code class="language-bash">kubectl create namespace storage --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic documentos-configuration \
+  --namespace storage \
+  --from-literal=config.env='export MINIO_ROOT_USER=admin-documentos
+export MINIO_ROOT_PASSWORD=una-clave-larga-y-aleatoria'
+
+kubectl apply -f documentos-tls.yaml
+kubectl apply -f tenant.yaml
+kubectl get tenant -n storage
+kubectl get pods -n storage -l v1.min.io/tenant=documentos
+kubectl get pvc -n storage
+</code></pre>
+        <pre><code class="language-text">NAME         STATE     HEALTH   POOLS   AGE
+documentos   ready     green    1       3m
+
+NAME               READY   STATUS    RESTARTS
+documentos-pool-0-0 1/1    Running   0
+documentos-pool-0-1 1/1    Running   0
+documentos-pool-0-2 1/1    Running   0
+documentos-pool-0-3 1/1    Running   0</code></pre>
+        <p>Con el tenant sano, configuras el alias y creas el bucket. Desde dentro del clúster usa el servicio; desde tu máquina, un port-forward temporal:</p>
+        <pre><code class="language-bash">kubectl port-forward -n storage svc/documentos 9000:9000 &amp;
+mc alias set documentos https://localhost:9000 admin-documentos 'una-clave-larga-y-aleatoria' --insecure
+mc mb documentos/documentos
+mc admin info documentos
+</code></pre>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar el Tenant en Git y aplicarlo con CI/CD</td><td>Editar el YAML a mano en producción</td><td>El clúster se vuelve reproducible y auditable.</td></tr>
+            <tr><td>Nacer con 4+ servidores si necesitas HA</td><td>Empezar con uno y «ya escalaremos»</td><td>El paso de standalone a distribuido no está soportado.</td></tr>
+            <tr><td>Usar block storage con <code>ReadWriteOnce</code></td><td>NFS o un PVC compartido entre pods</td><td>El erasure coding necesita fallos independientes por disco.</td></tr>
+            <tr><td>Repartir pods con anti-affinity y revisar la topología</td><td>Confiar solo en el número de réplicas</td><td>Cuatro pods en un nodo no sobreviven a la caída de ese nodo.</td></tr>
+            <tr><td>Fijar imagen y versión del Operator</td><td><code>latest</code> en producción</td><td>Las actualizaciones deben ser decisiones, no sorpresas.</td></tr>
+            <tr><td>Probar la actualización en staging y tener backup</td><td>Actualizar el día del incidente</td><td>Una versión nueva puede cambiar comportamiento o formato.</td></tr>
+            <tr><td>Versionar usuarios y políticas fuera del clúster</td><td>Configurar todo desde la consola</td><td>La consola no deja rastro reproducible; <code>mc</code> y los JSON sí.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Escalar cambiando <code>servers</code></h3>
+        <span class="code-label code-label--wrong">Mal — de 1 a 4 en el mismo pool</span>
+        <pre><code class="language-yaml">pools:
+  - name: pool-0
+    servers: 4   # antes 1; el Operator no soporta esta conversión
+</code></pre>
+        <span class="code-label code-label--right">Bien — crear el tenant distribuido desde el inicio o migrar</span>
+        <pre><code class="language-yaml">pools:
+  - name: pool-0
+    servers: 4
+    volumesPerServer: 4
+</code></pre>
+        <p>Si ya tienes datos en un standalone, crea otro tenant y copia con <code>mc mirror --preserve</code> o configura réplica. Intentar el cambio in-place deja el tenant en un estado que el Operator no garantiza.</p>
+        <h3>2. Usar NFS o un volumen compartido</h3>
+        <span class="code-label code-label--wrong">Mal — un único backend para todos los «discos»</span>
+        <pre><code class="language-yaml">volumeClaimTemplate:
+  spec:
+    accessModes: ["ReadWriteMany"]
+    storageClassName: nfs-slow
+</code></pre>
+        <span class="code-label code-label--right">Bien — un volumen de bloque por servidor</span>
+        <pre><code class="language-yaml">volumeClaimTemplate:
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: fast-block
+    resources:
+      requests:
+        storage: 500Gi
+</code></pre>
+        <p>Compartir el backend anula la premisa de fallos independientes. Además, el rendimiento de NFS suele ser incompatible con la carga de MinIO.</p>
+        <h3>3. Desplegar sin límites ni anti-affinity</h3>
+        <span class="code-label code-label--wrong">Mal — cuatro pods en el mismo nodo sin recursos</span>
+        <pre><code class="language-yaml">pools:
+  - servers: 4
+    volumesPerServer: 4   # sin resources ni affinity
+</code></pre>
+        <span class="code-label code-label--right">Bien — reservar recursos y repartir</span>
+        <pre><code class="language-yaml">resources:
+  requests: { cpu: "2", memory: 8Gi }
+  limits: { memory: 8Gi }
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+</code></pre>
+        <p>Sin límites, un pico de MinIO puede provocar el desalojo de otros servicios; sin anti-affinity, la alta disponibilidad es solo un número en el YAML.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> desplegar un tenant distribuido de laboratorio, comprobar que el Operator crea los PVC y que el clúster sobrevive a la pérdida de un pod.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea un clúster de laboratorio y el namespace:</strong>
+            <pre><code class="language-bash">kind create cluster --name minio-lab
+kubectl create namespace storage
+kubectl config set-context --current --namespace=storage
+</code></pre>
+            <p>Un solo nodo es suficiente para el ejercicio; recuerda que no representa alta disponibilidad real.</p>
+          </li>
+          <li>
+            <strong>Instala el Operator y espera a que esté listo:</strong>
+            <pre><code class="language-bash">kubectl apply -k "github.com/minio/operator"
+kubectl wait --for=condition=available deployment/minio-operator -n minio-operator --timeout=180s
+kubectl get crd tenants.minio.min.io
+</code></pre>
+          </li>
+          <li>
+            <strong>Crea el secret y el tenant de 4 servidores × 2 discos:</strong>
+            <pre><code class="language-bash">kubectl create secret generic lab-configuration \
+  --from-literal=config.env='export MINIO_ROOT_USER=labadmin
+export MINIO_ROOT_PASSWORD=labadmin-secreto'
+</code></pre>
+            <p>Aplica un Tenant como el de la sección 4, cambiando <code>servers: 4</code>, <code>volumesPerServer: 2</code>, <code>storage: 2Gi</code>, <code>storageClassName: standard</code> y sin <code>externalCertSecret</code> (<code>requestAutoCert: true</code>).</p>
+          </li>
+          <li>
+            <strong>Observa los recursos creados:</strong>
+            <pre><code class="language-bash">kubectl get tenant,pods,pvc -n storage
+kubectl get statefulset -n storage
+</code></pre>
+            <p>Espera 4 pods <code>Running</code> y 8 PVC <code>Bound</code> (4 servidores × 2 volúmenes). El número exacto de PVC es la primera comprobación de que entendiste el pool.</p>
+          </li>
+          <li>
+            <strong>Conecta, escribe y comprueba la recuperación:</strong>
+            <pre><code class="language-bash">kubectl port-forward svc/myminio 9000:9000 &amp;
+mc alias set lab https://localhost:9000 labadmin labadmin-secreto --insecure
+mc mb lab/documentos
+printf 'hola desde kubernetes\n' &gt; nota.txt
+mc cp nota.txt lab/documentos/pruebas/nota.txt
+kubectl delete pod myminio-pool-0-1 -n storage
+kubectl get pods -n storage -w
+mc cat lab/documentos/pruebas/nota.txt
+</code></pre>
+            <p>El pod vuelve a arrancar y el objeto sigue disponible. Con <code>mc admin info lab</code> verás el estado de los discos y del pool. Si el objeto desapareciera, revisa que los PVC sean independientes y no un único volumen compartido.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Borra el tenant con <code>kubectl delete tenant myminio -n storage</code> y observa qué recursos quedan. Los PVC pueden conservarse según la política de retención: entender qué sobrevive a un borrado es parte de operar el almacenamiento.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Del Compose al clúster sin perder un byte</h3>
+          <p>Diseña un plan de migración desde el MinIO de un solo nodo que usas en desarrollo hacia un tenant del Operator con cuatro servidores y TLS. El plan debe cubrir: creación del tenant, copia de buckets y objetos, usuarios y políticas, configuración de lifecycle y notificaciones, cambio de endpoint en la aplicación, verificación de integridad y vuelta atrás si algo falla.</p>
+          <p>Incluye una tabla de ventana y riesgos, y decide qué harías con las credenciales root y con las URLs presignadas que estén vivas durante el cambio. No escribas el resultado: deja el plan en un documento y critícalo como si fueras el revisor de guardia.</p>
+          <p><em>Pista: <code>mc mirror --preserve</code> copia objetos y metadatos, pero no copia políticas, usuarios ni configuración de eventos. Todo lo que no sea datos hay que recrearlo y probarlo por separado.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El Operator reconcilia un CRD <code>Tenant</code> y crea StatefulSets, servicios y PVC por ti.</li>
+          <li><code>pools[].servers</code> y <code>volumesPerServer</code> definen la topología; 4 servidores es el mínimo razonable para distribuido.</li>
+          <li>El modo standalone no se convierte en distribuido: se migra a otro tenant.</li>
+          <li>Los datos necesitan discos de bloque independientes; NFS y volúmenes compartidos no valen.</li>
+          <li>TLS se resuelve con auto-certificados o con cert-manager y <code>externalCertSecret</code>.</li>
+          <li>Se crece añadiendo pools; se actualiza cambiando la imagen, con backup y ventana.</li>
+          <li>Compose sigue siendo solo para un nodo de desarrollo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>kubectl apply -k github.com/minio/operator</code></td><td>Instala el Operator y sus CRD</td></tr>
+            <tr><td><code>kubectl get tenant -n storage</code></td><td>Muestra el estado de los tenants</td></tr>
+            <tr><td><code>kubectl get pods,pvc -n storage</code></td><td>Comprueba pods y volúmenes creados</td></tr>
+            <tr><td><code>kubectl port-forward svc/myminio 9000:9000</code></td><td>Acceso temporal a la API S3</td></tr>
+            <tr><td><code>mc admin info</code></td><td>Estado real del clúster y de los discos</td></tr>
+            <tr><td><code>kubectl edit tenant myminio -n storage</code></td><td>Cambia el estado deseado (imagen, pools…) con cuidado</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar Docker Compose para un clúster distribuido?</summary>
+            <div>
+              <p>No es un modo soportado. Compose sirve para un único proceso de MinIO en desarrollo. Para distribuido, usa el Operator en Kubernetes o la instalación baremetal con varios servidores y discos. Montar cuatro contenedores con Compose puede parecer que funciona, pero no tendrás las garantías ni el soporte de una topología validada.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos servidores y discos necesito para empezar?</summary>
+            <div>
+              <p>El ejemplo canónico es 4 servidores × 4 discos, que da 16 discos y permite tolerar fallos. Menos discos reducen la protección; más discos aumentan el rendimiento y la capacidad pero también el coste. La decisión depende de la criticidad y del presupuesto, no de una fórmula única.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El Operator crea el namespace y el secret de credenciales?</summary>
+            <div>
+              <p>El namespace lo creas tú. El secret de configuración también: el Tenant solo lo referencia por nombre. Así las credenciales no quedan escritas en el CRD y pueden gestionarse con tu flujo habitual de secretos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo actualizo MinIO sin downtime?</summary>
+            <div>
+              <p>El Operator hace una actualización gradual, pero «sin downtime» depende de que haya réplicas sanas y de que la aplicación reintente. Antes de cambiar la imagen, prueba en staging, haz backup y verifica que la versión nueva es compatible con tus datos. Un clúster de un solo servidor no puede actualizarse sin interrupción.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

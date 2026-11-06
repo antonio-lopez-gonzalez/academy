@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-endurecimiento-y-auditoria">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Endurecimiento y auditoría — Módulo 6 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Endurecimiento y auditoría</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La imagen <code>rabbitmq:4-management</code> está diseñada para que empieces en dos minutos: usuario <code>guest</code>, puerto 5672 abierto, management en 15672 y todos los plugins de management activos. Es una decisión correcta para un tutorial y una mala configuración para un broker que atiende tráfico real. Endurecer no es añadir una capa al final: es revisar cada superficie que el broker expone y decidir si debe existir.</p>
+        <p>Un broker de mensajería es un objetivo atractivo: concentra credenciales, datos de negocio y la capacidad de parar el sistema entero. El modelo de amenaza habitual no es un atacante sofisticado, sino algo más mundano:</p>
+        <table>
+          <thead><tr><th>Amenaza</th><th>Vector típico</th><th>Consecuencia</th></tr></thead>
+          <tbody>
+            <tr><td>UI expuesta a Internet</td><td><code>15672</code> publicado en <code>0.0.0.0</code> con contraseña débil</td><td>Lectura de mensajes, publicación, borrado de colas.</td></tr>
+            <tr><td>Credencial compartida</td><td>Un usuario <code>admin</code> en todos los servicios y personas</td><td>No se puede revocar a un empleado sin romper el sistema; sin atribución.</td></tr>
+            <tr><td>Usuario por defecto activo</td><td><code>guest</code> con acceso remoto habilitado</td><td>Cualquiera que escanee el puerto entra con <code>guest/guest</code>.</td></tr>
+            <tr><td>Tráfico en claro</td><td>AMQP por 5672 entre redes no confiables</td><td>Credenciales y cargas legibles en la red.</td></tr>
+            <tr><td>Permisos amplios</td><td><code>".*"</code> en las tres columnas</td><td>Un bug borra la topología; una fuga destruye el vhost.</td></tr>
+            <tr><td>Sin auditoría</td><td>Nadie revisa usuarios, políticas ni conexiones</td><td>Un acceso no autorizado pasa desapercibido durante meses.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">Endurecer es reducir superficie, no acumular flags</p>
+          <p>Cada puerto, plugin, usuario y permiso que no necesitas es una vía de entrada que no tienes que defender. La lista de comprobación final no es un ritual: es la lista de cosas que alguien puede usar contra ti si las dejas abiertas.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Inventario de superficies</h3>
+        <table>
+          <thead><tr><th>Puerto</th><th>Protocolo / uso</th><th>¿Quién debe llegar?</th></tr></thead>
+          <tbody>
+            <tr><td><code>4369</code></td><td>epmd, descubrimiento de nodos Erlang</td><td>Solo nodos del clúster y herramientas de administración.</td></tr>
+            <tr><td><code>25672</code></td><td>Distribución Erlang entre nodos y CLI</td><td>Solo nodos del clúster; nunca Internet.</td></tr>
+            <tr><td><code>5672</code></td><td>AMQP en claro</td><td>Nadie en producción si hay TLS; solo localhost en desarrollo.</td></tr>
+            <tr><td><code>5671</code></td><td>AMQP sobre TLS</td><td>Aplicaciones, desde la red privada.</td></tr>
+            <tr><td><code>15672</code></td><td>Management UI/API en claro</td><td>Nadie; se sustituye por 15671 o se encierra en localhost.</td></tr>
+            <tr><td><code>15671</code></td><td>Management UI/API sobre TLS</td><td>Operadores, por VPN o bastión.</td></tr>
+            <tr><td><code>15692</code></td><td>Prometheus (plugin)</td><td>Solo el scraper de métricas.</td></tr>
+            <tr><td><code>1883</code> / <code>8883</code></td><td>MQTT (si el plugin está activo)</td><td>Solo si el negocio usa MQTT; si no, se desactiva.</td></tr>
+            <tr><td><code>61613</code> / <code>61614</code></td><td>STOMP (si el plugin está activo)</td><td>Solo si el negocio usa STOMP.</td></tr>
+          </tbody>
+        </table>
+        <p>La regla es simple: <strong>los puertos de clúster solo se abren entre nodos</strong>; los de cliente, solo desde la red de aplicaciones; los de administración, solo desde la red de operación. Todo lo demás se cierra en el cortafuegos, no solo en la configuración de RabbitMQ.</p>
+        <pre><code class="language-text">Internet        DMZ / VPN            red de aplicaciones        red de datos
+   |                |                        |                       |
+   X   sin rutas    +--&gt; bastión -----------+                       |
+                    |    (15671 TLS)         |                       |
+                    |                        +--&gt; api/worker --------+
+                    |                             amqps 5671        |
+                    |                                               +--&gt; rabbitmq
+                    |                                                   5671, 15671
+                    |                                                   4369/25672 solo entre nodos
+                    X  nadie llega a 5672/15672 desde fuera</code></pre>
+
+        <h3>Identidad: menos cuentas y mejores</h3>
+        <ul>
+          <li><strong>Elimina <code>guest</code></strong>. No lo desactives «temporalmente»: bórralo y crea un administrador nominativo.</li>
+          <li><strong>Una cuenta por persona y por servicio</strong>. Compartir cuenta impide revocar, atribuir y rotar.</li>
+          <li><strong>Contraseñas generadas</strong> de al menos 24 caracteres aleatorios, guardadas en un gestor de secretos, nunca en Git ni en una variable de compose comprometida.</li>
+          <li><strong>Rotación periódica</strong> y tras la salida de una persona. La rotación se ensaya: si el procedimiento no está probado, no existe.</li>
+          <li><strong>Tags mínimos</strong>: <code>administrator</code> solo para el equipo de plataforma; <code>monitoring</code> para observabilidad; nada para APIs y workers.</li>
+          <li><strong>MFA en el proveedor de identidad</strong> si la UI se federó con OAuth/LDAP; RabbitMQ por sí solo no ofrece segundo factor para usuarios internos.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p class="callout__title">El export de definiciones contiene hashes de contraseñas</p>
+          <p><code>export_definitions</code> incluye usuarios, hashes y permisos. Versionarlo está bien; subirlo a un repositorio público o adjuntarlo a un ticket, no. Trátalo como un secreto, o exporta solo vhosts, políticas y colas con una herramienta que filtre usuarios.</p>
+        </div>
+
+        <h3>Transporte y administración</h3>
+        <p>En producción, el objetivo es que no exista una vía en claro. Eso significa <code>listeners.tcp = none</code>, management solo en <code>15671</code>, y el puerto 15671 escuchando en una interfaz privada o detrás de un proxy con autenticación. Si necesitas la UI en localhost para depurar, publica <code>127.0.0.1:15671:15671</code>, no <code>15671:15671</code>.</p>
+        <p>El detalle de TLS (CA, SAN, mTLS, rotación) está en <a href="02-tls.html">TLS en el broker</a>. Aquí basta con la decisión: sin TLS no hay endurecimiento posible, porque las credenciales viajan legibles.</p>
+
+        <h3>Configuración: desactivar lo que no se usa</h3>
+        <pre><code class="language-bash"># Qué plugins están activos de verdad
+docker exec rabbitmq rabbitmq-plugins list -e
+
+# Desactivar lo que no forma parte del producto
+docker exec rabbitmq rabbitmq-plugins disable rabbitmq_mqtt
+docker exec rabbitmq rabbitmq-plugins disable rabbitmq_stomp
+docker exec rabbitmq rabbitmq-plugins disable rabbitmq_federation
+docker exec rabbitmq rabbitmq-plugins disable rabbitmq_shovel</code></pre>
+        <p>Cada plugin activo añade endpoints, configuración y código que hay que parchear. MQTT y STOMP son útiles si los usas; si no, son superficie regalada. Lo mismo con <code>rabbitmq_management</code>: si solo lo usas para métricas, quizá te baste Prometheus y puedas cerrar la UI.</p>
+        <p>Fija también por escrito <code>listeners.tcp = none</code>, la IP privada de management, <code>log.console.level = info</code> y la imagen con digest: son decisiones que un despliegue reproducible no debe improvisar.</p>
+        <h3>Auditoría: qué mirar y cada cuánto</h3>
+        <p>RabbitMQ no trae un registro de auditoría de negocio con autor y acción listos para compliance. Lo que sí ofrece son piezas que, combinadas, cuentan la historia:</p>
+        <table>
+          <thead><tr><th>Fuente</th><th>Qué responde</th><th>Cómo se consulta</th></tr></thead>
+          <tbody>
+            <tr><td>Log del nodo</td><td>Fallos de login, cierres de conexión, errores de política, alarmas</td><td><code>docker compose logs rabbitmq</code> o el fichero de log</td></tr>
+            <tr><td>Event exchange</td><td>Qué conexiones, colas, usuarios y permisos se crearon o cambiaron, y cuándo</td><td>Plugin <code>rabbitmq_event_exchange</code>, cola enlazada a <code>amq.rabbitmq.event</code></td></tr>
+            <tr><td>Definiciones exportadas</td><td>Estado declarado: usuarios, vhosts, permisos, políticas, colas</td><td><code>rabbitmqctl export_definitions</code> + diff en Git</td></tr>
+            <tr><td>Management API</td><td>Conexiones, canales, consumidores y profundidad de colas en el momento</td><td><code>GET /api/connections</code>, <code>/api/queues</code></td></tr>
+            <tr><td>Métricas</td><td>Tendencias y alertas</td><td>Prometheus + Grafana (ver <a href="../05-operacion/04-observabilidad.html">observabilidad</a>)</td></tr>
+          </tbody>
+        </table>
+        <p>El plugin de eventos publica mensajes con <strong>cuerpo vacío</strong> y los atributos en cabeceras. Se puede consumir y volcar a un sistema de logs, o alertar en tiempo real:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect(process.env.RABBITMQ_URL);
+const ch = await conn.createChannel();
+
+const { queue } = await ch.assertQueue('', { exclusive: true });
+await ch.bindQueue(queue, 'amq.rabbitmq.event', 'user.#');
+await ch.bindQueue(queue, 'amq.rabbitmq.event', 'permission.#');
+
+await ch.consume(queue, (msg) =&gt; {
+  const event = msg.fields.routingKey;
+  const who = msg.properties.headers?.name ?? 'desconocido';
+  console.log(JSON.stringify({ event, who, at: new Date().toISOString() }));
+  ch.ack(msg);
+});</code></pre>
+        <p>Fíjate en que la cola es exclusiva y autoborrable: es un consumidor de auditoría, no un almacén. Para conservar eventos, publica en una cola durable con retención y envíalos a tu plataforma de logs.</p>
+
+        <h3>Mínimo privilegio y revisión periódica</h3>
+        <p>Los permisos se pudren: alguien añade <code>configure</code> para una migración y nunca lo quita; un servicio desaparece y su usuario sigue activo. Una revisión trimestral debería responder:</p>
+        <ul>
+          <li>¿Qué usuarios existen y quién es el dueño de cada uno?</li>
+          <li>¿Quién tiene el tag <code>administrator</code> y está justificado?</li>
+          <li>¿Qué identidades tienen <code>".*"</code> en algún vhost?</li>
+          <li>¿Hay cuentas sin conexiones en 90 días? ¿Se pueden desactivar?</li>
+          <li>¿Las políticas y los límites coinciden con lo versionado?</li>
+        </ul>
+        <p>La revisión no es un documento que se firma: es un script que produce una lista y un responsable que la revisa. Si no genera una acción concreta, no sirve.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Este es el mínimo endurecimiento que deberías aplicar antes de que el broker vea tráfico real. Primero, inspecciona lo que hay:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics listeners
+docker exec rabbitmq rabbitmqctl list_users
+docker exec rabbitmq rabbitmqctl list_permissions -p /</code></pre>
+        <pre><code class="language-text">Interface: [::], port: 25672, protocol: clustering, purpose: inter-node and CLI tool communication
+Interface: [::], port: 5672, protocol: amqp, purpose: AMQP 0-9-1 and AMQP 1.0
+Interface: [::], port: 15672, protocol: http, purpose: HTTP API
+Interface: [::], port: 1883, protocol: mqtt, purpose: MQTT</code></pre>
+        <p>Ese puerto 1883 es el plugin MQTT que nadie pidió. Ese 5672 en <code>[::]</code> escucha en todas las interfaces. Y <code>guest</code> sigue ahí.</p>
+        <p>Aplica el mínimo:</p>
+        <pre><code class="language-bash"># 1. Admin nominativo y contraseña generada
+docker exec rabbitmq rabbitmqctl add_user ana.admin "$(openssl rand -base64 32)"
+docker exec rabbitmq rabbitmqctl set_user_tags ana.admin administrator
+docker exec rabbitmq rabbitmqctl set_permissions -p / ana.admin ".*" ".*" ".*"
+
+# 2. Fuera el usuario por defecto
+docker exec rabbitmq rabbitmqctl delete_user guest
+
+# 3. Fuera plugins que no se usan
+docker exec rabbitmq rabbitmq-plugins disable rabbitmq_mqtt
+
+# 4. Solo TLS y UI en localhost
+#    (en rabbitmq.conf)
+#    listeners.tcp = none
+#    management.ssl.port = 15671
+#    management.ssl.ip = 127.0.0.1
+#    y reiniciar el contenedor</code></pre>
+        <p>Verifica el resultado con la misma orden que usaste para inspeccionar:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics listeners
+docker exec rabbitmq rabbitmqctl list_users</code></pre>
+        <p>Ahora no debe aparecer <code>guest</code>, no debe haber un listener AMQP en claro y MQTT no debe estar escuchando. Si algo sigue ahí, no es un detalle cosmético: es una puerta.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">La contraseña del ejemplo no se queda en el historial</p>
+          <p><code>openssl rand</code> en el shell deja la contraseña en el historial y en la lista de procesos. En producción se genera en el gestor de secretos y se inyecta como variable de entorno o fichero; el comando que ves es para el laboratorio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller monta un broker con tres redes: aplicaciones, operación y datos. La configuración queda así:</p>
+        <pre><code class="language-text">┌──────────────────────────────────────────────────────────────┐
+│ red de aplicaciones (sin salida a Internet)                  │
+│   api ──┐                                                    │
+│   worker ├── amqps 5671, certificado de cliente, usuario app │
+│   jobs ──┘                                                    │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                    ┌───────▼────────┐
+                    │   rabbitmq     │  15671 TLS solo en la red
+                    │  4.4-management│  de operación
+                    │  sin 5672      │  4369/25672 solo clúster
+                    └───────┬────────┘
+                            │
+┌───────────────────────────▼──────────────────────────────────┐
+│ red de operación                                             │
+│   bastión/VPN ──&gt; 15671 (UI)                                 │
+│   prometheus  ──&gt; 15692 (métricas, solo lectura)             │
+│   log shipper ──&gt; consume amq.rabbitmq.event                 │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+        <p>El contrato de operación tiene cuatro piezas que se revisan en cada cambio:</p>
+        <table>
+          <thead><tr><th>Pieza</th><th>Qué se comprueba</th><th>Frecuencia</th></tr></thead>
+          <tbody>
+            <tr><td>Identidades</td><td>Usuarios activos, tags, permisos, última conexión</td><td>Trimestral y en cada alta/baja</td></tr>
+            <tr><td>Superficie</td><td>Puertos escuchando, plugins activos, listeners TLS</td><td>Cada despliegue y semanal</td></tr>
+            <tr><td>Secretos</td><td>Rotación de contraseñas y certificados, caducidades</td><td>Calendario con alertas</td></tr>
+            <tr><td>Deriva</td><td>Diff entre definiciones exportadas y Git</td><td>Diario en CI</td></tr>
+          </tbody>
+        </table>
+        <p>La auditoría no vive en un wiki: vive en un job que compara el estado del broker con el declarado. Un diff inesperado abre un ticket; un cambio intencionado se aprueba y se aplica desde el repositorio. Así el broker no se convierte en una caja negra que solo una persona sabe tocar.</p>
+        <pre><code class="language-bash"># Auditoría semanal: usuarios con privilegios amplios
+docker exec rabbitmq rabbitmqctl list_permissions -p taller-prod \
+  | awk 'NR&gt;1 &amp;&amp; $2==".*" &amp;&amp; $3==".*" &amp;&amp; $4==".*" {print "revisar:", $1}'
+
+# Conexiones actuales y su usuario
+docker exec rabbitmq rabbitmqctl list_connections user peer_host state
+
+# Políticas frente a lo versionado
+docker exec rabbitmq rabbitmqctl list_policies -p taller-prod</code></pre>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Publicar solo 5671/15671 y solo en redes privadas</td><td>Mapear 5672 o 15672 a <code>0.0.0.0</code></td><td>Los puertos en claro son la vía más simple para leer o borrar mensajes.</td></tr>
+            <tr><td>Borrar <code>guest</code> y crear admins nominativos</td><td>Confiar en <code>loopback_users</code> para siempre</td><td>Una configuración copiada puede reactivar el acceso remoto.</td></tr>
+            <tr><td>Una identidad por servicio y por persona</td><td>Credenciales compartidas y usuarios «genéricos»</td><td>Permite revocar, atribuir y rotar sin efectos colaterales.</td></tr>
+            <tr><td>Tags mínimos y revisados</td><td><code>administrator</code> para todo el equipo</td><td>El tag abre la gestión completa; no es un permiso de lectura.</td></tr>
+            <tr><td>Desactivar plugins y listeners que no se usan</td><td>Dejar MQTT/STOMP «por si acaso»</td><td>Cada endpoint extra es código que hay que actualizar y vigilar.</td></tr>
+            <tr><td>Centralizar secretos y rotar con calendario</td><td>Contraseñas en <code>.env</code> o en la imagen</td><td>Una fuga en Git es una fuga para siempre.</td></tr>
+            <tr><td>Consumir eventos y comparar definiciones</td><td>Descubrir un usuario nuevo meses después</td><td>La auditoría detecta cambios no autorizados y deriva de configuración.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Publicar la management UI en Internet</h3>
+        <span class="code-label code-label--wrong">Mal — UI accesible desde cualquier IP</span>
+        <pre><code class="language-yaml">ports:
+  - "5672:5672"
+  - "15672:15672"</code></pre>
+        <span class="code-label code-label--right">Bien — TLS y solo en la interfaz privada</span>
+        <pre><code class="language-yaml">ports:
+  - "5671:5671"
+  - "127.0.0.1:15671:15671"</code></pre>
+        <p>La UI permite publicar mensajes, purgar colas y cambiar políticas. Exponerla convierte un escaneo de puertos en una consola de administración. El cifrado no arregla la exposición: la mueve a otro puerto.</p>
+
+        <h3>2. Reactivar <code>guest</code> para «poder conectarme»</h3>
+        <span class="code-label code-label--wrong">Mal — acceso remoto al usuario por defecto</span>
+        <pre><code class="language-text">loopback_users.guest = false</code></pre>
+        <span class="code-label code-label--right">Bien — usuario propio y <code>guest</code> eliminado</span>
+        <pre><code class="language-bash">rabbitmqctl add_user ana.admin "$(openssl rand -base64 32)"
+rabbitmqctl set_user_tags ana.admin administrator
+rabbitmqctl delete_user guest</code></pre>
+        <p><code>guest/guest</code> es la primera credencial que prueba cualquier escáner. Si necesitas conectarte desde otra máquina, crea un usuario con permisos limitados, no abras el de por defecto.</p>
+
+        <h3>3. Una sola cuenta para todo</h3>
+        <span class="code-label code-label--wrong">Mal — el mismo admin en CI, API y portátiles</span>
+        <pre><code class="language-bash"># .env de todos los servicios y de todas las personas
+RABBITMQ_URL=amqp://admin:admin123@rabbitmq:5672/</code></pre>
+        <span class="code-label code-label--right">Bien — identidades separadas y permisos acotados</span>
+        <pre><code class="language-text">CI:      taller-deploy  configure/write/read ^taller\.
+API:     taller-api     write/read ^taller\.
+worker:  taller-worker  read ^taller\.jobs.*, write ^taller\.
+persona: ana.admin      administrator + MFA en el IdP</code></pre>
+        <p>Con una cuenta única no puedes revocar a un empleado sin romper la API, ni saber quién borró la cola, ni rotar sin coordinar a todo el mundo.</p>
+
+        <h3>4. Desactivar la verificación de TLS para que arranque</h3>
+        <span class="code-label code-label--wrong">Mal — «ya funciona»</span>
+        <pre><code class="language-javascript">amqp.connect('amqps://user:pass@broker:5671', { rejectUnauthorized: false });</code></pre>
+        <span class="code-label code-label--right">Bien — corregir la CA o el hostname</span>
+        <pre><code class="language-javascript">amqp.connect('amqps://user:pass@broker:5671', {
+  ca: [readFileSync('/run/secrets/ca.pem')],
+  servername: 'broker',
+});</code></pre>
+        <p>El error de certificado es una señal, no un obstáculo. Desactivar la verificación convierte una conexión cifrada en una conexión cifrada con quien sea. El detalle está en <a href="02-tls.html">TLS en el broker</a>.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> endurecer un broker de laboratorio, comprobar la superficie resultante y montar una auditoría mínima de eventos y de configuración.</p>
+        <ol class="steps">
+          <li>
+            <strong>Fotografía el estado inicial:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics listeners
+docker exec rabbitmq rabbitmqctl list_users
+docker exec rabbitmq rabbitmqctl list_permissions -p /
+docker exec rabbitmq rabbitmq-plugins list -e</code></pre>
+            <p>Anota puertos, usuarios y plugins. Ese es tu «antes».</p>
+          </li>
+          <li>
+            <strong>Elimina la cuenta por defecto y crea un admin nominativo</strong> con contraseña generada. Verifica con <code>list_users</code> que solo queda tu cuenta y que tiene el tag <code>administrator</code>.</li>
+          <li>
+            <strong>Cierra la superficie:</strong> desactiva MQTT y STOMP si no los usas, pon <code>listeners.tcp = none</code> en <code>rabbitmq.conf</code>, configura TLS en 5671 y management en 15671 sobre <code>127.0.0.1</code>. Reinicia y comprueba con <code>rabbitmq-diagnostics listeners</code> que no queda ningún listener en claro.</li>
+          <li>
+            <strong>Activa el event exchange y consume eventos de identidad:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_event_exchange</code></pre>
+            <p>Ejecuta el consumidor del ejemplo con una cola exclusiva enlazada a <code>user.#</code> y <code>permission.#</code>. En otra terminal, crea un usuario de prueba y observa el evento <code>user.created</code>; bórralo y observa <code>user.deleted</code>. Comprueba que el cuerpo del mensaje está vacío y los datos vienen en cabeceras.</p>
+          </li>
+          <li>
+            <strong>Provoca un fallo de autenticación</strong> con una contraseña incorrecta y búscalo en el log:
+            <pre><code class="language-bash">docker compose logs rabbitmq | grep -i "login failed\|authentication"</code></pre>
+            <p>Debe aparecer el usuario y el host de origen. Ese es el rastro que usarás en una investigación.</p>
+          </li>
+          <li>
+            <strong>Versiona y compara:</strong> exporta las definiciones a un directorio del repositorio, haz un cambio manual (por ejemplo, crea un usuario extra) y vuelve a exportar. Diff de los dos ficheros: el cambio no autorizado debe aparecer. Cierra el ejercicio decidiendo qué harías con ese diff en CI.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprueba el «después» con las mismas órdenes</p>
+          <p>La tentación es fiarse de la configuración escrita. Ejecuta otra vez <code>rabbitmq-diagnostics listeners</code>, <code>list_users</code> y <code>list_permissions</code>: el estado real es el que responde el broker, no el que dice el fichero.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Auditoría con atribución y break-glass</h3>
+          <p>Diseña un sistema de auditoría que detecte en menos de cinco minutos un cambio de privilegios no autorizado en producción, y que permita a una persona de guardia obtener acceso de emergencia sin usar una cuenta compartida.</p>
+          <p>Debe cubrir: consumo de <code>user.#</code>, <code>permission.#</code>, <code>policy.#</code> y <code>vhost.#</code>; correlación con el cambio aprobado en Git; alerta si el cambio ocurre fuera de una ventana o sin PR; y un procedimiento <em>break-glass</em> con credenciales efímeras, registro de quién las usó y caducidad automática. Explica qué eventos no te dan atribución suficiente y cómo la obtendrías.</p>
+          <p><em>Pista: el event exchange te dice <em>qué</em> y <em>cuándo</em>, pero no siempre <em>quién</em> ni <em>desde dónde</em>; y los eventos de autenticación exitosa pueden ser muy ruidosos. Piensa en qué eventos son señal y cuáles son línea base.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Endurecer es <strong>reducir superficie</strong>: puertos, plugins, usuarios y permisos que no necesitas.</li>
+          <li>Solo 5671 y 15671 deben ser accesibles, y solo desde redes privadas; 4369 y 25672, solo entre nodos.</li>
+          <li>Borra <code>guest</code>, usa identidades nominativas y por servicio, y guarda los secretos fuera de Git.</li>
+          <li>Los tags no son permisos: limita <code>administrator</code> y revisa quién lo tiene.</li>
+          <li>Audita con logs, event exchange y diff de definiciones; una auditoría sin responsable no cambia nada.</li>
+          <li>La revisión de accesos es periódica y produce acciones: revocar, rotar, justificar o eliminar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comprobación</th><th>Comando</th></tr></thead>
+          <tbody>
+            <tr><td>Puertos y listeners</td><td><code>rabbitmq-diagnostics listeners</code></td></tr>
+            <tr><td>Usuarios y tags</td><td><code>rabbitmqctl list_users</code></td></tr>
+            <tr><td>Permisos por vhost</td><td><code>rabbitmqctl list_permissions -p &lt;vhost&gt;</code></td></tr>
+            <tr><td>Plugins activos</td><td><code>rabbitmq-plugins list -e</code></td></tr>
+            <tr><td>Conexiones actuales</td><td><code>rabbitmqctl list_connections user peer_host state</code></td></tr>
+            <tr><td>Definiciones</td><td><code>rabbitmqctl export_definitions &lt;file&gt;</code></td></tr>
+            <tr><td>Eventos</td><td><code>amq.rabbitmq.event</code> con <code>user.#</code>, <code>permission.#</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>Checklist de producción</h3>
+        <table>
+          <thead><tr><th>Área</th><th>Debe estar en…</th></tr></thead>
+          <tbody>
+            <tr><td>Red</td><td>Solo 5671/15671 accesibles; 4369/25672 segmentados; sin 5672/15672.</td></tr>
+            <tr><td>TLS</td><td>Servidor verificado, mTLS si aplica, certificados con caducidad monitorizada.</td></tr>
+            <tr><td>Identidades</td><td><code>guest</code> eliminado, una cuenta por servicio, tags mínimos.</td></tr>
+            <tr><td>Autorización</td><td>Permisos anclados, sin <code>".*"</code> en runtime, deploy separado de la app.</td></tr>
+            <tr><td>Secretos</td><td>Gestor de secretos, rotación probada, nada en Git ni en la imagen.</td></tr>
+            <tr><td>Configuración</td><td>Versionada, diff diario, plugins innecesarios desactivados.</td></tr>
+            <tr><td>Auditoría</td><td>Eventos de identidad y permisos, alertas y responsable asignado.</td></tr>
+            <tr><td>Operación</td><td>Runbook de incidentes, backups de definiciones y pruebas de restauración.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Basta con cerrar los puertos para considerar el broker seguro?</summary>
+            <div>
+              <p>No. El cortafuegos reduce la superficie, pero un cliente comprometido dentro de la red sigue necesitando permisos acotados y TLS. La seguridad es la combinación de red, identidad, autorización, transporte y auditoría; quitar una capa no compensa las demás. Un broker solo accesible por VPN pero con <code>".*"</code> para todos sigue siendo frágil.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si uso TLS y mTLS, ¿puedo simplificar los permisos?</summary>
+            <div>
+              <p>No. mTLS autentica la máquina, no autoriza operaciones. Un worker con certificado válido y permisos amplios puede borrar la topología igual. De hecho, mTLS facilita tener identidades por servicio, lo que hace más fácil aplicar mínimo privilegio, no menos necesario.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo saber quién publicó un mensaje concreto?</summary>
+            <div>
+              <p>AMQP no transporta una identidad de autor firmada por el broker. Puedes propagar un identificador de usuario o de traza en las cabeceras del mensaje, pero es responsabilidad del productor y se puede falsificar. Para atribución real, combina identidades por servicio, el evento <code>connection.created</code> y logs de aplicación con el mismo <code>jobId</code> o <code>traceId</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si sospecho que una credencial se ha filtrado?</summary>
+            <div>
+              <p>Primero revoca: cambia la contraseña o elimina el usuario, lo que cierra sus conexiones. Después revisa el event exchange y los logs para ver qué conexiones y operaciones hubo, y las colas para detectar mensajes inesperados. Finalmente rota los secretos relacionados y añade la detección que faltaba. La rotación de emergencia debe estar escrita y probada antes del incidente.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

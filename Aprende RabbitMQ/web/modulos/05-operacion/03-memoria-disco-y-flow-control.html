@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-memoria-disco-y-flow-control">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memoria, disco y flow control — Módulo 5 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Memoria, disco y flow control</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Son las tres de la mañana y la API empieza a devolver <code>503</code>. El broker responde al puerto, la management UI carga, los consumidores siguen procesando… pero las publicaciones se quedan colgadas. En el panel aparece una alarma de disco: al nodo le quedan 40 MB libres. RabbitMQ ha dejado de leer de las conexiones que publican para no llenar el disco por completo.</p>
+        <p>Ese comportamiento es una <strong>protección</strong>, no un fallo. El broker prefiere bloquear a los productores antes que quedarse sin memoria o sin disco y ser matado por el sistema operativo. Entender las alarmas, el <em>paging</em> y el <em>flow control</em> es lo que separa «el broker se cayó» de «el broker nos protegió y hay que actuar».</p>
+        <p>La lección explica los dos watermarks (memoria y disco), qué se bloquea exactamente, cómo se entera el cliente, cómo se dimensiona la capacidad y qué hacer —y qué no hacer— cuando la alarma salta. La regla central: una alarma no se silencia subiendo el umbral; se resuelve bajando la presión o ampliando el recurso.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el fallo en producción casi nunca es «RabbitMQ no puede». Es «el disco se llenó porque una cola sin consumidores acumuló tres millones de mensajes». Saber leer esa cadena evita reiniciar el broker y perder el backlog.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Los dos watermarks</h3>
+        <table>
+          <thead><tr><th>Ajuste</th><th>Valor por defecto</th><th>Qué mide</th><th>Cuándo salta</th></tr></thead>
+          <tbody>
+            <tr><td><code>vm_memory_high_watermark.relative</code></td> <td><code>0.6</code></td> <td>Memoria usada por el proceso Erlang respecto al total detectado</td> <td>Al superar el 60 % de la RAM</td></tr>
+            <tr><td><code>vm_memory_high_watermark.absolute</code></td> <td>—</td> <td>Límite absoluto en bytes o unidades</td> <td>Al superar esa cifra; tiene prioridad sobre el relativo</td></tr>
+            <tr><td><code>vm_memory_high_watermark_paging_ratio</code></td> <td><code>0.5</code></td> <td>Fracción del watermark a la que empieza el paging</td> <td>Al llegar al 50 % del límite de memoria</td></tr>
+            <tr><td><code>disk_free_limit.absolute</code></td> <td><code>50MB</code></td> <td>Espacio libre en la partición de datos</td> <td>Al bajar de ese espacio</td></tr>
+          </tbody>
+        </table>
+        <p>El valor por defecto de 50 MB de disco es un mínimo de emergencia, no una recomendación de producción. En un servidor real se configura en GB, con margen para que el broker siga escribiendo mientras tú reaccionas. En contenedores, ojo con la memoria: Erlang puede detectar la RAM del host y no la del límite del contenedor. Si usas Docker con <code>--memory</code>, fija un watermark absoluto para no llevarte sorpresas.</p>
+        <pre><code class="language-ini"># /etc/rabbitmq/rabbitmq.conf
+vm_memory_high_watermark.relative = 0.6
+vm_memory_high_watermark_paging_ratio = 0.5
+
+# en producción, un límite de disco realista para tu volumen
+disk_free_limit.absolute = 10GB</code></pre>
+        <p>También se ajustan en caliente, sin reiniciar:</p>
+        <pre><code class="language-bash">rabbitmqctl set_vm_memory_high_watermark 0.7
+rabbitmqctl set_vm_memory_high_watermark absolute 2GB
+rabbitmqctl set_disk_free_limit 10GB</code></pre>
+
+        <h3>Qué pasa exactamente cuando salta una alarma</h3>
+        <p>Cuando la memoria supera el watermark o el disco libre baja del límite, el nodo declara una alarma y <strong>deja de leer de las conexiones que publican</strong>. El efecto es una backpresión natural: el socket se llena, el cliente se bloquea y el broker gana tiempo.</p>
+        <pre><code class="language-text">ANTES DE LA ALARMA
+
+  publicador ---&gt; [socket] ---&gt; broker ---&gt; cola ---&gt; consumidor
+                                |
+                                +---&gt; disco (mensajes persistentes)
+
+CON ALARMA DE MEMORIA O DISCO
+
+  publicador ---&gt; [socket lleno] -X   broker deja de leer
+                                      |
+  consumidor &lt;--- sigue entregando &lt;--+---&gt; cola se vacía
+                                      |
+                                      +---&gt; disco se libera / memoria baja
+
+  El consumidor NO se bloquea. Solo se frena la entrada.</code></pre>
+        <p>Detalles que conviene tener claros:</p>
+        <ul>
+          <li>Las conexiones que <strong>solo consumen no se bloquean</strong>: las entregas continúan y la cola puede drenarse sola.</li>
+          <li>El <strong>heartbeat se desactiva</strong> mientras la conexión está bloqueada, para no cerrarla por inactividad.</li>
+          <li>La management UI muestra las conexiones como <code>blocking</code> (no han intentado publicar) o <code>blocked</code> (publicaron y están pausadas).</li>
+          <li>Los clientes compatibles reciben <code>connection.blocked</code> con el motivo; amqplib emite <code>blocked</code> y <code>unblocked</code>.</li>
+          <li>El mensaje que estaba en vuelo puede quedar sin confirmar: el productor debe tratarlo como fallo y reintentar con idempotencia cuando se libere.</li>
+        </ul>
+
+        <h3>Paging: bajar mensajes al disco</h3>
+        <p>Las colas clásicas mantienen mensajes en memoria. Antes de llegar al watermark, al alcanzar el <code>paging_ratio</code> (por defecto la mitad del límite), RabbitMQ empieza a <strong>paginar</strong> mensajes al disco para liberar RAM. No los pierde: los trae de vuelta cuando hace falta. El paging protege la memoria a costa de latencia y de IOPS.</p>
+        <p>Las quorum queues ya escriben todo en disco y solo mantienen un índice en memoria. Por eso el paging apenas les afecta: su problema no es la RAM, es el <strong>espacio y la velocidad del disco</strong>. Si tu carga es de quorum queues y ves la memoria subir, mira el número de mensajes en cola y los índices, no el contenido.</p>
+
+        <h3>Flow control: el freno interno</h3>
+        <p>Las alarmas son globales del nodo. Además, RabbitMQ aplica <strong>control de flujo por créditos</strong> entre canales, colas y procesos: si una cola o un disco no puede seguir el ritmo, el broker reduce la ventana de mensajes que acepta del publicador. No es un ajuste que configures; es el mecanismo que evita que un productor rápido desborde a un consumidor lento.</p>
+        <p>En el cliente se manifiesta de tres formas:</p>
+        <ol>
+          <li><code>channel.publish()</code> devuelve <code>false</code>: el buffer de escritura está lleno. Hay que esperar al evento <code>drain</code> antes de seguir publicando.</li>
+          <li>La promesa de <code>waitForConfirms()</code> tarda más: el broker no confirma hasta que puede procesar.</li>
+          <li>La conexión emite <code>blocked</code>: alarma de recurso, no simple lentitud.</li>
+        </ol>
+        <pre><code class="language-javascript">import { once } from 'node:events';
+
+if (!ch.publish('taller.jobs', 'facturas.generar', body, { persistent: true })) {
+  await once(ch, 'drain');          // esperar a que el buffer se vacíe
+}</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">No confundas flow control con alarma</p>
+          <p>El flow control es normal y transitorio: el broker está regulando el ritmo. Una alarma es un recurso del nodo por encima del umbral y requiere intervención. Si reaccionas a ambas igual (reconectando o subiendo límites), conviertes una señal en un incidente.</p>
+        </div>
+
+        <h3>Qué hacer cuando el publicador se bloquea</h3>
+        <table>
+          <thead><tr><th>Acción</th><th>Cuándo</th><th>Efecto</th></tr></thead>
+          <tbody>
+            <tr><td>Dejar de publicar y esperar <code>unblocked</code></td><td>Siempre, como primera reacción</td><td>El broker drena la cola y libera el recurso; no se pierde nada.</td></tr>
+            <tr><td>Acelerar consumidores</td><td>Hay backlog y consumidores lentos</td><td>Baja la memoria/el disco al procesar los mensajes.</td></tr>
+            <tr><td>Revisar colas sin consumidores</td><td>El disco baja y no hay tráfico</td><td>Una cola huérfana puede ser el origen del 90 % del espacio.</td></tr>
+            <tr><td>Aplicar límites de longitud o TTL</td><td>El backlog es estructural</td><td>Evita que la cola crezca sin techo; decide qué se descarta.</td></tr>
+            <tr><td>Ampliar disco o memoria</td><td>El recurso es insuficiente para la carga legítima</td><td>Resuelve la causa, no el síntoma.</td></tr>
+            <tr><td>Subir el watermark</td><td>Solo con margen real y diagnóstico</td><td>Retrasa la alarma; si no hay recursos, la convierte en caída.</td></tr>
+          </tbody>
+        </table>
+        <p><strong>Lo que no se hace</strong>: reconectar en bucle (cada reconexión vuelve a publicar y multiplica la presión), ignorar el evento <code>blocked</code> y seguir publicando desde un buffer propio sin límite, o apagar el disco para «liberar espacio» sin saber qué se borra.</p>
+
+        <h3>Capacidad: las cuentas que evitan la alarma</h3>
+        <p>Antes de producción, haz tres cuentas:</p>
+        <ul>
+          <li><strong>Profundidad máxima</strong>: mensajes/s × segundos de retraso aceptable. Si publicas 500/s y toleras 10 minutos de backlog, necesitas capacidad para 300 000 mensajes.</li>
+          <li><strong>Espacio en disco</strong>: tamaño medio × profundidad × factor de replicación (3 en quorum) + espacio para el WAL y los logs. Un mensaje de 2 KB con 300 000 copias y 3 réplicas son ~1,8 GB, más índices y WAL.</li>
+          <li><strong>Memoria</strong>: al menos 32 bytes por mensaje de índice en quorum (1 MB por cada 30 000), más conexiones, canales y buffers. Deja un 40 % de la RAM libre para el sistema y para el propio broker.</li>
+        </ul>
+        <p>Y pon un techo a las colas: <code>x-max-length</code>, <code>x-max-length-bytes</code> o una política. Una cola sin límite es una alarma de disco con fecha programada.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Forzar una alarma de memoria en un entorno de laboratorio y observar el bloqueo del publicador. <strong>Garantía:</strong> ningún mensaje publicado se pierde por la alarma; el publicador se frena y el consumidor sigue.</p>
+        <pre><code class="language-bash"># 1. límite de memoria muy bajo: la alarma salta casi seguro
+docker exec rabbitmq rabbitmqctl set_vm_memory_high_watermark absolute 20MB
+
+# 2. estado del nodo
+docker exec rabbitmq rabbitmq-diagnostics status | grep -i -A6 alarms
+
+# 3. publicar y observar
+node publicar.mjs</code></pre>
+        <p>El publicador se queda esperando en <code>waitForConfirms()</code> o recibe <code>blocked</code>. En la management UI, la conexión aparece como <code>blocked</code>. Los consumidores siguen recibiendo. Para liberar:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_vm_memory_high_watermark 0.6</code></pre>
+        <p>El evento <code>unblocked</code> llega, las publicaciones pendientes se confirman y el sistema vuelve a la normalidad. Si el cliente hubiera reintentado en bucle durante la alarma, habría multiplicado el trabajo sin acelerar nada.</p>
+        <pre><code class="language-javascript">conn.on('blocked', (reason) =&gt; {
+  salud.marcarNoListo('rabbitmq bloqueado: ' + reason);
+  publicador.pausar();                 // dejar de aceptar trabajo nuevo
+});
+conn.on('unblocked', () =&gt; {
+  salud.marcarListo();
+  publicador.reanudar();               // reanudar con backoff, no en tromba
+});</code></pre>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller tiene una cola <code>auditoria.pedido-creado</code> cuyo consumidor se desplegó mal y lleva dos días caído. El disco baja, salta la alarma y la API empieza a devolver <code>503</code> al publicar. El runbook tiene cuatro pasos y ninguno es «reiniciar el broker».</p>
+        <p><strong>1. Confirmar la alarma y el recurso:</strong></p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics status
+# ...
+# Alarms
+#   {resource_limit,disk,/var/lib/rabbitmq,[]}
+# Disk free space: 1.2 GiB
+
+docker exec rabbitmq rabbitmqctl list_queues -p / name messages message_bytes consumers</code></pre>
+        <pre><code class="language-text">auditoria.pedido-creado   2841902   5.4 GiB   0
+facturas.generar                12   24 KiB    4
+inventario.pedido-creado         0    0 B      2</code></pre>
+        <p>La causa está a la vista: 2,8 millones de mensajes y cero consumidores. El disco no es pequeño; la cola no tiene salida.</p>
+        <p><strong>2. Decidir qué hacer con el backlog.</strong> No se purga a ciegas. Opciones, en orden:</p>
+        <ul>
+          <li>Arrancar el consumidor de auditoría y dejar que drene (lo correcto si los eventos son necesarios).</li>
+          <li>Mover el backlog a otro almacenamiento con un consumidor de rescate y purgar después.</li>
+          <li>Si la retención de auditoría es de 90 días y estos eventos ya no importan, purgar con una decisión documentada y una copia previa.</li>
+        </ul>
+        <pre><code class="language-bash">docker compose up -d auditoria-worker
+# vigilar el drenaje
+watch -n 5 'docker exec rabbitmq rabbitmqctl list_queues name messages consumers'</code></pre>
+        <p><strong>3. Proteger la entrada mientras se drena.</strong> La API deja de aceptar pedidos nuevos o los guarda en una tabla de <em>outbox</em>; el publicador escucha <code>blocked</code> y no reintenta en bucle. El health check de la API devuelve <code>503</code> hasta que <code>unblocked</code> llega, para que el balanceador no le mande tráfico.</p>
+        <pre><code class="language-javascript">conn.on('blocked', (reason) =&gt; {
+  logger.warn('broker bloqueado', { reason });
+  estado.publicacion = 'pausada';
+});
+
+conn.on('unblocked', () =&gt; {
+  logger.info('broker desbloqueado');
+  estado.publicacion = 'activa';
+});</code></pre>
+        <p><strong>4. Poner un techo para que no vuelva a pasar.</strong> Una política sobre las colas de eventos:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_policy eventos-limite "^auditoria\." \
+  '{"max-length":500000,"overflow":"reject-publish","dead-letter-exchange":"taller.dlx"}' \
+  --priority 20 --apply-to quorum_queues</code></pre>
+        <p>Con <code>reject-publish</code>, al llegar al límite el broker rechaza la publicación y el productor recibe un <code>nack</code> en el confirm, en lugar de descartar silenciosamente los mensajes más antiguos. La DLX sigue aplicándose a los mensajes rechazados por el consumidor o caducados, no al desbordamiento. <code>reject-publish-dlx</code> existe en colas clásicas, pero las quorum queues no lo soportan. Es una decisión de negocio: ¿prefieres rechazar los nuevos o perder los viejos? La política debe reflejarlo.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">El disco no se libera solo</p>
+          <p>Purgar una cola o mover mensajes a la DLQ no reduce el espacio del sistema operativo de inmediato: el archivo de datos sigue abierto. RabbitMQ compacta y libera con el tiempo. Si el disco está al 100 %, necesitas espacio físico primero; ningún comando de RabbitMQ lo crea.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Fijar <code>disk_free_limit</code> en GB, no en el mínimo de 50 MB</td> <td>Dejar el valor por defecto en producción</td> <td>50 MB no da margen para reaccionar ni para escribir los logs de la alarma.</td></tr>
+            <tr><td>Usar un watermark absoluto en contenedores</td> <td>Confiar en la detección de RAM del host</td> <td>Erlang puede ver más memoria de la que el contenedor tiene y no protegerse a tiempo.</td></tr>
+            <tr><td>Escuchar <code>blocked</code> y pausar la entrada</td> <td>Reintentar publicaciones en bucle</td> <td>Cada reintento añade presión y consume CPU sin avanzar.</td></tr>
+            <tr><td>Límite de longitud o TTL en toda cola</td> <td>Colas sin techo «porque el disco es grande»</td> <td>El disco se llena igual; el techo convierte una caída en una decisión.</td></tr>
+            <tr><td>Alertar sobre <code>disk_free</code>, memoria y colas sin consumidores</td> <td>Alertar solo si el proceso no responde</td> <td>El broker aguanta mucho antes de caer; el aviso temprano es la diferencia.</td></tr>
+            <tr><td>Dejar 40 % de RAM libre y margen de disco</td> <td>Dimensionar al 100 % de la capacidad</td> <td>El paging y los picos necesitan espacio; sin margen, la alarma es continua.</td></tr>
+            <tr><td>Probar el bloqueo y la recuperación en staging</td> <td>Descubrir el comportamiento el día del incidente</td> <td>El runbook que no se ha ejecutado nunca no es un runbook.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Subir el watermark para «quitar la alarma»</h3>
+        <span class="code-label code-label--wrong">Mal — silenciar la señal</span>
+        <pre><code class="language-bash">rabbitmqctl set_vm_memory_high_watermark 0.95
+# la alarma desaparece... hasta que el OOM killer mata el nodo</code></pre>
+        <span class="code-label code-label--right">Bien — diagnosticar y liberar presión</span>
+        <pre><code class="language-bash">rabbitmq-diagnostics memory_breakdown --unit megabytes
+rabbitmqctl list_queues name messages message_bytes consumers | sort -k2 -n -r | head</code></pre>
+        <p>Subir el umbral no crea memoria. Solo retrasa la protección hasta que el sistema operativo interviene, y entonces el fallo es mucho peor: el proceso muere sin cerrar limpiamente.</p>
+
+        <h3>2. Ignorar <code>blocked</code> y seguir publicando</h3>
+        <span class="code-label code-label--wrong">Mal — buffer propio sin límite</span>
+        <pre><code class="language-javascript">for (const pedido of pedidos) {
+  ch.publish('taller.jobs', 'facturas.generar', body);   // sin mirar el retorno
+}
+// el buffer del cliente crece hasta agotar la memoria del proceso</code></pre>
+        <span class="code-label code-label--right">Bien — backpressure explícita</span>
+        <pre><code class="language-javascript">conn.on('blocked', () =&gt; publicador.pausar());
+conn.on('unblocked', () =&gt; publicador.reanudar());
+
+if (!ch.publish('taller.jobs', 'facturas.generar', body, { persistent: true })) {
+  await once(ch, 'drain');
+}</code></pre>
+        <p>El broker bloquea la conexión, pero tu proceso puede seguir aceptando trabajo y acumulándolo en memoria. La backpressure tiene que llegar hasta el origen: la API, la cola local o el productor.</p>
+
+        <h3>3. Confundir paging con pérdida de mensajes</h3>
+        <span class="code-label code-label--wrong">Mal — reiniciar porque «los mensajes desaparecieron de RAM»</span>
+        <pre><code class="language-text">messages_ready = 500000, pero el proceso usa poca memoria
+-&gt; ❌ "se han perdido mensajes, reinicio"</code></pre>
+        <span class="code-label code-label--right">Bien — comprobar el total y el disco</span>
+        <pre><code class="language-bash">rabbitmqctl list_queues name messages messages_ready messages_unacknowledged
+rabbitmq-diagnostics status | grep -i disk</code></pre>
+        <p>Durante el paging, los mensajes están en disco y siguen contando en <code>messages_ready</code>. Reiniciar el nodo no los recupera más rápido; puede alargar la interrupción y forzar una resincronización de las quorum queues.</p>
+
+        <h3>4. Dejar que una cola sin consumidores crezca sin límite</h3>
+        <span class="code-label code-label--wrong">Mal — confiar en que «alguien la consumirá»</span>
+        <pre><code class="language-javascript">await ch.assertQueue('auditoria.pedido-creado', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },   // sin max-length, sin TTL
+});</code></pre>
+        <span class="code-label code-label--right">Bien — techo y alerta</span>
+        <pre><code class="language-javascript">await ch.assertQueue('auditoria.pedido-creado', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-max-length': 500000,
+    'x-overflow': 'reject-publish',
+    'x-dead-letter-exchange': 'taller.dlx',
+  },
+});</code></pre>
+        <p>Una cola huérfana es la causa más común de alarmas de disco. El límite no sustituye al consumidor, pero evita que un despliegue roto se convierta en una caída del broker.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> provocar una alarma de memoria, observar el bloqueo, liberar el recurso y repetir con una alarma de disco.</p>
+        <ol class="steps">
+          <li>
+            <strong>Anota el estado inicial</strong> de memoria y disco:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics status | grep -Ei "memory|disk|alarm"</code></pre>
+            <p>Guarda las cifras para comparar al final.</p>
+          </li>
+          <li>
+            <strong>Baja el watermark a 20 MB</strong> y comprueba que la alarma aparece:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_vm_memory_high_watermark absolute 20MB
+docker exec rabbitmq rabbitmq-diagnostics status | grep -A4 Alarms</code></pre>
+            <p>Salida esperada: <code>{resource_limit,memory,...}</code>.</p>
+          </li>
+          <li>
+            <strong>Publica 1 000 mensajes</strong> con un productor que registre <code>blocked</code>/<code>unblocked</code>. Debe pausarse al poco de empezar. Comprueba en la UI que la conexión figura como <code>blocked</code> y que la cola sigue creciendo solo si hay consumidor.</li>
+          <li>
+            <strong>Arranca un consumidor</strong> y deja que drene. La memoria baja, la alarma desaparece y el publicador recibe <code>unblocked</code>. Anota cuánto tardó y cuántos mensajes quedaron pendientes.</li>
+          <li>
+            <strong>Provoca una alarma de disco:</strong> fija un límite por encima del espacio libre actual (por ejemplo, si tienes 8 GB libres, <code>set_disk_free_limit 9GB</code>). Comprueba la alarma y que las publicaciones se bloquean igual. Restaura con un valor sensato (<code>set_disk_free_limit 1GB</code>).</li>
+          <li>
+            <strong>Documenta el runbook:</strong> escribe los cuatro comandos que ejecutarías en producción ante una alarma real, en orden, con el criterio para purgar o drenar. Verifica que el broker sigue consumiendo durante la alarma.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Qué has aprendido</p>
+          <p>La alarma no detiene el consumo ni pierde mensajes: frena la entrada. El cliente que escucha <code>blocked</code> convierte una caída en una degradación controlada; el que no, convierte la degradación en un incidente.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Dimensionar el Black Friday</h3>
+          <p>El taller espera un pico de 2 000 pedidos por minuto durante cuatro horas, con un mensaje medio de 3 KB y tres réplicas por quorum queue. Calcula el disco necesario para un backlog de 30 minutos, la memoria para los índices y el número de consumidores para drenarlo en 10 minutos. Define los watermarks, el límite de longitud de cada cola y las tres alertas que avisarán antes de que la API devuelva <code>503</code>.</p>
+          <p>Después, escribe el plan de contingencia: si el disco llega al 90 %, ¿qué cola se degrada primero, qué se purga y qué se guarda en otro sitio? Justifica cada decisión con el impacto de negocio.</p>
+          <p><em>Pista: no olvides el WAL de Raft, los logs y el espacio que RabbitMQ no libera inmediatamente al purgar. Y recuerda que la memoria de una quorum queue depende del número de mensajes, no de su tamaño.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>RabbitMQ bloquea <strong>conexiones que publican</strong> cuando la memoria o el disco cruzan su watermark; los consumidores siguen.</li>
+          <li>El watermark de memoria es relativo (0,6) por defecto; en contenedores, fija un valor absoluto.</li>
+          <li><code>disk_free_limit</code> por defecto son 50 MB: un mínimo de emergencia, no una cifra de producción.</li>
+          <li>El <strong>paging</strong> mueve mensajes clásicos a disco antes de la alarma; las quorum ya viven en disco.</li>
+          <li>El <strong>flow control</strong> por créditos frena el ritmo; la alarma es un recurso del nodo y exige intervención.</li>
+          <li>El cliente debe escuchar <code>blocked</code>/<code>unblocked</code>, respetar <code>publish() === false</code> y propagar la backpressure.</li>
+          <li>La solución real es capacidad, drenaje y límites de cola; subir el umbral solo retrasa el fallo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>vm_memory_high_watermark</code></td><td>Umbral de memoria que dispara la alarma y bloquea publicadores</td></tr>
+            <tr><td><code>disk_free_limit</code></td><td>Espacio libre mínimo antes de la alarma de disco</td></tr>
+            <tr><td><code>memory_breakdown</code></td><td>Desglose de memoria por categoría para encontrar la causa</td></tr>
+            <tr><td><code>connection.blocked</code></td><td>Evento que avisa al cliente de que el broker dejó de leer</td></tr>
+            <tr><td><code>publish() === false</code></td><td>Buffer de escritura lleno; esperar <code>drain</code></td></tr>
+            <tr><td><code>x-max-length</code></td><td>Techo de mensajes por cola</td></tr>
+            <tr><td><code>x-overflow: reject-publish</code></td><td>Rechaza publicaciones al llenarse; en classic existe <code>reject-publish-dlx</code>, que quorum no soporta</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si el broker bloquea al publicador, ¿pierdo los mensajes que estaba enviando?</summary>
+            <div>
+              <p>Los que el broker ya recibió y confirmó están a salvo. Los que estaban en el buffer del cliente o sin confirmar deben reintentarse cuando llegue <code>unblocked</code>. Por eso el productor necesita confirms y una política de reintento idempotente: no puede asumir que el silencio significa éxito.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué la memoria no baja aunque purge la cola?</summary>
+            <div>
+              <p>Porque Erlang no devuelve la memoria al sistema operativo de inmediato y porque el paging deja datos en tránsito. Además, las quorum queues mantienen índices y el WAL. Mira <code>rabbitmq-diagnostics memory_breakdown</code>: puede que la memoria esté en conexiones, canales o buffers, no en los mensajes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo desactivar las alarmas?</summary>
+            <div>
+              <p>Puedes subir los umbrales o poner <code>disk_free_limit.absolute = 0</code>, pero es una mala idea: eliminas la protección que evita que el sistema operativo mate el nodo o que el disco se llene por completo. Si una alarma te molesta, el problema es la carga o la capacidad, no el aviso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El paging afecta a las quorum queues?</summary>
+            <div>
+              <p>Muy poco: su contenido ya está en disco y solo el índice vive en memoria. Si una quorum queue consume mucha memoria, revisa el número de mensajes acumulados, no el tamaño de los cuerpos. Mantener las colas cortas es la optimización más efectiva.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos file descriptors necesita RabbitMQ?</summary>
+            <div>
+              <p>Depende de conexiones, canales y archivos abiertos. El límite debe cubrir el pico con margen; si se agota, aparecen errores de <code>too many open files</code> y conexiones rechazadas. Revisa <code>ulimit -n</code> en el host o el contenedor y monitoriza <code>rabbitmq_process_open_fds</code>. La lección de observabilidad lo cubre con métricas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

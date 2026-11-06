@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-api-y-worker">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API y worker — Módulo 7 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>API y worker</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 7 · Proyecto final</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La <a href="01-arquitectura-job-queue.html">arquitectura</a> está decidida. Ahora hay que escribir dos procesos que se comporten como el diseño promete. La API acepta peticiones HTTP y publica; el worker consume y ejecuta. Ninguno de los dos puede asumir que el otro está vivo, que el broker está disponible o que el mensaje llegará una sola vez.</p>
+        <p>La cadena de responsabilidad es la siguiente:</p>
+        <table>
+          <thead><tr><th>Paso</th><th>Quién</th><th>Qué garantiza</th></tr></thead>
+          <tbody>
+            <tr><td>Validar y persistir el job</td><td>API</td><td>Existe una fila con estado <code>queued</code> antes de publicar.</td></tr>
+            <tr><td>Publicar con confirm</td><td>API + broker</td><td>El broker ha aceptado y replicado el mensaje (quorum).</td></tr>
+            <tr><td>Reclamar el job</td><td>Worker + almacén</td><td>Un solo worker lo ejecuta a la vez (o uno con lease vencido).</td></tr>
+            <tr><td>Hacer <code>ack</code></td><td>Worker</td><td>El mensaje se borra solo cuando el efecto terminó.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">Responder 202 es una promesa</p>
+          <p><code>202 Accepted</code> significa «he aceptado el trabajo y me hago responsable de él». Si la API responde 202 antes del confirm, esa promesa puede ser falsa: el mensaje se pierde si el broker rechaza la publicación o el canal se cierra. El orden —persistir, publicar, confirmar, responder— no es un detalle de estilo.</p>
+        </div>
+        <p>Errores típicos: <code>autoAck</code> para «simplificar», responder 202 sin confirm, hacer <code>ack</code> antes del efecto, matar el proceso con <code>process.exit</code> en el primer <code>SIGTERM</code> o reconectar sin volver a declarar la topología.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La API: publicar de forma fiable</h3>
+        <p>El canal de publicación debe ser un <strong>ConfirmChannel</strong>. Un canal normal acepta el <code>publish</code> y olvida: si el exchange no existe o el broker no puede persistir, el mensaje se pierde sin que el productor lo sepa. Con confirm, el broker responde <code>ack</code> o <code>nack</code> por cada publicación.</p>
+        <pre><code class="language-javascript">const connection = await amqp.connect(config.url);
+const channel = await connection.createConfirmChannel();
+await declareTopology(channel);
+
+channel.on('return', (msg) =&gt; {
+  console.error('mensaje no enrutable:', msg.fields.routingKey, msg.content.toString());
+});
+
+const accepted = channel.publish(EXCHANGE, 'job.run', body, {
+  persistent: true,
+  mandatory: true,
+  messageId: job.jobId,
+  contentType: 'application/json',
+  headers: { 'x-attempt': 0, 'x-trace-id': job.traceId },
+});
+
+if (!accepted) {
+  await new Promise((resolve) =&gt; channel.once('drain', resolve));
+}
+await channel.waitForConfirms();</code></pre>
+        <ul>
+          <li><code>mandatory: true</code> hace que un mensaje sin binding vuelva con <code>basic.return</code> en lugar de descartarse. El handler de <code>return</code> es tu red de seguridad ante una topología mal declarada.</li>
+          <li><code>persistent: true</code> pide al broker que guarde el mensaje en disco. En una quorum queue la persistencia es obligatoria; en una clásica, sin esta opción el mensaje puede perderse al reiniciar.</li>
+          <li><code>waitForConfirms()</code> espera a todas las publicaciones pendientes del canal. Es simple y seguro; para alto rendimiento se agrupan publicaciones y se confirma por lotes, aceptando una ventana de mensajes en vuelo.</li>
+          <li>El valor de retorno <code>false</code> indica presión de buffer, no fallo. Esperar <code>drain</code> evita acumular memoria.</li>
+        </ul>
+
+        <h3>El problema de las dos escrituras</h3>
+        <p>Persistir en la base de datos y publicar en RabbitMQ son dos sistemas distintos. No hay transacción que abarque ambos. Si el proceso muere entre las dos operaciones, el job existe sin mensaje; si publica antes de persistir, el mensaje existe sin job. El diseño pragmático:</p>
+        <pre><code class="language-text">1. INSERT job (status=queued, published_at=NULL)
+2. publish + waitForConfirms
+3. UPDATE job SET published_at=now()
+4. responder 202
+
+si el proceso muere entre 2 y 3:
+   el mensaje está en la cola y el job parece no publicado
+   -> el worker lo procesa igual; el sweeper debe ser idempotente
+si el proceso muere entre 1 y 2:
+   el job queda sin mensaje
+   -> un sweeper republica los published_at IS NULL con edad &gt; N</code></pre>
+        <p>La alternativa canónica es el <strong>outbox pattern</strong>: el job y un registro «pendiente de publicar» se guardan en la misma transacción; un publicador independiente lee el outbox y publica con confirm. Es más robusto y más complejo. Para el proyecto, el campo <code>published_at</code> y un barrido periódico dan la misma garantía con menos piezas.</p>
+
+        <h3>El worker: prefetch, concurrencia y ack</h3>
+        <p>Un worker abre <strong>una conexión</strong> y, normalmente, <strong>un canal</strong> para consumir. El canal no es thread-safe: no compartas el mismo canal entre tareas concurrentes que publican y consumen sin coordinación. El patrón del proyecto es un canal de consumo y, si hace falta publicar reintentos, un canal de confirmación separado.</p>
+        <pre><code class="language-javascript">await channel.prefetch(config.prefetch);   // 10 por defecto
+const consumer = await channel.consume(QUEUE, (msg) =&gt; {
+  if (!msg) return;                        // cancelación del consumidor
+  const task = handle(msg);
+  inFlight.add(task);
+  task.finally(() =&gt; inFlight.delete(task));
+}, { noAck: false });</code></pre>
+        <p><code>prefetch</code> limita cuántos mensajes sin <code>ack</code> puede tener el consumidor. No es un límite de concurrencia del proceso: amqplib entrega los mensajes y tu handler asíncrono decide cuándo termina. Con prefetch 10 y un handler que tarda 2 segundos, el worker puede tener 10 trabajos en vuelo; con prefetch 1, procesa de uno en uno. Un prefetch demasiado alto multiplica memoria y conexiones al servicio externo; uno demasiado bajo desaprovecha el worker.</p>
+
+        <h3>El handler: reclamar, ejecutar, confirmar</h3>
+        <pre><code class="language-javascript">async function handle(msg) {
+  const job = JSON.parse(msg.content.toString());
+  const claimed = await store.claim(job.jobId, { leaseMs: config.leaseMs });
+  if (!claimed) {
+    channel.ack(msg);                 // ya lo tiene otro o ya terminó
+    return;
+  }
+
+  try {
+    const result = await processJob(claimed);
+    await store.markSucceeded(job.jobId, result);
+    channel.ack(msg);
+  } catch (err) {
+    await store.markFailed(job.jobId, err);   // en 07/03: retry
+    channel.nack(msg, false, false);          // a la DLX
+  }
+}</code></pre>
+        <p>El <code>ack</code> va después de <code>markSucceeded</code>. Si el proceso muere entre ambos, el mensaje se reentrega y el job se vuelve a ejecutar; la reclamación verá <code>succeeded</code> y el worker hará <code>ack</code> sin repetir el efecto. Si el proceso muere antes de <code>markSucceeded</code> pero después del efecto, el upsert por clave de negocio evita la duplicación.</p>
+
+        <h3>Apagado ordenado</h3>
+        <p>En Docker o Kubernetes, el proceso recibe <code>SIGTERM</code> y tiene una ventana antes de <code>SIGKILL</code>. Matarlo de inmediato deja mensajes sin <code>ack</code> que el broker reentrega; no se pierden, pero se duplica trabajo y se ensucia el estado. El apagado correcto es:</p>
+        <ol>
+          <li>Dejar de aceptar peticiones HTTP nuevas (cerrar el servidor).</li>
+          <li>Cancelar el consumidor para que no lleguen mensajes nuevos.</li>
+          <li>Esperar a que los handlers en vuelo terminen y hagan <code>ack</code>.</li>
+          <li>Cerrar canal y conexión.</li>
+          <li>Salir con código 0, o forzar tras un timeout.</li>
+        </ol>
+        <pre><code class="language-javascript">async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(JSON.stringify({ event: 'shutdown', signal }));
+
+  await channel.cancel(consumerTag);
+  const drained = Promise.allSettled([...inFlight]);
+  await Promise.race([drained, new Promise((r) =&gt; setTimeout(r, config.shutdownTimeoutMs))]);
+
+  await channel.close();
+  await connection.close();
+}</code></pre>
+
+        <h3>Reconexión y códigos HTTP</h3>
+        <p>Si el broker se reinicia, la conexión emite <code>close</code> y el proceso se queda sin canal. <code>amqplib</code> no reconecta ni recrea consumidores: hay que esperar con backoff, reconectar, declarar topología y volver a consumir. Mientras no haya canal, la API responde <code>503</code> en <code>POST /jobs</code>; el resto de códigos (400 inválido, 404 inexistente, 413 demasiado grande) los decide la validación.</p>
+        <p>Existen librerías como <code>amqp-connection-manager</code> que encapsulan esta lógica. El proyecto usa <code>amqplib</code> directo para que el mecanismo sea visible; en producción, valora la librería si no quieres mantenerla.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El fragmento más pequeño que publica de forma fiable. No incluye HTTP ni almacén: solo la parte que distingue una publicación de verdad de una que parece funcionar.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect(process.env.RABBITMQ_URL);
+const ch = await conn.createConfirmChannel();
+
+await ch.assertExchange('taller.jobs', 'direct', { durable: true });
+await ch.assertQueue('taller.jobs.work', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-dead-letter-exchange': 'taller.dlx',
+    'x-dead-letter-routing-key': 'job.dead',
+  },
+});
+await ch.bindQueue('taller.jobs.work', 'taller.jobs', 'job.run');
+
+const jobId = crypto.randomUUID();
+ch.publish(
+  'taller.jobs',
+  'job.run',
+  Buffer.from(JSON.stringify({ jobId, type: 'invoice.generate', payload: {} })),
+  { persistent: true, messageId: jobId, contentType: 'application/json' }
+);
+await ch.waitForConfirms();
+console.log('confirmado por el broker:', jobId);
+
+await ch.close();
+await conn.close();</code></pre>
+        <p>Si quitas <code>createConfirmChannel</code> y usas <code>createChannel</code>, el programa termina igual y no hay forma de saber si el mensaje llegó. Si quitas <code>persistent</code>, el mensaje puede desaparecer en un reinicio. Si quitas la cola durable, la cola desaparece con el broker. Cada opción protege una cosa distinta.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API del taller usa <code>node:http</code> para no añadir dependencias. El punto interesante no es el router, sino el orden de las operaciones y la traducción de fallos a códigos HTTP.</p>
+        <pre><code class="language-javascript">import http from 'node:http';
+import crypto from 'node:crypto';
+
+const server = http.createServer(async (req, res) =&gt; {
+  if (req.method === 'POST' &amp;&amp; req.url === '/jobs') {
+    const raw = await readBody(req, 1024 * 1024).catch(() =&gt; null);
+    if (!raw) return send(res, 413, { error: 'payload_too_large' });
+
+    const body = parseJson(raw);
+    if (!body || !body.type || typeof body.payload !== 'object') {
+      return send(res, 400, { error: 'invalid_job' });
+    }
+
+    const job = {
+      jobId: crypto.randomUUID(),
+      type: body.type,
+      payload: body.payload,
+      traceId: req.headers['x-trace-id'] ?? crypto.randomUUID(),
+      status: 'queued',
+      attempts: 0,
+    };
+
+    await store.create(job);                       // 1. persistir
+
+    try {
+      await publishJob(job);                       // 2. publicar + confirm
+      await store.markPublished(job.jobId);        // 3. marcar
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'publish_failed', jobId: job.jobId, err: err.message }));
+      return send(res, 503, { error: 'broker_unavailable', jobId: job.jobId });
+    }
+
+    res.setHeader('Location', `/jobs/${job.jobId}`);
+    return send(res, 202, { id: job.jobId, status: 'queued' });  // 4. responder
+  }
+
+  const match = req.url.match(/^\/jobs\/([\w-]+)$/);
+  if (req.method === 'GET' &amp;&amp; match) {
+    const job = await store.get(match[1]);
+    if (!job) return send(res, 404, { error: 'not_found' });
+    return send(res, 200, { id: job.jobId, status: job.status, attempts: job.attempts, result: job.result });
+  }
+
+  return send(res, 404, { error: 'not_found' });
+});</code></pre>
+        <p>El 503 devuelve el <code>jobId</code> a propósito: el job está persistido y el sweeper lo republicará. El cliente puede consultar su estado antes de reintentar el <code>POST</code>. Sin una clave de idempotencia, reintentar el <code>POST</code> crearía otro job; ese es el reto de la lección.</p>
+        <p>El worker, por su parte, necesita una conexión separada y un canal de confirmación para publicar reintentos. Este es el esqueleto completo, con apagado ordenado:</p>
+        <pre><code class="language-javascript">const connection = await connectWithRetry(config.url);
+const channel = await connection.createChannel();
+const confirm = await connection.createConfirmChannel();
+await declareTopology(channel);
+await channel.prefetch(config.prefetch);
+
+const inFlight = new Set();
+const { consumerTag } = await channel.consume(config.queue, (msg) =&gt; {
+  if (!msg) return;
+  const task = handle(msg, confirm).catch((err) =&gt; {
+    console.error(JSON.stringify({ event: 'handler_crashed', err: err.message }));
+    channel.nack(msg, false, false);
+  });
+  inFlight.add(task);
+  task.finally(() =&gt; inFlight.delete(task));
+}, { noAck: false });</code></pre>
+        <p>El <code>handle</code> recibe el canal de confirmación porque, en la siguiente lección, publicará el reintento antes de hacer <code>ack</code>. El canal de consumo solo se usa para <code>ack</code>/<code>nack</code>; mezclar publicaciones y acknowledgements en el mismo canal funciona, pero separa responsabilidades y evita que un <code>nack</code> de publicación cierre el canal de consumo.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">No llames a <code>process.exit()</code> antes de drenar</p>
+          <p><code>process.exit()</code> no espera promesas pendientes. Si lo llamas nada más recibir <code>SIGTERM</code>, los handlers en vuelo mueren sin <code>ack</code> y el broker reentrega: el trabajo se duplica y el estado puede quedar inconsistente. Cierra el consumidor, espera a que termine lo que está en vuelo y solo entonces sal del proceso.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar <code>createConfirmChannel</code> para publicar</td><td>Publicar en un canal normal y asumir que llegó</td><td>Sin confirm no hay forma de detectar un fallo de publicación.</td></tr>
+            <tr><td>Responder 202 después del confirm</td><td>Responder antes de publicar</td><td>Un 202 prematuro promete un trabajo que puede no existir.</td></tr>
+            <tr><td>Un canal de consumo y otro de publicación</td><td>Compartir un canal para todo</td><td>Aísla el cierre por error de publicación del consumidor.</td></tr>
+            <tr><td>Declarar topología al reconectar</td><td>Asumir que exchanges y colas siguen ahí</td><td>Un broker recreado puede no tenerlos; la declaración es idempotente.</td></tr>
+            <tr><td>Apagado ordenado con timeout</td><td><code>process.exit()</code> inmediato</td><td>Evita duplicar trabajo y deja el estado consistente.</td></tr>
+            <tr><td>Loguear con <code>jobId</code> y <code>traceId</code></td><td>Logs sin identificador</td><td>Sin correlación, depurar un job es buscar una aguja en un pajar.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. <code>autoAck</code> para simplificar</h3>
+        <span class="code-label code-label--wrong">Mal — el mensaje se borra al entregarse</span>
+        <pre><code class="language-javascript">await ch.consume(QUEUE, async (msg) =&gt; {
+  await processJob(msg);
+}, { noAck: true });</code></pre>
+        <span class="code-label code-label--right">Bien — ack manual después del efecto</span>
+        <pre><code class="language-javascript">await ch.consume(QUEUE, async (msg) =&gt; {
+  await processJob(msg);
+  ch.ack(msg);
+}, { noAck: false });</code></pre>
+        <p>Con <code>noAck: true</code>, si el proceso muere a mitad del trabajo, el mensaje ya no existe. El broker no puede reentregar lo que considera entregado. Es la forma más rápida de perder trabajos sin recibir un error.</p>
+
+        <h3>2. Responder 202 sin confirm</h3>
+        <span class="code-label code-label--wrong">Mal — la promesa no está respaldada</span>
+        <pre><code class="language-javascript">ch.publish(EXCHANGE, 'job.run', body);   // canal normal
+return res.status(202).json({ id });</code></pre>
+        <span class="code-label code-label--right">Bien — confirmar antes de responder</span>
+        <pre><code class="language-javascript">ch.publish(EXCHANGE, 'job.run', body, { persistent: true });
+await ch.waitForConfirms();
+return res.status(202).json({ id });</code></pre>
+        <p>Si el exchange no existe o el broker está en una partición, el <code>publish</code> del canal normal puede fallar en silencio. El cliente recibe 202, el job no está en ninguna cola y nadie lo sabe hasta que el usuario pregunta por su factura.</p>
+
+        <h3>3. <code>ack</code> antes de terminar</h3>
+        <span class="code-label code-label--wrong">Mal — el efecto puede no ocurrir</span>
+        <pre><code class="language-javascript">ch.ack(msg);
+await generateInvoice(job);   // si esto falla, el mensaje ya no está</code></pre>
+        <span class="code-label code-label--right">Bien — el <code>ack</code> cierra la transacción lógica</span>
+        <pre><code class="language-javascript">await generateInvoice(job);
+await store.markSucceeded(job.jobId);
+ch.ack(msg);</code></pre>
+        <p>El <code>ack</code> no es «he recibido el mensaje»: es «he completado el trabajo». Adelantarlo convierte un fallo recuperable en una pérdida definitiva.</p>
+
+        <h3>4. Morir sin apagado ordenado</h3>
+        <span class="code-label code-label--wrong">Mal — matar el proceso en la señal</span>
+        <pre><code class="language-javascript">process.on('SIGTERM', () =&gt; process.exit(0));</code></pre>
+        <span class="code-label code-label--right">Bien — drenar antes de salir</span>
+        <pre><code class="language-javascript">process.on('SIGTERM', async () =&gt; {
+  await channel.cancel(consumerTag);
+  await Promise.allSettled([...inFlight]);
+  await connection.close();
+  process.exit(0);
+});</code></pre>
+        <p>El broker reentrega lo que no se confirmó, así que no se pierde; pero se duplica trabajo y se puede quedar un job en <code>running</code> hasta que venza el lease. En un despliegue rodado, eso se multiplica por cada réplica.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ejecutar API y worker, observar los estados y comprobar la reentrega cuando el worker muere a mitad de un job.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el broker y comprueba la topología:</strong>
+            <pre><code class="language-bash">docker compose up -d rabbitmq
+docker exec rabbitmq rabbitmq-diagnostics ping
+docker exec rabbitmq rabbitmqctl list_queues -p taller-prod name type</code></pre>
+          </li>
+          <li>
+            <strong>Arranca API y worker</strong> en dos terminales con <code>RABBITMQ_URL</code> apuntando a <code>/taller-prod</code>. Deben declarar la topología al arrancar sin errores de permisos. Si usas el usuario de aplicación, recuerda que no tiene <code>configure</code>: declara con el usuario de despliegue antes.</li>
+          <li>
+            <strong>Crea un job y sigue su estado:</strong>
+            <pre><code class="language-bash">curl -i -X POST http://localhost:3000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"type":"invoice.generate","payload":{"orderId":"PED-1042"}}'</code></pre>
+            <p>Esperado: <code>202</code>, cabecera <code>Location</code> y un <code>id</code>. Consulta <code>GET /jobs/&lt;id&gt;</code> varias veces: debe pasar de <code>queued</code> a <code>running</code> y a <code>succeeded</code> (o <code>failed</code> si el procesamiento simulado falla).</p>
+          </li>
+          <li>
+            <strong>Mata el worker a mitad de un job:</strong> configura el procesamiento con una espera de 10 segundos y envía <code>SIGKILL</code> al proceso mientras está en <code>running</code>. Reinicia el worker. El mensaje debe reentregarse y el job completarse; el <code>jobId</code> no cambia. Comprueba en los logs que el segundo intento ve el lease y decide correctamente.</li>
+          <li>
+            <strong>Prueba un duplicado:</strong> publica dos veces el mismo mensaje (mismo <code>jobId</code>) y confirma que el efecto se ejecuta una sola vez. Si tu implementación crea dos facturas, la idempotencia no está bien puesta: revisa la reclamación y el upsert.</li>
+          <li>
+            <strong>Apagado ordenado:</strong> envía <code>SIGTERM</code> al worker mientras hay un job en vuelo. Debe terminar el job, hacer <code>ack</code> y salir con código 0 dentro del timeout. Compara el log con el del paso 4: no hay reentrega forzada.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Idempotencia en el <code>POST</code></h3>
+          <p>Añade soporte para la cabecera <code>Idempotency-Key</code> en <code>POST /jobs</code>: si el cliente repite la petición con la misma clave, debe recibir el mismo <code>jobId</code> y el mismo <code>202</code>, sin crear un segundo trabajo ni publicar un segundo mensaje.</p>
+          <p>El diseño debe funcionar con dos réplicas de la API y con peticiones concurrentes que llegan a la vez. Define qué pasa si la primera petición falla antes de publicar, cuánto tiempo se guarda la clave, qué se devuelve si la misma clave se usa con un cuerpo distinto y cómo se limpia la tabla de claves. Incluye una prueba con <code>node --test</code> que lance dos peticiones simultáneas y compruebe que solo existe un job.</p>
+          <p><em>Pista: una restricción única sobre la clave y una transacción que inserte el job y el registro de idempotencia resuelven la carrera; la parte difícil es qué hacer cuando la segunda petición llega antes de que la primera haya publicado.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La API persiste, publica con confirm y solo entonces responde <code>202</code>.</li>
+          <li>El <code>ack</code> va después del efecto y del cambio de estado, nunca antes.</li>
+          <li><code>amqplib</code> no reconecta solo: hay que recrear canal, topología y consumidor.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Responsabilidad</th></tr></thead>
+          <tbody>
+            <tr><td><code>ConfirmChannel</code></td><td>Publicar y esperar el <code>ack</code> del broker</td></tr>
+            <tr><td><code>deliveryTag</code></td><td>Identificar el mensaje en <code>ack</code>, <code>nack</code> y <code>reject</code></td></tr>
+            <tr><td><code>leaseUntil</code></td><td>Permitir la reclamación tras la muerte de un worker</td></tr>
+            <tr><td><code>SIGTERM</code></td><td>Iniciar el drenaje ordenado antes de salir</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>waitForConfirms</code> por mensaje no es demasiado lento?</summary>
+            <div>
+              <p>Para un endpoint que acepta un job por petición, la latencia del confirm es pequeña comparada con la del trabajo real, y la corrección vale más que unos milisegundos. Para lotes grandes, publica varios mensajes y espera una sola vez; asumes una ventana de mensajes en vuelo, pero el throughput mejora. Mide antes de optimizar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo procesar en paralelo dentro de un mismo worker?</summary>
+            <div>
+              <p>Sí: <code>prefetch</code> permite varios mensajes en vuelo y tus handlers asíncronos se ejecutan concurrentemente. Ten en cuenta el límite del servicio externo y la CPU; si el trabajo es intensivo en CPU, más concurrencia no ayuda. Si es I/O, un prefetch de 10–20 suele ser razonable, pero el número correcto se mide con la carga real.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si el broker está caído cuando arranca la API?</summary>
+            <div>
+              <p>No aceptes tráfico que no puedes prometer. La API puede arrancar el servidor HTTP y responder <code>503</code> en <code>POST /jobs</code> hasta que tenga canal y topología; el healthcheck de readiness debe fallar mientras tanto. Reintenta la conexión con backoff y no bloquees el arranque en un bucle infinito sin exponer estado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el worker necesita un lease si RabbitMQ ya reentrega?</summary>
+            <div>
+              <p>Porque la reentrega no te dice si el job sigue ejecutándose en otro worker o si ya terminó. Sin lease, un mensaje reentregado tras un fallo de red puede ejecutarse en paralelo con el original. El lease acota esa ventana: si está vencido, se permite reclamar; si no, el worker espera o descarta. La idempotencia sigue siendo la última línea de defensa.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-usuarios-y-politicas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usuarios y políticas — Módulo 3 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Usuarios y políticas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Seguridad</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la <a href="./01-credenciales-root.html">lección anterior</a> dejamos root donde debe estar: en el arranque. Pero «no usar root» no es una política de seguridad, es una intención. La pregunta real es qué puede hacer cada proceso cuando ya no es root, y cómo lo demuestras antes de que ocurra en producción.</p>
+        <p>MinIO implementa un subconjunto de IAM: usuarios, grupos, políticas y <em>service accounts</em>. Una política es un documento JSON que dice <strong>quién</strong> puede hacer <strong>qué</strong> sobre <strong>qué recurso</strong>. Bien escrita, convierte un error de código en un <code>AccessDenied</code> inofensivo; mal escrita, convierte cualquier credencial filtrada en acceso total al bucket.</p>
+        <p>Esta lección construye el modelo mental de evaluación —deny explícito, allow, deny implícito—, escribe políticas por prefijo, distingue política de usuario de política de bucket y prueba el resultado con el mismo cliente que usará la aplicación. El objetivo no es memorizar acciones de S3, sino saber leer una política y predecir qué permitirá.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Mínimo privilegio no es «pocos permisos»</p>
+          <p>Es exactamente los permisos necesarios para la tarea, ni uno más. Un usuario que solo sube PDF a <code>acme/</code> no necesita listar el bucket entero, ni borrar, ni tocar otros prefijos. Cada permiso extra es una capacidad que un atacante hereda si roba esa credencial.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El modelo de identidad</h3>
+        <pre><code class="language-text">                 +-------------------+
+                 |     política      |  JSON: acciones + recursos
+                 +---------+---------+
+                           |
+          +----------------+----------------+
+          |                                 |
+     +----v----+                       +----v----+
+     |  grupo  |                       | usuario |<---- service account
+     +----+----+                       +----+----+      (credencial derivada)
+          |                                 |
+          +-----------+---------------------+
+                      |
+                 identidad efectiva
+                      |
+                 petición S3 firmada</code></pre>
+        <p>Un usuario puede tener políticas adjuntas directamente y también heredarlas de sus grupos. Los permisos efectivos son la <strong>unión</strong> de todas sus políticas, menos lo que esté denegado explícitamente. Los <em>service accounts</em> son credenciales hijas de un usuario: no pueden tener más permisos que el padre, pero sí menos, y no sirven para entrar en la consola.</p>
+
+        <h3>Anatomía de una política</h3>
+        <pre><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteOwnPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::documentos/acme/*"]
+    }
+  ]
+}</code></pre>
+        <table>
+          <thead><tr><th>Campo</th><th>Qué es</th><th>Error típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>Version</code></td><td>Versión del lenguaje de políticas</td><td>Omitirla o inventar una fecha</td></tr>
+            <tr><td><code>Sid</code></td><td>Identificador legible de la declaración</td><td>Duplicarlo entre statements</td></tr>
+            <tr><td><code>Effect</code></td><td><code>Allow</code> o <code>Deny</code></td><td>Creer que <code>Deny</code> es el valor por defecto</td></tr>
+            <tr><td><code>Action</code></td><td>Operaciones S3 permitidas</td><td>Usar <code>s3:*</code> para «que funcione»</td></tr>
+            <tr><td><code>Resource</code></td><td>ARN del bucket o de los objetos</td><td>Poner <code>/*</code> cuando la acción es de bucket</td></tr>
+            <tr><td><code>Condition</code></td><td>Restricciones adicionales</td><td>Confundir <code>s3:prefix</code> con el recurso</td></tr>
+            <tr><td><code>Principal</code></td><td>Quién recibe el permiso (solo bucket policy)</td><td>Incluirlo en una política de usuario</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Bucket ARN frente a object ARN</h3>
+        <p>Esta distinción explica la mitad de los <code>AccessDenied</code> que verás. Hay acciones que operan sobre el bucket y acciones que operan sobre objetos, y el <code>Resource</code> debe coincidir:</p>
+        <table>
+          <thead><tr><th>Acción</th><th>Recurso correcto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>s3:ListBucket</code></td><td><code>arn:aws:s3:::documentos</code></td><td>Listar claves del bucket</td></tr>
+            <tr><td><code>s3:GetBucketLocation</code></td><td><code>arn:aws:s3:::documentos</code></td><td>Resolver la región (lo piden muchos SDK)</td></tr>
+            <tr><td><code>s3:GetObject</code></td><td><code>arn:aws:s3:::documentos/acme/*</code></td><td>Leer un objeto</td></tr>
+            <tr><td><code>s3:PutObject</code></td><td><code>arn:aws:s3:::documentos/acme/*</code></td><td>Escribir un objeto</td></tr>
+            <tr><td><code>s3:DeleteObject</code></td><td><code>arn:aws:s3:::documentos/acme/*</code></td><td>Borrar un objeto</td></tr>
+            <tr><td><code>s3:AbortMultipartUpload</code></td><td><code>arn:aws:s3:::documentos/acme/*</code></td><td>Cancelar una subida multipart</td></tr>
+            <tr><td><code>s3:ListMultipartUploadParts</code></td><td><code>arn:aws:s3:::documentos/acme/*</code></td><td>Ver las partes ya subidas</td></tr>
+          </tbody>
+        </table>
+        <p>Si pones <code>arn:aws:s3:::documentos/*</code> en <code>ListBucket</code>, el comando falla aunque el usuario pueda leer cada objeto. El bucket y sus objetos son dos recursos distintos, no un prefijo y su contenido.</p>
+
+        <h3>Cómo se evalúa una petición</h3>
+        <pre><code class="language-text">petición firmada por una identidad
+        |
+        v
++---------------------------+
+| ¿Hay algún Deny explícito? |---- sí ----> DENEGAR (sin excepciones)
++-------------+-------------+
+              | no
+              v
++---------------------------+
+| ¿Hay algún Allow?         |---- no ----> DENEGAR (implícito)
++-------------+-------------+
+              | sí
+              v
+           PERMITIR</code></pre>
+        <p>El denegado implícito es la base del mínimo privilegio: todo lo que no está permitido, está prohibido. El <code>Deny</code> explícito existe para quitar algo que otra política concede; gana siempre, incluso si el usuario es administrador de ese bucket.</p>
+
+        <h3>Política de usuario frente a política de bucket</h3>
+        <table>
+          <thead><tr><th></th><th>Política de usuario</th><th>Política de bucket</th></tr></thead>
+          <tbody>
+            <tr><td>Se adjunta a</td><td>Usuario o grupo</td><td>Bucket</td></tr>
+            <tr><td>Viaja con</td><td>La identidad</td><td>El recurso</td></tr>
+            <tr><td>Lleva <code>Principal</code></td><td>No</td><td>Sí</td></tr>
+            <tr><td>Permite anónimo</td><td>No</td><td>Sí (<code>"Principal": {"AWS": ["*"]}</code>)</td></tr>
+            <tr><td>Se gestiona con</td><td><code>mc admin policy</code></td><td><code>mc anonymous set-json</code></td></tr>
+            <tr><td>Uso típico</td><td>Permisos de una aplicación o persona</td><td>Acceso público de lectura, integración externa</td></tr>
+          </tbody>
+        </table>
+        <p>Para una aplicación, casi siempre quieres política de usuario. La política de bucket es la excepción: sirve para publicar un prefijo, permitir a otra cuenta o dar acceso sin credenciales. Si te ves escribiendo <code>"Principal": "*"</code> para que funcione una subida, probablemente estés resolviendo el problema equivocado.</p>
+
+        <h3>Listar solo un prefijo</h3>
+        <p><code>s3:ListBucket</code> no se puede limitar con el <code>Resource</code>, porque el recurso es el bucket entero. Se limita con la condición <code>s3:prefix</code>, que compara el prefijo que envía la petición:</p>
+        <pre><code class="language-json">{
+  "Sid": "ListOwnPrefix",
+  "Effect": "Allow",
+  "Action": ["s3:ListBucket"],
+  "Resource": ["arn:aws:s3:::documentos"],
+  "Condition": {
+    "StringLike": { "s3:prefix": ["acme/*"] }
+  }
+}</code></pre>
+        <p>Sin esa condición, el usuario puede enumerar todas las claves del bucket aunque no pueda leerlas. La enumeración filtra nombres, tamaños y fechas: es información, y a veces es suficiente para un ataque.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una política que permite leer y escribir solo bajo <code>acme/</code>, y su usuario.</p>
+        <pre><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOwnPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::documentos"],
+      "Condition": { "StringLike": { "s3:prefix": ["acme/*"] } }
+    },
+    { "Sid": "Location", "Effect": "Allow", "Action": ["s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::documentos"] },
+    {
+      "Sid": "ReadWriteOwnPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::documentos/acme/*"]
+    }
+  ]
+}</code></pre>
+        <pre><code class="language-bash">mc admin user add local app-documentos 'un-secreto-largo-y-aleatorio'
+mc admin policy create local documentos-rw ./policies/documentos-rw.json
+mc admin policy attach local documentos-rw --user app-documentos
+mc admin user info local app-documentos</code></pre>
+        <pre><code class="language-text">AccessKey : app-documentos
+Status    : enabled
+Policy    : documentos-rw</code></pre>
+        <ul>
+          <li><code>user add</code> crea la identidad con una clave y un secreto; el secreto no se puede recuperar después, solo rotar.</li>
+          <li><code>policy create</code> registra el JSON en el servidor; si ya existe, lo reemplaza.</li>
+          <li><code>policy attach</code> une la política al usuario; el cambio es efectivo en la siguiente petición, sin reiniciar.</li>
+          <li><code>user info</code> muestra el estado y las políticas adjuntas, pero no el secreto.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén tiene tres roles: la API sube y lee, el analista solo lee, y nadie puede borrar documentos legales. Las políticas se versionan en <code>proyectos/document-store/policies/</code> y se aplican con un script, no a mano en la consola.</p>
+        <pre><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListTenantPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::documentos"],
+      "Condition": { "StringLike": { "s3:prefix": ["acme/*"] } }
+    },
+    { "Sid": "Location", "Effect": "Allow", "Action": ["s3:GetBucketLocation"], "Resource": ["arn:aws:s3:::documentos"] },
+    {
+      "Sid": "ReadWriteTenant",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": ["arn:aws:s3:::documentos/acme/*"]
+    },
+    {
+      "Sid": "ProtectLegal",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::documentos/acme/*/legal/*"]
+    }
+  ]
+}</code></pre>
+        <p>El <code>Deny</code> de <code>ProtectLegal</code> gana sobre el <code>Allow</code> de <code>ReadWriteTenant</code>, aunque el recurso esté incluido en el allow. Ese es el patrón para «todo el prefijo, excepto esta rama»: no se escribe una política gigante con exclusiones, se añade un deny quirúrgico.</p>
+        <pre><code class="language-bash"># Un grupo para todas las aplicaciones del tenant
+mc admin group add local apps-acme app-documentos
+mc admin policy attach local documentos-rw --group apps-acme
+
+# Un usuario de solo lectura para analítica
+mc admin user add local analytics-acme 'otro-secreto-distinto'
+mc admin policy attach local documentos-ro --user analytics-acme
+
+# Comprobar quién tiene una política
+mc admin policy entities local --policy documentos-rw</code></pre>
+        <pre><code class="language-text">Policy: documentos-rw
+  User: app-documentos
+  Group: apps-acme</code></pre>
+        <p>Los grupos simplifican la rotación: si mañana cambia el conjunto de permisos de las aplicaciones, editas una política y afectas a todos los miembros. Adjuntar políticas usuario por usuario garantiza que dentro de tres meses haya dos versiones distintas y nadie sepa cuál es la buena.</p>
+        <pre><code class="language-javascript">// La aplicación usa app-documentos: funciona en acme/,
+// recibe AccessDenied en otro/ y al borrar en acme/2026/11/legal/.
+await client.putObject('documentos', 'acme/2026/11/a.pdf', body, size)</code></pre>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una política por rol, adjunta a un grupo</td><td>Una política distinta por persona</td><td>Menos documentos que mantener y menos deriva entre entornos.</td></tr>
+            <tr><td>Recursos por prefijo de tenant</td><td><code>arn:aws:s3:::documentos/*</code> para todos</td><td>Un fallo en un tenant no alcanza a los demás.</td></tr>
+            <tr><td>Incluir acciones multipart si se suben objetos grandes</td><td>Solo <code>PutObject</code></td><td>El <code>CompleteMultipartUpload</code> falla con 403 y la subida se queda a medias.</td></tr>
+            <tr><td>Versionar las políticas en Git</td><td>Crearlas a mano en producción</td><td>Permite revisar el cambio, reproducirlo y revertirlo.</td></tr>
+            <tr><td>Usar <code>Deny</code> explícito para exclusiones</td><td>Listas enormes de recursos permitidos</td><td>El deny es claro y gana siempre; la lista se vuelve inmantenible.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Dar <code>ListBucket</code> sobre el ARN de los objetos</h3>
+        <span class="code-label code-label--wrong">Mal — el recurso no coincide con la acción</span>
+        <pre><code class="language-json">{
+  "Action": ["s3:ListBucket"],
+  "Resource": ["arn:aws:s3:::documentos/*"]
+}</code></pre>
+        <span class="code-label code-label--right">Bien — bucket para listar, objetos para leer</span>
+        <pre><code class="language-json">{
+  "Action": ["s3:ListBucket"],
+  "Resource": ["arn:aws:s3:::documentos"]
+}</code></pre>
+        <p>El usuario puede leer un objeto concreto si conoce la clave, pero <code>mc ls</code> devuelve <code>AccessDenied</code>. No es un fallo del cliente: la acción de listar pertenece al bucket.</p>
+
+        <h3>2. Resolver un 403 con <code>s3:*</code> sobre <code>*</code></h3>
+        <span class="code-label code-label--wrong">Mal — conviertes el usuario en root de facto</span>
+        <pre><code class="language-json">{
+  "Effect": "Allow",
+  "Action": "s3:*",
+  "Resource": ["*"]
+}</code></pre>
+        <span class="code-label code-label--right">Bien — la acción y el recurso que hacen falta</span>
+        <pre><code class="language-json">{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": ["arn:aws:s3:::documentos/acme/*"]
+}</code></pre>
+        <p>Ampliar permisos hasta que desaparezca el error es la forma más rápida de crear un problema mayor. Si no sabes qué acción falta, mira el <code>AccessDenied</code> con el <code>request-id</code> y reproduce la operación con <code>mc --debug</code>.</p>
+
+        <h3>3. Olvidar las acciones multipart</h3>
+        <span class="code-label code-label--wrong">Mal — solo <code>PutObject</code></span>
+        <pre><code class="language-json">"Action": ["s3:PutObject"]   // ❌ falla al completar una subida grande</code></pre>
+        <span class="code-label code-label--right">Bien — incluir el ciclo multipart</span>
+        <pre><code class="language-json">"Action": [
+  "s3:PutObject",
+  "s3:AbortMultipartUpload",
+  "s3:ListMultipartUploadParts"
+]</code></pre>
+        <p>Con objetos pequeños nunca lo ves. El día que alguien sube un vídeo, el SDK parte el archivo, sube las partes y recibe <code>AccessDenied</code> al completar. El objeto no aparece y las partes quedan ocupando espacio hasta que se limpian.</p>
+
+        <h3>4. Publicar el bucket para evitar firmar</h3>
+        <span class="code-label code-label--wrong">Mal — lectura anónima para todo el mundo</span>
+        <pre><code class="language-bash">mc anonymous set download local/documentos   # ❌ todo el bucket es público</code></pre>
+        <span class="code-label code-label--right">Bien — presigned GET acotado o bucket policy por prefijo</span>
+        <pre><code class="language-javascript">const url = await client.presignedGetObject('documentos', key, 300)
+// URL temporal, sin credenciales y con expiración</code></pre>
+        <p>Un bucket público no distingue entre un enlace compartido y un rastreador que enumera claves. Si necesitas acceso sin credenciales, firma una URL por objeto o publica solo un prefijo con una política explícita y revisada.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un usuario con mínimo privilegio, comprobar qué puede y qué no, y verificar que un <code>Deny</code> explícito gana.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el fichero de política de la sección 4:</strong>
+            <pre><code class="language-bash">mkdir -p policies
+# guarda el JSON como policies/documentos-rw.json
+mc admin policy create local documentos-rw ./policies/documentos-rw.json</code></pre>
+            <p>Salida esperada: <code>Created policy documentos-rw successfully.</code></p>
+          </li>
+          <li>
+            <strong>Crea el usuario y adjunta la política:</strong>
+            <pre><code class="language-bash">mc admin user add local app-documentos 'secreto-de-laboratorio-2026'
+mc admin policy attach local documentos-rw --user app-documentos
+mc admin user info local app-documentos</code></pre>
+          </li>
+          <li>
+            <strong>Prueba lo permitido:</strong>
+            <pre><code class="language-bash">mc alias set app http://localhost:9000 app-documentos 'secreto-de-laboratorio-2026'
+printf 'hola\n' &gt; nota.txt
+mc cp nota.txt app/documentos/acme/2026/11/nota.txt
+mc ls app/documentos/acme/2026/11/</code></pre>
+            <pre><code class="language-text">[2026-11-05 11:02:14 CET]     5B STANDARD nota.txt</code></pre>
+          </li>
+          <li>
+            <strong>Prueba lo prohibido por prefijo:</strong>
+            <pre><code class="language-bash">mc cp nota.txt app/documentos/otro/2026/11/nota.txt
+# mc: &lt;ERROR&gt; Unable to copy. Access Denied.</code></pre>
+            <p>Después intenta listar el bucket completo: <code>mc ls app/documentos/</code> debe fallar por la condición <code>s3:prefix</code>.</p>
+          </li>
+          <li>
+            <strong>Comprueba el <code>Deny</code> explícito:</strong>
+            <pre><code class="language-bash">mc cp nota.txt app/documentos/acme/2026/11/legal/nota.txt   # permitido
+mc rm app/documentos/acme/2026/11/legal/nota.txt            # denegado</code></pre>
+            <p>La escritura entra porque el allow cubre <code>acme/*</code>; el borrado falla porque <code>ProtectLegal</code> lo deniega. Anota el código: <code>AccessDenied</code>.</p>
+          </li>
+          <li>
+            <strong>Revisa la entidad efectiva y rota el secreto:</strong>
+            <pre><code class="language-bash">mc admin policy entities local --policy documentos-rw
+mc admin user add local app-documentos 'nuevo-secreto-de-laboratorio'
+mc alias set app http://localhost:9000 app-documentos 'nuevo-secreto-de-laboratorio'</code></pre>
+            <p>El usuario mantiene la política; lo que cambia es el secreto. Comprueba que el alias viejo deja de funcionar.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Escribe en una tabla las cuatro operaciones probadas y su resultado esperado. Si alguna te sorprende, vuelve al diagrama de evaluación: casi siempre es un recurso con el ARN equivocado o un deny que no esperabas.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Políticas como código, con pruebas</h3>
+          <p>Diseña tres roles para el almacén —<em>uploader</em>, <em>reader</em> y <em>auditor</em>— con permisos disjuntos y por prefijo. El uploader no puede leer lo que sube; el reader no puede escribir; el auditor puede listar todo pero solo leer metadatos, no contenido.</p>
+          <p>Escribe un script de pruebas que, para cada rol, ejecute una lista de operaciones permitidas y denegadas y falle si el resultado no coincide con lo esperado. Debe poder ejecutarse contra un MinIO local y limpiar lo que cree. Añade una comprobación de que ningún rol puede borrar bajo <code>legal/</code>.</p>
+          <p><em>Pista: <code>statObject</code> es un <code>HEAD</code> y <code>getObject</code> es un <code>GET</code>; para el auditor necesitas permitir el primero y denegar el segundo. Piensa en qué acción S3 corresponde a cada uno.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los permisos efectivos son la unión de las políticas del usuario y sus grupos.</li>
+          <li>Se evalúa en orden: deny explícito, allow, deny implícito. El deny gana siempre.</li>
+          <li><code>ListBucket</code> se aplica al bucket; <code>GetObject</code> y <code>PutObject</code>, a los objetos.</li>
+          <li><code>s3:prefix</code> limita el listado a un prefijo, no el <code>Resource</code>.</li>
+          <li>Política de usuario para identidades; política de bucket para acceso anónimo o entre cuentas.</li>
+          <li>Los grupos reducen la deriva y simplifican la rotación.</li>
+          <li>Las políticas se versionan y se prueban con el mismo cliente que usa la aplicación.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc admin user add ALIAS USER SECRET</code></td><td>Crea un usuario IAM</td></tr>
+            <tr><td><code>mc admin group add ALIAS GROUP USER...</code></td><td>Añade usuarios a un grupo</td></tr>
+            <tr><td><code>mc admin policy create ALIAS NAME FILE</code></td><td>Crea o reemplaza una política</td></tr>
+            <tr><td><code>mc admin policy attach ALIAS NAME --user USER</code></td><td>Adjunta una política a un usuario</td></tr>
+            <tr><td><code>mc admin policy attach ALIAS NAME --group GROUP</code></td><td>Adjunta una política a un grupo</td></tr>
+            <tr><td><code>mc admin policy entities ALIAS --policy NAME</code></td><td>Lista quién tiene esa política</td></tr>
+            <tr><td><code>mc anonymous set-json FILE ALIAS/BUCKET</code></td><td>Aplica una política de bucket</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Las políticas se aplican al instante?</summary>
+            <div>
+              <p>Sí. MinIO evalúa la política en cada petición; no hay que reiniciar ni refrescar una caché. Si un cambio no surte efecto, comprueba que adjuntaste la política correcta y que estás usando el alias y el usuario esperados.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo impedir que un usuario vea los nombres de otros tenants?</summary>
+            <div>
+              <p>Sí, con la condición <code>s3:prefix</code> en <code>ListBucket</code>. Sin ella, el usuario puede enumerar el bucket aunque reciba <code>AccessDenied</code> al leer los objetos. Los nombres, tamaños y fechas ya son información sensible en muchos contextos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué falla una subida grande si <code>PutObject</code> está permitido?</summary>
+            <div>
+              <p>Porque el SDK usa multipart por encima de cierto tamaño. Necesitas <code>s3:AbortMultipartUpload</code> y <code>s3:ListMultipartUploadParts</code>, y a veces <code>s3:ListBucketMultipartUploads</code> para reanudar. Añádelas si tus objetos pueden superar el umbral de parte.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito política de bucket si ya tengo política de usuario?</summary>
+            <div>
+              <p>Para una aplicación con credenciales, no. La política de bucket añade acceso sin identidad (anónimo) o desde otra cuenta, y lleva <code>Principal</code>. Si no necesitas eso, una política de usuario es más fácil de razonar y de auditar.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

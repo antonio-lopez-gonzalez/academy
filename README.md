@@ -48,6 +48,8 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Aprende Cloud` | Cloud (Azure / AWS, Terraform) | 8 | 32 | `proyectos/infra-cloud` |
 | `Aprende System Design` | System Design (arquitectura a escala) | 8 | 32 | `proyectos/case-studies` |
 | `Aprende Git` | Git (modelo, ramas, deshacer, rescate) | 8 | 32 | `proyectos/laboratorio` |
+| `Aprende RabbitMQ` | RabbitMQ (AMQP, patrones, DLQ, quorum) | 8 | 32 | `proyectos/job-queue` |
+| `Aprende MinIO` | MinIO (S3, buckets, lifecycle, operación) | 8 | 32 | `proyectos/document-store` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
@@ -148,6 +150,7 @@ npx serve "Aprende Python/web"
 - **.NET 8 SDK** para `Aprende Dotnet`, `Aprende NewRelic`, `Aprende Redis` y el backend de `Aprende React`.
 - **Python 3.12+** para `Aprende Python`.
 - **Docker / kind / kubectl / Helm** para `Aprende Docker`.
+- **Docker Compose** para `Aprende RabbitMQ` (broker) y `Aprende MinIO` (servidor de objetos).
 - Context7 MCP para agentes: se instala solo (`npx -y @upstash/context7-mcp`) al arrancar OpenCode.
 
 ---

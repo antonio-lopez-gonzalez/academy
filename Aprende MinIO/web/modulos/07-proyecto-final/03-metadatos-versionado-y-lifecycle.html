@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-metadatos-versionado-y-lifecycle">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Metadatos, versionado y lifecycle — Módulo 7 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Metadatos, versionado y lifecycle</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un documento no es solo su contenido. Es quién lo subió, cuándo, de qué tipo es, en qué estado está y qué versiones ha tenido. MinIO guarda una parte de esa información en el objeto; la aplicación guarda el resto en su catálogo. Y el tiempo —el lifecycle— decide cuánto vive cada cosa.</p>
+        <p>Las tres piezas se confunden con facilidad. Los metadatos de usuario no son un motor de búsqueda. Las etiquetas no son metadatos. El versionado no es un backup. El lifecycle no es «borrar lo viejo». Cada una tiene una semántica distinta y una forma distinta de equivocarse.</p>
+        <p>En esta lección conectamos las tres con el document store: qué metadatos escribe la API, cómo se recupera una versión borrada y cómo se declaran reglas que limpian temporales sin tocar documentos reales. El objetivo es que ninguna operación destructiva sea irreversible por accidente.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el lifecycle es la función más peligrosa del almacenamiento: una regla con el prefijo equivocado borra producción en silencio. Y porque el versionado solo protege lo que existía después de activarlo. Entender el modelo evita descubrirlo con una auditoría.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tres capas que no son intercambiables</h3>
+        <table>
+          <thead><tr><th>Capa</th><th>Dónde vive</th><th>Límite</th><th>Para qué sirve</th></tr></thead>
+          <tbody>
+            <tr><td>Metadatos del sistema</td><td>Cabeceras del objeto</td><td><code>Content-Type</code>, <code>Cache-Control</code>, <code>Content-Disposition</code></td><td>Controlan cómo se sirve y se descarga.</td></tr>
+            <tr><td>Metadatos de usuario</td><td><code>x-amz-meta-*</code></td><td>~2 KB en total</td><td>Contexto pequeño, se lee con <code>HEAD</code>.</td></tr>
+            <tr><td>Etiquetas</td><td>Subrecurso <code>?tagging</code></td><td>10 pares; clave 128, valor 256</td><td>Filtros de lifecycle y políticas.</td></tr>
+            <tr><td>Catálogo</td><td>Base de datos o JSON</td><td>Lo que defina tu esquema</td><td>Consultas por tenant, tipo, estado y fecha.</td></tr>
+          </tbody>
+        </table>
+        <p>La regla práctica: si necesitas <strong>buscar</strong>, va al catálogo; si necesitas <strong>filtrar una regla</strong>, va en etiquetas o prefijo; si necesitas <strong>servir mejor</strong>, va en metadatos del sistema. Guardar el mismo dato en tres sitios garantiza que se desincronicen.</p>
+
+        <h3>Qué escribe la API al completar</h3>
+        <pre><code class="language-javascript">await catalog.update(id, {
+  status: "stored",
+  size: stat.size,
+  etag: stat.etag,
+  versionId: stat.versionId ?? null,
+  completedAt: new Date().toISOString(),
+});
+</code></pre>
+        <p>El <code>versionId</code> es la pieza que permite descargar exactamente la versión que el catálogo conoce, incluso si el objeto se sobrescribe después. Sin él, una descarga «del documento» puede devolver una versión distinta de la registrada.</p>
+        <p>Los metadatos de presentación se fijan en la subida, no después:</p>
+        <pre><code class="language-javascript">await client.putObject("documentos", key, stream, {
+  "Content-Type": "application/pdf",
+  "Content-Disposition": 'attachment; filename="informe.pdf"',
+  "Cache-Control": "private, no-store",
+  "X-Amz-Meta-Tenant": tenant,
+  "X-Amz-Meta-Classification": "internal",
+});
+</code></pre>
+        <p>Con presigned PUT, esas cabeceras las envía el cliente. Si no están firmadas, la API debe leerlas al completar y decidir si las acepta; no puede confiar en que el navegador haya puesto las correctas.</p>
+
+        <h3>Versionado: qué cambia exactamente</h3>
+        <p>Con versionado activo, cada <code>PUT</code> sobre la misma clave crea una versión nueva y la anterior deja de ser actual. Un <code>DELETE</code> no borra: crea un <strong>delete marker</strong>, que es una versión especial que oculta las anteriores. La clave «desaparece» de un <code>GET</code> normal, pero los bytes siguen ahí.</p>
+        <pre><code class="language-text">clave: acme/2026/11/informe.pdf
+
+v1  PUT   9f3c...   &lt;- primera versión
+v2  PUT   4d81...   &lt;- actual
+v3  DELETE (marker) &lt;- GET devuelve 404; v1 y v2 siguen
+
+si se elimina el marker -&gt; v2 vuelve a ser actual
+si se elimina v2      -&gt; v1 pasa a ser actual
+si se eliminan todas  -&gt; el objeto desaparece de verdad</code></pre>
+        <table>
+          <thead><tr><th>Comando</th><th>Efecto</th><th>Reversible</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc rm objeto</code></td><td>Crea un delete marker si hay versionado</td><td>Sí: elimina el marker.</td></tr>
+            <tr><td><code>mc rm --version-id ID</code></td><td>Borra esa versión concreta</td><td>No, salvo backup o réplica.</td></tr>
+            <tr><td><code>mc rm --versions</code></td><td>Borra todas las versiones y markers</td><td>No: es destrucción permanente.</td></tr>
+            <tr><td>Lifecycle de versión no actual</td><td>Borra versiones antiguas tras N días</td><td>No; planifícalo con cuidado.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Versionado no es backup</p>
+          <p>Vive en el mismo bucket y en el mismo clúster. Si se pierde el despliegue, se pierden todas las versiones. El versionado protege de sobrescrituras y borrados lógicos; el backup y la réplica protegen de la pérdida del sistema. Son capas distintas y ninguna sustituye a la otra.</p>
+        </div>
+
+        <h3>Lifecycle: corriente, no actual y multpart</h3>
+        <p>Una regla de lifecycle tiene un filtro (prefijo, etiquetas o tamaño) y una acción (expirar, transicionar). En un bucket versionado, «expirar» el objeto corriente <strong>crea un delete marker</strong>; no borra las versiones. Para borrar versiones antiguas hay que decirlo explícitamente con la acción de versiones no actuales.</p>
+        <table>
+          <thead><tr><th>Regla</th><th>Qué hace</th><th>Riesgo si se mal configura</th></tr></thead>
+          <tbody>
+            <tr><td><code>Expiration.Days</code></td><td>Expira la versión corriente (delete marker)</td><td>Documentos activos desaparecen de los listados.</td></tr>
+            <tr><td><code>NoncurrentVersionExpiration</code></td><td>Borra versiones antiguas tras N días</td><td>Pierdes la recuperación que creías tener.</td></tr>
+            <tr><td><code>AbortIncompleteMultipartUpload</code></td><td>Limpia subidas multipart sin terminar</td><td>Sin ella, los restos consumen espacio invisible.</td></tr>
+            <tr><td><code>ExpiredObjectDeleteMarker</code></td><td>Elimina markers sin versiones detrás</td><td>Limpieza útil; no borra datos vivos.</td></tr>
+          </tbody>
+        </table>
+        <p>El proyecto declara dos reglas al arrancar: <code>expire-tmp</code> sobre <code>tmp/</code> a un día y <code>expire-noncurrent</code> sobre todo el bucket a 30 días. La primera limpia restos; la segunda limita el crecimiento de versiones. Ninguna expira la versión corriente de un documento real.</p>
+        <pre><code class="language-bash">mc ilm rule ls local/documentos
+mc ilm rule export local/documentos &gt; lifecycle.json
+mc ilm rule add local/documentos --prefix "tmp/" --expire-days 1
+mc ilm rule add local/documentos --noncurrent-expire-days 30 --expire-delete-marker
+</code></pre>
+        <p>Exportar a un archivo y versionarlo convierte el lifecycle en configuración revisable. Aplicarlo a mano desde la consola es exactamente lo que el curso quiere evitar.</p>
+
+        <h3>Object lock: cuando no se puede borrar</h3>
+        <p>El bloqueo de objetos (WORM) exige un bucket creado con <code>--with-lock</code>; no se puede activar después. Hay dos modos: <strong>governance</strong>, que un usuario con permisos especiales puede acortar, y <strong>compliance</strong>, que nadie puede acortar hasta que expire el plazo. El versionado es obligatorio; el detalle está en <a href="../01-objetos/04-versionado-y-object-locking.html">Versionado y object locking</a>.</p>
+        <pre><code class="language-bash">mc mb --with-lock local/documentos-legales
+mc retention set --default GOVERNANCE 30d local/documentos-legales
+mc retention info local/documentos-legales
+</code></pre>
+        <p>Úsalo solo si la ley o la política interna lo exigen: complica el borrado, el lifecycle y las pruebas. Un bucket con compliance y una retención mal calculada es inmutable durante años, incluido para ti.</p>
+
+        <h3>Coherencia con la API</h3>
+        <table>
+          <thead><tr><th>Acción de la API</th><th>MinIO</th><th>Catálogo</th></tr></thead>
+          <tbody>
+            <tr><td>Completar subida</td><td>Objeto versionado</td><td><code>stored</code> + <code>versionId</code></td></tr>
+            <tr><td>Borrar documento</td><td>Delete marker</td><td><code>deleted</code> + fecha</td></tr>
+            <tr><td>Restaurar</td><td>Quitar marker con <code>mc</code></td><td>Volver a <code>stored</code> (paso manual o job)</td></tr>
+            <tr><td>Expirar temporal</td><td>Lifecycle sobre <code>tmp/</code></td><td>Ninguno: no son documentos</td></tr>
+            <tr><td>Expirar versión antigua</td><td>Lifecycle no actual</td><td>Ninguno: el catálogo apunta a la actual</td></tr>
+          </tbody>
+        </table>
+        <p>La API no debe borrar versiones concretas salvo en una operación administrativa explícita. Su borrado es lógico: marca, no destruye. La destrucción real se reserva a políticas de retención y a un runbook con backup.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Comprueba con <code>mc</code> que un borrado normal no destruye nada. Usa el prefijo <code>tmp/</code> para no mezclarlo con documentos del catálogo:</p>
+        <pre><code class="language-bash">mc alias set local http://localhost:9000 minioadmin minioadmin123
+
+echo "version 1" &gt; nota.txt
+mc cp nota.txt local/documentos/tmp/versionado.txt
+
+echo "version 2" &gt; nota.txt
+mc cp nota.txt local/documentos/tmp/versionado.txt
+
+mc ls --versions local/documentos/tmp/versionado.txt
+</code></pre>
+        <pre><code class="language-text">[2026-11-05 10:30]  10B 4d81e07… v2 PUT versionado.txt
+[2026-11-05 10:29]  10B 9f3c2ab… v1 PUT versionado.txt</code></pre>
+        <p>Ahora borra y observa:</p>
+        <pre><code class="language-bash">mc rm local/documentos/tmp/versionado.txt
+mc ls --versions local/documentos/tmp/versionado.txt
+</code></pre>
+        <pre><code class="language-text">[2026-11-05 10:31]   0B 7a2b1c9… v3 DELETE versionado.txt
+[2026-11-05 10:30]  10B 4d81e07… v2 PUT versionado.txt
+[2026-11-05 10:29]  10B 9f3c2ab… v1 PUT versionado.txt</code></pre>
+        <p>La versión <code>v3</code> es un delete marker: no tiene contenido. Recupera la <code>v2</code> sin tocar el marker:</p>
+        <pre><code class="language-bash">mc cp --version-id 4d81e07… local/documentos/tmp/versionado.txt ./recuperado.txt
+cat ./recuperado.txt
+</code></pre>
+        <p>El objeto «borrado» sigue siendo accesible por versión. Para restaurarlo como actual, elimina el marker con <code>mc rm --version-id 7a2b1c9…</code>; entonces <code>v2</code> vuelve a ser la versión corriente.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El document store declara su lifecycle en código, no en la consola. Estas son las reglas reales de <code>src/storage.mjs</code>:</p>
+        <pre><code class="language-javascript">await client.setBucketLifecycle(config.bucket, {
+  Rule: [
+    {
+      ID: "expire-tmp",
+      Status: "Enabled",
+      Filter: { Prefix: "tmp/" },
+      Expiration: { Days: 1 },
+    },
+    {
+      ID: "expire-noncurrent",
+      Status: "Enabled",
+      Filter: { Prefix: "" },
+      NoncurrentVersionExpiration: { NoncurrentDays: 30 },
+    },
+  ],
+});
+</code></pre>
+        <p>La primera regla solo toca <code>tmp/</code>. La segunda no expira documentos: borra versiones que llevan 30 días sin ser actuales. Un documento activo no se ve afectado; una versión reemplazada sí, lo que acota el crecimiento del bucket.</p>
+        <p>Falta una tercera regla que conviene añadir: abortar subidas multipart incompletas. Sin ella, un cliente que empieza una subida grande y desaparece deja partes que nadie ve y que consumen capacidad. Se declara en la misma llamada:</p>
+        <pre><code class="language-javascript">Rule: [
+  // ... expire-tmp y expire-noncurrent
+  {
+    ID: "abort-multipart",
+    Status: "Enabled",
+    Filter: { Prefix: "" },
+    AbortIncompleteMultipartUpload: { DaysAfterInitiation: 3 },
+  },
+]
+</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">Todo el lifecycle en un solo sitio</p>
+          <p>Mantener las tres reglas en <code>setBucketLifecycle</code> evita que una aplicación las pise al arrancar. Si las creas con <code>mc ilm rule add</code> por separado, el siguiente arranque de la API puede reemplazar la configuración completa y eliminar las que no conoce.</p>
+        </div>
+        <p>El ciclo completo de un documento con versionado y lifecycle:</p>
+        <table>
+          <thead><tr><th>Día</th><th>Acción</th><th>Estado</th></tr></thead>
+          <tbody>
+            <tr><td>0</td><td>Subida y <code>complete</code></td><td><code>v1</code> actual, catálogo <code>stored</code></td></tr>
+            <tr><td>10</td><td>Nueva subida sobre la misma clave</td><td><code>v2</code> actual, <code>v1</code> no actual</td></tr>
+            <tr><td>20</td><td>Borrado desde la API</td><td>Delete marker, catálogo <code>deleted</code></td></tr>
+            <tr><td>21</td><td>Restauración manual</td><td><code>v2</code> actual, catálogo <code>stored</code></td></tr>
+            <tr><td>40</td><td>Lifecycle de no actuales</td><td><code>v1</code> borrada; <code>v2</code> intacta</td></tr>
+          </tbody>
+        </table>
+        <p>La restauración no es automática: quitar el delete marker devuelve el objeto, pero el catálogo sigue en <code>deleted</code> hasta que un job o una persona lo actualice. Ese hueco es el motivo por el que existe la reconciliación.</p>
+        <p>Para documentos con retención legal, el bucket se crea aparte:</p>
+        <pre><code class="language-bash">mc mb --with-lock local/documentos-legales
+mc retention set --default COMPLIANCE 365d local/documentos-legales
+mc retention info local/documentos-legales
+</code></pre>
+        <p>No mezcles documentos legales con el bucket general: una regla de lifecycle o un borrado administrativo no debe poder afectar a un objeto inmutable por ley.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Activar versionado antes de la primera subida</td><td>Activarlo cuando «haga falta»</td><td>Los objetos anteriores no tienen historial.</td></tr>
+            <tr><td>Guardar el <code>versionId</code> en el catálogo</td><td>Descargar «la última» sin identidad</td><td>Puedes servir exactamente la versión registrada.</td></tr>
+            <tr><td>Prefixar lifecycle a <code>tmp/</code> o a un tipo concreto</td><td>Reglas globales con <code>--expire-days</code></td><td>Una regla amplia borra documentos activos.</td></tr>
+            <tr><td>Exportar el lifecycle y versionarlo</td><td>Configurarlo a mano en la consola</td><td>Se revisa, se prueba y se puede restaurar.</td></tr>
+            <tr><td>Probar la restauración de una versión</td><td>Suponer que el versionado funciona</td><td>Un backup que no se restaura no es un backup.</td></tr>
+            <tr><td>Reservar object lock para requisitos legales</td><td>Bloquear todo «por seguridad»</td><td>Compliance es irreversible y complica la operación.</td></tr>
+            <tr><td>Reconciliar catálogo y versiones</td><td>Confiar en que el borrado lógico basta</td><td>El catálogo no se entera de un cambio hecho con <code>mc</code>.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Expirar el bucket entero</h3>
+        <span class="code-label code-label--wrong">Mal — una regla sin prefijo borra documentos reales</span>
+        <pre><code class="language-bash">mc ilm rule add local/documentos --expire-days 30
+# dentro de 30 días, TODOS los objetos corrientes desaparecen de los listados
+</code></pre>
+        <span class="code-label code-label--right">Bien — limitar a temporales y versiones no actuales</span>
+        <pre><code class="language-bash">mc ilm rule add local/documentos --prefix "tmp/" --expire-days 1
+mc ilm rule add local/documentos --noncurrent-expire-days 30
+</code></pre>
+        <p>La expiración de un objeto corriente en un bucket versionado crea un delete marker, pero el efecto para el usuario es el mismo: el documento deja de estar disponible.</p>
+
+        <h3>2. Borrar todas las versiones para «limpiar»</h3>
+        <span class="code-label code-label--wrong">Mal — destrucción permanente sin vuelta atrás</span>
+        <pre><code class="language-bash">mc rm --recursive --versions local/documentos/acme/
+</code></pre>
+        <span class="code-label code-label--right">Bien — borrado lógico y lifecycle planificado</span>
+        <pre><code class="language-bash">mc rm local/documentos/acme/2026/11/informe.pdf   # delete marker
+mc ls --versions local/documentos/acme/2026/11/
+# y si hace falta espacio, una regla de no actuales con revisión
+</code></pre>
+        <p><code>--versions</code> elimina también los delete markers y todas las versiones. No es una limpieza: es un borrado definitivo que solo un backup puede deshacer.</p>
+
+        <h3>3. Usar metadatos como base de datos</h3>
+        <span class="code-label code-label--wrong">Mal — listar todo para filtrar por tipo</span>
+        <pre><code class="language-javascript">// recorre millones de objetos y descarga metadatos para buscar facturas
+for await (const obj of client.listObjectsV2("documentos", "", true)) {
+  const stat = await client.statObject("documentos", obj.name);
+  if (stat.metaData["x-amz-meta-type"] === "factura") { /* ... */ }
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — consultar el catálogo indexado</span>
+        <pre><code class="language-javascript">const docs = await catalog.list({ tenant: "acme", type: "factura" });
+</code></pre>
+        <p>Los metadatos de usuario tienen un límite de tamaño y no se indexan para búsquedas. El catálogo existe precisamente para eso.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar versiones, recuperar un borrado, revisar las reglas de lifecycle y etiquetar un objeto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Confirma el versionado del proyecto:</strong>
+            <pre><code class="language-bash">cd proyectos/document-store
+docker compose up -d
+mc alias set local http://localhost:9000 minioadmin minioadmin123
+mc version info local/documentos
+mc ilm rule ls local/documentos
+</code></pre>
+            <p>Espera <code>Enabled</code> y las reglas <code>expire-tmp</code> y <code>expire-noncurrent</code>.</p>
+          </li>
+          <li>
+            <strong>Crea dos versiones de un objeto de prueba:</strong>
+            <pre><code class="language-bash">echo "v1" &gt; /tmp/v.txt
+mc cp /tmp/v.txt local/documentos/tmp/ejercicio.txt
+echo "v2" &gt; /tmp/v.txt
+mc cp /tmp/v.txt local/documentos/tmp/ejercicio.txt
+mc ls --versions local/documentos/tmp/ejercicio.txt
+</code></pre>
+            <p>Anota los dos <code>version-id</code>. La versión actual es la de arriba.</p>
+          </li>
+          <li>
+            <strong>Borra y comprueba el delete marker:</strong>
+            <pre><code class="language-bash">mc rm local/documentos/tmp/ejercicio.txt
+mc ls --versions local/documentos/tmp/ejercicio.txt
+mc cat local/documentos/tmp/ejercicio.txt
+</code></pre>
+            <p>El último comando debe fallar con <code>NoSuchKey</code>; el listado debe mostrar una versión <code>DELETE</code> de 0 bytes.</p>
+          </li>
+          <li>
+            <strong>Recupera una versión concreta:</strong>
+            <pre><code class="language-bash">mc cp --version-id &lt;version-id-v1&gt; \
+  local/documentos/tmp/ejercicio.txt /tmp/recuperado.txt
+cat /tmp/recuperado.txt
+</code></pre>
+            <p>Debe imprimir <code>v1</code>. Después elimina el marker para que la versión vuelva a ser actual.</p>
+          </li>
+          <li>
+            <strong>Etiqueta el objeto y observa los límites:</strong>
+            <pre><code class="language-bash">mc tag set local/documentos/tmp/ejercicio.txt "clasificacion=interno&amp;estado=revisado"
+mc tag list local/documentos/tmp/ejercicio.txt
+</code></pre>
+            <p>Las etiquetas se pueden usar en filtros de lifecycle. No las uses para datos que necesites consultar por rango o fecha: eso es catálogo.</p>
+          </li>
+          <li>
+            <strong>Exporta el lifecycle y añade una regla segura:</strong>
+            <pre><code class="language-bash">mc ilm rule export local/documentos &gt; /tmp/lifecycle.json
+mc ilm rule add local/documentos --prefix "tmp/" --expire-days 2
+mc ilm rule ls local/documentos
+</code></pre>
+            <p>Compara el JSON exportado con las reglas activas. Si añades una regla sin prefijo, vuelve a leer la sección 6: es el error más caro de esta lección.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Retención distinta para cada tenant</h3>
+          <p>Diseña una política de retención donde el tenant <code>legal</code> conserve todo durante siete años con object lock en modo compliance, <code>acme</code> conserve versiones 90 días y <code>demo</code> borre todo a los 7 días. Debes usar un solo bucket si es posible, explicar cómo lo consigues con prefijos, etiquetas y reglas, y qué limitaciones tiene object lock cuando se activa a nivel de bucket.</p>
+          <p>Incluye el orden de creación de las reglas, una prueba de que <code>demo</code> no puede afectar a <code>legal</code> y el procedimiento para cambiar la retención de un tenant sin destruir datos. Señala qué parte es reversible y qué parte no lo es nunca.</p>
+          <p><em>Pista: object lock se activa al crear el bucket y se aplica por objeto o por defecto. Si <code>legal</code> y <code>demo</code> comparten bucket, la retención por defecto afectaría a ambos; quizá el aislamiento no sea opcional.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Metadatos sirven para servir, etiquetas para filtrar y catálogo para consultar.</li>
+          <li>El <code>versionId</code> identifica la versión exacta que el catálogo registró.</li>
+          <li>Un borrado normal en un bucket versionado crea un delete marker, no destruye bytes.</li>
+          <li>El lifecycle de la versión corriente expira el documento; el de no actuales borra historia.</li>
+          <li>El proyecto limpia <code>tmp/</code> a un día y versiones no actuales a 30 días.</li>
+          <li>Object lock exige crear el bucket con lock y no se puede deshacer en modo compliance.</li>
+          <li>Versionado no es backup: la pérdida del clúster se cubre con réplica y copias externas.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc version enable</code></td><td>Activa el versionado antes de subir</td></tr>
+            <tr><td><code>mc ls --versions</code></td><td>Lista versiones y delete markers</td></tr>
+            <tr><td><code>mc cp --version-id</code></td><td>Recupera una versión concreta</td></tr>
+            <tr><td><code>mc rm --version-id</code></td><td>Borra una versión (irreversible)</td></tr>
+            <tr><td><code>mc ilm rule ls/export/add</code></td><td>Audita y declara lifecycle</td></tr>
+            <tr><td><code>mc tag set/list</code></td><td>Etiquetas para filtros y políticas</td></tr>
+            <tr><td><code>mc retention set/info</code></td><td>Retención WORM en buckets con lock</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántas versiones debo conservar?</summary>
+            <div>
+              <p>Depende de la criticidad y del espacio. Una política habitual es conservar las versiones no actuales 30 o 90 días y mantener un backup externo para el largo plazo. Lo importante es que la política esté escrita y probada: el lifecycle no avisa cuando borra.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El delete marker ocupa espacio?</summary>
+            <div>
+              <p>Es un objeto pequeño de metadatos, no una copia del contenido. Ocupa muy poco, pero puede acumularse si nunca se limpia. La acción <code>ExpiredObjectDeleteMarker</code> elimina los markers que ya no ocultan ninguna versión.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar el modo de object lock después?</summary>
+            <div>
+              <p>No se puede pasar de compliance a governance ni acortar una retención compliance. Governance permite a un usuario con permiso especial acortar el plazo; compliance no. Planifica la retención antes de crear el bucket y prueba con objetos de laboratorio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El lifecycle se aplica a los objetos que ya existen?</summary>
+            <div>
+              <p>Sí, MinIO evalúa las reglas sobre los objetos existentes además de los nuevos. La evaluación no es instantánea: puede tardar en ejecutarse. No uses el lifecycle como un cron exacto para acciones de negocio; úsalo para retención y limpieza.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo recupero un documento borrado desde la API?</summary>
+            <div>
+              <p>Localiza la clave en el catálogo, ejecuta <code>mc ls --versions</code>, elimina el delete marker con <code>mc rm --version-id</code> y actualiza el catálogo a <code>stored</code>. Si el documento tenía retención o el bucket es inmutable, el procedimiento cambia: consulta la política antes de tocar versiones.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

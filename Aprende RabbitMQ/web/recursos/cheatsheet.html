@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-lesson="recursos/cheatsheet">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet de RabbitMQ — Curso RabbitMQ</title>
+  <meta name="description" content="Chuleta de RabbitMQ organizada por intención: levantar el broker, publicar y consumir con amqplib, exchanges y routing, acknowledges, confirms, DLQ, quorum queues, operación, seguridad y anti-patrones.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../assets/css/site.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Cheatsheet de RabbitMQ</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Referencia rápida</span>
+          <span>🧭 por intención · RabbitMQ 4.4 + amqplib</span>
+        </div>
+      </header>
+
+      <section id="mapa">
+        <h2>El mapa antes de los comandos</h2>
+        <p>Un productor publica en un <strong>exchange</strong>; el exchange enruta a una o varias
+          <strong>colas</strong> según sus <strong>bindings</strong>; un consumidor lee de una cola.
+          Publicar y entregar son dos garantías distintas. Antes de escribir código, decide
+          <strong>quién sostiene qué</strong>.</p>
+        <pre><code class="language-text">productor ──basic.publish──▶ exchange ──binding + routing key──▶ cola ──basic.consume──▶ consumidor
+     │                          │                                   │                        │
+     │ publisher confirm        │ alternate exchange                │ durabilidad            │ ack / nack
+     └── «el broker lo tiene»   └── «si no enruta, avisa»          └── «sobrevive reinicio» └── «lo he procesado»</code></pre>
+        <table>
+          <thead><tr><th>Si buscas…</th><th>Quién lo garantiza</th><th>Mecanismo</th></tr></thead>
+          <tbody>
+            <tr><td>Que el broker reciba la publicación</td><td>Productor + broker</td><td><code>confirmChannel</code> + <code>waitForConfirms</code></td></tr>
+            <tr><td>Que el mensaje no se pierda si la cola cae</td><td>Broker</td><td>Cola durable + mensaje <code>persistent</code> + quorum queue</td></tr>
+            <tr><td>Que el consumidor no pierda trabajo a medias</td><td>Consumidor</td><td><code>ack</code> manual tras procesar</td></tr>
+            <tr><td>Que un fallo no bloquee la cola</td><td>Diseño</td><td>DLX + límite de reintentos + idempotencia</td></tr>
+            <tr><td>Que no se acumule sin control</td><td>Broker</td><td><code>x-max-length</code>, TTL, <code>prefetch</code></td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p><strong>La regla del curso:</strong> no hay entrega «exactamente una vez» gratis. Elige
+            <em>at-most-once</em> (puedes perder) o <em>at-least-once</em> (puedes duplicar) y haz el
+            consumidor idempotente. Ver <a href="../modulos/03-fiabilidad/04-idempotencia-y-reintentos.html">Idempotencia y reintentos</a>.</p>
+        </div>
+      </section>
+
+      <section id="broker">
+        <h2>Levantar el broker y mirarlo</h2>
+        <pre><code class="language-bash"># Broker local con management UI
+docker run -it --rm --name rabbitmq \
+  -p 5672:5672 -p 15672:15672 \
+  rabbitmq:4-management
+
+# Alternativa con Compose (recomendada en el curso)
+docker compose up -d
+docker compose logs -f rabbitmq
+
+# Dentro del contenedor
+docker exec rabbitmq rabbitmqctl status
+docker exec rabbitmq rabbitmqctl list_queues name type messages consumers
+docker exec rabbitmq rabbitmqctl list_exchanges name type
+docker exec rabbitmq rabbitmqctl list_bindings
+
+# Usuarios y vhosts
+docker exec rabbitmq rabbitmqctl add_vhost taller
+docker exec rabbitmq rabbitmqctl add_user app 'cambia-esto'
+docker exec rabbitmq rabbitmqctl set_permissions -p taller app ".*" ".*" ".*"
+
+# Management UI: http://localhost:15672 (guest/guest solo en local)</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>guest/guest solo funciona desde localhost.</strong> No lo uses en contenedores
+            remotos ni en producción; crea un usuario propio y un vhost por entorno.</p>
+        </div>
+      </section>
+
+      <section id="codigo">
+        <h2>Publicar y consumir con amqplib</h2>
+        <pre><code class="language-javascript">import amqp from "amqplib";
+
+const connection = await amqp.connect(process.env.AMQP_URL);
+const channel = await connection.createConfirmChannel();
+
+// Infraestructura idempotente: declarar siempre, no crear a mano en la UI
+await channel.assertExchange("pedidos", "topic", { durable: true });
+await channel.assertQueue("facturacion", {
+  durable: true,
+  arguments: { "x-queue-type": "quorum" },
+});
+await channel.bindQueue("facturacion", "pedidos", "pedido.creado");
+
+// Publicación persistente + confirm
+channel.publish(
+  "pedidos",
+  "pedido.creado",
+  Buffer.from(JSON.stringify({ id: "1042", total: 49.9 })),
+  { persistent: true, contentType: "application/json", messageId: "pedido-1042" }
+);
+await channel.waitForConfirms();
+
+// Consumo con ack manual y prefetch
+await channel.prefetch(10);
+await channel.consume("facturacion", async (msg) => {
+  if (!msg) return;
+  try {
+    const pedido = JSON.parse(msg.content.toString());
+    await facturar(pedido);          // idempotente por pedido.id
+    channel.ack(msg);
+  } catch (err) {
+    channel.nack(msg, false, false); // a DLX, sin reencolar en bucle
+  }
+});</code></pre>
+        <table>
+          <thead><tr><th>Quiero…</th><th>API</th></tr></thead>
+          <tbody>
+            <tr><td>Canal con confirms</td><td><code>connection.createConfirmChannel()</code></td></tr>
+            <tr><td>Declarar cola durable quorum</td><td><code>assertQueue(name, { durable: true, arguments: { "x-queue-type": "quorum" } })</code></td></tr>
+            <tr><td>Limitar mensajes en vuelo</td><td><code>channel.prefetch(n)</code></td></tr>
+            <tr><td>Rechazar sin reencolar</td><td><code>channel.nack(msg, false, false)</code></td></tr>
+            <tr><td>Reencolar para otro intento</td><td><code>channel.nack(msg, false, true)</code> (con cuidado)</td></tr>
+            <tr><td>Cancelar un consumidor</td><td><code>channel.cancel(consumerTag)</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="routing">
+        <h2>Exchanges y routing</h2>
+        <table>
+          <thead><tr><th>Tipo</th><th>Enruta por</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>direct</code></td><td>Routing key exacta</td><td>Un destino concreto por clave</td></tr>
+            <tr><td><code>fanout</code></td><td>Ignora la clave: todas las colas</td><td>Pub/sub, eventos a varios servicios</td></tr>
+            <tr><td><code>topic</code></td><td>Patrón con <code>*</code> (una palabra) y <code>#</code> (cero o más)</td><td>Eventos de dominio jerárquicos</td></tr>
+            <tr><td><code>headers</code></td><td>Cabeceras, no routing key</td><td>Casos con atributos complejos</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-javascript">await channel.assertExchange("pedidos", "topic", { durable: true });
+await channel.bindQueue("facturacion", "pedidos", "pedido.creado");
+await channel.bindQueue("auditoria", "pedidos", "pedido.#");
+await channel.bindQueue("cancelaciones", "pedidos", "pedido.cancelado");
+
+// Alternate exchange: lo que no enruta no desaparece
+await channel.assertExchange("pedidos.ae", "fanout", { durable: true });
+await channel.assertExchange("pedidos", "topic", {
+  durable: true,
+  alternateExchange: "pedidos.ae",
+});</code></pre>
+      </section>
+
+      <section id="fiabilidad">
+        <h2>Fiabilidad: DLQ, TTL y reintentos</h2>
+        <pre><code class="language-javascript">// Cola de trabajo con dead-letter exchange y límite de longitud
+await channel.assertExchange("pedidos.dlx", "direct", { durable: true });
+await channel.assertQueue("pedidos.dlq", { durable: true });
+await channel.bindQueue("pedidos.dlq", "pedidos.dlx", "fallido");
+
+await channel.assertQueue("facturacion", {
+  durable: true,
+  arguments: {
+    "x-queue-type": "quorum",
+    "x-dead-letter-exchange": "pedidos.dlx",
+    "x-dead-letter-routing-key": "fallido",
+    "x-message-ttl": 60_000,
+    "x-max-length": 10_000,
+  },
+});</code></pre>
+        <table>
+          <thead><tr><th>Quiero…</th><th>Configuración</th></tr></thead>
+          <tbody>
+            <tr><td>Mensajes fallidos aparte</td><td><code>x-dead-letter-exchange</code> + cola DLQ</td></tr>
+            <tr><td>Reintentar con espera</td><td>TTL en cola de reintento + DLX de vuelta a la principal</td></tr>
+            <tr><td>Limitar intentos</td><td>Cabecera <code>x-death</code> / contador propio + DLQ final</td></tr>
+            <tr><td>Evitar duplicados</td><td>Clave de negocio única + deduplicación en consumidor</td></tr>
+            <tr><td>No bloquear la cola</td><td><code>prefetch</code>, timeouts y <code>nack</code> sin requeue</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Reencolar en bucle es un anti-patrón.</strong> Un mensaje venenoso con
+            <code>nack(requeue=true)</code> vuelve al frente una y otra vez y consume CPU. Mándalo a
+            una cola de reintento con backoff o a la DLQ.</p>
+        </div>
+      </section>
+
+      <section id="operacion">
+        <h2>Operación y seguridad</h2>
+        <pre><code class="language-bash"># Colas, consumidores y mensajes listos
+docker exec rabbitmq rabbitmqctl list_queues name type messages messages_ready messages_unacknowledged consumers
+
+# Políticas (aplican a colas/exchanges existentes)
+docker exec rabbitmq rabbitmqctl set_policy ha-quorum '^taller\.' \
+  '{"queue-mode":"default","delivery-limit":5}' --apply-to queues
+
+# Alarmas y recursos
+docker exec rabbitmq rabbitmqctl status
+docker exec rabbitmq rabbitmqctl eval 'rabbit_alarm:get_alarms().'
+
+# Métricas Prometheus (plugin)
+docker exec rabbitmq rabbitmq-plugins enable rabbitmq_prometheus
+
+# TLS: usar amqps:// y verificar el certificado; nunca desactivar la verificación</code></pre>
+        <table>
+          <thead><tr><th>Señal</th><th>Qué mirar</th></tr></thead>
+          <tbody>
+            <tr><td>Cola crece sin parar</td><td>Consumidores caídos, prefetch, throughput, mensajes venenosos</td></tr>
+            <tr><td>Publicadores bloqueados</td><td>Alarma de memoria/disco y flow control</td></tr>
+            <tr><td>Mensajes sin confirmar</td><td><code>messages_unacknowledged</code> alto o consumidores lentos</td></tr>
+            <tr><td>Nodo inestable</td><td>Particiones de red, disco lleno, memoria</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Todo como código.</strong> Declara exchanges, colas, bindings y políticas en el
+            arranque de la aplicación o en un script versionado. La management UI sirve para observar,
+            no para ser la única fuente de verdad.</p>
+        </div>
+      </section>
+
+      <section id="antipatrones">
+        <h2>Anti-patrones que este curso evita</h2>
+        <table>
+          <thead><tr><th>Anti-patrón</th><th>Por qué duele</th><th>Alternativa</th></tr></thead>
+          <tbody>
+            <tr><td><code>autoAck: true</code></td><td>Pierdes el mensaje si el proceso cae</td><td><code>ack</code> manual tras procesar</td></tr>
+            <tr><td>Cola no durable para trabajo</td><td>Se pierde al reiniciar el broker</td><td>Durable + mensaje persistente + quorum</td></tr>
+            <tr><td>Reintentos infinitos</td><td>Bucle tóxico y CPU</td><td>Backoff + límite + DLQ</td></tr>
+            <tr><td>Un exchange por cada mensaje</td><td>Infraestructura inmanejable</td><td>Exchanges estables + routing keys</td></tr>
+            <tr><td>Confiar en el orden global</td><td>Varios consumidores rompen el orden</td><td>Orden por clave/cola, no global</td></tr>
+            <tr><td>Guardar secretos en la URL</td><td>Se filtran en logs</td><td>Variables de entorno + TLS + usuario acotado</td></tr>
+          </tbody>
+        </table>
+        <p>Vuelve al <a href="../modulos/00-fundamentos/02-modelo-amqp.html">modelo AMQP</a> cuando dudes:
+          casi todos los errores son una confusión entre exchange, cola y consumidor.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../';</script>
+  <script src="../assets/js/course-data.js"></script>
+  <script src="../assets/js/highlight.js"></script>
+  <script src="../assets/js/site.js"></script>
+</body>
+</html>

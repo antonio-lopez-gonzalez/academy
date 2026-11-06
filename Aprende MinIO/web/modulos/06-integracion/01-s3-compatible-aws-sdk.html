@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-s3-compatible-aws-sdk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Compatibilidad con AWS SDK — Módulo 6 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Compatibilidad con AWS SDK</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Integración</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has usado <code>minio-js</code> y <code>mc</code> contra MinIO. Ambos hablan la misma API S3, pero si mañana el almacenamiento se contrata en AWS, se migra a otro proveedor compatible o la empresa exige un SDK con soporte corporativo, no quieres reescribir la aplicación. Quieres <strong>cambiar configuración, no código</strong>.</p>
+        <p>El SDK v3 de AWS para JavaScript es la otra mitad de esa promesa. Es modular, está escrito en TypeScript, funciona en Node.js 22 y firma cada petición con Signature Version 4 (SigV4). MinIO valida esa misma firma. La compatibilidad no es magia: es un contrato HTTP con un conjunto de operaciones y unos cuantos matices que conviene conocer antes de encontrarlos en producción.</p>
+        <p>En esta lección conectaremos <code>@aws-sdk/client-s3</code> a MinIO, generaremos presigned URLs con <code>@aws-sdk/s3-request-presigner</code> y separaremos lo que es <em>portable</em> de lo que es <em>propio de cada implementación</em>. Los tres fallos clásicos —estilo de URL, región y checksums— aparecen casi siempre en la primera conexión, así que los trataremos con detalle.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>La API S3 es el estándar de facto del almacenamiento de objetos. Aprender un SDK propietario te ata a un proveedor; aprender el contrato S3 te permite usar MinIO en local, AWS en la nube y un tercero compatible en el mismo código. La diferencia está en cinco líneas de configuración y en una batería de pruebas de compatibilidad.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Qué viaja realmente por el cable</h3>
+        <p>El SDK no envía «sube este archivo». Construye una petición HTTP con un método, una ruta, unas cabeceras y un cuerpo; después calcula una firma sobre todos esos elementos. En SigV4 la firma cubre, entre otros, el método, la ruta canónica, los parámetros de consulta, las cabeceras firmadas y el hash del cuerpo. Cambiar una barra en la ruta o el valor de <code>Host</code> invalida la firma.</p>
+        <pre><code class="language-text">PUT /documentos/2026/informe.pdf HTTP/1.1
+Host: localhost:9000
+x-amz-date: 20261105T101500Z
+x-amz-content-sha256: e3b0c442...
+Authorization: AWS4-HMAC-SHA256 Credential=documentos-app/20261105/us-east-1/s3/aws4_request,
+               SignedHeaders=host;x-amz-content-sha256;x-amz-date,
+               Signature=5f2c...
+
+        firma = HMAC-SHA256(clave derivada, petición canónica)
+        si un byte cambia -> SignatureDoesNotMatch</code></pre>
+        <p>De ahí salen las tres constantes de configuración que veremos una y otra vez: <strong>endpoint</strong> (a qué host se envía), <strong>región</strong> (qué ámbito usa la firma) y <strong>estilo de ruta</strong> (cómo se coloca el bucket en la URL).</p>
+        <h3>Path-style frente a virtual-hosted-style</h3>
+        <p>AWS prefiere <code>https://bucket.s3.amazonaws.com/key</code>. MinIO, en local, no tiene DNS comodín para cada bucket, así que espera <code>http://localhost:9000/bucket/key</code>. Si el SDK usa el estilo virtual, intenta resolver <code>documentos.localhost</code> y falla antes de enviar nada.</p>
+        <pre><code class="language-text">VIRTUAL-HOSTED (AWS)                 PATH-STYLE (MinIO local)
++------------------------------+      +------------------------------+
+| https://bucket.s3.../k       |      | http://localhost:9000/bucket/k|
+| Host: bucket.s3.amazonaws.com|      | Host: localhost:9000          |
++------------------------------+      +------------------------------+
+        requiere DNS por bucket            una sola entrada DNS</code></pre>
+        <p>La opción <code>forcePathStyle: true</code> obliga al SDK a usar siempre la segunda forma. En un MinIO distribuido con <code>features.bucketDNS</code> o detrás de un proxy con comodín podrías usar virtual-host, pero para desarrollo y para la mayoría de instalaciones el path-style es la opción segura.</p>
+        <p>La <strong>región</strong> también forma parte de la firma: MinIO no tiene regiones reales, pero valida que el ámbito de la credencial sea coherente. Si firmas con <code>eu-west-1</code> y el servidor espera <code>us-east-1</code>, verás <code>SignatureDoesNotMatch</code>. Fija <code>region</code> en el cliente y usa el mismo valor en el <code>mc alias</code>; <code>us-east-1</code> es un buen valor por defecto y una variable de entorno (<code>S3_REGION</code>) permite cambiarlo al apuntar a AWS.</p>
+        <h3>Checksums: la trampa moderna</h3>
+        <p>Desde finales de 2024, el SDK v3 calcula checksums flexibles por defecto en muchas operaciones. Añade cabeceras como <code>x-amz-checksum-crc32</code> y <code>x-amz-sdk-checksum-algorithm</code>. Las versiones recientes de MinIO las entienden, pero un servidor antiguo o un proxy que no las espere puede rechazar la petición con <code>NotImplemented</code> o un error de checksum. Para un cliente que debe hablar con cualquier S3 compatible, se configura explícitamente:</p>
+        <pre><code class="language-javascript">requestChecksumCalculation: "WHEN_REQUIRED",
+responseChecksumValidation: "WHEN_REQUIRED",
+</code></pre>
+        <p>Así el SDK solo envía checksums cuando la operación los exige, y tú puedes añadir los tuyos (SHA-256, CRC32C) donde aporten valor. No es un retroceso de seguridad: es controlar el contrato en lugar de heredar el de AWS.</p>
+        <h3>Qué es igual y qué no</h3>
+        <table>
+          <thead><tr><th>Área</th><th>MinIO Community</th><th>Consecuencia para tu código</th></tr></thead>
+          <tbody>
+            <tr><td>Operaciones core</td><td>Put, get, head, delete, list, multipart, copy</td><td>Portables sin cambios.</td></tr>
+            <tr><td>Versionado y object lock</td><td>Soportados</td><td><code>versionId</code> y retención funcionan; el bucket debe crearse con lock.</td></tr>
+            <tr><td>Lifecycle y notificaciones</td><td>Soportados, con configuración propia</td><td>La API de lifecycle es portable; los <em>targets</em> de eventos se configuran con <code>mc</code>.</td></tr>
+            <tr><td>ACL de bucket/objeto</td><td>No se usan: se resuelven con políticas IAM</td><td>No diseñes con ACL. Usa políticas y presigned URLs.</td></tr>
+            <tr><td>Bucket website</td><td>No implementado como hosting</td><td>Sirve el sitio con nginx/Caddy delante, no con el bucket.</td></tr>
+            <tr><td>Analytics, metrics, logging vía S3</td><td>No: usa métricas y notificaciones de MinIO</td><td>No portes ese acoplamiento; instrumenta aparte.</td></tr>
+          </tbody>
+        </table>
+        <h3>Presigned URLs: firmar sin enviar</h3>
+        <p>Un presigned URL es una petición futura con la firma ya calculada en los parámetros de consulta. El SDK no contacta con el servidor: deriva la firma de las credenciales que tengas en memoria. Por eso importa <strong>quién firma</strong> y <strong>para qué host</strong>.</p>
+        <ul>
+          <li>El host firmado debe ser el host público por el que el cliente accederá. Firmar <code>http://minio:9000</code> y enviar la URL al navegador produce un error de red, no de permisos.</li>
+          <li>La expiración máxima con credenciales de larga duración es de siete días; para subidas de usuario, quince minutos suele ser suficiente.</li>
+          <li>Firma con un usuario de mínimo privilegio, nunca con root. La URL hereda sus permisos y su ámbito.</li>
+        </ul>
+        <h3>Portabilidad real: un adaptador y un contrato</h3>
+        <p>No repartas <code>S3Client</code> por toda la aplicación. Aísla el SDK en un módulo con cuatro o cinco funciones y prueba ese módulo contra MinIO y, si puedes, contra AWS. La aplicación no debe saber si debajo hay MinIO, AWS o un proveedor compatible: solo cambian las variables de entorno.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a listar buckets y subir un objeto contra el MinIO del curso usando el SDK de AWS. Crea el proyecto e instala solo los paquetes necesarios:</p>
+        <pre><code class="language-bash">mkdir s3-portable
+cd s3-portable
+npm init -y
+npm pkg set type=module
+npm i @aws-sdk/client-s3@3 @aws-sdk/s3-request-presigner@3
+</code></pre>
+        <p>El archivo <code>.env.example</code> documenta las variables; el <code>.env</code> real no se versiona:</p>
+        <pre><code class="language-bash">S3_ENDPOINT=http://localhost:9000
+S3_REGION=us-east-1
+S3_ACCESS_KEY=documentos-app
+S3_SECRET_KEY=cambia-esto-en-local
+S3_BUCKET=documentos
+</code></pre>
+        <p>Y este es el cliente mínimo, en <code>client.mjs</code>:</p>
+        <pre><code class="language-javascript">import {
+  S3Client,
+  ListBucketsCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+
+const client = new S3Client({
+  endpoint: process.env.S3_ENDPOINT,
+  region: process.env.S3_REGION ?? "us-east-1",
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY,
+    secretAccessKey: process.env.S3_SECRET_KEY,
+  },
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
+});
+
+const buckets = await client.send(new ListBucketsCommand({}));
+console.log("buckets:", buckets.Buckets?.map((b) =&gt; b.Name));
+
+await client.send(new PutObjectCommand({
+  Bucket: process.env.S3_BUCKET,
+  Key: "pruebas/hola.txt",
+  Body: "hola desde el SDK de AWS\n",
+  ContentType: "text/plain; charset=utf-8",
+}));
+console.log("objeto subido");
+</code></pre>
+        <p>Ejecútalo con el cargador de entorno de Node.js 22:</p>
+        <pre><code class="language-bash">node --env-file=.env client.mjs
+</code></pre>
+        <pre><code class="language-text">buckets: [ 'documentos' ]
+objeto subido
+</code></pre>
+        <p>Línea a línea, lo importante:</p>
+        <ul>
+          <li><code>endpoint</code> apunta al servidor; sin él, el SDK resolvería <code>s3.us-east-1.amazonaws.com</code>.</li>
+          <li><code>forcePathStyle: true</code> produce <code>/documentos/pruebas/hola.txt</code> en lugar de <code>documentos.localhost</code>.</li>
+          <li><code>region</code> forma parte del ámbito de la firma; debe ser estable.</li>
+          <li>Los dos flags de checksum evitan cabeceras que servidores antiguos no entienden.</li>
+          <li><code>ContentType</code> se firma y se guarda como metadato del sistema; no es un adorno.</li>
+        </ul>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos necesita firmar una subida y una descarga. Las encapsulamos en <code>storage.mjs</code> para que el resto de la aplicación no importe nada del SDK:</p>
+        <pre><code class="language-javascript">import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const client = new S3Client({
+  endpoint: process.env.S3_ENDPOINT,
+  region: process.env.S3_REGION ?? "us-east-1",
+  forcePathStyle: true,
+  ...(process.env.S3_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.S3_ACCESS_KEY,
+          secretAccessKey: process.env.S3_SECRET_KEY,
+        },
+      }
+    : {}),
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
+});
+
+const Bucket = process.env.S3_BUCKET;
+
+export function presignPut(key, contentType, expiresIn = 900) {
+  return getSignedUrl(
+    client,
+    new PutObjectCommand({ Bucket, Key: key, ContentType: contentType }),
+    { expiresIn },
+  );
+}
+
+export function presignGet(key, expiresIn = 300) {
+  return getSignedUrl(
+    client,
+    new GetObjectCommand({ Bucket, Key: key }),
+    { expiresIn },
+  );
+}
+</code></pre>
+        <p>Fíjate en el detalle de las credenciales: si existen variables, se usan; si no, el SDK aplica su cadena de proveedores (rol de IAM, perfil, SSO). Eso permite el mismo archivo en local y en AWS sin un <code>if</code> repartido por la aplicación.</p>
+        <p>El cambio de entorno queda reducido a una tabla:</p>
+        <table>
+          <thead><tr><th>Variable</th><th>MinIO local</th><th>AWS</th></tr></thead>
+          <tbody>
+            <tr><td><code>S3_ENDPOINT</code></td><td><code>http://localhost:9000</code></td><td>Sin valor (endpoint por defecto) o el endpoint de la región</td></tr>
+            <tr><td><code>S3_REGION</code></td><td><code>us-east-1</code></td><td><code>eu-west-1</code>, <code>us-east-2</code>…</td></tr>
+            <tr><td><code>S3_ACCESS_KEY</code></td><td>Usuario de la aplicación</td><td>Vacío si usas rol de IAM</td></tr>
+            <tr><td><code>S3_BUCKET</code></td><td><code>documentos</code></td><td>El bucket real, único a nivel global</td></tr>
+          </tbody>
+        </table>
+        <p>Para que la portabilidad sea una promesa y no una esperanza, escribe pruebas de contrato: subir, leer, listar, borrar y comprobar que un <code>HeadObject</code> de una clave inexistente devuelve <code>NotFound</code>. Esas pruebas deben pasar en los dos entornos. En el <a href="../02-sdk/03-errores-reintentos-y-checksums.html">módulo 2</a> viste cómo normalizar errores; el adaptador es el lugar donde se aplica.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un endpoint público para las URLs</p>
+          <p>Si la API corre dentro de Docker, el SDK puede hablar con <code>http://minio:9000</code>, pero el navegador no resuelve ese nombre. Configura un <code>S3_PUBLIC_ENDPOINT</code> (por ejemplo <code>http://localhost:9000</code>) y crea un segundo cliente solo para firmar URLs públicas. Es la causa número uno de «la URL se genera pero no funciona».</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Encapsular el SDK en un adaptador con operaciones de negocio</td><td>Importar <code>S3Client</code> en controladores y componentes</td><td>Puedes cambiar de proveedor, añadir trazas y probar sin tocar la aplicación.</td></tr>
+            <tr><td>Fijar <code>forcePathStyle</code>, región y checksums explícitamente</td><td>Confiar en los valores por defecto del SDK</td><td>Los defaults están pensados para AWS y cambian entre versiones menores.</td></tr>
+            <tr><td>Firmar URLs con un usuario de mínimo privilegio y expiración corta</td><td>Firmar con root o con expiraciones de días</td><td>La URL es una credencial temporal; su alcance debe ser mínimo.</td></tr>
+            <tr><td>Separar endpoint interno y endpoint público</td><td>Firmar con el host de la red Docker</td><td>El navegador debe poder resolver y alcanzar el host firmado.</td></tr>
+            <tr><td>Probar el adaptador contra MinIO y AWS con el mismo contrato</td><td>Descubrir diferencias el día de la migración</td><td>La compatibilidad se demuestra con pruebas, no con un documento.</td></tr>
+            <tr><td>Fijar versiones del SDK y revisar sus cambios</td><td>Usar <code>latest</code> en producción</td><td>Los checksums y la resolución de endpoints han cambiado entre versiones.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Olvidar el path-style</h3>
+        <span class="code-label code-label--wrong">Mal — el SDK intenta resolver un subdominio que no existe</span>
+        <pre><code class="language-javascript">const client = new S3Client({
+  endpoint: "http://localhost:9000",
+  region: "us-east-1",
+  credentials,
+}); // GET http://documentos.localhost:9000/ -&gt; ENOTFOUND
+</code></pre>
+        <span class="code-label code-label--right">Bien — bucket en la ruta</span>
+        <pre><code class="language-javascript">const client = new S3Client({
+  endpoint: "http://localhost:9000",
+  region: "us-east-1",
+  forcePathStyle: true,
+  credentials,
+});
+</code></pre>
+        <p>El error puede aparecer como <code>getaddrinfo ENOTFOUND documentos.localhost</code> o como una redirección permanente. En ambos casos, mira la URL antes de tocar credenciales.</p>
+        <h3>2. Heredar los checksums por defecto</h3>
+        <span class="code-label code-label--wrong">Mal — cabeceras que el servidor antiguo no soporta</span>
+        <pre><code class="language-text">x-amz-sdk-checksum-algorithm: CRC32
+x-amz-checksum-crc32: ...
+-&gt; NotImplemented / XAmzContentChecksumMismatch</code></pre>
+        <span class="code-label code-label--right">Bien — checksums solo cuando se piden</span>
+        <pre><code class="language-javascript">new S3Client({
+  endpoint, region, forcePathStyle: true,
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
+});
+</code></pre>
+        <p>Y si tu dominio exige integridad, calcula el checksum en el adaptador y compáralo con el <code>ETag</code> o con el valor que devuelve <code>HeadObject</code>. No dependas de que el transporte lo haga por ti.</p>
+        <h3>3. Generar la URL con el host interno o con root</h3>
+        <span class="code-label code-label--wrong">Mal — URL inalcanzable y privilegios excesivos</span>
+        <pre><code class="language-javascript">// dentro de Docker
+const client = new S3Client({ endpoint: "http://minio:9000", ... });
+const url = await getSignedUrl(client, new PutObjectCommand({
+  Bucket: "documentos", Key: key,
+})); // el navegador no resuelve "minio"
+</code></pre>
+        <span class="code-label code-label--right">Bien — cliente público y usuario acotado</span>
+        <pre><code class="language-javascript">const publicClient = new S3Client({
+  endpoint: process.env.S3_PUBLIC_ENDPOINT, // http://localhost:9000
+  region, forcePathStyle: true,
+  credentials: appCredentials, // no root
+});
+const url = await getSignedUrl(publicClient, command, { expiresIn: 600 });
+</code></pre>
+        <p>La URL hereda los permisos del firmante y el host firmado. Un error aquí no se arregla «regenerando la URL»: se arregla corrigiendo el cliente con el que se firma.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> conectar el SDK de AWS a MinIO con un usuario acotado, subir un objeto, firmar una URL y comprobar que el mismo código solo necesita configuración para cambiar de proveedor.</p>
+        <ol class="steps">
+          <li>
+            <strong>Levanta MinIO y crea el alias:</strong>
+            <pre><code class="language-bash">docker run -d --name minio-sdk \
+  -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  -v minio-sdk-data:/data \
+  quay.io/minio/minio server /data --console-address ":9001"
+
+mc alias set local http://localhost:9000 minioadmin minioadmin
+mc mb --ignore-existing local/documentos
+</code></pre>
+            <p>Salida esperada: <code>Bucket created successfully `local/documentos`</code>.</p>
+          </li>
+          <li>
+            <strong>Crea un usuario de aplicación con política acotada:</strong>
+            <pre><code class="language-bash">cat &gt; documentos-app.json &lt;&lt;'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::documentos/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::documentos"]
+    }
+  ]
+}
+JSON
+
+mc admin user add local documentos-app 'clave-local-segura'
+mc admin policy create local documentos-app-policy documentos-app.json
+mc admin policy attach local documentos-app-policy --user documentos-app
+</code></pre>
+            <p>El usuario no puede crear buckets ni cambiar políticas: solo operar sobre <code>documentos</code>.</p>
+          </li>
+          <li>
+            <strong>Crea el proyecto del ejemplo mínimo</strong> con las tres órdenes de la sección 3 y un <code>.env</code> con las credenciales del usuario recién creado. Ejecuta <code>node --env-file=.env client.mjs</code>.
+          </li>
+          <li>
+            <strong>Firma una subida, úsala con curl y comprueba el objeto:</strong>
+            <pre><code class="language-javascript">import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+// ... cliente igual que en storage.mjs
+const url = await getSignedUrl(client, new PutObjectCommand({
+  Bucket: "documentos",
+  Key: "pruebas/firmado.txt",
+  ContentType: "text/plain",
+}), { expiresIn: 300 });
+console.log(url);
+</code></pre>
+            <pre><code class="language-bash">curl -i -X PUT -H "Content-Type: text/plain" \
+  --data-binary "subido con presigned URL" "$URL"
+mc stat local/documentos/pruebas/firmado.txt
+mc cat local/documentos/pruebas/firmado.txt
+</code></pre>
+            <p>Espera <code>HTTP/1.1 200 OK</code> y un <code>ETag</code>. Si cambias el <code>Content-Type</code> en curl, la firma falla: la cabecera está firmada. <code>mc</code> debe ver el mismo objeto, tamaño y tipo.</p>
+          </li>
+          <li>
+            <strong>Rompe la configuración a propósito:</strong> elimina <code>forcePathStyle</code> y ejecuta de nuevo. Anota el error exacto. Restaura la opción y confirma que vuelve a funcionar. Repite con una región distinta y con <code>requestChecksumCalculation</code> en <code>WHEN_SUPPORTED</code>; documenta qué error produce cada cambio en tu versión de MinIO.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Tu adaptador debe funcionar con dos configuraciones sin tocar una línea de JavaScript: MinIO local y un bucket de AWS (o un segundo MinIO con otra región). Si necesitas cambiar código para alternar, todavía no es portable.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Una suite de contrato para dos proveedores</h3>
+          <p>Diseña y ejecuta una suite de pruebas que valide el mismo adaptador contra MinIO y contra AWS S3 (o un segundo proveedor compatible al que tengas acceso). Debe cubrir: subida, lectura, <code>HeadObject</code>, listado por prefijo, copia, borrado, versionado y una presigned URL usada desde fuera del proceso. Registra las diferencias que encuentres y clasifícalas en «portable», «requiere configuración» y «no soportado».</p>
+          <p>Después, escribe una tabla de decisión: para cada diferencia, qué haría tu aplicación si mañana cambia de proveedor. No vale decir «usar siempre AWS»: el objetivo es que el contrato sobreviva al cambio.</p>
+          <p><em>Pista: empieza por las operaciones que ya usas en el document store y añade una prueba por operación. Las diferencias más probables aparecen en ACL, website, checksums y en la forma de configurar notificaciones, no en <code>PutObject</code>.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>MinIO y AWS comparten la API S3 y SigV4; el mismo SDK sirve para ambos cambiando configuración.</li>
+          <li><code>forcePathStyle: true</code> evita depender de DNS por bucket, imprescindible en local.</li>
+          <li>La región forma parte de la firma; debe ser coherente entre cliente, servidor y alias de <code>mc</code>.</li>
+          <li>Los checksums flexibles del SDK v3 se controlan con <code>WHEN_REQUIRED</code> para maximizar compatibilidad.</li>
+          <li>Las presigned URLs se firman con un usuario acotado y para el host público, no para el host interno.</li>
+          <li>La portabilidad se demuestra con un adaptador pequeño y pruebas de contrato contra los dos entornos.</li>
+          <li>ACL, website, analytics y logging no son portables tal cual: usa políticas, un proxy y las herramientas propias de MinIO.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Para qué sirve</th></tr></thead>
+          <tbody>
+            <tr><td><code>@aws-sdk/client-s3</code></td><td>Cliente y comandos S3 (Put, Get, Head, List, Copy…)</td></tr>
+            <tr><td><code>@aws-sdk/s3-request-presigner</code></td><td><code>getSignedUrl</code> para firmar sin enviar la petición</td></tr>
+            <tr><td><code>forcePathStyle</code></td><td>Usar <code>/bucket/key</code> en lugar de <code>bucket.host/key</code></td></tr>
+            <tr><td><code>requestChecksumCalculation</code></td><td>Controlar cuándo se añaden checksums a la petición</td></tr>
+            <tr><td><code>HeadObjectCommand</code></td><td>Verificar existencia, tamaño, tipo y metadatos sin descargar</td></tr>
+            <tr><td><code>getSignedUrl(..., { expiresIn })</code></td><td>Crear una URL temporal con alcance y caducidad</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿MinIO implementa toda la API de S3?</summary>
+            <div>
+              <p>Implementa el núcleo que usan las aplicaciones —objetos, buckets, multipart, versionado, object lock, lifecycle, réplica y notificaciones— y deja fuera operaciones de AWS que no aportan a un almacén privado, como el hosting de sitios web o las ACL. La documentación oficial de compatibilidad lista cada caso. Antes de migrar, prueba las operaciones concretas que usas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar <code>minio-js</code> y el SDK de AWS a la vez?</summary>
+            <div>
+              <p>Sí, ambos hablan el mismo protocolo. Lo sensato es elegir uno por aplicación para no duplicar configuración y manejo de errores. <code>minio-js</code> es más directo para MinIO; el SDK de AWS es útil si necesitas portabilidad o ya está integrado en tu ecosistema. El adaptador permite cambiar sin tocar los casos de uso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué la presigned URL funciona en local pero no desde el navegador?</summary>
+            <div>
+              <p>Porque se firmó con el host interno (<code>minio:9000</code>) o con <code>localhost</code> visto desde otro contenedor. La firma incluye el <code>Host</code>: no puedes reescribir la URL y esperar que siga siendo válida. Firma con un cliente cuyo <code>endpoint</code> sea exactamente el host público que usará el navegador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La región de MinIO tiene algún efecto real?</summary>
+            <div>
+              <p>MinIO usa la región como parte del ámbito de firma y para algunas validaciones. No cambia dónde se almacenan los datos ni ofrece aislamiento geográfico. Lo importante es que cliente y servidor coincidan; <code>us-east-1</code> es un valor seguro por defecto.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

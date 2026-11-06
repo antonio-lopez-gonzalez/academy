@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-lesson="recursos/cheatsheet">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet de MinIO — Curso MinIO</title>
+  <meta name="description" content="Chuleta de MinIO organizada por intención: levantar el servidor, usar mc, buckets y objetos, presigned URLs, usuarios y políticas, lifecycle, réplica, notificaciones, operación y anti-patrones.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../assets/css/site.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Cheatsheet de MinIO</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Referencia rápida</span>
+          <span>🧭 por intención · MinIO Community + mc + minio-js</span>
+        </div>
+      </header>
+
+      <section id="mapa">
+        <h2>El mapa antes de los comandos</h2>
+        <p>MinIO implementa la <strong>API S3</strong>: guardas <strong>objetos</strong> (datos +
+          metadatos) bajo una <strong>clave</strong> dentro de un <strong>bucket</strong>. No hay
+          carpetas reales: los <strong>prefijos</strong> son parte de la clave. Antes de crear nada,
+          decide el modelo de claves y quién puede leerlas.</p>
+        <pre><code class="language-text">bucket: documentos
+├── 2026/facturas/1042.pdf         ← la clave completa es "2026/facturas/1042.pdf"
+├── 2026/facturas/1043.pdf
+└── tmp/upload-8f3a.pdf            ← lifecycle lo expira a los 7 días
+
+objeto = bytes + content-type + metadatos + ETag
+prefijo ≠ carpeta: es un prefijo de la clave, no un directorio del sistema</code></pre>
+        <table>
+          <thead><tr><th>Si buscas…</th><th>Quién lo garantiza</th><th>Mecanismo</th></tr></thead>
+          <tbody>
+            <tr><td>Que un objeto no se pierda</td><td>MinIO</td><td>Erasure coding + réplica / modo distribuido</td></tr>
+            <tr><td>Que nadie lea un bucket privado</td><td>Políticas</td><td>Bucket policy + usuario de mínimo privilegio</td></tr>
+            <tr><td>Subir sin dar credenciales</td><td>Firma</td><td>Presigned URL con expiración</td></tr>
+            <tr><td>Recuperar un borrado</td><td>Versionado</td><td>Versiones + delete marker</td></tr>
+            <tr><td>No acumular basura</td><td>Lifecycle</td><td>Reglas de expiración y transición</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p><strong>La regla del curso:</strong> root solo para arrancar. La aplicación usa un usuario
+            con una política acotada y, cuando puede, una <strong>presigned URL</strong>. Ver
+            <a href="../modulos/03-seguridad/02-usuarios-y-politicas.html">Usuarios y políticas</a>.</p>
+        </div>
+      </section>
+
+      <section id="servidor">
+        <h2>Levantar el servidor y mirarlo</h2>
+        <pre><code class="language-bash"># Servidor local (API S3 en 9000, consola en 9001)
+docker run -p 9000:9000 -p 9001:9001 \
+  --name minio \
+  -v ~/minio/data:/data \
+  -e "MINIO_ROOT_USER=minioadmin" \
+  -e "MINIO_ROOT_PASSWORD=cambia-esto-123" \
+  quay.io/minio/minio server /data --console-address ":9001"
+
+# Con Compose (recomendado en el curso)
+docker compose up -d
+docker compose logs -f minio
+
+# Consola: http://localhost:9001
+# Health de la API S3
+curl -I http://localhost:9000/minio/health/live</code></pre>
+        <div class="callout callout--warning">
+          <p><strong>Compose es para un solo nodo.</strong> MinIO no soporta Docker Compose para
+            clústeres distribuidos; para eso usa Kubernetes Operator o baremetal. No presentes un
+            Compose multi-nodo como arquitectura de producción.</p>
+        </div>
+      </section>
+
+      <section id="mc">
+        <h2>mc: buckets y objetos</h2>
+        <pre><code class="language-bash"># Alias del servidor
+mc alias set local http://127.0.0.1:9000 minioadmin cambia-esto-123
+mc admin info local
+
+# Buckets
+mc mb local/documentos
+mc ls local
+mc stat local/documentos
+
+# Objetos
+mc cp informe.pdf local/documentos/2026/facturas/1042.pdf
+mc ls local/documentos/2026/facturas/
+mc stat local/documentos/2026/facturas/1042.pdf
+mc cat local/documentos/2026/facturas/1042.pdf > copia.pdf
+mc rm local/documentos/2026/facturas/1042.pdf
+
+# Espejo (copia incremental) y borrado recursivo
+mc mirror ./documentos local/documentos
+mc rm --recursive --force local/documentos/tmp/
+
+# Presigned URL temporal
+mc share download --expire 1h local/documentos/2026/facturas/1042.pdf</code></pre>
+        <table>
+          <thead><tr><th>Quiero…</th><th>Comando</th></tr></thead>
+          <tbody>
+            <tr><td>Ver uso y salud</td><td><code>mc admin info local</code></td></tr>
+            <tr><td>Buscar objetos</td><td><code>mc find local/documentos --name "*.pdf"</code></td></tr>
+            <tr><td>Copiar entre servidores</td><td><code>mc mirror origen destino</code></td></tr>
+            <tr><td>Ver versiones</td><td><code>mc ls --versions local/documentos/prefijo/</code></td></tr>
+            <tr><td>Política de bucket</td><td><code>mc anonymous get local/documentos</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="sdk">
+        <h2>SDK de Node.js</h2>
+        <pre><code class="language-javascript">import * as Minio from "minio";
+
+const client = new Minio.Client({
+  endPoint: process.env.MINIO_ENDPOINT ?? "127.0.0.1",
+  port: Number(process.env.MINIO_PORT ?? 9000),
+  useSSL: process.env.MINIO_USE_SSL === "true",
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+});
+
+const bucket = "documentos";
+if (!(await client.bucketExists(bucket))) {
+  await client.makeBucket(bucket, "us-east-1");
+}
+
+// Subida desde Buffer o stream
+await client.putObject(bucket, "2026/facturas/1042.pdf", buffer, buffer.length, {
+  "Content-Type": "application/pdf",
+  "x-amz-meta-tenant": "acme",
+});
+
+// URL firmada para que el navegador suba/descargue sin credenciales
+const putUrl = await client.presignedPutObject(bucket, "tmp/8f3a.pdf", 15 * 60);
+const getUrl = await client.presignedGetObject(bucket, "2026/facturas/1042.pdf", 60 * 60);
+
+// Listado por prefijo
+const stream = client.listObjectsV2(bucket, "2026/", true);
+stream.on("data", (obj) => console.log(obj.name, obj.size));
+stream.on("error", console.error);</code></pre>
+        <table>
+          <thead><tr><th>Quiero…</th><th>API</th></tr></thead>
+          <tbody>
+            <tr><td>Crear bucket</td><td><code>makeBucket(bucket, region)</code></td></tr>
+            <tr><td>Subir objeto</td><td><code>putObject(bucket, key, stream, size, meta)</code></td></tr>
+            <tr><td>Descargar</td><td><code>getObject(bucket, key)</code> (stream)</td></tr>
+            <tr><td>Firmar subida</td><td><code>presignedPutObject(bucket, key, expiry)</code></td></tr>
+            <tr><td>Firmar descarga</td><td><code>presignedGetObject(bucket, key, expiry)</code></td></tr>
+            <tr><td>Listar</td><td><code>listObjectsV2(bucket, prefix, recursive)</code></td></tr>
+            <tr><td>Borrar</td><td><code>removeObject(bucket, key)</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="seguridad">
+        <h2>Usuarios, políticas y presigned URLs</h2>
+        <pre><code class="language-bash"># Usuario de aplicación (no root)
+mc admin user add local app 'secreto-largo-y-aleatorio'
+mc admin policy attach local readwrite --user app
+
+# Política propia de mínimo privilegio
+cat > documentos-rw.json <<'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::documentos/*"]
+  }]
+}
+JSON
+mc admin policy create local documentos-rw documentos-rw.json
+mc admin policy attach local documentos-rw --user app
+
+# Presigned: corta, acotada y con HTTPS en producción
+mc share download --expire 15m local/documentos/2026/facturas/1042.pdf</code></pre>
+        <table>
+          <thead><tr><th>Riesgo</th><th>Mitigación</th></tr></thead>
+          <tbody>
+            <tr><td>Root en la app</td><td>Usuario con política acotada</td></tr>
+            <tr><td>Bucket público «temporal»</td><td>Presigned URL en su lugar</td></tr>
+            <tr><td>URL que no caduca</td><td>Expiración corta y mínima acción</td></tr>
+            <tr><td>HTTP en tránsito</td><td>TLS en el servidor y en el cliente</td></tr>
+            <tr><td>Datos en reposo sin cifrar</td><td>SSE-S3 / SSE-KMS según el caso</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p><strong>Una presigned URL es una credencial temporal.</strong> No la registres en logs,
+            no la publiques y no la generes con root. Si se filtra, cualquiera puede usarla hasta que
+            expire.</p>
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <h2>Lifecycle, réplica y eventos</h2>
+        <pre><code class="language-bash"># Versionado (imprescindible para borrados recuperables)
+mc version enable local/documentos
+
+# Lifecycle: expirar temporales a los 7 días
+mc ilm rule add local/documentos --expire-days 7 --prefix "tmp/"
+
+# Réplica de bucket a otro sitio
+mc replicate add local/documentos \
+  --remote-bucket https://otro-minio/documentos \
+  --replicate "delete,delete-marker"
+
+# Notificaciones a webhook
+mc event add local/documentos arn:minio:sqs::1:webhook \
+  --event put --suffix ".pdf"
+mc event list local/documentos</code></pre>
+        <table>
+          <thead><tr><th>Quiero…</th><th>Herramienta</th></tr></thead>
+          <tbody>
+            <tr><td>Recuperar un borrado</td><td>Versionado + object locking</td></tr>
+            <tr><td>Mover datos fríos</td><td>ILM / transición a tiers</td></tr>
+            <tr><td>Copiar a otro sitio</td><td><code>mc replicate</code> o <code>mc mirror</code></td></tr>
+            <tr><td>Reaccionar a una subida</td><td>Notificaciones (webhook/cola)</td></tr>
+            <tr><td>Retener por ley</td><td>Object locking (WORM) con retención</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="operacion">
+        <h2>Operación</h2>
+        <pre><code class="language-bash"># Salud y métricas
+curl -s http://localhost:9000/minio/health/live
+curl -s http://localhost:9000/minio/health/ready
+mc admin info local
+mc admin prometheus generate local
+
+# Capacidad y uso por bucket
+mc du local
+mc admin info local
+
+# Actualizar: nunca a ciegas; lee las notas y prueba en un entorno réplica
+docker pull quay.io/minio/minio:latest</code></pre>
+        <table>
+          <thead><tr><th>Señal</th><th>Qué mirar</th></tr></thead>
+          <tbody>
+            <tr><td>Errores de escritura</td><td>Discos, paridad, espacio libre</td></tr>
+            <tr><td>Latencia alta</td><td>Capacidad, tamaño de objetos, red</td></tr>
+            <tr><td>Nodo caído</td><td>Erasure coding / réplica / healing</td></tr>
+            <tr><td>Coste/crecimiento</td><td>Lifecycle, versiones huérfanas, objetos temporales</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p><strong>Prueba la restauración, no solo el backup.</strong> Un backup que nunca se ha
+            restaurado es una hipótesis. El curso incluye una lección específica de backups y
+            retención.</p>
+        </div>
+      </section>
+
+      <section id="antipatrones">
+        <h2>Anti-patrones que este curso evita</h2>
+        <table>
+          <thead><tr><th>Anti-patrón</th><th>Por qué duele</th><th>Alternativa</th></tr></thead>
+          <tbody>
+            <tr><td>Root en la aplicación</td><td>Un fallo compromete todo el servidor</td><td>Usuario y política acotados</td></tr>
+            <tr><td>Bucket público</td><td>Filtración silenciosa</td><td>Privado + presigned</td></tr>
+            <tr><td>Guardar archivos en disco local</td><td>No escala ni sobrevive al contenedor</td><td>Objetos con claves estables</td></tr>
+            <tr><td>Contar con carpetas</td><td>Renombrar un «directorio» copia cada objeto</td><td>Diseñar la clave desde el inicio</td></tr>
+            <tr><td>Sin versionado</td><td>Un borrado es definitivo</td><td>Versionado + lifecycle</td></tr>
+            <tr><td>Compose multi-nodo</td><td>No está soportado</td><td>Kubernetes Operator o baremetal</td></tr>
+          </tbody>
+        </table>
+        <p>Vuelve al <a href="../modulos/00-fundamentos/01-que-es-object-storage.html">modelo de objetos</a>
+          cuando dudes: casi todos los errores vienen de tratar un bucket como un sistema de ficheros.</p>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../';</script>
+  <script src="../assets/js/course-data.js"></script>
+  <script src="../assets/js/highlight.js"></script>
+  <script src="../assets/js/site.js"></script>
+</body>
+</html>

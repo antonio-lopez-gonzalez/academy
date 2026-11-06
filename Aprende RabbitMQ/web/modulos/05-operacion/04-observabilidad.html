@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-observabilidad">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Observabilidad y alertas — Módulo 5 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Observabilidad y alertas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>«El broker funciona» es una frase que solo se puede decir con datos. Sin métricas, un equipo descubre que la cola de facturas lleva dos horas creciendo cuando un cliente llama; con métricas, lo sabe quince minutos antes de que el backlog afecte al negocio. La diferencia entre ambas situaciones no es suerte: es observabilidad.</p>
+        <p>Observar RabbitMQ tiene tres capas. La <strong>management HTTP API</strong> da el estado actual con detalle (colas, conexiones, canales, nodos). El plugin de <strong>Prometheus</strong> da series temporales para dashboards y alertas. Los <strong>logs</strong> dan el contexto de lo que pasó en un instante concreto. Las tres se necesitan: una métrica dice «el disco baja», un log dice «la cola de auditoría rechazó publicaciones».</p>
+        <p>Esta lección monta las tres, define las métricas que de verdad importan, escribe alertas que no despiertan a nadie por ruido y cierra con un <strong>runbook</strong>: qué mirar y qué hacer cuando una alerta salta. También insiste en la trazabilidad de negocio: <code>messageId</code> y <code>correlationId</code> son la diferencia entre «falló un mensaje» y «falló la factura 1042 del pedido 8831».</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el objetivo no es tener dashboards bonitos, sino reducir el tiempo entre «algo va mal» y «sabemos qué hacer». Una alerta sin runbook es una notificación; un runbook sin métricas es una suposición.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Management HTTP API</h3>
+        <p>El plugin <code>rabbitmq_management</code> expone una API REST en el puerto <code>15672</code> con autenticación básica. Es la misma fuente que alimenta la UI, así que todo lo que ves en pantalla se puede consultar y automatizar.</p>
+        <pre><code class="language-bash"># estado del clúster
+curl -s -u guest:guest http://localhost:15672/api/overview | jq '.queue_totals'
+
+# una cola concreta (el vhost / se codifica como %2F)
+curl -s -u guest:guest \
+  'http://localhost:15672/api/queues/%2F/facturas.generar' \
+  | jq '{messages, messages_ready, messages_unacknowledged, consumers,
+         publish: .message_stats.publish_details.rate,
+         deliver: .message_stats.deliver_get_details.rate}'
+
+# nodos, conexiones y canales
+curl -s -u guest:guest http://localhost:15672/api/nodes | jq '.[].name'
+curl -s -u guest:guest http://localhost:15672/api/connections | jq '.[].user'</code></pre>
+        <p>Endpoints que conviene conocer:</p>
+        <table>
+          <thead><tr><th>Endpoint</th><th>Qué devuelve</th></tr></thead>
+          <tbody>
+            <tr><td><code>/api/overview</code></td><td>Totales del clúster y tasas de mensajes</td></tr>
+            <tr><td><code>/api/queues/{vhost}/{name}</code></td><td>Profundidad, consumidores y estadísticas de una cola</td></tr>
+            <tr><td><code>/api/nodes</code></td><td>Memoria, disco, file descriptors y alarmas por nodo</td></tr>
+            <tr><td><code>/api/connections</code></td><td>Conexiones, usuario, estado <code>blocked</code> y tráfico</td></tr>
+            <tr><td><code>/api/health/checks/alarms</code></td><td><code>200</code> si no hay alarmas; <code>503</code> si hay alguna en el clúster</td></tr>
+            <tr><td><code>/api/health/checks/local-alarms</code></td><td>Alarmas del nodo que atiende la petición</td></tr>
+            <tr><td><code>/api/health/checks/port-listener/5672</code></td><td><code>200</code> si el listener AMQP está activo</td></tr>
+            <tr><td><code>/api/health/checks/virtual-hosts</code></td><td><code>200</code> si todos los vhosts están sanos</td></tr>
+          </tbody>
+        </table>
+        <p>Los <em>health checks</em> son la forma correcta de conectar un balanceador o Kubernetes: no preguntan «¿responde el proceso?», preguntan «¿puede atender tráfico?». Un nodo en alarma de disco debe salir del pool aunque el puerto siga abierto.</p>
+
+        <h3>Prometheus: series temporales</h3>
+        <p>El plugin <code>rabbitmq_prometheus</code> viene incluido y escucha en el puerto <code>15692</code>. Expone métricas de nodo, colas, conexiones y canales en formato Prometheus.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_prometheus
+curl -s http://localhost:15692/metrics | head -n 20</code></pre>
+        <p>Hay dos endpoints con propósitos distintos:</p>
+        <ul>
+          <li><code>/metrics</code>: métricas agregadas y de nodo; es el scrape habitual y tiene coste bajo.</li>
+          <li><code>/metrics/detailed?family=...</code>: métricas por objeto (por cola, por conexión) solo de las familias pedidas. Las métricas llevan el prefijo <code>rabbitmq_detailed_</code>.</li>
+        </ul>
+        <pre><code class="language-bash"># solo lo necesario para vigilar profundidad y consumidores
+curl -s 'http://localhost:15692/metrics/detailed?family=queue_coarse_metrics&amp;family=queue_consumer_count' \
+  | grep 'queue="facturas.generar"'</code></pre>
+        <pre><code class="language-text">rabbitmq_detailed_queue_messages_ready{queue="facturas.generar",vhost="/"} 184
+rabbitmq_detailed_queue_messages_unacked{queue="facturas.generar",vhost="/"} 10
+rabbitmq_detailed_queue_messages{queue="facturas.generar",vhost="/"} 194
+rabbitmq_detailed_queue_consumers{queue="facturas.generar",vhost="/"} 2</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">No pidas todas las métricas por objeto «por si acaso»</p>
+          <p>Con cientos de colas y conexiones, <code>/metrics/per-object</code> genera una salida enorme y consume CPU en cada scrape. Pide solo las familias que usas y filtra por vhost o por nombre de cola. En un broker grande, la diferencia puede ser de decenas de veces.</p>
+        </div>
+
+        <h3>Las métricas que importan</h3>
+        <table>
+          <thead><tr><th>Qué mirar</th><th>Métrica</th><th>Qué te dice</th></tr></thead>
+          <tbody>
+            <tr><td>Backlog listo</td><td><code>rabbitmq_detailed_queue_messages_ready</code></td><td>Trabajo esperando; si crece sostenidamente, faltan consumidores o capacidad.</td></tr>
+            <tr><td>En vuelo</td><td><code>rabbitmq_detailed_queue_messages_unacked</code></td><td>Entregado sin confirmar; si no baja, hay un consumidor atascado.</td></tr>
+            <tr><td>Consumidores</td><td><code>rabbitmq_detailed_queue_consumers</code></td><td>Cero con mensajes listos es un incidente, no una métrica más.</td></tr>
+            <tr><td>Entregas</td><td><code>rabbitmq_detailed_queue_messages_delivered_ack_total</code></td><td>Ritmo real de procesamiento; compáralo con la entrada.</td></tr>
+            <tr><td>Confirmaciones</td><td><code>rabbitmq_detailed_queue_messages_acked_total</code></td><td>Trabajo completado; el cociente con entregas mide reintentos.</td></tr>
+            <tr><td>Reentregas</td><td><code>rabbitmq_detailed_queue_messages_redelivered_total</code></td><td>Si sube, hay fallos o consumidores que mueren a mitad.</td></tr>
+            <tr><td>Memoria</td><td><code>rabbitmq_detailed_process_resident_memory_bytes</code></td><td>Presión del nodo; relaciónalo con el watermark.</td></tr>
+            <tr><td>Disco libre</td><td><code>rabbitmq_detailed_disk_space_available_bytes</code></td><td>El recurso que más incidentes causa; alerta con margen.</td></tr>
+            <tr><td>File descriptors</td><td><code>rabbitmq_detailed_process_open_fds</code></td><td>Fugas de conexiones o canales; si se agota, no entran clientes.</td></tr>
+          </tbody>
+        </table>
+        <p>Las tasas se calculan con <code>rate()</code> sobre contadores, no con el valor instantáneo. Y una profundidad absoluta dice poco sin su tendencia: 5 000 mensajes en una cola que drena 1 000/s es normal; 500 en una cola que drena 1/min es una hora de retraso.</p>
+
+        <h3>Logs: el contexto que las métricas no tienen</h3>
+        <p>RabbitMQ escribe logs de eventos del broker: arranque, cierre de conexiones, errores de canal, alarmas, cambios de líder. Por defecto, la imagen oficial escribe a la salida estándar, así que <code>docker logs</code> es el primer sitio donde mirar. En instalaciones con fichero, configura JSON para que tu plataforma los indexe:</p>
+        <pre><code class="language-ini">log.file.level = info
+log.file.formatter = json
+log.console = true
+log.console.formatter = json</code></pre>
+        <pre><code class="language-bash">docker logs --since 30m rabbitmq | grep -i -E "error|alarm|closed"
+docker exec rabbitmq rabbitmq-diagnostics log_tail --number 100
+docker exec rabbitmq rabbitmqctl set_log_level debug   # solo durante un diagnóstico</code></pre>
+        <p>Los logs del <strong>broker</strong> no saben de tu negocio. Para trazar una factura necesitas logs de <strong>aplicación</strong> con identificadores correlacionados. El patrón mínimo: el productor genera un <code>messageId</code> estable y un <code>correlationId</code> por petición; el consumidor los registra junto al identificador de negocio y los propaga a los mensajes que emita.</p>
+        <pre><code class="language-javascript">logger.info('factura.procesada', {
+  messageId: msg.properties.messageId,
+  correlationId: msg.properties.correlationId,
+  facturaId,
+  attempt: msg.fields.redelivered ? 'redelivery' : 'first',
+  ms: Date.now() - inicio,
+});</code></pre>
+        <p>Para trazas distribuidas, propaga el contexto W3C (<code>traceparent</code>) en las cabeceras del mensaje. RabbitMQ no lo interpreta: solo transporta cabeceras. La instrumentación es tuya, pero el campo viaja con el mensaje y sobrevive a reintentos y DLQ.</p>
+
+        <h3>Alertas con intención</h3>
+        <p>Una alerta debe cumplir tres condiciones: <strong>detecta un problema que importa</strong>, <strong>llega antes de que el usuario lo note</strong> y <strong>tiene una acción asociada</strong>. Si falta la tercera, es ruido.</p>
+        <table>
+          <thead><tr><th>Alerta</th><th>Condición típica</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>Cola sin consumidores</td><td><code>ready &gt; 0</code> y <code>consumers == 0</code> durante 5 min</td><td>Revisar despliegue del worker; arrancarlo o pausar productores.</td></tr>
+            <tr><td>Backlog creciendo</td><td><code>ready</code> por encima del umbral durante 15 min</td><td>Escalar workers, revisar latencia y dependencias.</td></tr>
+            <tr><td>Mensajes sin confirmar</td><td><code>unacked</code> alto y plano durante 10 min</td><td>Buscar consumidor colgado; revisar logs y <code>prefetch</code>.</td></tr>
+            <tr><td>Disco bajo</td><td><code>disk_space_available_bytes</code> bajo el umbral</td><td>Drenar o purgar con criterio; ampliar volumen.</td></tr>
+            <tr><td>Memoria alta</td><td>Uso por encima del 90 % del watermark</td><td>Revisar colas, paging y conexiones; ampliar o limitar.</td></tr>
+            <tr><td>File descriptors</td><td>Uso por encima del 80 % del límite</td><td>Buscar fugas de conexiones/canales; subir <code>ulimit</code>.</td></tr>
+            <tr><td>Nodo caído o partición</td><td>Nodo no visible o clúster sin quórum</td><td>Comprobar red, recuperar nodo, revisar política de partición.</td></tr>
+            <tr><td>Publicadores bloqueados</td><td>Conexiones en estado <code>blocked</code></td><td>Ver alarma de recurso; pausar entrada y drenar.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">Alerta sobre síntomas, no sobre causas aisladas</p>
+          <p>«Un mensaje fue rechazado» no es una alerta; «la tasa de rechazos supera el 1 % durante 10 minutos» sí. «La memoria está al 70 %» puede ser normal; «la memoria lleva 30 minutos subiendo y el disco libre baja» es una tendencia que merece atención. Las alertas buenas miran tasas, tendencias y combinaciones.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Habilitar Prometheus y consultar la salud de una cola sin abrir la UI. <strong>Garantía:</strong> las métricas describen el estado del broker; no sustituyen a los confirms ni al <code>ack</code>, solo los observan.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_prometheus
+sleep 2
+curl -s http://localhost:15692/metrics | grep -E '^rabbitmq_(identity|process_resident|disk_space)' | head</code></pre>
+        <pre><code class="language-text">rabbitmq_identity_info{rabbitmq_version="4.4.0",cluster_name="rabbit@rabbit1",...} 1
+rabbitmq_process_resident_memory_bytes 1.284e+08
+rabbitmq_disk_space_available_bytes 4.812e+10</code></pre>
+        <p>Ahora la cola concreta, con la familia mínima:</p>
+        <pre><code class="language-bash">curl -s 'http://localhost:15692/metrics/detailed?family=queue_coarse_metrics&amp;family=queue_consumer_count&amp;queue=^facturas' \
+  | grep -v '^#'</code></pre>
+        <p>Y una comprobación de salud que puedes usar en un balanceador:</p>
+        <pre><code class="language-bash">curl -s -o /dev/null -w '%{http_code}\n' -u guest:guest \
+  http://localhost:15672/api/health/checks/alarms
+# 200 si no hay alarmas; 503 si hay alguna</code></pre>
+        <p>Con tres comandos tienes lo esencial: versión e identidad del clúster, recursos del nodo, profundidad de la cola y una señal binaria de salud. El resto es automatizar y poner umbrales con criterio.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller quiere saber, antes que el cliente, que la facturación va lenta. El panel tiene cuatro filas: entrada, salida, backlog y recursos. Las tres primeras se calculan con métricas de cola; la cuarta, con métricas de nodo.</p>
+        <pre><code class="language-text">facturas.generar
+  entrada    publish rate (management API)      220 msg/s
+  salida     delivered_ack rate                 180 msg/s
+  backlog    ready                                4 200
+  en vuelo   unacked                                 40
+  consumidores                                        6
+
+Lectura: entran 220 y salen 180 -> el backlog crece 40/s.
+En 10 minutos serán 24 000 mensajes. Hay que escalar o investigar.</code></pre>
+        <p><strong>Scrape de Prometheus</strong> (una vez por nodo, o una por servicio descubierto):</p>
+        <pre><code class="language-yaml">scrape_configs:
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['rabbit1:15692', 'rabbit2:15692', 'rabbit3:15692']
+
+  - job_name: rabbitmq-detailed
+    metrics_path: /metrics/detailed
+    params:
+      family: ['queue_coarse_metrics', 'queue_consumer_count', 'queue_delivery_metrics']
+    static_configs:
+      - targets: ['rabbit1:15692', 'rabbit2:15692', 'rabbit3:15692']</code></pre>
+        <p><strong>Reglas de alerta</strong> con umbrales del taller:</p>
+        <pre><code class="language-yaml">groups:
+  - name: rabbitmq-taller
+    rules:
+      - alert: FacturasSinConsumidores
+        expr: |
+          sum by (queue) (rabbitmq_detailed_queue_messages_ready{queue="facturas.generar"}) &gt; 0
+          and
+          sum by (queue) (rabbitmq_detailed_queue_consumers{queue="facturas.generar"}) == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "facturas.generar sin consumidores"
+          runbook: "https://wiki.taller/runbooks/rabbitmq#sin-consumidores"
+
+      - alert: FacturasBacklogAlto
+        expr: sum by (queue) (rabbitmq_detailed_queue_messages_ready{queue="facturas.generar"}) &gt; 5000
+        for: 15m
+        labels: { severity: warning }
+
+      - alert: FacturasAtascadas
+        expr: sum by (queue) (rabbitmq_detailed_queue_messages_unacked{queue="facturas.generar"}) &gt; 500
+        for: 10m
+        labels: { severity: warning }
+
+      - alert: DiscoBajo
+        expr: min by (instance) (rabbitmq_detailed_disk_space_available_bytes) &lt; 10e9
+        for: 10m
+        labels: { severity: critical }
+
+      - alert: NodoEnAlarma
+        expr: rabbitmq_alarms_free_disk_space_watermark == 1 or rabbitmq_alarms_memory_used_watermark == 1
+        for: 2m
+        labels: { severity: critical }</code></pre>
+        <p>Las etiquetas <code>severity</code> y <code>runbook</code> no son decorativas: enrutan la alerta al canal correcto y dan al que está de guardia el primer paso. Una alerta sin enlace al runbook obliga a improvisar a las tres de la mañana.</p>
+        <p><strong>El runbook</strong>, en cuatro pasos:</p>
+        <ol>
+          <li><strong>Confirmar el alcance:</strong> <code>/api/health/checks/alarms</code> y <code>rabbitmqctl list_queues name messages messages_ready consumers</code>. ¿Es una cola o todo el clúster?</li>
+          <li><strong>Mirar la tendencia:</strong> ¿el backlog crece por entrada alta o por salida baja? Compara las tasas de publicación y entrega en los últimos 30 minutos.</li>
+          <li><strong>Actuar:</strong> si faltan consumidores, arrancarlos; si están lentos, revisar su latencia y dependencias; si hay una cola huérfana, decidir drenar o purgar con copia.</li>
+          <li><strong>Registrar:</strong> deja en el incidente la cola, el pico, la causa y el cambio aplicado. Sin eso, el próximo incidente empieza de cero.</li>
+        </ol>
+        <p>Para la traza de negocio, el worker registra una línea por factura y la API propaga el mismo <code>correlationId</code> que usó en la petición HTTP:</p>
+        <pre><code class="language-json">{"ts":"2026-11-05T09:14:22.318Z","level":"info","event":"factura.procesada",
+ "facturaId":"fac-1042","pedidoId":"ped-8831","messageId":"fac-1042",
+ "correlationId":"req-7f3a","ms":842,"attempt":1,"queue":"facturas.generar"}</code></pre>
+        <p>Con ese campo puedes responder «¿por qué tardó 40 minutos la factura de este cliente?» cruzando el log de la API, el del worker y el historial de <code>x-death</code> si pasó por la DLQ.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Alertar sobre <code>ready</code>, <code>unacked</code> y <code>consumers</code> juntos</td> <td>Mirar solo la profundidad total</td> <td>Las tres cifras distinguen falta de workers, atasco y cola sin salida.</td></tr>
+            <tr><td>Usar <code>rate()</code> y tendencias</td> <td>Alertar sobre un valor instantáneo</td> <td>Un pico puntual no es un incidente; una tendencia sostenida sí.</td></tr>
+            <tr><td>Pedir solo las familias necesarias en <code>/metrics/detailed</code></td> <td>Scrapear <code>/metrics/per-object</code> con todo</td> <td>El coste crece con el número de objetos y puede afectar al broker.</td></tr>
+            <tr><td>Health checks de RabbitMQ en el balanceador</td> <td>Comprobar solo que el puerto TCP abre</td> <td>Un nodo en alarma puede aceptar TCP y no poder publicar.</td></tr>
+            <tr><td>Logs JSON con <code>messageId</code> y <code>correlationId</code></td> <td>Logs sin identificadores de negocio</td> <td>Sin correlación, una traza de 20 servicios no se puede reconstruir.</td></tr>
+            <tr><td>Cada alerta con enlace a un runbook</td> <td>Alertas que solo dicen «algo va mal»</td> <td>La acción es parte de la alerta; si no, es ruido que se ignora.</td></tr>
+            <tr><td>Probar las alertas y el runbook en staging</td> <td>Confiar en que «funcionará»</td> <td>Una regla mal escrita no dispara nunca o dispara siempre.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Alertar solo de «nodo caído»</h3>
+        <span class="code-label code-label--wrong">Mal — el proceso responde, el negocio no avanza</span>
+        <pre><code class="language-yaml">- alert: RabbitMQDown
+  expr: up{job="rabbitmq"} == 0</code></pre>
+        <span class="code-label code-label--right">Bien — alertar del síntoma de negocio</span>
+        <pre><code class="language-yaml">- alert: FacturasSinConsumidores
+  expr: sum by (queue) (rabbitmq_detailed_queue_messages_ready{queue="facturas.generar"}) &gt; 0
+        and sum by (queue) (rabbitmq_detailed_queue_consumers{queue="facturas.generar"}) == 0
+  for: 5m</code></pre>
+        <p>El broker puede estar «up» y no procesar nada: un worker caído, una cola sin consumidores o un consumidor colgado. La métrica de disponibilidad del proceso no cuenta esa historia.</p>
+
+        <h3>2. Scrapear todas las métricas por objeto</h3>
+        <span class="code-label code-label--wrong">Mal — coste innecesario en cada scrape</span>
+        <pre><code class="language-yaml">metrics_path: /metrics/per-object
+# con 2 000 colas y 500 conexiones, esto es caro y enorme</code></pre>
+        <span class="code-label code-label--right">Bien — familias concretas y filtro</span>
+        <pre><code class="language-yaml">metrics_path: /metrics/detailed
+params:
+  family: ['queue_coarse_metrics', 'queue_consumer_count']
+  queue: ['^facturas\\.', '^recordatorios\\.']</code></pre>
+        <p>El endpoint detallado existe precisamente para esto. Pedir todo «por si acaso» añade latencia al scrape y CPU al broker, y hace que los dashboards tarden en cargar.</p>
+
+        <h3>3. Confundir el estado de la cola con el estado del negocio</h3>
+        <span class="code-label code-label--wrong">Mal — «la cola está vacía, todo bien»</span>
+        <pre><code class="language-bash">rabbitmqctl list_queues name messages
+# facturas.generar  0   -&gt; ✅ ¿seguro?</code></pre>
+        <span class="code-label code-label--right">Bien — comprobar entrada, salida y DLQ</span>
+        <pre><code class="language-bash">rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+rabbitmqctl list_queues name messages | grep facturas.fallidas</code></pre>
+        <p>Una cola vacía puede significar que todo se procesó o que los productores dejaron de publicar. Y una DLQ creciendo es un fallo silencioso: el mensaje salió de la cola principal, pero el negocio no se completó.</p>
+
+        <h3>4. Logs sin correlación</h3>
+        <span class="code-label code-label--wrong">Mal — no se puede seguir una factura</span>
+        <pre><code class="language-javascript">console.log('factura procesada');</code></pre>
+        <span class="code-label code-label--right">Bien — identificadores y contexto</span>
+        <pre><code class="language-javascript">logger.info('factura.procesada', {
+  messageId: msg.properties.messageId,
+  correlationId: msg.properties.correlationId,
+  facturaId,
+});</code></pre>
+        <p>Cuando un cliente pregunta por su factura, «factura procesada» no sirve. El <code>correlationId</code> conecta la petición HTTP, el evento y el trabajo del worker; el <code>messageId</code> conecta los reintentos y la DLQ.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> habilitar métricas, consultar la API, provocar un backlog y comprobar que una alerta lo detecta.</p>
+        <ol class="steps">
+          <li>
+            <strong>Habilita Prometheus y comprueba el endpoint:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_prometheus
+curl -s http://localhost:15692/metrics | grep '^rabbitmq_identity_info'</code></pre>
+            <p>Debe aparecer la versión (<code>4.4.x</code>) y el nombre del clúster.</p>
+          </li>
+          <li>
+            <strong>Consulta la cola por la management API</strong> y guarda la salida:
+            <pre><code class="language-bash">curl -s -u guest:guest 'http://localhost:15672/api/queues/%2F/facturas.generar' \
+  | jq '{messages, messages_ready, messages_unacknowledged, consumers,
+         publish_rate: .message_stats.publish_details.rate}'</code></pre>
+          </li>
+          <li>
+            <strong>Provoca backlog:</strong> para el worker, publica 2 000 mensajes y comprueba cómo crecen <code>messages_ready</code> y la métrica detallada:
+            <pre><code class="language-bash">curl -s 'http://localhost:15692/metrics/detailed?family=queue_coarse_metrics&amp;queue=^facturas' \
+  | grep -E 'messages_ready|consumers'</code></pre>
+          </li>
+          <li>
+            <strong>Arranca el worker</strong> y observa la salida: <code>messages_ready</code> baja y <code>unacked</code> se mantiene alrededor del <code>prefetch</code> × workers. Anota cuánto tarda en drenar.</li>
+          <li>
+            <strong>Escribe las reglas de alerta</strong> del ejemplo real en <code>rabbitmq-alerts.yml</code> y valídalas:
+            <pre><code class="language-bash">promtool check rules rabbitmq-alerts.yml</code></pre>
+            <p>Si no tienes Prometheus instalado, revisa a mano la sintaxis y ejecuta las expresiones en la UI de Prometheus si está disponible.</p>
+          </li>
+          <li>
+            <strong>Comprueba el health check</strong> con y sin alarma: fuerza una alarma de memoria (<code>set_vm_memory_high_watermark absolute 20MB</code>), consulta <code>/api/health/checks/alarms</code> y verifica que devuelve <code>503</code>. Restaura el valor y vuelve a comprobar el <code>200</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Si tu balanceador usara <code>/api/health/checks/alarms</code>, el nodo en alarma habría salido del pool antes de que la API empezara a fallar. Ese es el valor real de la observabilidad: actuar antes de que el usuario lo note.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un SLO para la facturación</h3>
+          <p>Define un SLO de «el 99 % de las facturas se generan en menos de 2 minutos desde que el pedido se confirma». Construye el SLI con las métricas disponibles: ¿qué combinación de <code>ready</code>, <code>unacked</code>, tasas y marcas de tiempo necesitas? ¿Cómo detectas el incumplimiento sin medir la latencia exacta de cada factura?</p>
+          <p>Escribe la regla de <em>burn rate</em> para avisar cuando se esté consumiendo el presupuesto de error demasiado rápido, y explica qué alerta se dispara primero: la técnica (cola creciendo) o la de negocio (SLO). Después, calcula cuántos workers necesitas para cumplir el SLO con la carga del Black Friday.</p>
+          <p><em>Pista: una cola puede estar vacía y el SLO incumplirse si el worker tarda 10 minutos por factura. Para medir latencia de extremo a extremo necesitas una marca de tiempo en el mensaje o en la base de datos; las métricas del broker solo te dan profundidad y tasas.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La <strong>management API</strong> da estado detallado; <strong>Prometheus</strong> da series; los <strong>logs</strong> dan contexto. Se necesitan las tres.</li>
+          <li><code>/metrics</code> es el scrape barato; <code>/metrics/detailed</code> da métricas por cola con prefijo <code>rabbitmq_detailed_</code>.</li>
+          <li>Vigila <code>messages_ready</code>, <code>messages_unacked</code>, <code>consumers</code>, tasas, disco, memoria y file descriptors.</li>
+          <li>Alerta sobre tendencias y combinaciones, no sobre valores instantáneos aislados.</li>
+          <li>Usa los <em>health checks</em> de RabbitMQ en el balanceador: el puerto abierto no significa «puede publicar».</li>
+          <li>Propaga <code>messageId</code> y <code>correlationId</code>; sin ellos no hay traza de negocio.</li>
+          <li>Toda alerta debe tener un runbook con la primera acción y el criterio para escalar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>/api/overview</code></td><td>Totales y tasas del clúster</td></tr>
+            <tr><td><code>/api/queues/%2F/nombre</code></td><td>Estado detallado de una cola</td></tr>
+            <tr><td><code>/api/health/checks/alarms</code></td><td><code>200</code>/<code>503</code> según alarmas del clúster</td></tr>
+            <tr><td><code>rabbitmq_prometheus</code></td><td>Plugin que expone métricas en <code>:15692</code></td></tr>
+            <tr><td><code>rabbitmq_detailed_queue_messages_ready</code></td><td>Mensajes listos de una cola concreta</td></tr>
+            <tr><td><code>rabbitmq_detailed_queue_consumers</code></td><td>Consumidores de una cola concreta</td></tr>
+            <tr><td><code>log.file.formatter = json</code></td><td>Logs estructurados para ingesta</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no veo métricas por cola en <code>/metrics</code>?</summary>
+            <div>
+              <p>Porque en RabbitMQ 4.x las métricas por objeto no se incluyen por defecto para no generar salidas enormes. Usa <code>/metrics/detailed?family=queue_coarse_metrics&amp;family=queue_consumer_count</code> y filtra por <code>vhost</code> o <code>queue</code>. Las series resultantes llevan el prefijo <code>rabbitmq_detailed_</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cada cuánto debo scrapear?</summary>
+            <div>
+              <p>Cada 15–30 segundos es habitual para alertas operativas; cada 60 segundos es suficiente para dashboards y reduce coste. Si tienes cientos de colas, empieza por 30 s con familias filtradas y mide el impacto. No bajes de 10 s: RabbitMQ no cambia tan rápido y multiplicas el coste.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre <code>messages_ready</code> y <code>messages_unacknowledged</code>?</summary>
+            <div>
+              <p><code>ready</code> son mensajes que esperan ser entregados; <code>unacked</code> son mensajes ya entregados a un consumidor que aún no confirmó. Un <code>unacked</code> alto y plano sugiere un consumidor colgado o un <code>prefetch</code> demasiado grande; un <code>ready</code> alto sugiere falta de capacidad.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si un mensaje se perdió?</summary>
+            <div>
+              <p>Con las métricas del broker no lo sabrás con certeza; necesitas confirmas de publicación, <code>ack</code> de consumo y un registro de negocio. Si el productor publicó con confirm y el consumidor confirmó el <code>ack</code>, el mensaje se procesó (posiblemente dos veces). Si el confirm nunca llegó, el productor debe reintentar. La observabilidad te dice dónde mirar; la garantía la da el diseño.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

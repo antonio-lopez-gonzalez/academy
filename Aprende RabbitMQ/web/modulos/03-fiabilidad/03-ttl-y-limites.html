@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="03-ttl-y-limites">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTL y límites de cola — Módulo 3 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TTL y límites de cola</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Fiabilidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Una cola sin límites es una promesa de que el disco nunca se llenará. Y el disco siempre se llena: un consumidor se cae, un pico de tráfico dura más de lo previsto, un mensaje venenoso se reencola sin fin. RabbitMQ ofrece dos familias de controles para que la cola no se convierta en un agujero negro: <strong>TTL</strong> (cuánto tiempo vive un mensaje o una cola) y <strong>límites de longitud</strong> (cuántos mensajes o bytes caben).</p>
+        <p>Son controles potentes y llenos de matices. El TTL por mensaje no se evalúa con un temporizador por mensaje: RabbitMQ expira de forma <strong>perezosa</strong>, cuando el mensaje llega a la cabeza de la cola. Un mensaje con TTL corto puede quedarse horas detrás de uno con TTL largo. Y cuando se supera un límite, hay que decidir qué se descarta: lo más antiguo, el mensaje que acaba de llegar, o nada —rechazando al productor—. Cada opción cambia quién se entera y qué se pierde.</p>
+        <p>El objetivo de esta lección no es memorizar argumentos, sino poder responder a tres preguntas de diseño: ¿qué mensaje puede desaparecer y cuándo?, ¿quién debe enterarse?, y ¿qué pasa cuando la cola está llena justo en el peor momento?</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Los límites no son solo higiene operativa: son parte del contrato de entrega. Una cola con <code>max-length</code> y sin DLX pierde mensajes en silencio; una con <code>reject-publish</code> traslada la decisión al productor. Elegir bien evita incidentes que solo se descubren cuando alguien pregunta «¿y los pedidos de las 3 de la mañana?».</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>TTL por mensaje y TTL por cola</h3>
+        <p>Hay dos formas de poner fecha de caducidad, y se combinan quedándose con la <strong>menor</strong>:</p>
+        <table>
+          <thead><tr><th>Forma</th><th>Cómo</th><th>Ámbito</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Por mensaje</td><td>Propiedad <code>expiration</code> al publicar (string de milisegundos)</td><td>Solo ese mensaje</td><td>Mayor: cada mensaje puede tener un valor distinto</td></tr>
+            <tr><td>Por cola</td><td>Argumento <code>x-message-ttl</code> o policy <code>message-ttl</code> (número de ms)</td><td>Todos los mensajes de la cola</td><td>Menor: la cola puede descartar desde la cabeza</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-javascript">// Por mensaje: la propiedad es un string en AMQP 0-9-1.
+ch.publish(exchange, key, body, { expiration: '60000' });
+
+// Por cola: el argumento es un número.
+await ch.assertQueue('ofertas', {
+  durable: true,
+  arguments: { 'x-message-ttl': 60_000 },
+});
+</code></pre>
+        <p>Si un mensaje lleva <code>expiration: 1000</code> y la cola tiene <code>x-message-ttl: 60000</code>, vive un segundo. Si la cola no tiene TTL y el mensaje no lleva <code>expiration</code>, vive hasta que se consuma o se borre la cola.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">La expiración es perezosa</p>
+          <p>RabbitMQ no mantiene un temporizador por mensaje. Los mensajes expiran cuando llegan a la <strong>cabeza</strong> de la cola y el broker va a entregarlos o a mirarlos. Con TTL por cola, todos caducan a la vez y el broker puede retirarlos desde la cabeza con eficiencia. Con TTL por mensaje mezclados, un mensaje con plazo corto puede quedar bloqueado detrás de uno con plazo largo: no caduca «a tiempo», sino cuando le toca el turno.</p>
+        </div>
+
+        <h3>Qué significa «caducar»</h3>
+        <p>Un mensaje expirado no se entrega a un consumidor. Si la cola tiene <code>x-dead-letter-exchange</code>, se republica allí con <code>reason: expired</code>; si no, se descarta. El broker elimina la propiedad <code>expiration</code> del mensaje dead-lettered y guarda el valor original en <code>original-expiration</code>, para que no vuelva a caducar nada más llegar a la DLQ. Ese detalle se estudia en <a href="02-dead-letter-exchange.html">dead-letter exchange</a>.</p>
+        <p>Un caso especial: <code>x-message-ttl: 0</code> significa «caduca salvo que se pueda entregar inmediatamente». Es útil para mensajes que solo tienen sentido si hay un consumidor esperando, pero es fácil de confundir con «no caduca nunca». No es eso.</p>
+
+        <h3>Límites de longitud: mensajes o bytes</h3>
+        <p>Puedes limitar la cola por número de mensajes (<code>x-max-length</code>) y por tamaño total del cuerpo (<code>x-max-length-bytes</code>). Si defines ambos, se aplica el que se alcance primero. Los bytes cuentan solo el cuerpo: no las propiedades ni el overhead del protocolo.</p>
+        <pre><code class="language-text">x-max-length: 10        → como máximo 10 mensajes listos
+x-max-length-bytes: 1MB → como máximo ~1 MiB de cuerpos
+ambos                   → el primero que se llene manda</code></pre>
+        <p>En classic queues, el límite cuenta mensajes en estado <strong>ready</strong>; los no confirmados por un consumidor no cuentan. En quorum queues también cuentan los mensajes retrasados y los pendientes de dead-lettering. Esa diferencia importa cuando tienes consumidores lentos: una cola puede parecer vacía y tener miles de mensajes en vuelo.</p>
+
+        <h3>Qué se descarta: las tres políticas de overflow</h3>
+        <table>
+          <thead><tr><th><code>x-overflow</code></th><th>Qué pasa al llenarse</th><th>¿Quién se entera?</th><th>¿Va a la DLX?</th></tr></thead>
+          <tbody>
+            <tr><td><code>drop-head</code> (defecto)</td><td>Se descarta el mensaje más antiguo (cabeza)</td><td>Nadie, salvo que haya DLX</td><td>Sí, si hay DLX configurado</td></tr>
+            <tr><td><code>reject-publish</code></td><td>Se rechaza el mensaje nuevo</td><td>El productor recibe <code>basic.nack</code> si hay confirms</td><td>No</td></tr>
+            <tr><td><code>reject-publish-dlx</code></td><td>Se rechaza el nuevo y se dead-letterea</td><td>Productor (nack) y DLQ</td><td>Sí</td></tr>
+          </tbody>
+        </table>
+        <p>El valor por defecto, <code>drop-head</code>, prioriza lo reciente y sacrifica lo antiguo. Es razonable para datos efímeros (precios, métricas) y peligroso para trabajo pendiente (pedidos). <code>reject-publish</code> no pierde mensajes en silencio: obliga al productor a gestionar el nack, con backoff y reintento. La variante <code>-dlx</code> añade la copia a la DLQ, pero no está soportada por quorum queues, que además pueden sobrepasar el límite en algunos mensajes durante la transición.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Un mensaje, varias colas</p>
+          <p>Si un mensaje se enruta a tres colas y una lo rechaza por límite, el canal recibe un nack, pero el mensaje sigue publicándose en las otras dos. El nack significa «al menos una cola no lo aceptó», no «ninguna lo aceptó». Tenlo en cuenta al reintentar: puedes duplicar en las que sí lo aceptaron.</p>
+        </div>
+
+        <h3>TTL de cola: borrar la cola, no los mensajes</h3>
+        <p><code>x-expires</code> (o la policy <code>expires</code>) borra una cola que lleva un tiempo <strong>sin usarse</strong>. «Sin usarse» significa: sin consumidores online, sin redeclaraciones recientes y sin <code>basic.get</code> durante el periodo. Debe ser un entero positivo; no admite 0. No es lo mismo que el TTL de mensajes: aquí desaparece la cola entera, con lo que tenga dentro.</p>
+        <p>Su uso típico son colas temporales de RPC o de sesión que pueden quedar huérfanas si el cliente muere sin cerrar limpiamente. En colas de trabajo durables no se usa: un despiste de configuración puede borrar trabajo pendiente. Streams no soportan expiración de cola.</p>
+
+        <h3>Combinar TTL, límites y DLX</h3>
+        <pre><code class="language-text">mensaje publicado
+   |
+   +-- ¿cola llena? --sí--> drop-head: sale el más antiguo → DLX (maxlen)
+   |                        reject-publish: nack al productor (sin DLX)
+   |
+   +-- ¿TTL agotado? --sí--> DLX (expired) o descarte
+   |
+   +-- consumidor lo recibe → ack → desaparece</code></pre>
+        <p>El orden real no es una cascada estricta: el broker comprueba límites al publicar y expira al llegar a la cabeza. Pero el diagrama sirve para razonar sobre las tres salidas. Si configuras DLX, cada salida deja rastro; si no, dos de las tres son silenciosas.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-least-once mientras el mensaje está en la cola, pero con pérdidas <em>deliberadas</em> por límite y TTL. La DLQ conserva la evidencia; si no la consumieras, el mensaje se perdería igual al expirar su retención.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertExchange('demo.dlx', 'fanout', { durable: true });
+await ch.assertQueue('demo.dlq', { durable: true });
+await ch.bindQueue('demo.dlq', 'demo.dlx', '');
+
+await ch.assertQueue('demo.limitada', {
+  durable: true,
+  arguments: {
+    'x-message-ttl': 2000,           // 2 segundos
+    'x-max-length': 3,               // 3 mensajes listos
+    'x-overflow': 'drop-head',       // descarta el más antiguo
+    'x-dead-letter-exchange': 'demo.dlx',
+  },
+});
+
+for (let i = 1; i &lt;= 5; i++) {
+  ch.sendToQueue('demo.limitada', Buffer.from(`m${i}`), { persistent: true });
+}
+
+console.log('inmediato:', (await ch.checkQueue('demo.limitada')).messageCount); // 3
+await new Promise((resolve) =&gt; setTimeout(resolve, 2500));
+
+console.log('tras TTL:', (await ch.checkQueue('demo.limitada')).messageCount);  // 0
+console.log('DLQ:', (await ch.checkQueue('demo.dlq')).messageCount);            // 5
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">inmediato: 3
+tras TTL: 0
+DLQ: 5</code></pre>
+        <p>Lo que ha pasado, en orden:</p>
+        <ul>
+          <li>Los mensajes 1, 2 y 3 llenan la cola. Al llegar el 4, se descarta el 1 (<code>maxlen</code>); al llegar el 5, se descarta el 2 (<code>maxlen</code>). Quedan 3, 4 y 5.</li>
+          <li>A los 2 segundos, los tres expiran (<code>expired</code>) y se dead-letterean.</li>
+          <li>La DLQ tiene 5: dos por límite y tres por TTL. Si inspeccionas <code>x-death</code>, verás los dos motivos distintos.</li>
+        </ul>
+        <p>Cambia <code>drop-head</code> por <code>reject-publish</code> y repite con confirms: los mensajes 4 y 5 no entran y el productor recibe un nack. La cola acaba con 3 mensajes que expiran igual. La diferencia es <strong>quién se enteró</strong> de la pérdida.</p>
+
+        <h3>El bloqueo de cabeza con TTL por mensaje</h3>
+        <pre><code class="language-javascript">ch.sendToQueue('demo.ttl', Buffer.from('cabeza'), { expiration: '10000' });
+ch.sendToQueue('demo.ttl', Buffer.from('detras'), { expiration: '100' });
+// 'detras' NO expira a los 100 ms: espera a que 'cabeza' salga de la cola.
+</code></pre>
+        <p>Si tras un segundo haces <code>checkQueue</code>, verás 2 mensajes. El corto sigue ahí porque la expiración es perezosa. Ese es el motivo por el que mezclar TTL por mensaje con plazos muy distintos en una misma cola es una mala idea.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller necesita tres políticas de retención distintas, y ninguna es «infinito»:</p>
+        <table>
+          <thead><tr><th>Cola</th><th>Control</th><th>Valor</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td><code>trabajos.pedidos</code></td><td>Sin TTL; <code>max-length</code> alto</td><td>100.000 mensajes</td><td>El trabajo pendiente no debe caducar por tiempo; el límite protege el disco.</td></tr>
+            <tr><td><code>eventos.hot</code></td><td><code>max-length-bytes</code> + <code>reject-publish</code></td><td>256 MiB</td><td>Pico de tráfico: mejor rechazar al productor que perder eventos ya aceptados.</td></tr>
+            <tr><td><code>pedidos.dlq</code></td><td><code>x-message-ttl</code> + <code>max-length</code></td><td>7 días / 50.000</td><td>Retención para diagnóstico, con techo y alerta.</td></tr>
+            <tr><td><code>rpc.reply.*</code></td><td><code>x-expires</code></td><td>60.000 ms</td><td>Cola de respuesta que debe desaparecer si el cliente murió.</td></tr>
+          </tbody>
+        </table>
+        <p>La cola de trabajo protege el broker sin sacrificar trabajo aceptado: si se llena, el productor recibe un nack y decide esperar. La cola de eventos en caliente usa el límite por bytes porque los mensajes varían de tamaño y el disco es el recurso escaso:</p>
+        <pre><code class="language-javascript">await ch.assertQueue('eventos.hot', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-max-length-bytes': 256 * 1024 * 1024,
+    'x-overflow': 'reject-publish',
+  },
+});
+</code></pre>
+        <p>El productor no puede ignorar el nack: si publica con confirms y recibe <code>basic.nack</code>, debe aplicar backoff y reintentar, no descartar el evento. Esa es la diferencia entre un límite que protege y un límite que miente.</p>
+        <p>La cola de respuesta RPC se declara efímera y con expiración de cola. Así, si el cliente cae sin borrarla, el broker la limpia:</p>
+        <pre><code class="language-javascript">const { queue } = await ch.assertQueue('', {
+  exclusive: true,
+  arguments: { 'x-expires': 60_000 },
+});
+// La cola se borra tras 60 s sin consumidores ni uso.
+</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Elige el límite por el recurso escaso</p>
+          <p>Si te preocupa el número de mensajes (backlog de trabajos), limita por cantidad. Si te preocupa el disco (payloads grandes o variables), limita por bytes. Si te preocupan ambos, configura los dos: se aplica el primero que se alcance.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>TTL por cola cuando todos los mensajes comparten plazo</td><td>Mezclar TTL por mensaje con valores muy distintos</td><td>La expiración perezosa bloquea los plazos cortos detrás de los largos.</td></tr>
+            <tr><td>Configurar DLX junto con TTL y max-length</td><td>Confiar en que «ya se verá»</td><td>Sin DLX, la pérdida es silenciosa y no hay evidencia para diagnosticar.</td></tr>
+            <tr><td>Usar <code>reject-publish</code> y manejar el nack</td><td>Ignorar el nack porque «casi nunca pasa»</td><td>El límite existe para el día que sí pasa; ignorarlo lo convierte en pérdida.</td></tr>
+            <tr><td>Poner techo y alerta a la DLQ</td><td>DLQ con TTL pero sin monitorización</td><td>El TTL borra la evidencia antes de que alguien la lea.</td></tr>
+            <tr><td>Medir <code>messages_ready</code> y <code>message_bytes_ready</code></td><td>Mirar solo el total de mensajes</td><td>Un backlog de mensajes pequeños y uno de 10 MB no se operan igual.</td></tr>
+            <tr><td>Reservar <code>x-expires</code> para colas temporales</td><td>Aplicarlo a colas de trabajo durables</td><td>Una cola inactiva un fin de semana desaparecería con su trabajo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Creer que un TTL corto caduca puntualmente</h3>
+        <span class="code-label code-label--wrong">Mal — asumir un temporizador por mensaje</span>
+        <pre><code class="language-javascript">ch.sendToQueue('cola', body1, { expiration: '60000' });
+ch.sendToQueue('cola', body2, { expiration: '1000' });
+// body2 no desaparece al segundo: espera a la cabeza.
+</code></pre>
+        <span class="code-label code-label--right">Bien — TTL uniforme por cola</span>
+        <pre><code class="language-javascript">await ch.assertQueue('cola', {
+  durable: true,
+  arguments: { 'x-message-ttl': 60_000 },
+});
+</code></pre>
+        <p>Si necesitas plazos distintos, usa colas distintas o acepta que la expiración es perezosa. No diseñes un SLA sobre una promesa que el broker no hace.</p>
+
+        <h3>2. Poner <code>max-length</code> sin DLX</h3>
+        <span class="code-label code-label--wrong">Mal — pérdida silenciosa</span>
+        <pre><code class="language-javascript">await ch.assertQueue('pedidos', {
+  durable: true,
+  arguments: { 'x-max-length': 1_000 },
+});
+// Al llegar al límite, los pedidos viejos se descartan sin rastro.
+</code></pre>
+        <span class="code-label code-label--right">Bien — límite + DLX + alerta</span>
+        <pre><code class="language-javascript">await ch.assertQueue('pedidos', {
+  durable: true,
+  arguments: {
+    'x-max-length': 1_000,
+    'x-dead-letter-exchange': 'pedidos.dlx',
+  },
+});
+</code></pre>
+        <p>El límite sigue perdiendo trabajo de la cola activa, pero al menos queda en la DLQ y puedes reprocesarlo. Sin DLX, solo tienes un contador que baja.</p>
+
+        <h3>3. Usar <code>reject-publish</code> sin confirms</h3>
+        <span class="code-label code-label--wrong">Mal — el nack se pierde</span>
+        <pre><code class="language-javascript">await ch.assertQueue('eventos', {
+  durable: true,
+  arguments: { 'x-max-length': 100, 'x-overflow': 'reject-publish' },
+});
+ch.publish(exchange, key, body);   // sin confirm channel
+</code></pre>
+        <span class="code-label code-label--right">Bien — canal confirm y manejo del nack</span>
+        <pre><code class="language-javascript">const ch = await conn.createConfirmChannel();
+ch.publish(exchange, key, body, { persistent: true }, (err) =&gt; {
+  if (err) reintentarConBackoff(key, body);
+});
+</code></pre>
+        <p><code>reject-publish</code> informa al productor mediante <code>basic.nack</code>, y eso solo llega si el canal está en modo confirm. Sin confirms, el mensaje se rechaza y tú ni te enteras.</p>
+
+        <h3>4. Confundir TTL de mensaje con TTL de cola</h3>
+        <span class="code-label code-label--wrong">Mal — borrar la cola entera</span>
+        <pre><code class="language-javascript">// «Quiero que los mensajes duren 5 minutos»
+await ch.assertQueue('trabajos', {
+  durable: true,
+  arguments: { 'x-expires': 300_000 },   // borra la COLA a los 5 min sin uso
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — TTL de mensajes</span>
+        <pre><code class="language-javascript">await ch.assertQueue('trabajos', {
+  durable: true,
+  arguments: { 'x-message-ttl': 300_000 },
+});
+</code></pre>
+        <p><code>x-expires</code> elimina la cola y todo su contenido. <code>x-message-ttl</code> caduca mensajes individuales. El primero es para colas temporales; el segundo, para retención de datos.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> observar la expiración perezosa, comparar las políticas de overflow y comprobar el efecto de <code>x-expires</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Ejecuta el ejemplo mínimo</strong> y verifica <code>3 → 0</code> en la cola y <code>5</code> en la DLQ.
+          </li>
+          <li>
+            <strong>Inspecciona los motivos</strong>: lee los cinco mensajes de <code>demo.dlq</code> con <code>basic.get</code> y agrupa por <code>x-death[0].reason</code>. Esperado: dos <code>maxlen</code> y tres <code>expired</code>.
+          </li>
+          <li>
+            <strong>Prueba el bloqueo de cabeza</strong>: crea <code>demo.ttl</code> sin TTL de cola, publica un mensaje con <code>expiration: '10000'</code> y otro con <code>'100'</code>. Tras un segundo, <code>checkQueue</code> debe devolver 2. Tras once segundos, 0.
+          </li>
+          <li>
+            <strong>Cambia a <code>reject-publish</code></strong>: repite el ejemplo con un confirm channel y <code>x-max-length: 3</code>. Los dos últimos publishes deben recibir nack; la cola mantiene 3. Anota qué harías en el productor.
+          </li>
+          <li>
+            <strong>Prueba <code>x-expires</code></strong>: declara una cola con <code>x-expires: 5000</code>, compruébala en <code>list_queues</code>, espera seis segundos y vuelve a listar. Debe haber desaparecido. Repite con un consumidor activo: no debe desaparecer mientras se usa.
+          </li>
+          <li>
+            <strong>Mide bytes</strong>: llena una cola con <code>x-max-length-bytes</code> usando mensajes de 1 KB y de 10 KB. Comprueba con <code>message_bytes_ready</code> qué límite se alcanzó antes y explica por qué.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Retención para una avalancha de 10 minutos</h3>
+          <p>Un proveedor externo se cae cada mañana durante diez minutos y libera 200.000 eventos de golpe. El worker procesa 5.000/s en el mejor caso, pero durante el pico solo 2.000/s. El disco del broker tiene 20 GB libres y cada evento pesa 2 KB de media (picos de 50 KB).</p>
+          <p>Diseña la política de retención: ¿limitas por mensajes, por bytes o por ambos? ¿<code>drop-head</code>, <code>reject-publish</code> o <code>reject-publish-dlx</code>? ¿Qué TTL pones a la cola de trabajo y a la DLQ? Calcula cuánto backlog cabe y durante cuánto tiempo. Después explica qué le pasa al productor cuando se alcanza el límite y cómo evitas que pierda eventos sin enterarse.</p>
+          <p><em>Pista: 200.000 × 2 KB son ~400 MB; el problema no es el tamaño medio, sino la cola de 50 KB y el tiempo de drenaje. Haz el cálculo con el peor caso, no con la media.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>TTL por mensaje (<code>expiration</code>, string) y por cola (<code>x-message-ttl</code>, número); gana el menor.</li>
+          <li>La expiración es <strong>perezosa</strong>: ocurre al llegar a la cabeza, no en un temporizador exacto.</li>
+          <li><code>x-max-length</code> y <code>x-max-length-bytes</code> limitan mensajes listos y bytes de cuerpo; se aplica el primero que se llena.</li>
+          <li><code>drop-head</code> descarta lo más antiguo; <code>reject-publish</code> rechaza lo nuevo con nack; <code>reject-publish-dlx</code> además lo dead-letterea.</li>
+          <li>Sin DLX, el TTL y el límite pierden mensajes sin dejar rastro.</li>
+          <li><code>x-expires</code> borra la <strong>cola</strong> inactiva, no los mensajes: úsalo solo en colas temporales.</li>
+          <li>Elige el límite por el recurso escaso: cantidad para backlog, bytes para payloads grandes.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Argumento</th><th>Efecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>expiration</code></td><td>TTL de un mensaje concreto (string de ms)</td></tr>
+            <tr><td><code>x-message-ttl</code></td><td>TTL de todos los mensajes de la cola</td></tr>
+            <tr><td><code>x-expires</code></td><td>Borra la cola tras inactividad (entero positivo)</td></tr>
+            <tr><td><code>x-max-length</code> / <code>x-max-length-bytes</code></td><td>Límite por cantidad o por bytes</td></tr>
+            <tr><td><code>x-overflow</code></td><td><code>drop-head</code>, <code>reject-publish</code> o <code>reject-publish-dlx</code></td></tr>
+            <tr><td><code>x-dead-letter-exchange</code></td><td>Destino de los mensajes expirados o descartados</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué mi mensaje con TTL de 1 segundo sigue en la cola después de un minuto?</summary>
+            <div>
+              <p>Porque la expiración es perezosa y el mensaje no está en la cabeza. Detrás tiene uno con TTL mayor que aún no ha salido. En cuanto el de delante se consuma o expire, el broker evaluará el siguiente. Si necesitas plazos exactos, usa TTL por cola y una cola por plazo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>x-message-ttl: 0</code> significa que no caduca?</summary>
+            <div>
+              <p>No, es lo contrario: caduca a menos que se pueda entregar inmediatamente a un consumidor. Se usa para mensajes que solo tienen sentido en tiempo real. Para «sin caducidad», simplemente no configures TTL ni <code>expiration</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los mensajes no confirmados cuentan para <code>x-max-length</code>?</summary>
+            <div>
+              <p>En classic queues, no: el límite cuenta mensajes en estado ready. En quorum queues cuentan también los retrasados y los pendientes de dead-lettering. Por eso una cola con muchos mensajes en vuelo puede aceptar más publicaciones de las que sugiere el número de mensajes totales.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre <code>drop-head</code> y <code>reject-publish</code>?</summary>
+            <div>
+              <p><code>drop-head</code> mantiene lo nuevo y descarta lo más antiguo, sin avisar al productor (salvo DLX). <code>reject-publish</code> rechaza lo nuevo con <code>basic.nack</code> y conserva lo que ya estaba, trasladando la decisión al productor. Para trabajo pendiente, <code>reject-publish</code> suele ser más segura; para datos efímeros, <code>drop-head</code> es aceptable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar el TTL o el límite de una cola en producción?</summary>
+            <div>
+              <p>Con una policy, sí: se aplica sin recrear la cola y afecta a los mensajes nuevos y a los que ya están (el TTL se recalcula sobre la cola). Redeclarar con argumentos distintos devuelve <code>406</code>. Los cambios de límite no recuperan lo ya descartado.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

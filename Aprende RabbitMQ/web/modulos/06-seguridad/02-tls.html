@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-tls">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TLS en el broker — Módulo 6 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TLS en el broker</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>AMQP 0-9-1 autentica con SASL <code>PLAIN</code>: usuario y contraseña viajan en un sobre que, sin TLS, se puede leer con un <code>tcpdump</code> en la misma red. No es un fallo del protocolo; es el modelo: AMQP asume que la capa de transporte protege el canal. En localhost da igual. Entre dos máquinas de un clúster, entre la API y el broker, o entre tu portátil y un broker en la nube, no.</p>
+        <p>TLS aporta cuatro cosas distintas que conviene no mezclar:</p>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Qué significa</th><th>Quién la aporta</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Confidencialidad</strong></td><td>Nadie en la red lee credenciales ni cuerpos de mensajes</td><td>Cifrado simétrico negociado en el handshake</td></tr>
+            <tr><td><strong>Integridad</strong></td><td>Un mensaje alterado en tránsito se detecta</td><td>MAC/AEAD del cifrado</td></tr>
+            <tr><td><strong>Autenticación del servidor</strong></td><td>El cliente sabe que habla con el broker legítimo</td><td>Certificado del servidor + CA de confianza</td></tr>
+            <tr><td><strong>Autenticación del cliente</strong></td><td>El broker sabe qué máquina se conecta (opcional)</td><td>Certificado de cliente + <code>verify_peer</code></td></tr>
+          </tbody>
+        </table>
+        <p>El error más caro no es configurar mal un cipher: es desactivar la verificación para «que funcione ya». Un TLS con <code>rejectUnauthorized: false</code> cifra el canal, pero acepta cualquier certificado; un atacante con capacidad de interceptar puede presentar el suyo y leerlo todo. Cifrado sin autenticación es una falsa sensación de seguridad.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Dos puertos, dos mundos</p>
+          <p><code>5672</code> es AMQP en claro y <code>15672</code> es la management UI en claro. TLS usa <code>5671</code> (AMQP) y <code>15671</code> (UI). Que el primero esté cerrado no implica que el segundo lo esté: son listeners independientes y se configuran por separado.</p>
+        </div>
+        <p>Errores típicos: certificados autofirmados repartidos por correo, certificados con <code>CN</code> pero sin <code>subjectAltName</code>, clientes que conectan por IP a un certificado emitido para un nombre DNS, y rotaciones que nadie probó hasta que el certificado caducó un viernes.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué ocurre antes del primer frame AMQP</h3>
+        <pre><code class="language-text">cliente                                         broker
+  |  TCP connect :5671                            |
+  |----------------------------------------------&gt;|
+  |  ClientHello (versiones, SNI, cifrados)       |
+  |----------------------------------------------&gt;|
+  |                    ServerHello + certificado  |
+  |&lt;----------------------------------------------|
+  |  cliente valida: firma de la CA, fechas,      |
+  |  SAN contra el hostname, usos de la clave     |
+  |  (si mTLS) certificado de cliente             |
+  |----------------------------------------------&gt;|
+  |                    verificación y Finished    |
+  |&lt;----------------------------------------------|
+  |  "AMQP" + 0 0 9 1  -> handshake AMQP          |
+  |----------------------------------------------&gt;|
+  |  SASL PLAIN (usuario/contraseña cifrados)     |
+  |----------------------------------------------&gt;|</code></pre>
+        <p>TLS termina <strong>antes</strong> de AMQP. El broker no ve el usuario hasta que el túnel está establecido; por eso un fallo de certificado se manifiesta como error de socket y no como error de autenticación.</p>
+
+        <h3>La PKI mínima: tres certificados y tres claves</h3>
+        <table>
+          <thead><tr><th>Fichero</th><th>Quién lo tiene</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>ca_certificate.pem</code></td><td>Broker y todos los clientes</td><td>Verificar la firma de los certificados; es el ancla de confianza.</td></tr>
+            <tr><td><code>ca_key.pem</code></td><td>Solo la CA / el sistema de emisión</td><td>Firmar certificados nuevos. Nunca viaja al broker ni a los clientes.</td></tr>
+            <tr><td><code>server_certificate.pem</code> + <code>server_key.pem</code></td><td>Broker</td><td>Identificarse ante los clientes. El certificado incluye el nombre DNS en <code>subjectAltName</code>.</td></tr>
+            <tr><td><code>client_certificate.pem</code> + <code>client_key.pem</code></td><td>Cada cliente, si hay mTLS</td><td>Identificarse ante el broker.</td></tr>
+          </tbody>
+        </table>
+        <p>Las claves privadas se generan en el sitio y no se copian entre máquinas. En producción se usan certificados emitidos por una CA corporativa o pública; para el laboratorio crearemos nuestra propia CA y la trataremos como un secreto más.</p>
+
+        <h3>Verificación del servidor: la matriz que hay que entender</h3>
+        <table>
+          <thead><tr><th><code>ssl_options.verify</code></th><th><code>fail_if_no_peer_cert</code></th><th>Qué pasa</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>verify_none</code></td><td><code>false</code></td><td>El broker no pide certificado al cliente</td><td>Solo si el cliente verifica al servidor; nunca en producción seria</td></tr>
+            <tr><td><code>verify_peer</code></td><td><code>false</code></td><td>Pide certificado, pero acepta clientes sin él</td><td>Transición a mTLS</td></tr>
+            <tr><td><code>verify_peer</code></td><td><code>true</code></td><td>Exige certificado de cliente válido y firmado por la CA</td><td>mTLS real</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">mTLS no reemplaza a los usuarios AMQP</p>
+          <p>Un certificado de cliente demuestra que la máquina posee la clave privada, pero el broker sigue esperando un usuario y una contraseña en el handshake SASL. Para autenticar por el <em>DN</em> del certificado hay que habilitar el mecanismo <code>EXTERNAL</code> del plugin <code>rabbitmq_auth_mechanism_ssl</code> y mapear el nombre. Es una configuración avanzada: en este curso usamos mTLS como capa extra y seguimos autenticando con usuario y contraseña.</p>
+        </div>
+
+        <h3>Hostname: el error que no perdona</h3>
+        <p>El cliente compara el nombre al que se conecta con las entradas <code>DNS</code> e <code>IP</code> de <code>subjectAltName</code>. Si el certificado dice <code>DNS:rabbitmq</code> y el cliente abre <code>amqps://localhost:5671</code>, la verificación falla aunque la firma sea correcta. Soluciones válidas: emitir el certificado con todos los nombres reales (<code>DNS:localhost, DNS:rabbitmq, IP:127.0.0.1</code>) o conectar siempre por el nombre que figura en el certificado.</p>
+        <p>En Node.js, el cliente usa el hostname de la URL para SNI y verificación. Cuando conectas por IP o necesitas forzar el nombre, pasa <code>servername</code> en las opciones de socket. Lo que <strong>no</strong> se hace es desactivar <code>rejectUnauthorized</code>.</p>
+
+        <h3>Configuración del broker: rabbitmq.conf</h3>
+        <p>RabbitMQ 4.x usa el formato <code>sysctl</code> en <code>/etc/rabbitmq/rabbitmq.conf</code>. Para TLS necesitas un listener, la terna CA/cert/key y las decisiones de verificación:</p>
+        <pre><code class="language-text">listeners.tcp = none                 # cierra 5672: solo TLS
+listeners.ssl.default = 5671
+
+ssl_options.cacertfile = /etc/rabbitmq/certs/ca_certificate.pem
+ssl_options.certfile   = /etc/rabbitmq/certs/server_certificate.pem
+ssl_options.keyfile    = /etc/rabbitmq/certs/server_key.pem
+ssl_options.verify     = verify_peer
+ssl_options.fail_if_no_peer_cert = true
+
+management.ssl.port      = 15671
+management.ssl.cacertfile = /etc/rabbitmq/certs/ca_certificate.pem
+management.ssl.certfile   = /etc/rabbitmq/certs/server_certificate.pem
+management.ssl.keyfile    = /etc/rabbitmq/certs/server_key.pem
+# El listener HTTP en claro sigue existiendo, pero queda en localhost:
+management.tcp.ip = 127.0.0.1</code></pre>
+        <p><code>listeners.tcp = none</code> es la forma de obligar a que todo el tráfico AMQP pase por TLS. Si lo omites, el 5672 sigue abierto y un cliente despistado se conectará en claro sin enterarse.</p>
+
+        <h3>Rotación: el certificado caduca siempre</h3>
+        <p>Un certificado tiene fecha de inicio y de fin. La rotación sin caída se apoya en dos ideas:</p>
+        <ul>
+          <li><strong>Misma CA</strong>: si renuevas solo el certificado del servidor, los clientes que confían en la CA no cambian nada. Sustituye los ficheros y reinicia el listener (o el nodo, en un despliegue rodado).</li>
+          <li><strong>Solape de CA</strong>: el fichero <code>cacertfile</code> puede contener varias CA concatenadas. Publica un bundle con la CA vieja y la nueva, rueda broker y clientes, y retira la vieja cuando ya nadie la use.</li>
+        </ul>
+        <p>Lo que no funciona: renovar el certificado y olvidar que los clientes con <code>ca</code> fijada en un fichero concreto no aceptan una CA nueva sin actualizar su bundle. La rotación se ensaya en staging y se automatiza con alertas de caducidad a 30, 14 y 7 días.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a crear una CA local y un certificado de servidor válido para <code>localhost</code> y para el nombre <code>rabbitmq</code> de la red de Docker. Necesitas <code>openssl</code> (viene con Git Bash en Windows y con macOS/Linux).</p>
+        <pre><code class="language-bash">mkdir -p certs &amp;&amp; cd certs
+
+# 1. CA con extensión CA explícita
+openssl genrsa -out ca_key.pem 4096
+cat &gt; ca.ext &lt;&lt;'EOF'
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+EOF
+openssl req -x509 -new -key ca_key.pem -sha256 -days 3650 \
+  -subj "/CN=Taller Local CA" -extfile ca.ext -out ca_certificate.pem
+
+# 2. Clave y CSR del servidor
+openssl genrsa -out server_key.pem 2048
+openssl req -new -key server_key.pem -subj "/CN=rabbitmq" -out server.csr
+
+# 3. El certificado debe nombrar todos los hostnames usados
+cat &gt; server.ext &lt;&lt;'EOF'
+subjectAltName = DNS:localhost, DNS:rabbitmq, IP:127.0.0.1
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+EOF
+openssl x509 -req -in server.csr -CA ca_certificate.pem -CAkey ca_key.pem \
+  -CAcreateserial -out server_certificate.pem -days 825 -sha256 -extfile server.ext</code></pre>
+        <p>Comprueba lo que has emitido antes de tocar el broker:</p>
+        <pre><code class="language-bash">openssl x509 -in server_certificate.pem -noout -subject -dates -ext subjectAltName</code></pre>
+        <pre><code class="language-text">subject=CN = rabbitmq
+notBefore=Nov  5 10:00:00 2026 GMT
+notAfter=Feb  7 10:00:00 2029 GMT
+X509v3 Subject Alternative Name:
+    DNS:localhost, DNS:rabbitmq, IP Address:127.0.0.1</code></pre>
+        <p>Línea a línea, lo importante: la CA lleva <code>CA:TRUE</code> o los clientes rechazarán la cadena; el servidor lleva <code>serverAuth</code>; y el <code>subjectAltName</code> es lo que se compara con el hostname, no el <code>CN</code>.</p>
+        <p>Monta los ficheros en el contenedor y arranca con la configuración TLS:</p>
+        <pre><code class="language-yaml">services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    ports:
+      - "5671:5671"
+      - "15671:15671"
+    volumes:
+      - ./certs:/etc/rabbitmq/certs:ro
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro</code></pre>
+        <p>Con <code>verify_peer</code> y <code>fail_if_no_peer_cert = true</code>, cualquier cliente sin certificado de cliente será rechazado en el handshake. Para el primer intento puedes poner <code>fail_if_no_peer_cert = false</code> y comprobar que el servidor se autentica; después lo endureces.</p>
+        <p>Verifica el túnel sin escribir una línea de JavaScript:</p>
+        <pre><code class="language-bash">openssl s_client -connect localhost:5671 -servername localhost \
+  -CAfile certs/ca_certificate.pem -verify_return_error &lt; /dev/null</code></pre>
+        <p>Busca <code>Verify return code: 0 (ok)</code> en la salida. Si aparece <code>unable to verify the first certificate</code>, el cliente no está recibiendo la CA correcta; si aparece <code>hostname mismatch</code>, el SAN no cubre <code>localhost</code>.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">PowerShell y la redirección</p>
+          <p>En PowerShell, <code>&lt; /dev/null</code> no existe. Usa <code>echo "" | openssl s_client ...</code> con los mismos argumentos, o ejecuta el comando desde Git Bash.</p>
+        </div>
+        <p>Ahora el cliente Node. Esta es la forma correcta:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+import { readFileSync } from 'node:fs';
+
+const conn = await amqp.connect('amqps://taller-api:PASSWORD@localhost:5671/taller-dev', {
+  ca: [readFileSync('./certs/ca_certificate.pem')],
+  servername: 'localhost',
+  timeout: 5000,
+});
+
+const ch = await conn.createChannel();
+console.log('conectado por TLS');
+await ch.close();
+await conn.close();</code></pre>
+        <p><code>amqplib</code> pasa estas opciones al módulo <code>tls</code> de Node: <code>ca</code> es el ancla de confianza, <code>servername</code> es el nombre que se usa para SNI y verificación, y <code>timeout</code> evita conexiones colgadas. No hay ningún <code>rejectUnauthorized: false</code>, y eso es deliberado.</p>
+        <p>Si el broker exige certificado de cliente, añade <code>cert</code> y <code>key</code>:</p>
+        <pre><code class="language-javascript">const conn = await amqp.connect('amqps://taller-worker:PASSWORD@rabbitmq:5671/taller-prod', {
+  ca: [readFileSync('./certs/ca_certificate.pem')],
+  cert: readFileSync('./certs/client_certificate.pem'),
+  key: readFileSync('./certs/client_key.pem'),
+  servername: 'rabbitmq',
+});</code></pre>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, la API y los workers viven en contenedores distintos del broker. El despliegue queda así:</p>
+        <pre><code class="language-text">          red privada docker (sin exposición a Internet)
+  +----------------+        TLS 5671        +------------------+
+  |  api (Node)    |----------------------&gt;|                  |
+  |  cert cliente  |                       |    rabbitmq      |
+  +----------------+                       |  cert servidor   |
+  +----------------+        TLS 5671        |  CA del taller   |
+  | worker (Node)  |----------------------&gt;|                  |
+  |  cert cliente  |                       +---------+--------+
+  +----------------+                                 |
+                                                     | 15671 TLS
+  +----------------+        HTTPS 15671              |
+  |  navegador /   |---------------------------------+
+  |  bastión       |   solo desde la VPN, no público
+  +----------------+</code></pre>
+        <p>Las decisiones que hacen esto operativo:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Valor</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td>Puerto AMQP</td><td>Solo <code>5671</code>; <code>listeners.tcp = none</code></td><td>No hay ruta en claro ni por error de configuración.</td></tr>
+            <tr><td>Verificación de cliente</td><td><code>verify_peer</code> + <code>fail_if_no_peer_cert = true</code></td><td>Un contenedor sin certificado no llega ni al handshake SASL.</td></tr>
+            <tr><td>Management</td><td><code>15671</code> TLS, jamás publicado en Internet</td><td>La UI es una superficie de administración; se accede por VPN.</td></tr>
+            <tr><td>Confianza</td><td>CA del taller montada como secreto</td><td>Los clientes no llevan certificados autofirmados ad hoc.</td></tr>
+            <tr><td>Certificados de cliente</td><td>Uno por servicio, con <code>CN</code> distinto</td><td>Se pueden revocar por separado y auditar en el handshake.</td></tr>
+          </tbody>
+        </table>
+        <p>Un detalle de operación: los certificados de cliente no se meten en la imagen Docker. Se montan como secreto en tiempo de ejecución; si se hornean en la imagen, cualquiera con acceso al registro puede extraerlos. En Compose, un volumen de solo lectura o un secreto; en Kubernetes, un <code>Secret</code> montado como fichero. Y la conexión TLS se abre al arrancar y se reutiliza, nunca por petición: un handshake por job agota conexiones y añade latencia.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Verificar siempre el certificado del servidor con una CA explícita</td><td><code>rejectUnauthorized: false</code> o <code>NODE_TLS_REJECT_UNAUTHORIZED=0</code></td><td>Sin verificación, el cifrado no impide un ataque de intermediario.</td></tr>
+            <tr><td>Emitir el certificado con todos los SAN que se usan</td><td>Confiar en el <code>CN</code> o en un solo nombre</td><td>La verificación moderna usa <code>subjectAltName</code>; un nombre que falta rompe el cliente.</td></tr>
+            <tr><td>Cerrar <code>5672</code> y <code>15672</code> cuando TLS está listo</td><td>Dejar ambos puertos abiertos «por comodidad»</td><td>Un cliente mal configurado vuelve al canal en claro sin avisar.</td></tr>
+            <tr><td>mTLS con <code>verify_peer</code> y <code>fail_if_no_peer_cert = true</code></td><td>Poner <code>verify_none</code> y llamarlo mTLS</td><td>Sin exigir certificado, el broker acepta a cualquiera que tenga usuario y contraseña.</td></tr>
+            <tr><td>Montar claves como secretos, nunca en la imagen</td><td>Commitear <code>server_key.pem</code> al repositorio</td><td>Una clave filtrada permite suplantar el broker o a un cliente.</td></tr>
+            <tr><td>Rotar con solape de CA y probar en staging</td><td>Renovar el día antes de que caduque</td><td>La rotación tiene pasos ordenados; descubrirlos en producción es caro.</td></tr>
+            <tr><td>Alertar de caducidad a 30/14/7 días</td><td>Confiar en la memoria del equipo</td><td>Un certificado caducado tumba el sistema entero, no una funcionalidad.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. «Funciona, pero desactivo la verificación»</h3>
+        <span class="code-label code-label--wrong">Mal — cifrado sin autenticación</span>
+        <pre><code class="language-javascript">const conn = await amqp.connect('amqps://user:pass@broker:5671', {
+  rejectUnauthorized: false,
+});</code></pre>
+        <span class="code-label code-label--right">Bien — CA explícita y hostname correcto</span>
+        <pre><code class="language-javascript">const conn = await amqp.connect('amqps://user:pass@broker:5671', {
+  ca: [readFileSync('/run/secrets/ca_certificate.pem')],
+  servername: 'broker',
+});</code></pre>
+        <p>La primera versión acepta cualquier certificado, incluido el de un atacante que intercepte la conexión. La segunda falla si el certificado no es válido, que es exactamente lo que quieres que ocurra.</p>
+
+        <h3>2. Certificado sin el nombre correcto</h3>
+        <span class="code-label code-label--wrong">Mal — el certificado solo cubre <code>rabbitmq</code></span>
+        <pre><code class="language-text">subject=CN = rabbitmq
+X509v3 Subject Alternative Name:
+    DNS:rabbitmq
+
+# cliente: amqps://localhost:5671 -> hostname mismatch</code></pre>
+        <span class="code-label code-label--right">Bien — SAN con todos los nombres de acceso</span>
+        <pre><code class="language-text">X509v3 Subject Alternative Name:
+    DNS:localhost, DNS:rabbitmq, IP:127.0.0.1</code></pre>
+        <p>El error típico aparece al pasar de <code>localhost</code> a Compose: el certificado se emitió pensando en un nombre y el cliente usa otro. No lo arregles con <code>servername</code> inventado; emite el certificado para los nombres reales.</p>
+
+        <h3>3. Confundir TLS con mTLS</h3>
+        <span class="code-label code-label--wrong">Mal — se anuncia mTLS pero no se pide certificado</span>
+        <pre><code class="language-text">ssl_options.verify = verify_none
+ssl_options.fail_if_no_peer_cert = false</code></pre>
+        <span class="code-label code-label--right">Bien — exigir certificado de cliente</span>
+        <pre><code class="language-text">ssl_options.verify = verify_peer
+ssl_options.fail_if_no_peer_cert = true</code></pre>
+        <p>Con la primera configuración, cualquiera con unas credenciales válidas entra. mTLS significa que el broker valida un certificado de cliente, no solo que el cliente valide al broker.</p>
+
+        <h3>4. Dejar la UI en claro</h3>
+        <span class="code-label code-label--wrong">Mal — TLS en AMQP y UI abierta en 15672</span>
+        <pre><code class="language-yaml">ports:
+  - "5671:5671"
+  - "15672:15672"   # management sin TLS</code></pre>
+        <span class="code-label code-label--right">Bien — UI por TLS y no publicada</span>
+        <pre><code class="language-yaml">ports:
+  - "5671:5671"
+  - "127.0.0.1:15671:15671"   # solo accesible desde el host/VPN</code></pre>
+        <p>La UI permite publicar y consumir mensajes y cambiar políticas. Proteger solo AMQP y dejar la UI expuesta es como cerrar la puerta y dejar la ventana abierta.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> levantar el broker con TLS, verificar el certificado con OpenSSL, conectar desde Node y comprobar qué ocurre cuando la verificación falla.</p>
+        <ol class="steps">
+          <li>
+            <strong>Genera la CA y el certificado del servidor</strong> con los comandos del ejemplo mínimo. Comprueba las fechas y el SAN con <code>openssl x509 -in server_certificate.pem -noout -subject -dates -ext subjectAltName</code>.</li>
+          <li>
+            <strong>Escribe <code>rabbitmq.conf</code></strong> con <code>listeners.ssl.default = 5671</code>, la terna CA/cert/key y <code>fail_if_no_peer_cert = false</code> para esta primera prueba. Añade <code>listeners.tcp = none</code> y arranca:
+            <pre><code class="language-bash">docker compose up -d
+docker compose logs -f rabbitmq</code></pre>
+            <p>Espera a ver el nodo arrancado y comprueba que el listener TLS está activo con <code>docker exec rabbitmq rabbitmq-diagnostics listeners</code>.</p>
+          </li>
+          <li>
+            <strong>Verifica el handshake con OpenSSL:</strong>
+            <pre><code class="language-bash">openssl s_client -connect localhost:5671 -servername localhost \
+  -CAfile certs/ca_certificate.pem -verify_return_error &lt; /dev/null</code></pre>
+            <p>Salida esperada: <code>Verify return code: 0 (ok)</code> y la cadena con <code>CN = Taller Local CA</code>.</p>
+          </li>
+          <li>
+            <strong>Conecta con amqplib</strong> usando <code>ca</code> y <code>servername</code>. Publica un mensaje persistente en <code>taller.jobs</code> y consúmelo; debe funcionar igual que por <code>5672</code>, pero por <code>5671</code>.</li>
+          <li>
+            <strong>Rompe la verificación a propósito:</strong> conecta sin la opción <code>ca</code>. Debes recibir un error de certificado (<code>UNABLE_TO_VERIFY_LEAF_SIGNATURE</code> o similar) y ninguna conexión AMQP. Repite usando <code>amqps://127.0.0.1:5671</code> con un certificado que solo tenga <code>DNS:rabbitmq</code>: el error será de hostname. Anota ambos mensajes: son los que verás en producción.</li>
+          <li>
+            <strong>Endurece y comprueba:</strong> genera un certificado de cliente, pon <code>verify_peer</code> y <code>fail_if_no_peer_cert = true</code>, reinicia y verifica que una conexión sin <code>cert</code>/<code>key</code> falla en el handshake mientras la que los incluye funciona. Cierra el ejercicio mirando <code>docker compose logs rabbitmq</code>: los rechazos TLS dejan rastro.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Depuración en dos capas</p>
+          <p>Si <code>openssl s_client</code> falla, el problema es TLS y AMQP no tiene nada que ver. Si OpenSSL conecta pero amqplib no, revisa las opciones del cliente (CA, <code>servername</code>, cert de cliente) o el usuario/vhost. Separar las capas evita horas perdidas culpando al broker.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rotación de CA sin caída y sin tocar clientes</h3>
+          <p>Diseña y documenta una rotación completa de la CA del taller: la CA actual caduca en 30 días y hay que pasar a una nueva sin que API ni workers dejen de publicar o consumir, y sin redesplegar los clientes.</p>
+          <p>El plan debe indicar el orden exacto de pasos (bundles de CA, certificados de servidor y de cliente, reinicios y ventanas), cómo verificar en cada fase que ambos lados siguen confiando, qué hacer si un cliente falla a mitad y cómo retirar la CA antigua sin romper a nadie. Incluye los comandos de verificación y una prueba de que la ventana de convivencia funciona con OpenSSL.</p>
+          <p><em>Pista: <code>cacertfile</code> admite varias CA concatenadas, y un cliente puede confiar en un bundle con las dos. La parte difícil no es emitir el certificado nuevo, sino saber cuándo ya nadie usa el viejo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>AMQP <code>PLAIN</code> envía credenciales en el handshake: sin TLS, cualquiera que vea la red las lee.</li>
+          <li>TLS usa <strong>5671</strong> para AMQP y <strong>15671</strong> para la management UI; son listeners distintos de 5672 y 15672.</li>
+          <li>La verificación del servidor exige una <strong>CA de confianza</strong> y un <strong>SAN</strong> que cubra el hostname usado por el cliente.</li>
+          <li>mTLS es <code>verify_peer</code> + <code>fail_if_no_peer_cert = true</code>; sin lo segundo, el certificado de cliente es opcional.</li>
+          <li><code>rejectUnauthorized: false</code> y <code>verify_none</code> convierten TLS en una ilusión: cifra, pero no autentica.</li>
+          <li>La rotación se planifica con solape de CA, se prueba en staging y se alerta antes de la caducidad.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Dónde vive</th><th>Comprobación</th></tr></thead>
+          <tbody>
+            <tr><td><code>ca_certificate.pem</code></td><td>Broker y clientes</td><td><code>openssl verify -CAfile ca_certificate.pem server_certificate.pem</code></td></tr>
+            <tr><td><code>server_certificate.pem</code></td><td>Broker</td><td><code>openssl x509 -noout -dates -ext subjectAltName</code></td></tr>
+            <tr><td><code>server_key.pem</code></td><td>Broker, como secreto</td><td>Permisos <code>0400</code>, nunca en Git</td></tr>
+            <tr><td><code>listeners.ssl.default</code></td><td><code>rabbitmq.conf</code></td><td><code>rabbitmq-diagnostics listeners</code></td></tr>
+            <tr><td><code>amqps://</code> + <code>ca</code></td><td>Cliente Node</td><td><code>openssl s_client</code> y conexión real</td></tr>
+            <tr><td><code>servername</code></td><td>Cliente Node</td><td>Coincide con un SAN del certificado</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar un certificado autofirmado en producción?</summary>
+            <div>
+              <p>Técnicamente sí, si distribuyes ese certificado como CA de confianza a todos los clientes y lo tratas como una CA privada. El problema es operativo: cada cliente necesita el fichero exacto, la rotación se multiplica y no hay revocación cómoda. Una CA corporativa o pública con certificados de corta duración es más mantenible. Lo que nunca vale es aceptar cualquier certificado con <code>rejectUnauthorized: false</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿TLS sustituye a los usuarios y permisos?</summary>
+            <div>
+              <p>No. TLS protege el canal; la <a href="01-usuarios-vhosts-permisos.html">autorización</a> sigue siendo la tripleta <code>configure</code>/<code>write</code>/<code>read</code>. Un cliente con un certificado válido pero sin permisos recibirá <code>403 ACCESS_REFUSED</code> en cuanto intente publicar. Son capas independientes: transporte, autenticación y autorización.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el certificado caduca con el broker en marcha?</summary>
+            <div>
+              <p>Las conexiones ya establecidas pueden seguir hasta que se cierren, pero cualquier handshake nuevo falla: los clientes que reconecten no podrán entrar. El broker sigue vivo y los mensajes persistidos se conservan, pero el sistema deja de aceptar tráfico. Por eso la alerta de caducidad es obligatoria y la rotación se prueba antes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito mTLS si ya uso usuario y contraseña?</summary>
+            <div>
+              <p>No es obligatorio, pero añade una capa útil: aunque filtren la contraseña, un atacante sin el certificado de cliente no puede completar el handshake. También permite identificar cada servicio por su certificado y revocar uno solo. El coste es gestionar certificados de cliente y rotarlos; en redes muy controladas puede ser suficiente con TLS de servidor y credenciales fuertes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo depuro un <code>ECONNRESET</code> al conectar por <code>amqps</code>?</summary>
+            <div>
+              <p>Empieza por <code>openssl s_client -connect host:5671 -servername host -CAfile ca.pem</code>. Si falla ahí, es TLS: revisa CA, SAN, fechas y si el broker exige certificado de cliente. Si OpenSSL conecta y Node no, compara las opciones (<code>ca</code>, <code>cert</code>, <code>key</code>, <code>servername</code>) y mira el log del broker: un rechazo por certificado deja una entrada con el motivo. Un <code>ECONNRESET</code> inmediato suele ser el broker cerrando el handshake, no un problema de red.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

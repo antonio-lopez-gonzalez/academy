@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="03-multipart-y-streaming">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multipart y streaming — Módulo 1 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Multipart y streaming</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Objetos y buckets</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Subir un PDF de 2 MB con un <code>PUT</code> es trivial. Subir un vídeo de 8 GB no lo es: si lo cargas entero en memoria, el proceso muere; si lo envías en una sola petición y la red falla en el minuto veinte, empiezas de cero; si el servidor limita el tamaño de una petición, ni siquiera puedes intentarlo. <strong>Multipart upload</strong> existe para resolver esos tres problemas.</p>
+        <p>La idea es sencilla: en lugar de un <code>PUT</code> gigante, se inicia una subida, se envían partes de tamaño acotado —en paralelo si quieres—, se reintenta solo la parte que falló y se completa el objeto al final. El objeto resultante es uno solo, con una sola clave, pero se construyó por piezas. El servidor guarda las partes en un área temporal hasta que llega el <code>CompleteMultipartUpload</code>.</p>
+        <p>Esta lección explica cuándo hace falta, cuáles son los límites reales, cómo se calcula el tamaño de parte, cómo se comporta el <code>ETag</code> y cómo se implementa con <code>mc</code> y con <code>minio-js</code> sin cargar el fichero en memoria. También el detalle que más facturas sorprende: las subidas abortadas o abandonadas ocupan espacio hasta que alguien las limpia.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Streaming no es un adorno</p>
+          <p>Un servidor de 512 MB de RAM no puede hacer <code>readFile()</code> de un vídeo de 4 GB. El streaming permite que el consumo de memoria dependa del tamaño de parte y del paralelismo, no del tamaño del fichero. Esa es la diferencia entre un uploader que aguanta y uno que se cae con el primer fichero grande.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Límites que hay que conocer</h3>
+        <table>
+          <thead><tr><th>Límite</th><th>MinIO</th><th>Nota de portabilidad (AWS S3)</th></tr></thead>
+          <tbody>
+            <tr><td>Tamaño mínimo de parte</td><td>5 MiB</td><td>Igual, salvo la última parte</td></tr>
+            <tr><td>Tamaño máximo de parte</td><td>5 GiB</td><td>Igual</td></tr>
+            <tr><td>Número máximo de partes</td><td>10 000</td><td>Igual</td></tr>
+            <tr><td>Tamaño máximo por <code>PUT</code> simple</td><td>5 TiB</td><td>5 GiB en AWS</td></tr>
+            <tr><td>Tamaño máximo de objeto</td><td>50 TiB con multipart</td><td>5 TiB en AWS</td></tr>
+            <tr><td>Última parte</td><td>Puede ser de 0 B a 5 GiB</td><td>Igual</td></tr>
+          </tbody>
+        </table>
+        <p>La diferencia de tamaño máximo es importante: un objeto de 20 TiB es válido en MinIO y no lo será en AWS. Si diseñas para ambos, el techo práctico es <strong>5 TiB</strong>. Y si haces un <code>PUT</code> simple de más de 5 GiB, AWS lo rechaza aunque MinIO lo acepte: usa multipart siempre por encima de ese umbral.</p>
+        <h3>El flujo, paso a paso</h3>
+        <pre><code class="language-text">CLIENTE                                      MINIO
+   |                                            |
+   |-- POST /bucket/key?uploads --------------> |  crea uploadId
+   |&lt;------------- uploadId -------------------- |
+   |                                            |
+   |-- PUT ...?uploadId=U&amp;partNumber=1 -------> |  guarda parte 1
+   |&lt;------------- ETag "a1" ------------------ |
+   |-- PUT ...?uploadId=U&amp;partNumber=2 -------> |  guarda parte 2
+   |&lt;------------- ETag "b2" ------------------ |
+   |-- PUT ...?uploadId=U&amp;partNumber=3 -------> |  guarda parte 3
+   |&lt;------------- ETag "c3" ------------------ |
+   |                                            |
+   |-- POST ...?uploadId=U -------------------> |  valida orden y ETags
+   |    Part 1 a1, Part 2 b2, Part 3 c3         |  compone el objeto
+   |&lt;------------- ETag "d4-3" ---------------- |
+   |                                            |
+   |  Si algo falla:                            |
+   |-- DELETE ...?uploadId=U -----------------> |  libera las partes</code></pre>
+        <p>Mientras la subida está abierta, el objeto <strong>no existe</strong> para un <code>GET</code>. Las partes viven en un espacio temporal asociado al <code>uploadId</code>. Solo el <code>Complete</code> publica el objeto de forma atómica. Si el cliente desaparece, las partes se quedan ahí y consumen capacidad.</p>
+        <h3>Elegir el tamaño de parte</h3>
+        <p>Dos restricciones mandan: cada parte (menos la última) debe tener al menos 5 MiB, y no puede haber más de 10 000. Para un objeto de tamaño <code>S</code>, un punto de partida habitual es:</p>
+        <pre><code class="language-text">partSize = max(5 MiB, ceil(S / 10 000))   redondeado a MiB
+S = 100 MiB   -> 5 MiB   (20 partes)
+S = 1 GiB     -> 5 MiB   (205 partes)
+S = 50 GiB    -> 5 MiB   (10 240 partes)  ¡demasiadas!
+S = 50 GiB    -> 8 MiB   (6 400 partes)   mejor
+S = 1 TiB     -> 105 MiB (10 000 partes)  cerca del límite
+S = 5 TiB     -> 525 MiB (10 000 partes)  cerca del límite</code></pre>
+        <p>En la práctica, 64 MiB o 128 MiB son buenos valores por defecto: suficientes para no acercarse a 10 000 partes y pequeños como para que un reintento no cueste minutos. Partes más pequeñas aumentan el paralelismo y el número de peticiones; más grandes reducen la sobrecarga pero castigan el reintento. <code>minio-js</code> usa 64 MiB por defecto en su multipart automático.</p>
+        <h3>El ETag de una subida multipart</h3>
+        <p>No es el MD5 del objeto. Es el MD5 de la concatenación de los MD5 binarios de cada parte, seguido de un guion y el número de partes:</p>
+        <pre><code class="language-text">ETag = md5( md5(parte1) || md5(parte2) || md5(parte3) ) + "-3"
+Ejemplo: "7c9e2f4a1b3d5e6f8a0b1c2d3e4f5a6b-3"</code></pre>
+        <p>Por eso <code>mc stat</code> de un objeto multipart termina en <code>-N</code>. Ese sufijo es la pista de que hubo partes y de que comparar el ETag con un MD5 local no va a funcionar. Para integridad, guarda un <code>sha256</code> calculado por ti, como en la lección <a href="02-put-get-y-metadatos.html">PUT, GET y metadatos</a>.</p>
+        <h3>Streaming, memoria y backpressure</h3>
+        <table>
+          <thead><tr><th>Enfoque</th><th>Memoria</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>readFile()</code> + <code>putObject</code></td><td>Todo el objeto</td><td>Solo ficheros pequeños y controlados</td></tr>
+            <tr><td><code>createReadStream()</code> + <code>putObject</code> con tamaño</td><td>Una parte por stream</td><td>Lo normal cuando conoces el tamaño</td></tr>
+            <tr><td>Multipart manual con rangos</td><td>Parte × paralelismo</td><td>Reintentos, progreso, reanudación</td></tr>
+            <tr><td>Buffer completo en memoria</td><td>Objeto + copia</td><td>Nunca para ficheros grandes</td></tr>
+          </tbody>
+        </table>
+        <p>El <em>backpressure</em> es lo que impide que el productor adelante al consumidor: si el socket va lento, el stream de lectura reduce su ritmo y la memoria no crece sin control. Un <code>readFile</code> rompe esa propiedad porque materializa todo antes de empezar. Con multipart manual, el paralelismo también cuenta: cuatro partes de 64 MiB en vuelo son 256 MiB de buffers potenciales, no 64.</p>
+        <h3>Reintentos y reanudación</h3>
+        <p>Cada parte es una petición independiente e idempotente por número: si reintentas la parte 3 con el mismo <code>partNumber</code>, sobrescribes la anterior. Eso permite un reintento con backoff sin reiniciar la subida. Lo que no puedes hacer es cambiar de <code>uploadId</code> a mitad: si lo pierdes, empiezas de nuevo.</p>
+        <p>Para reanudar tras un reinicio del proceso, guarda <code>uploadId</code>, clave y tamaño de parte. Al volver, llama a <code>listParts</code> para ver qué partes llegaron y sube solo las que faltan. El servidor te devuelve el número, el tamaño y el ETag de cada una. No puedes verificar el contenido de una parte ya subida sin descargarla, pero sí confiar en el ETag que devolvió el servidor y en el tamaño.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Las partes huérfanas cuestan dinero</p>
+          <p>Una subida abortada por un cliente que cerró el portátil no se borra sola. Las partes quedan en el bucket, invisibles para <code>ls</code> normal, y consumen capacidad. <code>mc ls --incomplete</code> las muestra. La solución es abortar en el <code>catch</code>, limpiar periódicamente y configurar una regla de lifecycle que aborte subidas incompletas tras unos días.</p>
+        </div>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La forma más corta: dejar que <code>minio-js</code> decida. Si pasas un stream <strong>con tamaño</strong>, el SDK hace multipart solo cuando hace falta:</p>
+        <pre><code class="language-javascript">import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+import * as Minio from 'minio'
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.S3_ACCESS_KEY,
+  secretKey: process.env.S3_SECRET_KEY,
+})
+const file = './scan-20mb.pdf'
+const { size } = await stat(file)
+const info = await client.putObject(
+  'documentos',
+  '2026/escaneos/acme/scan-20mb.pdf',
+  createReadStream(file),
+  size,
+  { 'Content-Type': 'application/pdf' },
+)
+console.log(info.etag)   // termina en "-4": hubo cuatro partes
+</code></pre>
+        <p>Qué hace el SDK por dentro:</p>
+        <ul>
+          <li>Compara <code>size</code> con su tamaño de parte calculado (64 MiB por defecto). Si cabe en una, hace un <code>PUT</code> simple.</li>
+          <li>Si no, inicia un multipart, divide el stream y sube las partes en paralelo.</li>
+          <li>Antes de iniciar, busca una subida incompleta compatible y reutiliza las partes que ya coinciden. Es una reanudación automática, no magia: depende de la misma clave y del mismo tamaño de parte.</li>
+          <li>Al terminar, completa y devuelve el ETag final.</li>
+        </ul>
+        <p>Este camino es el correcto para la mayoría de aplicaciones: poco código, memoria acotada y reanudación razonable. El multipart manual se reserva para cuando necesitas control de progreso, reintentos por parte o reanudación entre procesos.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén recibe escaneos de 20 MB a 4 GB. La API necesita mostrar progreso, reintentar una parte sin repetir el resto y abortar limpiamente si el usuario cancela. Este es el núcleo, con partes de 8 MiB y control explícito:</p>
+        <pre><code class="language-javascript">import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+import * as Minio from 'minio'
+const PART_SIZE = 8 * 1024 * 1024
+const CONCURRENCY = 4
+async function uploadLarge(client, { file, key, contentType }) {
+  const { size } = await stat(file)
+  const totalParts = Math.ceil(size / PART_SIZE)
+  if (totalParts &gt; 10_000) {
+    throw new Error('demasiadas partes: aumenta PART_SIZE')
+  }
+  const uploadId = await client.initiateNewMultipartUpload(
+    'documentos', key, { 'Content-Type': contentType },
+  )
+  const parts = []
+  try {
+    for (let start = 0; start &lt; totalParts; start += CONCURRENCY) {
+      const batch = []
+      for (let i = start; i &lt; Math.min(start + CONCURRENCY, totalParts); i++) {
+        const offset = i * PART_SIZE
+        const length = Math.min(PART_SIZE, size - offset)
+        batch.push(
+          client.uploadPart(
+            'documentos', key, uploadId, i + 1,
+            createReadStream(file, { start: offset, end: offset + length - 1 }),
+            length,
+          ).then(({ etag }) =&gt; ({ part: i + 1, etag })),
+        )
+      }
+      parts.push(...await Promise.all(batch))
+    }
+    const result = await client.completeMultipartUpload(
+      'documentos', key, uploadId,
+      parts.sort((a, b) =&gt; a.part - b.part),
+    )
+    return result
+  } catch (error) {
+    await client.abortMultipartUpload('documentos', key, uploadId)
+    throw error
+  }
+}</code></pre>
+        <p>Las decisiones que importan:</p>
+        <ul>
+          <li><strong>8 MiB</strong> cumple el mínimo de 5 MiB y permite 10 000 partes hasta 78 GiB. Para 4 GB son 512 partes: muchas peticiones, pero reintentos baratos.</li>
+          <li><strong>Cuatro en paralelo</strong> acota la memoria a unos 32 MiB de buffers y aprovecha la red sin saturar.</li>
+          <li><strong>Rangos explícitos</strong>: cada parte lee solo su tramo del fichero, no todo el archivo.</li>
+          <li><strong>Orden al completar</strong>: los ETags deben ir en orden ascendente de <code>partNumber</code>. El <code>sort</code> no es decorativo; un orden incorrecto produce <code>InvalidPartOrder</code>.</li>
+          <li><strong>Abort en el catch</strong>: si falla una parte, no dejamos las otras huérfanas.</li>
+        </ul>
+        <h3>Reintento por parte</h3>
+        <p>En producción, cada <code>uploadPart</code> se envuelve en un reintento con backoff. La clave es que el número de parte no cambia:</p>
+        <pre><code class="language-javascript">async function uploadPartWithRetry(client, args, attempts = 4) {
+  let lastError
+  for (let attempt = 1; attempt &lt;= attempts; attempt++) {
+    try {
+      return await client.uploadPart(...args)
+    } catch (error) {
+      lastError = error
+      if (error.code === 'NoSuchUpload') break   // el uploadId ya no existe
+      await new Promise((r) =&gt; setTimeout(r, 250 * 2 ** attempt))
+    }
+  }
+  throw lastError
+}</code></pre>
+        <p>No reintentes un <code>NoSuchUpload</code>: significa que la subida se abortó o expiró. Tampoco reintentes un <code>InvalidPart</code> al completar sin revisar la lista de ETags; el problema está en los datos, no en la red.</p>
+        <h3>Reanudar tras un reinicio</h3>
+        <pre><code class="language-javascript">const uploaded = await client.listParts('documentos', key, uploadId)
+const done = new Set(uploaded.map((p) =&gt; p.part))
+for (let i = 1; i &lt;= totalParts; i++) {
+  if (done.has(i)) continue
+  // subir solo la parte que falta
+}</code></pre>
+        <p>Para que esto funcione, el proceso debe persistir <code>uploadId</code>, <code>key</code> y <code>PART_SIZE</code> en algún sitio (base de datos, fichero de estado). Si el tamaño de parte cambia entre intentos, los números ya no significan lo mismo y la reanudación deja de ser fiable.</p>
+        <h3>Con <code>mc</code>, sin escribir código</h3>
+        <pre><code class="language-bash">mc put --part-size 8MiB --parallel 4 \
+  ./scan-4gb.pdf \
+  local/documentos/2026/escaneos/acme/scan-4gb.pdf
+mc stat local/documentos/2026/escaneos/acme/scan-4gb.pdf | grep ETag
+mc ls --incomplete local/documentos/2026/escaneos/acme/</code></pre>
+        <p><code>mc</code> calcula las partes y las sube en paralelo. El ETag termina en <code>-N</code>, donde <code>N</code> es el número de partes. <code>mc ls --incomplete</code> muestra subidas abiertas: úsalo para diagnosticar y para limpiar antes de que el lifecycle lo haga por ti.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un objeto, muchas peticiones</p>
+          <p>Multipart no cambia el modelo: el resultado sigue siendo un objeto con una clave y un ETag. Lo que cambia es el coste de subirlo y la posibilidad de paralelizar. Para descargar no necesitas multipart: <code>GET</code> con <code>Range</code> y varias conexiones es suficiente.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Subir con stream y tamaño conocido</td>
+              <td><code>readFile()</code> de ficheros grandes</td>
+              <td>La memoria debe depender de la parte, no del objeto.</td>
+            </tr>
+            <tr>
+              <td>Partes de 8–128 MiB según el tamaño</td>
+              <td>Partes de 1 MiB «para paralelizar más»</td>
+              <td>Por debajo de 5 MiB el servidor rechaza todo salvo la última.</td>
+            </tr>
+            <tr>
+              <td>Abortar en el <code>catch</code> y limpiar huérfanas</td>
+              <td>Dejar que el cliente desaparezca</td>
+              <td>Las partes incompletas ocupan capacidad y no se ven en un listado normal.</td>
+            </tr>
+            <tr>
+              <td>Reintentar cada parte con backoff</td>
+              <td>Reiniciar la subida entera al primer error</td>
+              <td>Una parte es idempotente por número; repetir todo multiplica el tráfico.</td>
+            </tr>
+            <tr>
+              <td>Verificar con <code>sha256</code> propio</td>
+              <td>Comparar el ETag multipart con un MD5 local</td>
+              <td>El ETag multipart es un digest de digests con sufijo.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Partes por debajo del mínimo</h3>
+        <span class="code-label code-label--wrong">Mal — 1 MiB por parte</span>
+        <pre><code class="language-javascript">// ❌ EntityTooSmall: todas las partes menos la última deben tener &gt;= 5 MiB.
+const PART_SIZE = 1024 * 1024</code></pre>
+        <span class="code-label code-label--right">Bien — mínimo 5 MiB, práctico 8 MiB o más</span>
+        <pre><code class="language-javascript">const PART_SIZE = 8 * 1024 * 1024</code></pre>
+        <p>El error llega al completar o al subir la parte, según el servidor. Si tu fichero mide 12 MB y usas partes de 1 MB, las once primeras son ilegales. La última sí puede ser pequeña, incluso de 0 bytes.</p>
+        <h3>2. Cargar el fichero entero en memoria</h3>
+        <span class="code-label code-label--wrong">Mal — <code>readFile</code> de 4 GB</span>
+        <pre><code class="language-javascript">// ❌ El proceso necesita 4 GB (o más) antes de empezar a subir.
+const body = await readFile('./scan-4gb.pdf')
+await client.putObject('documentos', key, body)</code></pre>
+        <span class="code-label code-label--right">Bien — stream con tamaño y multipart</span>
+        <pre><code class="language-javascript">const { size } = await stat(file)
+await client.putObject('documentos', key, createReadStream(file), size)</code></pre>
+        <p>En local puede parecer que funciona porque hay RAM de sobra. En un contenedor con 512 MB, el proceso muere con <code>JavaScript heap out of memory</code> o el sistema lo mata sin mensaje claro.</p>
+        <h3>3. Dejar subidas incompletas</h3>
+        <span class="code-label code-label--wrong">Mal — salir sin abortar</span>
+        <pre><code class="language-javascript">// ❌ Si falla la parte 200, las 199 anteriores quedan huérfanas.
+const uploadId = await client.initiateNewMultipartUpload('documentos', key, {})
+for (const part of parts) await client.uploadPart(/* ... */)</code></pre>
+        <span class="code-label code-label--right">Bien — abortar y auditar</span>
+        <pre><code class="language-javascript">try {
+  // subir partes y completar
+} catch (error) {
+  await client.abortMultipartUpload('documentos', key, uploadId)
+  throw error
+}</code></pre>
+        <pre><code class="language-bash">mc ls --incomplete local/documentos/2026/escaneos/acme/</code></pre>
+        <p>Las partes ocupan espacio real. Una subida de 100 GB abandonada puede ser más cara que muchos objetos completos. Configura además una regla de lifecycle para abortar subidas incompletas antiguas.</p>
+        <h3>4. Completar con ETags desordenados o incompletos</h3>
+        <span class="code-label code-label--wrong">Mal — completar sin ordenar ni comprobar</span>
+        <pre><code class="language-javascript">// ❌ InvalidPartOrder o InvalidPart si falta alguna parte.
+await client.completeMultipartUpload('documentos', key, uploadId, parts)</code></pre>
+        <span class="code-label code-label--right">Bien — orden ascendente y lista completa</span>
+        <pre><code class="language-javascript">parts.sort((a, b) =&gt; a.part - b.part)
+if (parts.length !== totalParts) throw new Error('faltan partes')
+await client.completeMultipartUpload('documentos', key, uploadId, parts)</code></pre>
+        <p>El servidor necesita los ETags exactos que devolvió cada parte y en orden. Si los reconstruyes a mano o los pierdes, no puedes completar: tendrás que abortar y volver a subir.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> subir un fichero de 20 MiB con partes de 5 MiB, comprobar el ETag multipart y observar una subida incompleta.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea un fichero de prueba de 20 MiB.</strong>
+            <pre><code class="language-bash"># macOS / Linux
+dd if=/dev/urandom of=scan-20mb.bin bs=1M count=20
+# Windows PowerShell
+fsutil file createnew scan-20mb.bin 20971520</code></pre>
+            <p>No necesitas que sea un PDF válido; para esta práctica importan los bytes y el tamaño.</p>
+          </li>
+          <li>
+            <strong>Súbelo con partes explícitas.</strong>
+            <pre><code class="language-bash">mc put --part-size 5MiB --parallel 4 \
+  ./scan-20mb.bin \
+  local/documentos/2026/escaneos/acme/scan-20mb.bin</code></pre>
+            <p>20 MiB / 5 MiB = 4 partes exactas. Si el tamaño no fuera múltiplo, la última sería más pequeña.</p>
+          </li>
+          <li>
+            <strong>Comprueba el ETag y el tamaño.</strong>
+            <pre><code class="language-bash">mc stat local/documentos/2026/escaneos/acme/scan-20mb.bin</code></pre>
+            <pre><code class="language-text">Size      : 20 MiB
+ETag      : 9a1f...e7-4
+Metadata  :
+  Content-Type: application/octet-stream</code></pre>
+            <p>El sufijo <code>-4</code> confirma que hubo cuatro partes. El ETag no es el MD5 del fichero completo.</p>
+          </li>
+          <li>
+            <strong>Provoca una subida incompleta.</strong> Inicia el script de multipart manual, y ciérralo con <code>Ctrl+C</code> después de la segunda parte. Después lista las subidas abiertas:
+            <pre><code class="language-bash">mc ls --incomplete local/documentos/2026/escaneos/acme/</code></pre>
+            <p>Aparecerá la clave con el <code>uploadId</code> y las partes ya subidas. El objeto no existe para un <code>GET</code> normal.</p>
+          </li>
+          <li>
+            <strong>Aborta y verifica la limpieza.</strong> Ejecuta <code>abortMultipartUpload</code> con el <code>uploadId</code> observado y vuelve a listar:
+            <pre><code class="language-javascript">await client.abortMultipartUpload(
+  'documentos',
+  '2026/escaneos/acme/scan-20mb.bin',
+  uploadId,
+)</code></pre>
+            <pre><code class="language-bash">mc ls --incomplete local/documentos/2026/escaneos/acme/</code></pre>
+            <p>La lista debe quedar vacía. Si no, el <code>uploadId</code> no era el correcto.</p>
+          </li>
+          <li>
+            <strong>Repite con el uploader automático.</strong> Ejecuta el ejemplo mínimo con <code>putObject</code> y compara el tiempo y el ETag. Después cambia <code>PART_SIZE</code> a 5 MiB en el ejemplo manual y comprueba que el ETag cambia aunque el contenido sea el mismo: el ETag depende de cómo se dividió, no solo de los bytes.</li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Subida reanudable entre procesos</h3>
+          <p>Implementa un uploader que sobreviva a un reinicio del proceso. Debe persistir el estado en un fichero JSON o en SQLite, y al arrancar de nuevo debe ser capaz de continuar la misma subida sin volver a enviar las partes que ya llegaron. Si el fichero local cambió de tamaño o de contenido desde el primer intento, debe detectarlo y empezar de cero en lugar de completar un objeto corrupto.</p>
+          <p>Añade un comando <code>status</code> que muestre partes subidas, bytes transferidos y tiempo restante estimado, y un comando <code>abort</code> que limpie tanto el servidor como el estado local. Prueba el flujo matando el proceso a mitad y volviendo a ejecutarlo.</p>
+          <p><em>Pista: <code>listParts</code> te dice qué números de parte existen; <code>uploadId</code>, clave y tamaño de parte son el estado mínimo. Para detectar cambios del fichero, guarda tamaño, fecha y un hash de las primeras y últimas partes; no necesitas leer 4 GB otra vez.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Multipart divide un objeto grande en partes, las sube en paralelo y las compone al completar.</li>
+          <li>Partes de <strong>5 MiB a 5 GiB</strong>, máximo <strong>10 000</strong>; la última puede ser menor.</li>
+          <li>El objeto no existe hasta el <code>Complete</code>; las partes viven asociadas a un <code>uploadId</code>.</li>
+          <li>El <strong>ETag multipart</strong> termina en <code>-N</code> y no es el MD5 del objeto completo.</li>
+          <li>Streaming mantiene la memoria acotada; el paralelismo multiplica los buffers en vuelo.</li>
+          <li>Aborta en el error y limpia huérfanas: las partes incompletas ocupan capacidad.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Valor / comando</th></tr></thead>
+          <tbody>
+            <tr><td>Parte mínima</td><td>5 MiB (salvo la última)</td></tr>
+            <tr><td>Parte máxima</td><td>5 GiB</td></tr>
+            <tr><td>Partes máximas</td><td>10 000</td></tr>
+            <tr><td>Iniciar</td><td><code>initiateNewMultipartUpload</code></td></tr>
+            <tr><td>Subir parte</td><td><code>uploadPart(bucket, key, uploadId, n, stream, size)</code></td></tr>
+            <tr><td>Completar</td><td><code>completeMultipartUpload(bucket, key, uploadId, parts)</code></td></tr>
+            <tr><td>Abortar</td><td><code>abortMultipartUpload(bucket, key, uploadId)</code></td></tr>
+            <tr><td>Listar abiertas</td><td><code>mc ls --incomplete</code></td></tr>
+            <tr><td>Subir con <code>mc</code></td><td><code>mc put --part-size 8MiB --parallel 4</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>putObject</code> usa multipart automáticamente?</summary>
+            <div>
+              <p>Sí, cuando el tamaño supera el umbral interno (64 MiB por defecto en <code>minio-js</code>) y le pasas el tamaño del stream. Si no pasas tamaño, el SDK no puede dividir de forma fiable y puede terminar bufferizando. Para objetos grandes, pasa siempre <code>size</code> o usa el multipart explícito.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si falla el <code>Complete</code>?</summary>
+            <div>
+              <p>Las partes siguen ahí y puedes reintentar el <code>Complete</code> con la misma lista de ETags. Si el <code>uploadId</code> expiró o se abortó, recibirás <code>NoSuchUpload</code> y tendrás que empezar de nuevo. El <code>Complete</code> es idempotente en el sentido de que, si el objeto ya se publicó, un reintento puede devolver el mismo resultado o un error de conflicto; comprueba con <code>stat</code> antes de repetir a ciegas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Las subidas incompletas se cobran?</summary>
+            <div>
+              <p>Ocupan capacidad, así que en un despliegue propio consumen disco y en la nube se facturan como almacenamiento de partes. No aparecen en un <code>ls</code> normal. Contrólalas con <code>mc ls --incomplete</code>, aborta desde el cliente y añade una regla de lifecycle que elimine las subidas incompletas antiguas.</p>
+            </div>
+          </details>
+          <details><summary>¿Multipart es más rápido?</summary><div><p>Puede serlo, porque paraleliza la red y permite reintentar partes pequeñas, pero añade peticiones y complejidad. Para 10 MB en una red estable, un <code>PUT</code> simple gana; para varios GB o una red inestable, multipart es la opción sensata. Mide con tu latencia real.</p></div></details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

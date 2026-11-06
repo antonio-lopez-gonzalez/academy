@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="02-put-get-y-metadatos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PUT, GET y metadatos — Módulo 1 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>PUT, GET y metadatos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Objetos y buckets</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Subir un objeto parece el comando más simple del mundo: <code>PUT /bucket/clave</code> con unos bytes. Pero en esos bytes viajan también decisiones que afectan a cómo se sirve el documento, cómo se verifica su integridad y qué ocurre cuando dos personas lo modifican a la vez. Un PDF subido como <code>application/octet-stream</code> se descarga en lugar de abrirse en el navegador; un objeto sobrescrito sin versionado pierde la versión anterior para siempre; un <code>ETag</code> interpretado como MD5 de todo el contenido miente en las subidas multipart.</p>
+        <p>Esta lección cubre el ciclo básico de un objeto: <code>PUT</code> para escribirlo, <code>HEAD</code> para inspeccionarlo sin descargarlo, <code>GET</code> para leerlo y las peticiones condicionales y por rangos que evitan transferir lo que no necesitas. También los dos tipos de metadatos —los del sistema y los tuyos— y por qué no son una base de datos.</p>
+        <p>Es la base del almacén de documentos: cada PDF llevará su tipo de contenido, su tenant, su identificador y un checksum. Con eso podrás servir descargas correctas, verificar que el archivo llegó intacto y detectar modificaciones.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La diferencia entre guardar y servir bien</p>
+          <p>Guardar bytes es fácil. Servirlos con el <code>Content-Type</code> correcto, permitir una vista previa de la primera página sin descargar 60 MB y responder <code>304 Not Modified</code> cuando el cliente ya tiene la versión buena es lo que separa un bucket de un almacén de documentos profesional.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El ciclo de vida de una petición</h3>
+        <pre><code class="language-text">PUT /documentos/2026/informes/acme/INF-2026-0007.pdf
+    Content-Type: application/pdf
+    x-amz-meta-tenant: acme
+    x-amz-meta-sha256: 4f9c...
+    [ 2 411 233 bytes ]
+                 |
+                 v
+        +------------------+
+        |      MinIO       |  valida, escribe y calcula ETag
+        +------------------+
+                 |
+                 v
+200 OK
+    ETag: "2b7e1a..."
+    x-amz-version-id: (si el bucket tiene versionado)
+GET /documentos/2026/informes/acme/INF-2026-0007.pdf
+    -> 200 OK + bytes + Content-Type + metadatos
+HEAD (mc stat)
+    -> 200 OK + mismas cabeceras, sin cuerpo
+GET con Range: bytes=0-1023
+    -> 206 Partial Content + Content-Range</code></pre>
+        <h3>Metadatos del sistema y metadatos de usuario</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Ejemplos</th><th>Quién los controla</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Del sistema</strong></td>
+              <td><code>Content-Type</code>, <code>Content-Length</code>, <code>Last-Modified</code>, <code>ETag</code>, <code>Cache-Control</code>, <code>Content-Disposition</code></td>
+              <td>MinIO calcula algunos; tú puedes fijar los de presentación</td>
+            </tr>
+            <tr>
+              <td><strong>De usuario</strong></td>
+              <td><code>x-amz-meta-tenant</code>, <code>x-amz-meta-doc-id</code>, <code>x-amz-meta-sha256</code></td>
+              <td>Tú, al subir el objeto</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Los metadatos de usuario se envían con el prefijo <code>x-amz-meta-</code>. Los SDK suelen añadirlo por ti si pasas una clave que no es una cabecera conocida. Las claves se normalizan a minúsculas y no admiten espacios. En AWS el conjunto completo de metadatos de usuario está limitado a 2 KB; MinIO puede ser más permisivo, pero si tu código va a ser portable, mantente en ese presupuesto.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Los metadatos no son consultables</p>
+          <p>No puedes hacer <code>WHERE tenant = 'acme'</code> sobre un bucket. Los metadatos se leen objeto a objeto con <code>HEAD</code>. Si necesitas buscar por tenant, por fecha o por estado, mantén un índice en PostgreSQL y usa MinIO para los bytes. Los metadatos sirven para describir el objeto, no para sustituir una base de datos.</p>
+        </div>
+        <h3><code>Content-Type</code>: el metadato que más se olvida</h3>
+        <p>El navegador decide qué hacer con la respuesta según <code>Content-Type</code>. Si envías un PDF como <code>application/octet-stream</code>, lo descargará como archivo binario; si lo envías como <code>application/pdf</code>, lo abrirá en el visor. Lo mismo ocurre con imágenes, JSON y texto.</p>
+        <table>
+          <thead><tr><th>Extensión</th><th>Content-Type correcto</th><th>Efecto si falta</th></tr></thead>
+          <tbody>
+            <tr><td><code>.pdf</code></td><td><code>application/pdf</code></td><td>Descarga en vez de vista previa</td></tr>
+            <tr><td><code>.json</code></td><td><code>application/json</code></td><td>Se muestra como texto plano</td></tr>
+            <tr><td><code>.png</code></td><td><code>image/png</code></td><td>El navegador no lo renderiza</td></tr>
+            <tr><td><code>.txt</code></td><td><code>text/plain; charset=utf-8</code></td><td>Acentos mal interpretados</td></tr>
+            <tr><td><code>.csv</code></td><td><code>text/csv; charset=utf-8</code></td><td>Se descarga o se muestra mal</td></tr>
+          </tbody>
+        </table>
+        <p><code>mc cp</code> deduce el tipo por la extensión, pero no es infalible. Si el documento se genera en memoria o llega sin extensión, fíjalo explícitamente. Y si el contenido es un PDF, no lo llames <code>.txt</code>: el nombre y el tipo deben contar la misma historia.</p>
+        <h3>ETag: qué es y qué no es</h3>
+        <p>El <code>ETag</code> identifica una versión del objeto. En una subida simple suele ser el MD5 del contenido, en hexadecimal y entre comillas en la respuesta HTTP. Pero hay dos trampas:</p>
+        <ul>
+          <li>En una subida <strong>multipart</strong>, el ETag es un digest de los digests de las partes, con un sufijo <code>-N</code>. No es el MD5 del objeto completo.</li>
+          <li>Con cifrado del lado del servidor, el ETag puede no ser el MD5 del texto plano. No lo uses como checksum universal.</li>
+        </ul>
+        <p>Para verificar integridad de forma portable, guarda un <code>sha256</code> en metadatos y compáralo al descargar. El ETag sigue siendo útil para condiciones HTTP y para detectar que un objeto cambió, pero no como hash de negocio.</p>
+        <h3><code>HEAD</code>: preguntar sin descargar</h3>
+        <p><code>HEAD</code> devuelve las mismas cabeceras que <code>GET</code> pero sin cuerpo. Es la operación más barata para comprobar si un objeto existe, cuánto mide, qué tipo tiene y qué metadatos lleva. En <code>mc</code> es <code>mc stat</code>; en <code>minio-js</code>, <code>statObject</code>; en AWS SDK, <code>HeadObjectCommand</code>.</p>
+        <pre><code class="language-text">HEAD /documentos/2026/informes/acme/INF-2026-0007.pdf
+200 OK
+Content-Type: application/pdf
+Content-Length: 2411233
+ETag: "2b7e1a..."
+Last-Modified: Wed, 11 Feb 2026 08:14:22 GMT
+x-amz-meta-tenant: acme
+x-amz-meta-sha256: 4f9c...</code></pre>
+        <p>Un <code>HEAD</code> que devuelve <code>404</code> es la forma correcta de saber que la clave no existe. No listes el prefijo para comprobarlo: es más caro y más frágil.</p>
+        <h3>Rangos y condiciones</h3>
+        <p><strong>Range</strong> permite pedir una parte del objeto. Es la base de la vista previa de PDF, del <em>seek</em> en un vídeo y de las descargas reanudables:</p>
+        <pre><code class="language-text">GET .../informe.pdf
+Range: bytes=0-1023
+206 Partial Content
+Content-Range: bytes 0-1023/2411233
+Content-Length: 1024
+[ 1 024 bytes ]</code></pre>
+        <p><strong>If-None-Match</strong> y <strong>If-Match</strong> comparan el ETag. Si el cliente envía el ETag que ya tiene y el objeto no ha cambiado, el servidor responde <code>304 Not Modified</code> sin cuerpo. Si envía <code>If-Match</code> con un ETag que ya no coincide, la lectura falla con <code>412 Precondition Failed</code>. Eso permite implementar «actualiza solo si nadie lo ha cambiado».</p>
+        <table>
+          <thead><tr><th>Cabecera</th><th>Pregunta</th><th>Respuesta si no se cumple</th></tr></thead>
+          <tbody>
+            <tr><td><code>If-None-Match: "etag"</code></td><td>¿Sigue siendo esta versión?</td><td><code>304</code> en GET/HEAD (sin cuerpo)</td></tr>
+            <tr><td><code>If-Match: "etag"</code></td><td>¿Es exactamente esta versión?</td><td><code>412 Precondition Failed</code></td></tr>
+            <tr><td><code>If-Modified-Since</code></td><td>¿Cambió desde esa fecha?</td><td><code>304</code></td></tr>
+          </tbody>
+        </table>
+        <p>Para crear un objeto solo si no existe, MinIO ofrece <code>mc put --if-not-exists</code>. En la API S3 el equivalente es una escritura condicional con <code>If-None-Match: *</code>, pero no todos los clientes la exponen igual. Si tu caso es crítico, combina claves únicas, versionado y una verificación posterior; no confíes solo en una comprobación previa con <code>HEAD</code>, porque entre el <code>HEAD</code> y el <code>PUT</code> otro proceso puede escribir.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Subir un objeto con tipo de contenido y metadatos, y comprobarlo:</p>
+        <pre><code class="language-bash">mc cp --attr "Content-Type=application/pdf;tenant=acme;doc-id=INF-2026-0007;sha256=4f9c" \
+  ./informe.pdf \
+  local/documentos/2026/informes/acme/INF-2026-0007.pdf
+mc stat local/documentos/2026/informes/acme/INF-2026-0007.pdf</code></pre>
+        <pre><code class="language-text">Name      : 2026/informes/acme/INF-2026-0007.pdf
+Date      : 2026-02-11 09:14:22 CET
+Size      : 2.4 MiB
+ETag      : 2b7e1a9c4d5f60718293a4b5c6d7e8f9
+Type      : file
+Metadata  :
+  Content-Type: application/pdf
+  X-Amz-Meta-Tenant: acme
+  X-Amz-Meta-Doc-Id: INF-2026-0007
+  X-Amz-Meta-Sha256: 4f9c</code></pre>
+        <p>Qué ha pasado:</p>
+        <ul>
+          <li><code>--attr</code> acepta pares separados por <code>;</code>. <code>Content-Type</code> es una cabecera conocida; <code>tenant</code>, <code>doc-id</code> y <code>sha256</code> se convierten en <code>x-amz-meta-*</code>.</li>
+          <li><code>mc stat</code> hace un <code>HEAD</code>: no descarga los 2,4 MB. Los metadatos de usuario aparecen con el prefijo <code>X-Amz-Meta-</code> y las iniciales en mayúsculas al mostrarse.</li>
+          <li>El <code>ETag</code> es distinto del <code>sha256</code>: el primero lo calcula el servidor para esa escritura; el segundo es tu checksum de negocio.</li>
+        </ul>
+        <p>El mismo flujo con <code>minio-js</code>, que es lo que usará la aplicación:</p>
+        <pre><code class="language-javascript">import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+import * as Minio from 'minio'
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.S3_ACCESS_KEY,
+  secretKey: process.env.S3_SECRET_KEY,
+})
+const file = './informe.pdf'
+const { size } = await stat(file)
+const info = await client.putObject(
+  'documentos',
+  '2026/informes/acme/INF-2026-0007.pdf',
+  createReadStream(file),
+  size,
+  {
+    'Content-Type': 'application/pdf',
+    tenant: 'acme',
+    'doc-id': 'INF-2026-0007',
+    sha256: '4f9c',
+  },
+)
+console.log(info.etag, info.versionId)
+const meta = await client.statObject(
+  'documentos',
+  '2026/informes/acme/INF-2026-0007.pdf',
+)
+console.log(meta.size, meta.etag, meta.metaData.tenant)</code></pre>
+        <p>Puntos finos del SDK:</p>
+        <ul>
+          <li>Al subir un stream, pasa el tamaño. Sin él, el SDK no puede dividir correctamente en partes y puede consumir más memoria de la necesaria.</li>
+          <li>Las claves sin prefijo conocido se envían como <code>x-amz-meta-*</code>; no escribas <code>x-amz-meta-</code> a mano salvo que sepas lo que haces.</li>
+          <li><code>statObject</code> devuelve <code>metaData</code> con las claves de usuario <em>sin</em> el prefijo <code>x-amz-meta-</code>, en minúsculas.</li>
+        </ul>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el almacén de documentos, la API de subida hace cuatro cosas antes de responder: calcula el checksum, fija el tipo, guarda metadatos de negocio y verifica lo escrito. El orden importa:</p>
+        <pre><code class="language-javascript">import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+async function sha256File(path) {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk)
+  }
+  return hash.digest('hex')
+}
+async function uploadDocument(client, { path, key, tenant, docId }) {
+  const hash = await sha256File(path)
+  const { size } = await stat(path)
+  const info = await client.putObject('documentos', key, createReadStream(path), size, {
+    'Content-Type': 'application/pdf',
+    'Cache-Control': 'private, max-age=3600',
+    tenant,
+    'doc-id': docId,
+    sha256: hash,
+  })
+  const meta = await client.statObject('documentos', key)
+  if (meta.size !== size || meta.metaData.sha256 !== hash) {
+    throw new Error(`verificación fallida para ${key}`)
+  }
+  return { etag: info.etag, versionId: info.versionId, sha256: hash }
+}</code></pre>
+        <p>La verificación no es paranoia: detecta un truncamiento, una clave equivocada o un problema de codificación antes de que el documento llegue al usuario. Si el <code>stat</code> no coincide, el objeto ya está escrito; con versionado puedes borrar esa versión concreta sin tocar las anteriores.</p>
+        <h3>Servir una vista previa sin descargar todo</h3>
+        <p>Un visor de PDF solo necesita las primeras páginas para mostrarse. Con una URL firmada y una petición <code>Range</code> puedes servir 256 KB en lugar de 60 MB:</p>
+        <pre><code class="language-bash">URL=$(mc share download --expire 15m \
+  local/documentos/2026/informes/acme/INF-2026-0007.pdf | awk '/^Share:/ {print $2}')
+curl -s -D headers.txt -o preview.bin \
+  -H "Range: bytes=0-262143" "$URL"
+grep -i "content-range" headers.txt</code></pre>
+        <pre><code class="language-text">Content-Range: bytes 0-262143/25165824
+Content-Length: 262144
+</code></pre>
+        <p>El servidor devuelve <code>206 Partial Content</code>, no <code>200</code>. Si devuelve <code>200</code> con el objeto completo, el cliente no envió el rango o el proxy lo eliminó. Es un detalle que conviene comprobar en el borde de la red, no solo en local.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un objeto, un propósito</p>
+          <p>No mezcles el PDF original con su miniatura ni con su texto extraído en la misma clave. Cada derivado es un objeto con su propio <code>Content-Type</code> y su propio ciclo de vida. Eso permite regenerar miniaturas sin tocar originales y aplicar lifecycle solo a los temporales.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Fijar <code>Content-Type</code> explícitamente</td>
+              <td>Confiar solo en la extensión del fichero</td>
+              <td>El navegador y la CDN deciden cómo servir el objeto con esa cabecera.</td>
+            </tr>
+            <tr>
+              <td>Guardar un <code>sha256</code> en metadatos</td>
+              <td>Usar el <code>ETag</code> como checksum de negocio</td>
+              <td>El ETag multipart no es el MD5 del objeto completo.</td>
+            </tr>
+            <tr>
+              <td>Usar <code>HEAD</code>/<code>stat</code> para comprobar existencia</td>
+              <td>Listar el prefijo y buscar el nombre</td>
+              <td>Una petición frente a un recorrido; además es exacto.</td>
+            </tr>
+            <tr>
+              <td>Aprovechar <code>Range</code> y condicionales</td>
+              <td>Descargar el objeto entero para leer 1 KB</td>
+              <td>Menos latencia, menos ancho de banda y mejor experiencia.</td>
+            </tr>
+            <tr>
+              <td>Mantener los metadatos pequeños y estables</td>
+              <td>Guardar un JSON de negocio de 50 KB</td>
+              <td>AWS limita a 2 KB los metadatos de usuario; el objeto auxiliar escala mejor.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Subir todo como <code>application/octet-stream</code></h3>
+        <span class="code-label code-label--wrong">Mal — el navegador no sabe qué hacer</span>
+        <pre><code class="language-javascript">// ❌ El PDF se descarga como binario y la vista previa no funciona.
+await client.putObject('documentos', key, stream, size, {
+  'Content-Type': 'application/octet-stream',
+})</code></pre>
+        <span class="code-label code-label--right">Bien — el tipo real del contenido</span>
+        <pre><code class="language-javascript">await client.putObject('documentos', key, stream, size, {
+  'Content-Type': 'application/pdf',
+})</code></pre>
+        <p>Si el tipo depende del usuario, valídalo contra una lista blanca. Nunca confíes en el <code>Content-Type</code> que envía el navegador sin comprobarlo: puede ser cualquier cosa.</p>
+        <h3>2. Usar el ETag como hash del contenido</h3>
+        <span class="code-label code-label--wrong">Mal — comparar ETag con el MD5 local</span>
+        <pre><code class="language-javascript">// ❌ En multipart el ETag termina en "-4" y no es el MD5 del objeto.
+if (info.etag !== md5(file)) throw new Error('corrupto')</code></pre>
+        <span class="code-label code-label--right">Bien — checksum propio y explícito</span>
+        <pre><code class="language-javascript">const sha256 = await sha256File(file)
+await client.putObject('documentos', key, stream, size, { sha256 })
+const meta = await client.statObject('documentos', key)
+if (meta.metaData.sha256 !== sha256) throw new Error('corrupto')</code></pre>
+        <p>El ETag sirve para cache y condiciones HTTP. Para integridad de negocio, usa un algoritmo y un metadato que tú controlas.</p>
+        <h3>4. Sobrescribir sin control de concurrencia</h3>
+        <span class="code-label code-label--wrong">Mal — leer, modificar y escribir sin comprobar</span>
+        <pre><code class="language-javascript">// ❌ Dos procesos hacen esto: el segundo pisa al primero sin enterarse.
+const current = await getText(client, key)
+await client.putObject('documentos', key, current + '\nrevisado')</code></pre>
+        <span class="code-label code-label--right">Bien — condición por versión o versión nueva</span>
+        <pre><code class="language-javascript">// Publica una versión nueva con un id propio y deja que versionado guarde el historial.
+const key = `revisiones/${docId}/${crypto.randomUUID()}.txt`
+await client.putObject('documentos', key, revised)</code></pre>
+        <p>Si necesitas el «compare and swap», usa <code>If-Match</code> con el ETag leído y trata el <code>412</code> como conflicto. Si el cliente no lo soporta, versionado más claves únicas evita perder trabajo, aunque no elimina la necesidad de resolver el conflicto en la aplicación.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar con <code>curl</code> cómo se comportan <code>HEAD</code>, <code>Range</code> y las peticiones condicionales sobre un objeto real.</p>
+        <ol class="steps">
+          <li>
+            <strong>Sube un objeto de texto con metadatos.</strong>
+            <pre><code class="language-bash">printf 'alpha\nbeta\ngamma\n' &gt; notas.txt
+mc cp --attr "Content-Type=text/plain;tenant=acme" \
+  ./notas.txt local/documentos/2026/informes/acme/notas.txt
+mc stat local/documentos/2026/informes/acme/notas.txt</code></pre>
+            <p>Comprueba que <code>Content-Type</code> y <code>X-Amz-Meta-Tenant</code> aparecen en la salida. Ojo: <code>--attr</code> usa <code>;</code> como separador, así que un <code>charset=utf-8</code> dentro del valor se interpretaría como otro par; para eso usa el SDK o un valor sin punto y coma.</p>
+          </li>
+          <li>
+            <strong>Genera una URL temporal y guarda el ETag.</strong>
+            <pre><code class="language-bash">URL=$(mc share download --expire 15m \
+  local/documentos/2026/informes/acme/notas.txt | awk '/^Share:/ {print $2}')
+ETAG=$(mc stat --json local/documentos/2026/informes/acme/notas.txt | jq -r '.etag')
+echo "$ETAG"</code></pre>
+          </li>
+          <li>
+            <strong>Lee las cabeceras con un GET.</strong>
+            <pre><code class="language-bash">curl -s -D - -o /dev/null "$URL"</code></pre>
+            <pre><code class="language-text">HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 17
+ETag: "..."</code></pre>
+            <p>No se guarda el cuerpo (va a <code>/dev/null</code>), pero la petición es un <code>GET</code>: una URL firmada para GET no autoriza un <code>HEAD</code>, porque el método forma parte de la firma. Es la misma información que <code>mc stat</code>, a nivel HTTP.</p>
+          </li>
+          <li>
+            <strong>Pide un rango de bytes.</strong>
+            <pre><code class="language-bash">curl -s -D - -o partial.txt -H "Range: bytes=0-4" "$URL"
+cat partial.txt</code></pre>
+            <p>Debe responder <code>206 Partial Content</code> con <code>Content-Range: bytes 0-4/17</code> y el contenido <code>alpha</code>. Si recibes <code>200</code>, el rango no llegó al servidor.</p>
+          </li>
+          <li>
+            <strong>Prueba la condición.</strong>
+            <pre><code class="language-bash">curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "If-None-Match: \"$ETAG\"" "$URL"
+printf 'alpha\nbeta\ngamma\ndelta\n' &gt; notas.txt
+mc cp ./notas.txt local/documentos/2026/informes/acme/notas.txt
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "If-None-Match: \"$ETAG\"" "$URL"</code></pre>
+            <p>La primera llamada devuelve <code>304</code>; tras reemplazar el objeto, la misma condición devuelve <code>200</code> porque el ETag ya no coincide.</p>
+          </li>
+          <li>
+            <strong>Verifica el reemplazo.</strong>
+            <pre><code class="language-bash">mc stat --json local/documentos/2026/informes/acme/notas.txt | jq '.etag, .size'</code></pre>
+            <p>Si el bucket no tiene versionado, solo hay una versión: la nueva. Actívalo en la lección <a href="04-versionado-y-object-locking.html">Versionado y object locking</a> antes de probar la recuperación.</p>
+          </li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Edición optimista de un documento</h3>
+          <p>Dos editores abren el mismo documento y lo guardan con segundos de diferencia. Implementa un flujo de «leer, editar, guardar» que detecte el conflicto en lugar de pisar el cambio del otro. Debe funcionar con la API S3 y devolver un error claro al segundo editor, junto con la versión que ganó.</p>
+          <p>Diseña también qué pasa si el cliente no puede usar cabeceras condicionales: propone una alternativa con versionado, claves de revisión y una regla de resolución. Explica qué información necesita la interfaz para mostrar el conflicto y cómo se recupera el trabajo del perdedor.</p>
+          <p><em>Pista: el ETag que devuelve el <code>HEAD</code> inicial es tu testigo. <code>If-Match</code> convierte el guardado en una apuesta: si el testigo ya no vale, <code>412</code>. No resuelvas el reto borrando versiones.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <code>ETag</code> identifica una escritura, pero no es un checksum universal: en multipart no es el MD5 del objeto.</li>
+          <li><code>Range</code> devuelve <code>206</code> y permite vistas previas y descargas reanudables.</li>
+          <li>Reemplazar un objeto es atómico para los lectores, pero sin versionado la versión anterior se pierde.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Operación</th><th><code>mc</code></th><th><code>minio-js</code></th></tr></thead>
+          <tbody>
+            <tr><td>Escribir</td><td><code>mc cp --attr …</code></td><td><code>putObject</code></td></tr>
+            <tr><td>Leer</td><td><code>mc cat</code></td><td><code>getObject</code></td></tr>
+            <tr><td>Metadatos</td><td><code>mc stat</code></td><td><code>statObject</code></td></tr>
+            <tr><td>Listar versiones</td><td><code>mc ls --versions</code></td><td><code>listObjectsV2Query</code> con versiones</td></tr>
+            <tr><td>URL temporal</td><td><code>mc share download</code></td><td><code>presignedGetObject</code></td></tr>
+            <tr><td>Crear si no existe</td><td><code>mc put --if-not-exists</code></td><td>Condición en la API o clave única</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo cambiar los metadatos de un objeto ya subido?</summary>
+            <div>
+              <p>No se editan en sitio: hay que reescribir el objeto con los metadatos nuevos. Herramientas como <code>mc cp</code> lo hacen copiando y reemplazando; en la API es un <code>CopyObject</code> con <code>MetadataDirective: REPLACE</code>. Si el bucket tiene versionado, la versión anterior conserva los metadatos antiguos. Para metadatos que cambian mucho, guarda un objeto JSON auxiliar o usa la base de datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El ETag siempre es el MD5 del contenido?</summary>
+            <div>
+              <p>No. En una subida simple suele serlo, pero en multipart es un digest de los digests de las partes con sufijo <code>-N</code>, y con cifrado del lado del servidor puede no corresponder al texto plano. Úsalo para cache y condiciones HTTP; para integridad de negocio, guarda y verifica un <code>sha256</code> propio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si subo dos veces la misma clave?</summary>
+            <div>
+              <p>La segunda escritura sustituye a la primera como versión actual. Es atómica: nadie ve un objeto a medio escribir. Sin versionado, la primera deja de ser accesible; con versionado, queda como versión anterior y puedes recuperarla por su <em>version ID</em>. Si quieres evitar el reemplazo, usa <code>mc put --if-not-exists</code> o claves únicas.</p>
+            </div>
+          </details>
+          <details><summary>¿Cuál es el límite de metadatos?</summary><div><p>AWS limita el conjunto de metadatos de usuario a 2 KB y normaliza las claves a minúsculas; MinIO puede aceptar más, pero si diseñas para la nube mantente en ese presupuesto. Si necesitas un JSON grande, súbelo como objeto aparte.</p></div></details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

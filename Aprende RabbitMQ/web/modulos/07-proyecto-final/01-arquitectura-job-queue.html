@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-arquitectura-job-queue">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura de la job queue — Módulo 7 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura de la job queue</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El taller de pedidos necesita generar facturas en PDF. El trabajo tarda entre dos y veinte segundos, depende de un servicio externo que a veces falla y no puede ejecutarse dentro de la petición HTTP: bloquearía al usuario, agotaría el pool de conexiones y, si el proceso muere, la factura se perdería sin rastro.</p>
+        <p>La solución es una <strong>cola de trabajos</strong>: la API acepta la petición, persiste el trabajo, publica un mensaje y responde <code>202 Accepted</code>. Uno o varios workers consumen el mensaje, ejecutan el trabajo y actualizan su estado. El usuario consulta el estado por HTTP. RabbitMQ es el mecanismo que desacopla la aceptación de la ejecución, pero <strong>no es la base de datos del trabajo</strong>: la cola transporta la orden, no el historial.</p>
+        <p>Antes de escribir una línea hay que decidir las garantías. Estas son las que pediremos:</p>
+        <table>
+          <thead><tr><th>Requisito</th><th>Decisión</th><th>Quién la sostiene</th></tr></thead>
+          <tbody>
+            <tr><td>No perder un job aceptado</td><td>Cola durable, mensaje persistente y confirm de publicación</td><td>API + broker</td></tr>
+            <tr><td>No perder trabajo si el worker muere</td><td><code>ack</code> manual después de completar el efecto</td><td>Worker + broker</td></tr>
+            <tr><td>Sobrevivir a fallos transitorios</td><td>Reintentos con backoff y límite</td><td>Worker</td></tr>
+            <tr><td>Poder investigar fallos definitivos</td><td>DLQ con el mensaje y el motivo</td><td>Broker + operación</td></tr>
+            <tr><td>No duplicar efectos</td><td>Idempotencia por <code>jobId</code> + clave de negocio</td><td>Worker + almacén</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">«Exactamente una vez» no existe gratis</p>
+          <p>Entre la publicación, el consumo y el <code>ack</code> hay ventanas en las que el proceso puede morir. La garantía realista es <strong>at-least-once</strong>: un job puede ejecutarse dos veces. La idempotencia no es un extra; es lo que hace usable esa garantía. Todo el diseño parte de ahí.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Topología</h3>
+        <p>Tres exchanges (entrada, reintentos y DLX), una cola de trabajo, tres colas de reintento y una DLQ. El estado del job vive fuera de RabbitMQ.</p>
+        <pre><code class="language-text">                       POST /jobs
+                           |
+                           v
+                  +------------------+
+                  |  API (Node)      |  guarda job (queued)
+                  |  publish confirm |  publica job.run
+                  +--------+---------+
+                           |
+                    taller.jobs (direct, durable)
+                           | routing key "job.run"
+                           v
+                  +---------------------+
+                  | taller.jobs.work    |  quorum, durable
+                  | prefetch 10, ack    |  x-delivery-limit 5
+                  +----+-----------+----+
+                       |           |
+             éxito     |           |  fallo transitorio
+             ack       |           |  publish retry + ack
+                       v           v
+                 succeeded    taller.jobs.retry (direct)
+                                   | "retry.5s" | "retry.1m" | "retry.10m"
+                                   v            v             v
+                            retry.5s        retry.1m      retry.10m
+                            TTL 5s          TTL 1m        TTL 10m
+                                   \            |            /
+                                    \           |           /
+                                     v          v          v
+                              dead-letter -> taller.jobs -> job.run
+                              (vuelve a la cola de trabajo)
+
+             fallo permanente o intentos agotados
+                       |
+                       v
+                 taller.dlx (direct) --"job.dead"--> taller.jobs.dead (quorum)
+                                                        |
+                                                        v
+                                                 inspección / replay</code></pre>
+        <p>Los nombres son deliberadamente explícitos. En producción conviene prefijarlos por entorno (<code>prod.taller.jobs.work</code>) o aislarlos por vhost; en el proyecto usamos un vhost por entorno y nombres estables.</p>
+
+        <h3>Por qué quorum y no classic</h3>
+        <p>La cola de trabajo es el corazón del sistema: si el nodo que la aloja cae, no queremos perder los jobs aceptados. Una <strong>quorum queue</strong> replica cada mensaje en una mayoría del clúster mediante Raft y confirma la publicación cuando la réplica es segura. Una cola clásica durable sobrevive a un reinicio, pero no a la pérdida del nodo, y las mirrored queues se retiraron. Quorum cuesta más latencia y disco, pero añade límite de entregas para mensajes veneno y persistencia por diseño.</p>
+        <p>Las colas de reintento también son quorum: un mensaje en espera de reintento es tan importante como uno en la cola principal. RabbitMQ 4.x permite fijar quorum como tipo por defecto del vhost o del nodo, pero el proyecto declara <code>x-queue-type: quorum</code> explícitamente para no depender de esa configuración.</p>
+
+        <h3>El contrato del mensaje</h3>
+        <p>El cuerpo es el trabajo. Las cabeceras son metadatos de transporte. Mantenerlos separados evita que el contador de intentos contamine el payload de negocio.</p>
+        <pre><code class="language-json">{
+  "jobId": "6f1c2a9e-4b7d-4c1e-9f30-2a7d5e8b1c44",
+  "type": "invoice.generate",
+  "schemaVersion": 1,
+  "payload": {
+    "orderId": "PED-1042",
+    "customerId": "CLI-88"
+  },
+  "enqueuedAt": "2026-11-05T10:00:00.000Z",
+  "traceId": "b3f1c0d2e4a5"
+}</code></pre>
+        <p>En las propiedades del mensaje viajan <code>messageId = jobId</code>, <code>deliveryMode: 2</code> (persistente) y <code>contentType: application/json</code>; en las cabeceras, <code>x-attempt</code> (contador lógico) y <code>x-error</code> (motivo del último fallo). El contador no contamina el payload de negocio, y el error solo aparece cuando el mensaje va a la DLQ.</p>
+        <p>El mensaje no lleva el PDF ni el historial completo del pedido. Los mensajes grandes cuestan memoria, disco y replicación; si el trabajo necesita un fichero, se guarda en un object store y el mensaje lleva la referencia. Un job debe poder reconstruirse a partir de su <code>jobId</code> y el estado persistido.</p>
+
+        <h3>Estados y quién los escribe</h3>
+        <table>
+          <thead><tr><th>Estado</th><th>Significado</th><th>Quién lo escribe</th><th>Transición válida</th></tr></thead>
+          <tbody>
+            <tr><td><code>queued</code></td><td>Persistido y publicado con confirm</td><td>API</td><td>→ <code>running</code>, <code>failed</code></td></tr>
+            <tr><td><code>running</code></td><td>Un worker lo ha reclamado y tiene un lease</td><td>Worker</td><td>→ <code>succeeded</code>, <code>retry_scheduled</code>, <code>failed</code></td></tr>
+            <tr><td><code>retry_scheduled</code></td><td>En una cola de reintento, con hora de próximo intento</td><td>Worker</td><td>→ <code>running</code>, <code>failed</code></td></tr>
+            <tr><td><code>succeeded</code></td><td>Efecto completado y <code>ack</code> enviado</td><td>Worker</td><td>Terminal</td></tr>
+            <tr><td><code>failed</code></td><td>Intentos agotados o error permanente; está en la DLQ</td><td>Worker</td><td>Terminal (salvo replay manual)</td></tr>
+          </tbody>
+        </table>
+        <p>El estado <code>running</code> necesita un <strong>lease</strong> (<code>leaseUntil</code>) porque un worker puede morir después de reclamar y antes de terminar. Sin lease, el mensaje se reentrega, el worker ve <code>running</code>, no puede reclamarlo y lo descarta: el job queda colgado para siempre. Con lease, la reclamación es válida si el estado es <code>queued</code>/<code>retry_scheduled</code> o si el lease ha caducado.</p>
+
+        <p>El flujo tiene tres desenlaces: éxito (<code>ack</code> y <code>succeeded</code>), fallo transitorio (publicar en la cola de reintento, <code>ack</code> del original y <code>retry_scheduled</code>) y fallo definitivo (publicar en la DLQ, <code>ack</code> y <code>failed</code>). Si el worker muere entre el efecto y el <code>ack</code>, el broker reentrega y la idempotencia absorbe el duplicado.</p>
+
+        <h3>Idempotencia: la clave está en el negocio</h3>
+        <p>El <code>messageId</code> ayuda a rastrear, pero no es una clave de idempotencia fiable: un cliente que reintenta el <code>POST</code> puede generar dos jobs distintos, y un <code>redelivery</code> del mismo mensaje conserva el mismo <code>messageId</code>. La clave debe ser del dominio: <code>jobId</code> para el trabajo y <code>orderId</code> (o la clave de negocio que corresponda) para el efecto.</p>
+        <pre><code class="language-text">reclamar:  UPDATE jobs SET status='running', lease_until=?
+           WHERE id=? AND (status IN ('queued','retry_scheduled')
+                           OR (status='running' AND lease_until &lt; now))
+           -- 0 filas: otro worker lo tiene o ya terminó -> ack y salir
+
+efecto:    INSERT INTO facturas (job_id, order_id, ...)
+           ON CONFLICT (job_id) DO NOTHING
+           -- o upsert por order_id, según la regla del negocio</code></pre>
+        <p>La condición atómica evita que dos workers procesen el mismo job a la vez. El upsert evita que un reintento cree una segunda factura aunque la reclamación haya sido válida.</p>
+
+        <h3>Decisiones y trade-offs</h3>
+        <table>
+          <thead><tr><th>Decisión</th><th>Elegido</th><th>Alternativa</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una cola o una por tipo</td><td>Una cola de trabajo para empezar</td><td>Colas por tipo y workers especializados</td><td>Menos operación; si un tipo bloquea la cola, se separa. Con tipos muy distintos, una cola por tipo evita head-of-line blocking.</td></tr>
+            <tr><td>Reintentos</td><td>Tres colas con TTL fijo</td><td>Una cola con TTL por mensaje o el plugin de retardo</td><td>TTL por mensaje sufre head-of-line blocking; tres niveles cubren 5 s, 1 min y 10 min con poca complejidad.</td></tr>
+            <tr><td>Estado</td><td>Almacén propio (SQLite/Postgres)</td><td>Deducirlo de la cola</td><td>El broker no conserva el estado tras el <code>ack</code>; la API necesita consultar jobs terminados.</td></tr>
+            <tr><td>Respuesta</td><td><code>202</code> + sondeo</td><td>Esperar el resultado en la petición</td><td>Un PDF de 20 s no cabe en un request HTTP sano; además el worker puede estar caído.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Declarar la topología es la primera pieza ejecutable. El código es idempotente: se puede ejecutar en cada arranque sin recrear nada. Lo usaremos como módulo compartido entre API y worker.</p>
+        <pre><code class="language-javascript">// src/topology.js
+export const EXCHANGE = 'taller.jobs';
+export const RETRY_EXCHANGE = 'taller.jobs.retry';
+export const DLX = 'taller.dlx';
+
+export async function declareTopology(channel) {
+  await channel.assertExchange(EXCHANGE, 'direct', { durable: true });
+  await channel.assertExchange(RETRY_EXCHANGE, 'direct', { durable: true });
+  await channel.assertExchange(DLX, 'direct', { durable: true });
+
+  await channel.assertQueue('taller.jobs.work', {
+    durable: true,
+    arguments: {
+      'x-queue-type': 'quorum',
+      'x-delivery-limit': 5,
+      'x-dead-letter-exchange': DLX,
+      'x-dead-letter-routing-key': 'job.dead',
+    },
+  });
+  await channel.bindQueue('taller.jobs.work', EXCHANGE, 'job.run');
+
+  for (const [tier, ttl] of [['5s', 5000], ['1m', 60000], ['10m', 600000]]) {
+    const queue = `taller.jobs.retry.${tier}`;
+    await channel.assertQueue(queue, {
+      durable: true,
+      arguments: {
+        'x-queue-type': 'quorum',
+        'x-message-ttl': ttl,
+        'x-dead-letter-exchange': EXCHANGE,
+        'x-dead-letter-routing-key': 'job.run',
+      },
+    });
+    await channel.bindQueue(queue, RETRY_EXCHANGE, `retry.${tier}`);
+  }
+
+  await channel.assertQueue('taller.jobs.dead', {
+    durable: true,
+    arguments: { 'x-queue-type': 'quorum' },
+  });
+  await channel.bindQueue('taller.jobs.dead', DLX, 'job.dead');
+}</code></pre>
+        <p>Lo que hace cada bloque:</p>
+        <ul>
+          <li><strong>Exchanges durables</strong>: sobreviven al reinicio. El tipo <code>direct</code> basta porque las routing keys son fijas; un topic añadiría flexibilidad que aquí no se usa.</li>
+          <li><strong>Cola de trabajo quorum</strong>: replicada, persistente por diseño. <code>x-delivery-limit</code> es una red de seguridad para mensajes que se reentregan sin <code>ack</code>; no sustituye al contador de intentos lógico.</li>
+          <li><strong>DLX en la cola de trabajo</strong>: si el mensaje se rechaza sin requeue o supera el límite de entregas, va a la cola de muertos en lugar de perderse.</li>
+          <li><strong>Colas de reintento con TTL</strong>: al expirar, el broker las dead-letterea de vuelta al exchange principal con <code>job.run</code>. No hay worker esperando: el retardo lo hace el broker.</li>
+          <li><strong>DLQ sin TTL</strong>: un mensaje fallido se queda hasta que alguien lo inspecciona o lo reprocesa. Si le pones TTL, lo estás borrando.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Así se ve un job de principio a fin, con sus estados persistidos. La API genera el identificador antes de publicar, para que el mensaje y la fila compartan la misma clave.</p>
+        <pre><code class="language-javascript">// POST /jobs (resumen)
+const jobId = crypto.randomUUID();
+
+await store.create({ id: jobId, type: 'invoice.generate', status: 'queued', payload });
+
+channel.publish(
+  EXCHANGE,
+  'job.run',
+  Buffer.from(JSON.stringify({ jobId, type: 'invoice.generate', schemaVersion: 1, payload })),
+  {
+    persistent: true,
+    messageId: jobId,
+    contentType: 'application/json',
+    headers: { 'x-attempt': 0, 'x-trace-id': traceId },
+  }
+);
+await channel.waitForConfirms();
+
+res.status(202).location(`/jobs/${jobId}`).json({ id: jobId, status: 'queued' });</code></pre>
+        <p>El orden importa: primero se persiste el job, después se publica. Si se publicara antes, el worker podría terminar antes de que exista la fila y la API devolvería <code>404</code> a un cliente que acaba de crear el job. Si el <code>publish</code> falla, el job queda en <code>queued</code> sin mensaje: un barrido periódico puede reintentar los que tengan <code>published_at</code> nulo.</p>
+        <p>El worker, en cambio, nunca confía en que el estado sea <code>queued</code>:</p>
+        <pre><code class="language-javascript">const claimed = await store.claim(jobId, { leaseMs: 60_000 });
+if (!claimed) {
+  channel.ack(msg);        // otro worker lo tiene o ya terminó
+  return;
+}
+
+try {
+  const invoice = await generateInvoice(claimed.payload);
+  await store.markSucceeded(jobId, { invoiceId: invoice.id });
+  channel.ack(msg);        // solo después del efecto
+} catch (err) {
+  await scheduleRetry(channel, msg, claimed, err); // publica y luego ack
+}</code></pre>
+        <p>Ese <code>ack</code> después del efecto es la diferencia entre «el trabajo se hizo» y «el mensaje se procesó». Si el proceso muere entre el efecto y el <code>ack</code>, el broker reentrega y el upsert por <code>jobId</code> hace que el segundo intento sea inofensivo.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">El estado no se deduce de la cola</p>
+          <p>Cuando un mensaje se consume y se hace <code>ack</code>, desaparece del broker. La API no puede preguntar «¿dónde está mi job?» a RabbitMQ. Por eso el estado vive en el almacén de la aplicación, y la cola solo transporta la orden de ejecución. Intentar reconstruir el historial con <code>queue.messageCount</code> es un error de diseño, no una optimización.</p>
+        </div>
+        <p>La API expone el estado con una consulta simple y responde <code>404</code> si el job no existe, <code>200</code> con el estado actual si existe. Un cliente que recibe <code>202</code> debe poder consultar <code>GET /jobs/:id</code> sin hablar con el broker ni conocer los detalles de la topología.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Persistir el job antes de publicar</td><td>Publicar y esperar que el worker cree la fila</td><td>El consumidor puede adelantarse y el estado se pierde.</td></tr>
+            <tr><td>Un <code>jobId</code> generado por la API</td><td>Confiar en el <code>messageId</code> del broker como clave</td><td>El broker no conoce el dominio y el cliente puede reintentar la petición.</td></tr>
+            <tr><td>Quorum para trabajo y reintentos</td><td>Colas clásicas no replicadas</td><td>La pérdida de un nodo no debe perder jobs aceptados.</td></tr>
+            <tr><td>Reintentos con backoff y límite</td><td>Reintentos infinitos o inmediatos</td><td>Un fallo permanente se convierte en un bucle que consume recursos.</td></tr>
+            <tr><td>Estado y lease en el almacén</td><td>Marcar <code>running</code> sin caducidad</td><td>Un worker muerto dejaría el job bloqueado para siempre.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Publicar antes de persistir</h3>
+        <span class="code-label code-label--wrong">Mal — el worker puede ganar la carrera</span>
+        <pre><code class="language-javascript">channel.sendToQueue('taller.jobs.work', body);
+await store.create({ id: jobId, status: 'queued' });</code></pre>
+        <span class="code-label code-label--right">Bien — fila primero, mensaje después</span>
+        <pre><code class="language-javascript">await store.create({ id: jobId, status: 'queued' });
+channel.publish(EXCHANGE, 'job.run', body, { persistent: true, messageId: jobId });
+await channel.waitForConfirms();</code></pre>
+        <p>La ventana es de milisegundos, pero existe. Un worker rápido hace <code>GET /jobs/:id</code> interno para enriquecer el trabajo y recibe <code>404</code>; el job se marca fallido por un problema de orden, no de negocio.</p>
+
+        <h3>2. Confirmar antes de terminar</h3>
+        <span class="code-label code-label--wrong">Mal — <code>ack</code> y luego trabajar</span>
+        <pre><code class="language-javascript">channel.consume('taller.jobs.work', async (msg) =&gt; {
+  channel.ack(msg);
+  await generateInvoice(JSON.parse(msg.content));
+}, { noAck: false });</code></pre>
+        <span class="code-label code-label--right">Bien — efecto primero, <code>ack</code> después</span>
+        <pre><code class="language-javascript">channel.consume('taller.jobs.work', async (msg) =&gt; {
+  await generateInvoice(JSON.parse(msg.content));
+  channel.ack(msg);
+}, { noAck: false });</code></pre>
+        <p>Si el proceso muere después del <code>ack</code> y antes de generar la factura, el mensaje ya no existe y el trabajo se pierde. El <code>ack</code> es la promesa de que el efecto ocurrió.</p>
+
+        <h3>3. Reintentos sin límite</h3>
+        <span class="code-label code-label--wrong">Mal — un fallo permanente se repite para siempre</span>
+        <pre><code class="language-javascript">catch (err) {
+  channel.nack(msg, false, true);   // requeue inmediato, sin contador
+}</code></pre>
+        <span class="code-label code-label--right">Bien — contador, backoff y DLQ</span>
+        <pre><code class="language-javascript">catch (err) {
+  const attempt = Number(msg.properties.headers['x-attempt'] ?? 0);
+  if (attempt &gt;= MAX_ATTEMPTS) return sendToDead(channel, msg, err);
+  await scheduleRetry(channel, msg, attempt, err);
+  channel.ack(msg);
+}</code></pre>
+        <p>El <code>nack</code> con requeue inmediato crea un bucle que satura la CPU del worker y llena la cola de mensajes que nunca van a funcionar. Sin contador no hay forma de distinguir un fallo transitorio de un mensaje veneno.</p>
+
+        <h3>4. Suponer que el mensaje se entrega una sola vez</h3>
+        <span class="code-label code-label--wrong">Mal — crear la factura sin comprobar si ya existe</span>
+        <pre><code class="language-javascript">await db.insert('facturas', { orderId, total });   // el reintento duplica</code></pre>
+        <span class="code-label code-label--right">Bien — upsert por clave de negocio</span>
+        <pre><code class="language-javascript">await db.query(
+  'INSERT INTO facturas (job_id, order_id, total) VALUES (?, ?, ?) ON CONFLICT (job_id) DO NOTHING',
+  [jobId, orderId, total]
+);</code></pre>
+        <p>El broker garantiza <em>al menos una</em> entrega, no exactamente una. Cualquier efecto externo —cobrar, enviar un correo, crear una factura— debe ser idempotente o estar protegido por una clave única.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> declarar la topología completa y comprobar con el broker que las colas, tipos, argumentos y bindings son los diseñados.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el vhost y el usuario de despliegue:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl add_vhost taller-prod
+docker exec rabbitmq rabbitmqctl add_user taller-deploy "$DEPLOY_PASSWORD"
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-prod taller-deploy "^taller\." "^taller\." "^taller\."</code></pre>
+          </li>
+          <li>
+            <strong>Ejecuta la declaración</strong> del ejemplo mínimo con una conexión a <code>/taller-prod</code>. Al terminar, la conexión puede cerrarse: exchanges, colas y bindings son durables.</li>
+          <li>
+            <strong>Inspecciona las colas y sus argumentos:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues -p taller-prod \
+  name type messages consumers arguments</code></pre>
+            <p>Esperado: cinco colas <code>quorum</code>, las tres de reintento con <code>x-message-ttl</code> distinto y la DLQ sin TTL.</p>
+          </li>
+          <li>
+            <strong>Inspecciona los bindings:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_bindings -p taller-prod</code></pre>
+            <p>Debe aparecer <code>taller.jobs -&gt; job.run -&gt; taller.jobs.work</code>, cada <code>retry.*</code> y <code>taller.dlx -&gt; job.dead -&gt; taller.jobs.dead</code>.</p>
+          </li>
+          <li>
+            <strong>Publica un mensaje de prueba</strong> con <code>persistent: true</code> y <code>messageId</code>, sin consumidor. Comprueba con <code>list_queues name messages</code> que está en <code>taller.jobs.work</code>. Después publica uno al exchange <code>taller.jobs.retry</code> con routing key <code>retry.5s</code> y observa cómo, tras cinco segundos, aparece en la cola de trabajo con el TTL aplicado.</li>
+          <li>
+            <strong>Comprueba el dead-lettering:</strong> publica en la cola de trabajo y haz <code>basic.get</code> con <code>noAck: false</code>, seguido de <code>nack(requeue=false)</code>. El mensaje debe aparecer en <code>taller.jobs.dead</code>. Revisa las cabeceras con <code>basic.get</code>: verás <code>x-death</code> con el motivo y la cola de origen.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">El diseño se valida en el broker, no en el diagrama</p>
+          <p>Un diagrama correcto con una cola declarada como <code>classic</code> es un sistema distinto. Antes de escribir el worker, confirma tipo, durabilidad, argumentos y bindings. Es más barato ahora que depurar pérdidas de mensajes después.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Prioridad sin perder garantías</h3>
+          <p>El taller quiere que las facturas urgentes se procesen antes que las normales, sin crear un sistema paralelo y sin perder la garantía de que todo job aceptado se ejecuta o acaba en la DLQ. Diseña la topología y las reglas de enrutado.</p>
+          <p>Debe cubrir: cómo se marca la urgencia, qué colas y exchanges se añaden, cómo se reparte el prefetch entre workers, qué pasa si el worker de urgentes está caído, cómo se evita que los jobs urgentes inunden la cola normal y cómo se mantiene el orden de reintentos por job. Explica también por qué las prioridades nativas de AMQP pueden no ser la respuesta y qué alternativa usarías.</p>
+          <p><em>Pista: las prioridades de cola funcionan mal con consumidores activos y muchos niveles; separar colas con pools de workers distintos suele dar un control más predecible. Piensa qué garantía se rompe si un job urgente se queda esperando en la cola normal.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La cola transporta la orden; el <strong>estado del job</strong> vive en un almacén propio y durable (la implementación está en <a href="02-api-y-worker.html">API y worker</a>).</li>
+          <li>La garantía de extremo a extremo es <strong>at-least-once</strong>; la idempotencia es obligatoria.</li>
+          <li>Cola de trabajo <strong>quorum</strong>, mensajes persistentes, publisher confirms y <code>ack</code> manual.</li>
+          <li>Los reintentos usan <strong>colas con TTL + DLX</strong>, no <code>sleep</code> ni <code>nack(requeue=true)</code>.</li>
+          <li>Estados con transiciones atómicas y <strong>lease</strong> para sobrevivir a workers muertos.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Nombre</th><th>Función</th></tr></thead>
+          <tbody>
+            <tr><td>Exchange principal</td><td><code>taller.jobs</code></td><td>Enruta <code>job.run</code> a la cola de trabajo</td></tr>
+            <tr><td>Cola de trabajo</td><td><code>taller.jobs.work</code></td><td>Quorum; consume el worker con prefetch y ack</td></tr>
+            <tr><td>Colas de reintento</td><td><code>taller.jobs.retry.*</code></td><td>TTL + DLX de vuelta a <code>taller.jobs</code></td></tr>
+            <tr><td>DLX / DLQ</td><td><code>taller.dlx</code> / <code>taller.jobs.dead</code></td><td>Fallos permanentes e intentos agotados</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no usar una cola clásica con mensajes persistentes?</summary>
+            <div>
+              <p>Porque la persistencia protege frente a un reinicio del broker, no frente a la pérdida del nodo que aloja la cola. Sin colas mirrored —retiradas— no hay réplica. Una quorum queue replica el contenido en varios nodos y confirma la publicación cuando la mayoría lo tiene. El coste es más latencia y más disco; para trabajo que no se puede perder, es el precio correcto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos reintentos y qué backoff?</summary>
+            <div>
+              <p>Depende del servicio externo. Un punto de partida razonable es 3 reintentos con 5 s, 1 min y 10 min, y un máximo de 4 intentos totales. El backoff debe superar la ventana de recuperación típica del proveedor: si su caída media es de 30 s, reintentar a los 5 s y al minuto tiene sentido; si es de 10 minutos, el tercer nivel es el que importa. Nunca reintentes un error de validación: va directo a la DLQ.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el worker termina el trabajo pero no llega el <code>ack</code>?</summary>
+            <div>
+              <p>El broker reentrega el mensaje pasado el timeout de consumidor o cuando se cierra el canal. El job se ejecuta otra vez. La reclamación atómica y el upsert por clave de negocio hacen que el segundo intento no duplique el efecto. Es el escenario normal de at-least-once, no una anomalía que haya que «arreglar» con más <code>ack</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo consultar el estado del job en RabbitMQ?</summary>
+            <div>
+              <p>Solo mientras el mensaje está en la cola. Cuando se consume y se hace <code>ack</code>, desaparece. No hay historial de jobs terminados en el broker, y la management UI no es una base de datos. Por eso la API guarda el estado en su almacén y el broker se usa para transportar la orden y programar reintentos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

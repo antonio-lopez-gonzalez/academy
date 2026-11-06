@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="01-usuarios-vhosts-permisos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usuarios, vhosts y permisos — Módulo 6 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Usuarios, vhosts y permisos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La instalación de RabbitMQ con Docker trae un usuario <code>guest</code> con contraseña <code>guest</code> y permisos totales sobre el vhost <code>/</code>. Es cómodo para el primer mensaje del módulo 0 y catastrófico en cuanto el broker deja de estar en tu portátil. Ese usuario no es un modelo de seguridad: es una muleta de desarrollo.</p>
+        <p>En un sistema real conviven varios protagonistas: la API que publica trabajos, los workers que los consumen, el pipeline de despliegue que declara la topología, la persona que mira la management UI y el sistema de monitorización que consulta métricas. Todos necesitan <strong>cosas distintas</strong>. Darles el mismo usuario con <code>".*"</code> en las tres columnas convierte cualquier fuga de credenciales en un borrado total de colas.</p>
+        <p>RabbitMQ separa tres conceptos que se confunden a diario:</p>
+        <table>
+          <thead><tr><th>Concepto</th><th>Pregunta que responde</th><th>Mecanismo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Autenticación</strong></td><td>¿Quién eres?</td><td>Usuario y contraseña, certificado de cliente, LDAP/OAuth.</td></tr>
+            <tr><td><strong>Autorización</strong></td><td>¿Qué puedes hacer sobre este recurso?</td><td>Triple <code>configure</code> / <code>write</code> / <code>read</code> por vhost.</td></tr>
+            <tr><td><strong>Aislamiento</strong></td><td>¿Qué recursos ves siquiera?</td><td>Vhosts: espacios de nombres independientes.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué esta lección va antes que TLS</p>
+          <p>TLS protege el transporte, pero no impide que un cliente autenticado borre un exchange. Sin permisos ajustados, el cifrado solo garantiza que el atacante opera por un canal privado. Primero se decide <em>quién puede tocar qué</em>; después se protege el canal con <a href="02-tls.html">TLS</a>.</p>
+        </div>
+        <p>Errores típicos que veremos: usar <code>guest</code> en producción, regalar <code>".*"</code>, escribir regex que parecen correctas y no lo son, confundir los <em>tags</em> de la UI con permisos reales y meter desarrollo y producción en el mismo vhost.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Usuarios globales, recursos aislados por vhost</h3>
+        <p>Un usuario existe una sola vez en el clúster. Lo que cambia por vhost son sus permisos. Un vhost agrupa exchanges, colas, bindings, políticas y permisos; dos vhosts pueden tener una cola con el mismo nombre sin conflicto.</p>
+        <pre><code class="language-text">CLÚSTER RABBITMQ
+├── usuario: taller-api        (global, misma contraseña en todos los vhosts)
+├── vhost: taller-dev
+│   ├── exchange taller.jobs
+│   ├── queue    taller.jobs.work
+│   └── permisos de taller-api: conf="^$" write="^taller\." read="^taller\."
+└── vhost: taller-prod
+    ├── exchange taller.jobs   ← mismo nombre, OTRO recurso
+    ├── queue    taller.jobs.work
+    └── permisos de taller-api: conf="^$" write="^taller\." read="^taller\."</code></pre>
+        <p>Un vhost <strong>no es un cortafuegos</strong>. Alguien con el tag <code>administrator</code> o acceso a <code>rabbitmqctl</code> puede ver y borrar todos los vhosts del nodo. El aislamiento protege a las aplicaciones entre sí, no del operador del broker.</p>
+
+        <h3>La tripleta configure / write / read</h3>
+        <p>Cada permiso es una <strong>expresión regular</strong> que se compara con el <em>nombre del recurso</em>, no con la routing key ni con el contenido del mensaje. Las tres columnas tienen significados distintos:</p>
+        <table>
+          <thead><tr><th>Permiso</th><th>Qué autoriza</th><th>Se comprueba contra</th></tr></thead>
+          <tbody>
+            <tr><td><code>configure</code></td><td>Declarar y borrar exchanges, colas y bindings</td><td>Nombre del exchange o de la cola</td></tr>
+            <tr><td><code>write</code></td><td>Publicar mensajes; enlazar una cola a un exchange</td><td>Nombre del exchange (o de la cola si publicas al default exchange)</td></tr>
+            <tr><td><code>read</code></td><td>Consumir, hacer <code>basic.get</code>, purgar y enlazar colas</td><td>Nombre de la cola</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">Los bindings necesitan dos permisos</p>
+          <p>Crear un binding exige <code>write</code> sobre el exchange y <code>read</code> sobre la cola. Es un detalle que rompe muchos pipelines de despliegue: el usuario que declara topología necesita las tres columnas, aunque nunca consuma un mensaje.</p>
+        </div>
+        <p>El <em>default exchange</em> (el exchange sin nombre, <code>""</code>) es especial: enruta a la cola cuyo nombre coincide con la routing key y la comprobación de <code>write</code> se hace contra <strong>el nombre de la cola</strong>. Por eso un usuario con <code>write "^taller\."</code> puede publicar a <code>taller.jobs.work</code> tanto por el exchange como por el default exchange.</p>
+
+        <h3>Cómo se evalúa una operación</h3>
+        <pre><code class="language-text">cliente                         broker
+  |  CONNECT usuario+password      |
+  |------------------------------->|  1. autenticación (usuario global)
+  |  OPEN vhost=taller-prod        |
+  |------------------------------->|  2. ¿tiene ALGÚN permiso en el vhost?
+  |  PUBLISH exchange=taller.jobs  |
+  |------------------------------->|  3. write contra "taller.jobs"
+  |                                |     ¿regex casa? -> ACCEPT
+  |                                |     ¿no casa?    -> 403 y CIERRA el canal
+  |  CONSUME queue=taller.jobs.work|
+  |------------------------------->|  4. read contra "taller.jobs.work"</code></pre>
+        <p>Un <code>403 ACCESS_REFUSED</code> no cierra la conexión: cierra el <strong>canal</strong>. El cliente puede abrir otro canal y seguir, pero el mensaje publicado en la operación rechazada no existe para nadie.</p>
+
+        <h3>Tags: permisos de la management UI, no del protocolo</h3>
+        <p>Los tags son etiquetas del usuario que controlan qué puede hacer en la management UI y en la HTTP API de gestión. No sustituyen a los permisos de vhost: un usuario con tag <code>monitoring</code> pero sin <code>read</code> en un vhost no puede consumir nada.</p>
+        <table>
+          <thead><tr><th>Tag</th><th>Permite</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>administrator</code></td><td>Todo: usuarios, vhosts, permisos, políticas, cierre de conexiones, definiciones</td><td>Solo personas de plataforma, con cuentas nominativas y MFA en el proveedor de identidad.</td></tr>
+            <tr><td><code>management</code></td><td>Entrar en la UI y ver/operar los recursos de los vhosts donde tiene permisos</td><td>Desarrolladores que necesitan inspeccionar sus colas.</td></tr>
+            <tr><td><code>policymaker</code></td><td>Ver y gestionar políticas en sus vhosts</td><td>Equipos que ajustan TTL o límites sin tocar usuarios.</td></tr>
+            <tr><td><code>monitoring</code></td><td>Ver conexiones, canales, colas y métricas de todo el clúster, sin leer mensajes</td><td>Prometheus, Grafana o el equipo de guardia.</td></tr>
+          </tbody>
+        </table>
+        <p>Un usuario sin tags puede conectarse por AMQP y trabajar con normalidad; simplemente no puede entrar en la UI. Eso es exactamente lo que quieres para una API o un worker.</p>
+
+        <h3>guest: cómodo, conocido y restringido</h3>
+        <p>Por defecto, <code>guest</code> solo puede conectarse desde <code>localhost</code> (ajuste <code>loopback_users.guest = true</code>). Esa restricción es la única razón por la que el broker de Docker no está abierto al mundo. En producción se elimina el usuario, no se confía en la restricción.</p>
+
+        <h3>Mínimo privilegio, en la práctica</h3>
+        <p>El mínimo privilegio no es «dar menos por dar menos»: es limitar el radio de daño de una credencial filtrada. Una API comprometida con <code>write</code> sobre <code>^taller\.</code> puede inundar el broker, pero no puede borrar colas ni leer trabajos ajenos. Un worker comprometido con <code>read</code> sobre sus colas puede leer esos mensajes, pero no publicar en cualquier exchange.</p>
+        <table>
+          <thead><tr><th>Principal</th><th>configure</th><th>write</th><th>read</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>taller-deploy</code></td><td><code>^taller\.</code></td><td><code>^taller\.</code></td><td><code>^taller\.</code></td><td>Declara topología y bindings; no se usa en runtime.</td></tr>
+            <tr><td><code>taller-api</code></td><td><code>^$</code></td><td><code>^taller\.</code></td><td><code>^taller\.</code></td><td>Publica trabajos y, más adelante, lee respuestas RPC.</td></tr>
+            <tr><td><code>taller-worker</code></td><td><code>^$</code></td><td><code>^taller\.</code></td><td><code>^taller\.jobs.*</code></td><td>Consume trabajos y publica reintentos; no declara nada.</td></tr>
+            <tr><td><code>taller-monitor</code></td><td><code>^$</code></td><td><code>^$</code></td><td><code>^$</code></td><td>Tag <code>monitoring</code>; no toca mensajes.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Un vhost por entorno y, si hay inquilinos, por inquilino</h3>
+        <p>La separación por entorno evita el accidente clásico: un script de pruebas apuntando a <code>/</code> que purga la cola de producción. La separación por inquilino añade aislamiento de nombres y de permisos, pero multiplica la topología: cada vhost necesita sus exchanges, colas y políticas. Si los inquilinos comparten worker, un vhost por inquilino obliga a abrir una conexión por vhost o a usar un worker por inquilino; valora el coste antes de multiplicar.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a crear un vhost, un usuario de aplicación y sus permisos. Ejecuta los comandos dentro del contenedor del módulo 0 (el nombre <code>rabbitmq</code> es el que usamos en el curso):</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl add_vhost taller-dev
+docker exec rabbitmq rabbitmqctl add_user taller-api 'S3cret-rotativo-2026'
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-dev taller-api \
+  "^$" "^taller\." "^taller\."
+docker exec rabbitmq rabbitmqctl list_user_permissions taller-api</code></pre>
+        <p>Salida esperada (las columnas son vhost, configure, write, read):</p>
+        <pre><code class="language-text">Listing permissions for user "taller-api" ...
+taller-dev	^$	^taller\.	^taller\.</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">PowerShell: continuaciones y comillas</p>
+          <p>Los ejemplos usan <code>\</code> para continuar líneas en bash. En PowerShell, escribe el comando en una sola línea o usa el acento grave (<code>`</code>) al final; las comillas simples funcionan igual para las regex.</p>
+        </div>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>add_vhost taller-dev</code> crea el espacio de nombres. El usuario aún no puede entrar.</li>
+          <li><code>add_user</code> crea la identidad global. La contraseña entre comillas simples evita que el shell interprete caracteres.</li>
+          <li>El primer <code>^$</code> significa «no puede declarar ni borrar nada»: el patrón solo casa con la cadena vacía, y ningún recurso se llama así.</li>
+          <li><code>^taller\.</code> exige que el nombre empiece por <code>taller.</code> literal. El punto va escapado porque en regex <code>.</code> significa «cualquier carácter».</li>
+        </ul>
+        <p>Comprueba que la identidad funciona y que la autorización limita. Este script publica con las credenciales nuevas:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller-api:S3cret-rotativo-2026@localhost:5672/taller-dev');
+const ch = await conn.createChannel();
+
+await ch.assertExchange('taller.jobs', 'direct', { durable: true });
+await ch.publish('taller.jobs', 'job.run', Buffer.from('{}'), { persistent: true });
+console.log('publicado');
+await ch.close();
+await conn.close();</code></pre>
+        <p>El <code>assertExchange</code> fallará con <code>403 ACCESS_REFUSED</code>: el usuario no tiene <code>configure</code> para crear el exchange. Y aunque ya existiera, el <code>publish</code> exige <code>write</code> sobre su nombre. Declara la topología con el usuario de despliegue y repite la publicación: esa es la lección, <strong>declarar y publicar son permisos distintos</strong>.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller de pedidos separa cuatro identidades. El pipeline de despliegue declara la topología; la API y el worker solo la usan; el equipo de guardia monitoriza. Estas son las órdenes completas, reproducibles en cualquier entorno:</p>
+        <pre><code class="language-bash"># 1. Espacios de nombres
+docker exec rabbitmq rabbitmqctl add_vhost taller-dev
+docker exec rabbitmq rabbitmqctl add_vhost taller-prod
+
+# 2. Identidades (contraseñas generadas y guardadas en el gestor de secretos)
+docker exec rabbitmq rabbitmqctl add_user taller-deploy "$DEPLOY_PASSWORD"
+docker exec rabbitmq rabbitmqctl add_user taller-api    "$API_PASSWORD"
+docker exec rabbitmq rabbitmqctl add_user taller-worker "$WORKER_PASSWORD"
+docker exec rabbitmq rabbitmqctl add_user taller-monitor "$MONITOR_PASSWORD"
+
+# 3. Permisos en producción
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-prod taller-deploy \
+  "^taller\." "^taller\." "^taller\."
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-prod taller-api \
+  "^$" "^taller\." "^taller\."
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-prod taller-worker \
+  "^$" "^taller\." "^taller\.jobs.*"
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-prod taller-monitor \
+  "^$" "^$" "^$"
+
+# 4. Tags: solo lo justo
+docker exec rabbitmq rabbitmqctl set_user_tags taller-monitor monitoring
+docker exec rabbitmq rabbitmqctl set_user_tags taller-deploy management
+
+# 5. Fuera la cuenta por defecto
+docker exec rabbitmq rabbitmqctl delete_user guest
+
+# 6. Auditoría rápida
+docker exec rabbitmq rabbitmqctl list_users
+docker exec rabbitmq rabbitmqctl list_permissions -p taller-prod</code></pre>
+        <p>Salida ilustrativa de <code>list_permissions</code>:</p>
+        <pre><code class="language-text">Listing permissions for vhost "taller-prod" ...
+taller-api	^$	^taller\.	^taller\.
+taller-deploy	^taller\.	^taller\.	^taller\.
+taller-worker	^$	^taller\.	^taller\.jobs.*</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Los permisos no se heredan ni se copian</p>
+          <p>Crear un vhost no copia usuarios, permisos ni políticas. Si añades <code>taller-staging</code>, tendrás que repetir el bloque entero. Por eso conviene versionar los <code>rabbitmqctl</code> en un script de aprovisionamiento o importar un <code>definitions.json</code> revisado, nunca configurar a mano en la UI.</p>
+        </div>
+        <p>Cuando la API arranca, comprueba su identidad una sola vez y falla rápido si no puede operar. Un <em>smoke test</em> de arranque barato: publicar un mensaje de sondeo a una cola de diagnóstico y consumirlo. Si devuelve <code>403</code>, el despliegue se detiene antes de aceptar tráfico.</p>
+        <pre><code class="language-javascript">export async function assertPermissions(channel) {
+  const probe = 'taller.api.probe';
+  await channel.assertQueue(probe, { durable: false, autoDelete: true });
+  channel.sendToQueue(probe, Buffer.from('ping'), { persistent: false });
+  const msg = await channel.get(probe, { noAck: true });
+  if (!msg) throw new Error('la cola de sondeo no devolvió el mensaje');
+  console.log('permisos de API verificados');
+}</code></pre>
+        <p>Ojo: ese <code>assertQueue</code> requiere <code>configure</code>, que la API no tiene en nuestro diseño. El sondeo debe usar una cola declarada por el despliegue y limitarse a <code>write</code> y <code>read</code>. Es un buen recordatorio de que los ejemplos hay que diseñarlos con la misma matriz de permisos que producción.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un usuario por servicio y por entorno</td><td>Un usuario compartido «app» para todo</td><td>Rotar o revocar una credencial no obliga a redesplegar el resto del sistema.</td></tr>
+            <tr><td>Anclar los patrones: <code>^taller\.jobs\..*$</code></td><td><code>.*</code> o <code>^taller</code> a secas</td><td>El ancla y el punto escapado evitan que un nombre parecido entre en el permiso.</td></tr>
+            <tr><td>Separar usuario de despliegue y usuario de runtime</td><td>Dar <code>configure</code> a la API «por si acaso»</td><td>Una API comprometida no puede borrar la topología.</td></tr>
+            <tr><td>Un vhost por entorno; por inquilino solo si aporta aislamiento real</td><td>Todo en <code>/</code></td><td>Evita que un script de pruebas toque producción y limita el alcance de un error.</td></tr>
+            <tr><td>Tags mínimos: ninguno para servicios, <code>monitoring</code> para observabilidad</td><td><code>administrator</code> para todos</td><td>Los tags abren la UI y la API de gestión, no solo «dan permisos».</td></tr>
+            <tr><td>Eliminar <code>guest</code> y crear un admin nominativo</td><td>Confiar en que <code>guest</code> solo entra por localhost</td><td>La restricción es configuración, y la configuración se cambia.</td></tr>
+            <tr><td>Versionar usuarios, vhosts y permisos como código</td><td>Aprovisionar a mano desde la UI</td><td>Permite revisión, reproduce entornos y detecta deriva.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Regalar <code>".*"</code> a la aplicación</h3>
+        <span class="code-label code-label--wrong">Mal — la API puede borrar todo el vhost</span>
+        <pre><code class="language-bash">rabbitmqctl set_permissions -p taller-prod taller-api ".*" ".*" ".*"</code></pre>
+        <span class="code-label code-label--right">Bien — solo publicar y leer lo suyo</span>
+        <pre><code class="language-bash">rabbitmqctl set_permissions -p taller-prod taller-api "^$" "^taller\." "^taller\."</code></pre>
+        <p>Con la versión amplia, un fallo de código que ejecute <code>deleteQueue</code> sobre la cola equivocada no encuentra ninguna barrera. La credencial filtrada vale oro para cualquiera que quiera destruir el sistema.</p>
+
+        <h3>2. Regex que parecen correctas</h3>
+        <span class="code-label code-label--wrong">Mal — sin ancla y con puntos sin escapar</span>
+        <pre><code class="language-bash">rabbitmqctl set_permissions -p taller-prod taller-worker "^taller.jobs" ".*" ".*"</code></pre>
+        <span class="code-label code-label--right">Bien — anclada, escapada y acotada</span>
+        <pre><code class="language-bash">rabbitmqctl set_permissions -p taller-prod taller-worker "^$" "^taller\." "^taller\.jobs\..*$"</code></pre>
+        <p><code>^taller.jobs</code> casa con <code>tallerXjobs-lo-que-sea</code>, porque <code>.</code> es cualquier carácter y no hay <code>$</code>. El permiso parece específico y es mucho más amplio de lo que su autor cree.</p>
+
+        <h3>3. Confundir tags con permisos</h3>
+        <span class="code-label code-label--wrong">Mal — dar <code>administrator</code> para que «vea las colas»</span>
+        <pre><code class="language-javascript">// usuario de monitorización con tag administrator y sin permisos de vhost
+// -> entra en la UI, pero no ve las colas de taller-prod</code></pre>
+        <span class="code-label code-label--right">Bien — tag monitoring + permisos de lectura donde haga falta</span>
+        <pre><code class="language-bash">rabbitmqctl set_user_tags taller-monitor monitoring
+rabbitmqctl set_permissions -p taller-prod taller-monitor "^$" "^$" "^taller\."</code></pre>
+        <p>Los tags no conceden acceso a recursos. Y al revés: un usuario sin tags puede consumir por AMQP sin problema. Son dos ejes independientes.</p>
+
+        <h3>4. Producción y desarrollo en el mismo vhost</h3>
+        <span class="code-label code-label--wrong">Mal — un script de pruebas apunta a <code>/</code></span>
+        <pre><code class="language-bash"># el script de seeds purga "taller.jobs.work" en el vhost por defecto
+curl -u taller-deploy:... -X DELETE http://localhost:15672/api/queues/%2F/taller.jobs.work/contents</code></pre>
+        <span class="code-label code-label--right">Bien — vhost por entorno y credenciales distintas</span>
+        <pre><code class="language-bash"># dev: amqp://taller-api:...@localhost:5672/taller-dev
+# prod: amqp://taller-api:...@rabbitmq.internal:5671/taller-prod</code></pre>
+        <p>El vhost evita el accidente por nombre, pero la credencial de producción tampoco debe estar en la máquina de desarrollo. Separar vhosts y secretos son dos capas que se complementan.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar tres identidades con privilegios distintos, demostrar que una operación no autorizada cierra el canal y dejar el broker sin <code>guest</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el vhost y las identidades:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl add_vhost taller-lab
+docker exec rabbitmq rabbitmqctl add_user lab-deploy 'lab-deploy-2026'
+docker exec rabbitmq rabbitmqctl add_user lab-api 'lab-api-2026'
+docker exec rabbitmq rabbitmqctl add_user lab-worker 'lab-worker-2026'</code></pre>
+            <p>Salida esperada: <code>Creating vhost "taller-lab" ...</code> y <code>Adding user "lab-api" ...</code>.</p>
+          </li>
+          <li>
+            <strong>Aplica permisos distintos a cada uno:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_permissions -p taller-lab lab-deploy \
+  "^taller\." "^taller\." "^taller\."
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-lab lab-api \
+  "^$" "^taller\." "^$"
+docker exec rabbitmq rabbitmqctl set_permissions -p taller-lab lab-worker \
+  "^$" "^$" "^taller\.jobs.*"</code></pre>
+            <p>Comprueba con <code>list_permissions -p taller-lab</code> que cada fila tiene la tripleta correcta.</p>
+          </li>
+          <li>
+            <strong>Declara la topología con el usuario de despliegue:</strong>
+            <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://lab-deploy:lab-deploy-2026@localhost:5672/taller-lab');
+const ch = await conn.createChannel();
+await ch.assertExchange('taller.jobs', 'direct', { durable: true });
+await ch.assertQueue('taller.jobs.work', { durable: true });
+await ch.bindQueue('taller.jobs.work', 'taller.jobs', 'job.run');
+console.log('topología declarada');
+await conn.close();</code></pre>
+            <p>El binding funciona porque <code>lab-deploy</code> tiene <code>write</code> sobre el exchange y <code>read</code> sobre la cola.</p>
+          </li>
+          <li>
+            <strong>Publica con la API y consume con el worker:</strong>
+            <pre><code class="language-javascript">// lab-api
+const conn = await amqp.connect('amqp://lab-api:lab-api-2026@localhost:5672/taller-lab');
+const ch = await conn.createConfirmChannel();
+ch.publish('taller.jobs', 'job.run', Buffer.from('{"jobId":"j-1"}'), { persistent: true });
+await ch.waitForConfirms();
+console.log('publicado por lab-api');</code></pre>
+            <pre><code class="language-javascript">// lab-worker
+const conn = await amqp.connect('amqp://lab-worker:lab-worker-2026@localhost:5672/taller-lab');
+const ch = await conn.createChannel();
+await ch.consume('taller.jobs.work', (msg) =&gt; {
+  console.log('recibido:', msg.content.toString());
+  ch.ack(msg);
+}, { noAck: false });</code></pre>
+            <p>El worker puede consumir y el ack no requiere permisos adicionales.</p>
+          </li>
+          <li>
+            <strong>Intenta lo prohibido:</strong> con <code>lab-api</code>, publica al exchange <code>amq.direct</code>, que existe pero queda fuera de tu patrón <code>^taller\.</code>. Debes ver un error del estilo <code>Channel closed by server: 403 (ACCESS_REFUSED)</code>. Repite con <code>lab-api</code> intentando <code>assertQueue</code> y comprobarás que <code>configure</code> también está denegado.</li>
+          <li>
+            <strong>Retira la cuenta por defecto y audita:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl delete_user guest
+docker exec rabbitmq rabbitmqctl list_users
+docker exec rabbitmq rabbitmqctl list_permissions -p taller-lab</code></pre>
+            <p>Comprueba que ya no aparece <code>guest</code> y que las tres identidades del ejercicio siguen ahí.</p>
+          </li>
+        </ol>
+        <div class="callout callout--warning">
+          <p class="callout__title">No borres el vhost al terminar</p>
+          <p><code>delete_vhost</code> elimina exchanges, colas, bindings, políticas y permisos de golpe, sin confirmación y sin papelera. En el ejercicio puedes recrearlo, pero en producción es una operación de destrucción masiva que conviene restringir por política de cambio.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Auditoría de privilegios y rotación sin caída</h3>
+          <p>Diseña un procedimiento que, con el broker en marcha y workers consumiendo, detecte qué usuarios tienen permisos más amplios de los necesarios y rote sus contraseñas sin perder mensajes ni provocar un pico de reconexiones.</p>
+          <p>El procedimiento debe cubrir: inventario de identidades y tags, detección de patrones peligrosos (<code>.*</code>, <code>^</code> sin anclar, <code>configure</code> en runtime), creación de la credencial nueva, convivencia de ambas durante la transición y retirada de la antigua. Debe funcionar también si un worker mantiene conexiones abiertas y reconecta solo cuando se cierra la anterior.</p>
+          <p><em>Pista: RabbitMQ no permite dos contraseñas para el mismo usuario. Piensa si la transición se hace con dos usuarios temporales, con un cambio de contraseña coordinado o con un reinicio escalonado de consumidores; y recuerda que <code>list_user_permissions</code> no te dice qué recursos existen, solo qué nombres casan con el patrón.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Los <strong>usuarios</strong> son globales; los <strong>vhosts</strong> aíslan recursos y permisos.</li>
+          <li>Los permisos son tres regex por vhost: <code>configure</code> (declarar/borrar), <code>write</code> (publicar/enlazar), <code>read</code> (consumir/purgar).</li>
+          <li>La regex se compara con el <strong>nombre del recurso</strong>, nunca con la routing key ni con el cuerpo.</li>
+          <li>Los <strong>tags</strong> controlan la management UI y la API de gestión; no conceden acceso a colas ni exchanges.</li>
+          <li><code>guest</code> está limitado a localhost por defecto; en producción se elimina y se crea un admin nominativo.</li>
+          <li>Separa el usuario que declara topología del que opera en runtime: el mínimo privilegio limita el daño de una credencial filtrada.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>rabbitmqctl add_vhost &lt;vhost&gt;</code></td><td>Crea un espacio de nombres aislado</td></tr>
+            <tr><td><code>rabbitmqctl add_user &lt;user&gt; &lt;password&gt;</code></td><td>Crea una identidad global en el clúster</td></tr>
+            <tr><td><code>rabbitmqctl set_permissions -p &lt;vhost&gt; &lt;user&gt; conf write read</code></td><td>Define la tripleta de permisos con regex</td></tr>
+            <tr><td><code>rabbitmqctl set_user_tags &lt;user&gt; &lt;tag&gt;…</code></td><td>Asigna tags de UI (<code>management</code>, <code>monitoring</code>, …)</td></tr>
+            <tr><td><code>rabbitmqctl list_permissions -p &lt;vhost&gt;</code></td><td>Audita los permisos de un vhost</td></tr>
+            <tr><td><code>rabbitmqctl list_user_permissions &lt;user&gt;</code></td><td>Audita los permisos de una identidad</td></tr>
+            <tr><td><code>rabbitmqctl delete_user &lt;user&gt;</code></td><td>Elimina la identidad; sus conexiones se cierran</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo dar permisos a un usuario sobre un exchange concreto y nada más?</summary>
+            <div>
+              <p>Sí: <code>configure</code> y <code>write</code> con un patrón que case solo con ese nombre, por ejemplo <code>^taller\.jobs$</code>, y <code>read</code> con <code>^$</code> si no consume. Recuerda que consumir de una cola requiere <code>read</code> sobre la cola, no sobre el exchange. Un usuario así puede publicar, pero no leer ni declarar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si cambio los permisos, ¿se desconectan los clientes?</summary>
+            <div>
+              <p>No por el cambio en sí. Las conexiones siguen abiertas, pero cada operación se vuelve a autorizar: la primera que incumpla el nuevo permiso provoca un <code>403</code> y cierra el canal. Si eliminas el usuario, el broker sí cierra sus conexiones. Diseña los clientes para reconectar y volver a declarar la topología con permisos vigentes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un vhost por inquilino o un vhost compartido con prefijos?</summary>
+            <div>
+              <p>El vhost da aislamiento real de nombres y permisos, pero multiplica exchanges, colas, políticas y conexiones. Si los inquilinos comparten workers y topología, los prefijos (<code>acme.jobs</code>, <code>globex.jobs</code>) con permisos por prefijo son más baratos de operar. Si un inquilino exige borrar y recrear su topología sin afectar a otros, el vhost separado es la opción sólida.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los permisos se aplican también a la management UI?</summary>
+            <div>
+              <p>Sí. La UI y la HTTP API respetan los permisos de vhost para listar, publicar, consumir y borrar recursos. Los tags añaden capacidades de administración por encima: un usuario con <code>monitoring</code> ve estadísticas de todo el clúster, y uno con <code>administrator</code> puede gestionar usuarios y vhosts. Ningún tag evita un <code>403</code> sobre un recurso para el que no tiene permiso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé qué permisos necesita realmente mi aplicación?</summary>
+            <div>
+              <p>Empieza por el mínimo: <code>read</code> sobre sus colas de consumo y <code>write</code> sobre el exchange de publicación. Añade <code>configure</code> solo si la aplicación declara topología al arrancar. Después prueba el arranque completo con esas credenciales y revisa los <code>403</code> del log; cada uno indica un permiso que falta, y cada permiso que añadas debe tener una justificación escrita.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

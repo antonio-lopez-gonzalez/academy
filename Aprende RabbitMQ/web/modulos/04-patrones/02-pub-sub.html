@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-pub-sub">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pub/sub — Módulo 4 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Pub/sub</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Patrones</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El taller acaba de confirmar un pedido. A partir de ese hecho, tres áreas tienen trabajo: facturación emite la factura, inventario reserva el stock y auditoría registra la traza. Si publicas <code>pedido.creado</code> en una sola cola, el broker entrega el evento a <strong>uno</strong> de los tres consumidores: los otros dos nunca se enteran. No es un fallo de RabbitMQ; es el contrato de una cola.</p>
+        <p>El patrón <strong>pub/sub</strong> resuelve esto con un exchange <em>fanout</em> y <strong>una cola por consumidor</strong>. El productor publica una vez y no sabe quién escucha; cada servicio tiene su propia cola, su propio ritmo, su propio backlog y su propio dead-letter exchange. Añadir un cuarto interesado (por ejemplo, notificaciones) es declarar una cola y un binding: no se toca al productor ni a los demás consumidores.</p>
+        <p>La diferencia con una work queue es conceptual, no de API. En una work queue los consumidores <strong>comparten</strong> el trabajo y cada mensaje se procesa una vez. En pub/sub cada consumidor recibe <strong>su propia copia</strong> del evento y lo procesa para sí. Confundir ambos patrones produce el error más caro de esta lección: una única cola para varios servicios.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Los eventos de dominio son la forma habitual de desacoplar servicios, pero «desacoplar» no significa «publicar y olvidar». Hay que decidir qué pasa si un consumidor está caído, si la cola es durable, cuánto se retiene un evento y quién es dueño de cada cola. Esas decisiones son el contenido real del patrón.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Fanout: el exchange copia, no elige</h3>
+        <p>Un exchange <code>fanout</code> ignora la routing key y entrega una copia a <strong>cada cola vinculada</strong>. El desacoplamiento está en el binding: el productor solo conoce el nombre del exchange.</p>
+        <pre><code class="language-text">                          pedido.creado
+                                |
+                                v
+                   +----------------------------+
+                   | exchange taller.eventos    |
+                   | type: fanout               |
+                   +---+----------+----------+--+
+                       |          |          |
+          binding ---- +          |          + ---- binding
+                       |          |          |
+                       v          v          v
+             +--------------+ +-----------+ +--------------+
+             | facturacion. | | inventario.| | auditoria.   |
+             | pedido-creado| | pedido-... | | pedido-...   |
+             | (quorum)     | | (quorum)   | | (quorum)     |
+             +------+-------+ +-----+-----+ +------+-------+
+                    |               |              |
+                    v               v              v
+              facturación      inventario       auditoría
+              (su ritmo)       (su ritmo)       (su ritmo)
+
+  Un publish -&gt; tres copias independientes. Cada cola falla o se retrasa por su cuenta.</code></pre>
+        <p>Cada cola es un <strong>buffer independiente</strong>. Si auditoría está en mantenimiento, su backlog crece y nadie más se entera; facturación sigue procesando. Esa independencia es la ventaja y también la responsabilidad: nadie va a avisarte de que la cola de auditoría lleva tres días creciendo salvo que la monitorices.</p>
+
+        <h3>Fanout no es topic</h3>
+        <table>
+          <thead><tr><th></th><th>Fanout</th><th>Topic</th></tr></thead>
+          <tbody>
+            <tr><td>Routing key</td><td>Se ignora</td><td>Se compara con el patrón del binding</td></tr>
+            <tr><td>Casos de uso</td><td>Eventos que interesan a todos; difusión simple</td><td>Filtrar por tipo o área (<code>pedido.*</code>, <code>#.creado</code>)</td></tr>
+            <tr><td>Acoplamiento</td><td>Máximo: todos reciben todo</td><td>El consumidor elige qué le importa</td></tr>
+            <tr><td>Coste</td><td>Una copia por cola vinculada</td><td>Una copia por cola que case</td></tr>
+          </tbody>
+        </table>
+        <p>Si los tres consumidores necesitan <em>todos</em> los pedidos, fanout es correcto. Si auditoría solo quiere <code>pedido.cancelado</code>, un topic exchange evita copias inútiles. La lección <a href="../02-exchanges-routing/03-topic.html">Topic: rutas con comodines</a> cubre el filtrado.</p>
+
+        <h3>Cola durable frente a cola efímera</h3>
+        <p>«Suscribirse» no es una bandera del consumidor: es <strong>declarar una cola y vincularla</strong>. La durabilidad de esa cola decide qué ocurre cuando el servicio está caído.</p>
+        <table>
+          <thead><tr><th>Configuración</th><th>Declaración</th><th>Comportamiento</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Durable</strong></td> <td><code>{ durable: true, arguments: { 'x-queue-type': 'quorum' } }</code></td> <td>Sobrevive a reinicios del broker; acumula eventos mientras el consumidor está caído. Es la opción para eventos de negocio.</td></tr>
+            <tr><td><strong>Temporal exclusiva</strong></td> <td><code>{ exclusive: true, autoDelete: true }</code></td> <td>Vive mientras viva la conexión que la declaró. Al desconectarse, se borra con todo su contenido. Para telemetría, UIs o suscripciones best-effort.</td></tr>
+            <tr><td><strong>Auto-delete con nombre</strong></td> <td><code>{ durable: true, autoDelete: true }</code></td> <td>Se borra cuando se va el último consumidor. Peligrosa: si nadie se conecta nunca, la cola queda vacía pero viva; si todos se van, se pierde el backlog.</td></tr>
+          </tbody>
+        </table>
+        <p>Las quorum queues <strong>no pueden ser exclusivas ni auto-delete</strong>: son durables por diseño. Si usas una quorum para eventos críticos, el ciclo de vida lo controlas tú, no la conexión del consumidor.</p>
+
+        <h3>Dar de baja una suscripción</h3>
+        <p>La baja tiene dos niveles y conviene no mezclarlos:</p>
+        <ol>
+          <li><strong>Dejar de consumir</strong>: <code>channel.cancel(consumerTag)</code>. La cola y sus mensajes siguen ahí. Es lo que quieres en un despliegue: el servicio para de procesar, pero no pierde lo pendiente.</li>
+          <li><strong>Eliminar la suscripción</strong>: además de cancelar, <code>channel.deleteQueue(nombre)</code> y eliminar el binding. Esto borra el backlog y los eventos futuros dejan de acumularse. Es una decisión de negocio, no una limpieza técnica.</li>
+        </ol>
+        <div class="callout callout--warning">
+          <p class="callout__title">Borrar la cola no «desuscribe» al consumidor que sigue vivo</p>
+          <p>Si otro proceso tiene un consumidor sobre esa cola, borrarla provoca un <em>consumer cancel</em> (el callback recibe <code>null</code>) y el cliente debe reaccionar. Cancelar consumidores y borrar colas son operaciones coordinadas, no un <code>DELETE</code> silencioso.</p>
+        </div>
+
+        <h3>El sobre del evento</h3>
+        <p>Un evento no es solo el payload. Sin metadatos no puedes depurar, deduplicar ni versionar. Un sobre mínimo:</p>
+        <pre><code class="language-json">{
+  "eventId": "evt-01J9Z8K3",
+  "type": "pedido.creado",
+  "version": 1,
+  "occurredAt": "2026-11-05T09:14:22.318Z",
+  "correlationId": "req-7f3a",
+  "data": { "pedidoId": "ped-8831", "clienteId": "cli-204", "total": 149.9 }
+}</code></pre>
+        <p>El <code>eventId</code> sirve para deduplicar en cada consumidor; <code>correlationId</code> permite seguir la estela desde la petición original hasta la factura; <code>version</code> permite evolucionar el esquema sin romper a los suscriptores antiguos. El <code>messageId</code> de AMQP puede llevar el <code>eventId</code>, pero la deduplicación debe usar el identificador del evento, no un valor que el broker pueda regenerar.</p>
+
+        <h3>Quién sostiene la garantía</h3>
+        <table>
+          <thead><tr><th>Garantía</th><th>Quién</th><th>Cómo</th></tr></thead>
+          <tbody>
+            <tr><td>El evento llega al exchange</td><td>Productor + broker</td><td>Publisher confirm y exchange durable</td></tr>
+            <tr><td>Hay una copia por suscriptor</td><td>Broker</td><td>Una cola vinculada por consumidor; fanout copia al publicar</td></tr>
+            <tr><td>La copia sobrevive si el consumidor está caído</td><td>Broker</td><td>Cola durable y mensaje persistente</td></tr>
+            <tr><td>El evento se procesa al menos una vez</td><td>Consumidor</td><td><code>ack</code> manual tras el efecto; redelivery si falla</td></tr>
+            <tr><td>No se duplica el efecto</td><td>Consumidor</td><td>Deduplicación por <code>eventId</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un fanout y dos colas. El productor publica un evento; los dos consumidores reciben una copia. <strong>Garantía:</strong> cada cola recibe el evento si existe en el momento de publicar; las colas son durables, así que el que esté desconectado lo encontrará al volver.</p>
+        <p><strong>Productor</strong> (<code>emitir.mjs</code>):</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createConfirmChannel();
+
+await ch.assertExchange('taller.eventos', 'fanout', { durable: true });
+ch.publish(
+  'taller.eventos',
+  '',                                    // fanout ignora la routing key
+  Buffer.from(JSON.stringify({ pedidoId: 'ped-8831' })),
+  { persistent: true, contentType: 'application/json', messageId: 'evt-001' },
+);
+await ch.waitForConfirms();
+await ch.close();
+await conn.close();</code></pre>
+        <p><strong>Consumidor</strong> (<code>escuchar.mjs</code>), con el nombre de cola como argumento:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const cola = process.argv[2];               // facturacion.pedido-creado | inventario.pedido-creado
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertExchange('taller.eventos', 'fanout', { durable: true });
+await ch.assertQueue(cola, {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+await ch.bindQueue(cola, 'taller.eventos', '');   // fanout: binding sin clave
+await ch.prefetch(10);
+
+await ch.consume(cola, (msg) =&gt; {
+  if (!msg) return;
+  console.log(cola, '&lt;-', msg.content.toString());
+  ch.ack(msg);
+}, { noAck: false });</code></pre>
+        <p>Arranca dos consumidores con nombres distintos y publica una vez:</p>
+        <pre><code class="language-bash">node escuchar.mjs facturacion.pedido-creado
+node escuchar.mjs auditoria.pedido-creado
+node emitir.mjs</code></pre>
+        <pre><code class="language-text">facturacion.pedido-creado &lt;- {"pedidoId":"ped-8831"}
+auditoria.pedido-creado   &lt;- {"pedidoId":"ped-8831"}</code></pre>
+        <p>Dos colas, dos copias, un solo <code>publish</code>. Si arrancas un tercer consumidor con el <strong>mismo</strong> nombre de cola, no recibirá una copia extra: competirá con el primero por los mismos mensajes. El nombre de la cola es la identidad de la suscripción.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller publica <code>pedido.creado</code> desde la API. Tres servicios se suscriben con colas propias y políticas propias:</p>
+        <table>
+          <thead><tr><th>Suscriptor</th><th>Cola</th><th>Qué hace</th><th>Si se cae</th></tr></thead>
+          <tbody>
+            <tr><td>Facturación</td><td><code>facturacion.pedido-creado</code></td><td>Emite factura y envía email</td><td>Acumula eventos; al volver, factura el backlog</td></tr>
+            <tr><td>Inventario</td><td><code>inventario.pedido-creado</code></td><td>Reserva stock y descuenta unidades</td><td>Acumula; el stock puede quedar desfasado hasta que se recupere</td></tr>
+            <tr><td>Auditoría</td><td><code>auditoria.pedido-creado</code></td><td>Guarda traza inmutable durante 90 días</td><td>Acumula; la traza se escribe con retraso, pero no se pierde</td></tr>
+          </tbody>
+        </table>
+        <p>La topología se declara en un módulo compartido para que productor y consumidores no discrepen. Una declaración incompatible (otro tipo de exchange, otra durabilidad, otros argumentos) cierra el canal con <code>PRECONDITION_FAILED</code>.</p>
+        <pre><code class="language-javascript">// topologia.mjs — la usan la API y los tres workers
+export async function declarar(ch) {
+  await ch.assertExchange('taller.eventos', 'fanout', { durable: true });
+  await ch.assertExchange('taller.dlx', 'direct', { durable: true });
+
+  await ch.assertQueue('pedidos.fallidos', {
+    durable: true,
+    arguments: { 'x-queue-type': 'quorum' },
+  });
+  await ch.bindQueue('pedidos.fallidos', 'taller.dlx', 'pedido.fallido');
+
+  for (const cola of [
+    'facturacion.pedido-creado',
+    'inventario.pedido-creado',
+    'auditoria.pedido-creado',
+  ]) {
+    await ch.assertQueue(cola, {
+      durable: true,
+      arguments: {
+        'x-queue-type': 'quorum',
+        'x-dead-letter-exchange': 'taller.dlx',
+        'x-dead-letter-routing-key': 'pedido.fallido',
+        'x-delivery-limit': 8,
+      },
+    });
+    await ch.bindQueue(cola, 'taller.eventos', '');
+  }
+}</code></pre>
+        <p>Cada worker consume <strong>solo su cola</strong> y decide su política de reintentos. Facturación puede usar un backoff de 30 s; auditoría, ninguno (si falla la escritura, va a su DLQ y se revisa a mano). Compartir una cola obligaría a compartir también esas decisiones, y ahí empieza el acoplamiento que el patrón pretendía evitar.</p>
+        <p>El productor publica con confirm y con un sobre completo:</p>
+        <pre><code class="language-javascript">const evento = {
+  eventId: crypto.randomUUID(),
+  type: 'pedido.creado',
+  version: 1,
+  occurredAt: new Date().toISOString(),
+  correlationId: req.id,
+  data: { pedidoId, clienteId, total },
+};
+
+ch.publish('taller.eventos', '', Buffer.from(JSON.stringify(evento)), {
+  persistent: true,
+  contentType: 'application/json',
+  messageId: evento.eventId,
+  correlationId: evento.correlationId,
+  type: evento.type,
+});
+await ch.waitForConfirms();</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">Fanout sin colas vinculadas descarta el evento</p>
+          <p>Si nadie ha declarado todavía las colas, el exchange no tiene a quién entregar y el mensaje se pierde, aunque el confirm sea positivo: el broker confirma que lo recibió, no que lo enrutó. Publica <code>mandatory: true</code> y escucha <code>basic.return</code>, o usa un alternate exchange, si un evento sin suscriptores es un error de despliegue. Lo vimos en <a href="../02-exchanges-routing/04-headers-y-alternate.html">Headers y alternate exchange</a>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una cola durable por servicio consumidor</td> <td>Una sola cola compartida por varios servicios</td> <td>En una cola compartida los mensajes se reparten; cada servicio ve solo una parte.</td></tr>
+            <tr><td>Nombrar la cola con el consumidor: <code>servicio.evento</code></td> <td>Nombres genéricos como <code>eventos</code> o <code>cola1</code></td> <td>El nombre identifica la suscripción; facilita permisos, métricas y borrado seguro.</td></tr>
+            <tr><td>Declarar la topología en código compartido</td> <td>Declarar a mano en la management UI</td> <td>Evita discrepancias de argumentos y permite recrear el entorno.</td></tr>
+            <tr><td>Publicar con confirm y mensaje persistente</td> <td>Confiar en que «ya llegará»</td> <td>El confirm cubre la entrada al broker; la persistencia cubre el reinicio.</td></tr>
+            <tr><td>Deduplicar por <code>eventId</code> en cada consumidor</td> <td>Asumir una única entrega</td> <td>Cada cola reentrega si el consumidor falla; el duplicado es esperado.</td></tr>
+            <tr><td>Versionar el esquema del evento</td> <td>Cambiar el payload y desplegar todo a la vez</td> <td>Los suscriptores evolucionan a distinto ritmo; un campo nuevo opcional no rompe a nadie.</td></tr>
+            <tr><td>Monitorizar el backlog de cada cola</td> <td>Mirar solo la cola del servicio propio</td> <td>Un suscriptor caído no bloquea a los demás, así que nadie lo nota salvo su métrica.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Una cola para tres servicios</h3>
+        <span class="code-label code-label--wrong">Mal — creer que todos reciben el evento</span>
+        <pre><code class="language-text">taller.eventos (fanout) -&gt; cola "eventos" -&gt; facturacion | inventario | auditoria
+
+Cada mensaje va a UNO de los tres. Los otros dos no lo ven nunca.</code></pre>
+        <span class="code-label code-label--right">Bien — una cola por consumidor</span>
+        <pre><code class="language-text">taller.eventos (fanout) -&gt; facturacion.pedido-creado -&gt; facturacion
+                       -&gt; inventario.pedido-creado  -&gt; inventario
+                       -&gt; auditoria.pedido-creado   -&gt; auditoria</code></pre>
+        <p>El fanout copia por cola, no por consumidor. Si los tres procesos comparten cola, compiten y el evento se procesa una sola vez. Es una work queue disfrazada de pub/sub.</p>
+
+        <h3>2. Cola efímera para eventos que no se pueden perder</h3>
+        <span class="code-label code-label--wrong">Mal — suscripción atada a la conexión</span>
+        <pre><code class="language-javascript">await ch.assertQueue('', { exclusive: true, autoDelete: true });
+await ch.bindQueue(q.queue, 'taller.eventos', '');</code></pre>
+        <span class="code-label code-label--right">Bien — cola durable con nombre estable</span>
+        <pre><code class="language-javascript">await ch.assertQueue('facturacion.pedido-creado', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});</code></pre>
+        <p>La cola exclusiva desaparece al cerrar la conexión, con todo lo que tenía dentro. Un despliegue de 30 segundos borra los eventos de ese intervalo. Para negocio, siempre durable; para una vista en vivo, efímera está bien.</p>
+
+        <h3>3. Publicar antes de que existan las colas</h3>
+        <span class="code-label code-label--wrong">Mal — confiar en el confirm como entrega</span>
+        <pre><code class="language-javascript">ch.publish('taller.eventos', '', body, { persistent: true });
+await ch.waitForConfirms();   // ✅ el broker lo tiene… pero no había bindings</code></pre>
+        <span class="code-label code-label--right">Bien — declarar topología y detectar el retorno</span>
+        <pre><code class="language-javascript">await declarar(ch);           // exchange + colas + bindings
+ch.publish('taller.eventos', '', body, { persistent: true, mandatory: true });
+ch.on('return', (msg) =&gt; {
+  console.error('sin ruta:', msg.fields.routingKey);   // alerta de despliegue
+});</code></pre>
+        <p>Un exchange sin bindings acepta y descarta. El confirm dice «recibido», no «enrutado». En un arranque en frío, el orden de despliegue importa: primero los consumidores, después el productor; o mejor, declara la topología de forma idempotente en ambos.</p>
+
+        <h3>4. Tratar un evento como una orden</h3>
+        <span class="code-label code-label--wrong">Mal — el productor decide qué debe hacer el otro</span>
+        <pre><code class="language-json">{ "accion": "reservarStock", "pedidoId": "ped-8831" }</code></pre>
+        <span class="code-label code-label--right">Bien — describir el hecho ocurrido</span>
+        <pre><code class="language-json">{ "type": "pedido.creado", "data": { "pedidoId": "ped-8831", "lineas": [] } }</code></pre>
+        <p>Un evento cuenta algo que ya pasó; una orden exige una acción concreta. Si el productor nombra la acción, cada cambio en los consumidores obliga a cambiar al productor y el acoplamiento vuelve por la puerta de atrás. Los comandos existen, pero van a <strong>una</strong> cola con un consumidor concreto, no a un fanout.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar que cada suscriptor recibe su copia, que un consumidor caído conserva su backlog y que compartir cola rompe el patrón.</p>
+        <ol class="steps">
+          <li>
+            <strong>Declara el fanout y las tres colas.</strong> Usa <code>topologia.mjs</code> del ejemplo real o la management UI. Comprueba los bindings:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_bindings source_name destination_name routing_key</code></pre>
+            <pre><code class="language-text">taller.eventos  facturacion.pedido-creado
+taller.eventos  inventario.pedido-creado
+taller.eventos  auditoria.pedido-creado</code></pre>
+          </li>
+          <li>
+            <strong>Arranca facturación y auditoría</strong>, pero deja inventario sin arrancar. Publica un evento y observa los dos consumidores activos.
+            <pre><code class="language-bash">node escuchar.mjs facturacion.pedido-creado
+node escuchar.mjs auditoria.pedido-creado
+node emitir.mjs</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba el backlog del ausente</strong>:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready consumers</code></pre>
+            <pre><code class="language-text">auditoria.pedido-creado    0  1
+facturacion.pedido-creado  0  1
+inventario.pedido-creado   1  0</code></pre>
+            <p>El evento está esperando a inventario; los otros dos ya lo procesaron. Esa es la independencia de consumidores.</p>
+          </li>
+          <li>
+            <strong>Arranca inventario</strong> y verifica que recibe el evento pendiente, no los ya procesados por los demás. Después publica dos eventos más y comprueba que cada cola tiene su propia copia.</li>
+          <li>
+            <strong>Rompe el patrón a propósito:</strong> arranca un cuarto consumidor con el nombre <code>facturacion.pedido-creado</code>. Publica cuatro eventos y observa cómo se reparten entre los dos procesos de facturación: cada uno recibe una parte, no todos. Ese es el síntoma de una cola compartida.</li>
+          <li>
+            <strong>Simula una baja:</strong> cancela el consumidor de auditoría con <code>Ctrl+C</code> y publica un evento. La cola conserva el mensaje. Vuelve a arrancarlo y confirma que lo recibe: la suscripción sobrevivió al proceso porque la cola es durable.</li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un suscriptor que se une tarde</h3>
+          <p>El equipo de marketing quiere empezar a recibir <code>pedido.creado</code> a partir de hoy, pero también necesita procesar los eventos de los últimos siete días que ya fueron consumidos por los otros servicios. Con fanout y colas durables, ¿puede conseguirlo sin republicar nada?</p>
+          <p>Diseña dos alternativas: una con RabbitMQ puro y otra que introduzca un almacén de eventos. Para cada una, explica qué garantías ofrece, cuánto cuesta en disco y qué pasa si marketing se cae durante un mes. Después implementa la que consideres correcta y documenta el binding y la retención.</p>
+          <p><em>Pista: piensa qué significa «consumido» para el broker. Una cola nueva solo recibe lo que se publique después de existir; el pasado no está en el exchange. ¿Dónde tendrías que haberlo guardado?</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Pub/sub = exchange <strong>fanout</strong> + <strong>una cola por consumidor</strong>; el productor publica una vez y no conoce a los suscriptores.</li>
+          <li>Cada cola recibe su propia copia y evoluciona de forma independiente: backlog, DLQ y ritmo propios.</li>
+          <li>Una cola compartida por varios servicios es una work queue: los mensajes se reparten y cada servicio ve solo una parte.</li>
+          <li>Colas durables para eventos de negocio; exclusivas y auto-delete solo para suscripciones efímeras.</li>
+          <li>El sobre del evento (<code>eventId</code>, <code>type</code>, <code>version</code>, <code>occurredAt</code>, <code>correlationId</code>) hace posible deduplicar, trazar y evolucionar.</li>
+          <li>El confirm acredita la entrada al broker; si no hay bindings, el mensaje se descarta igualmente.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>assertExchange(nombre, 'fanout', { durable: true })</code></td><td>Declara el exchange que copia a todas las colas vinculadas</td></tr>
+            <tr><td><code>bindQueue(cola, exchange, '')</code></td><td>Vincula una cola al fanout (la clave se ignora)</td></tr>
+            <tr><td><code>{ durable: true }</code></td><td>La cola sobrevive a reinicios y acumula mientras el consumidor está caído</td></tr>
+            <tr><td><code>{ exclusive: true, autoDelete: true }</code></td><td>Cola temporal atada a la conexión; se borra al desconectar</td></tr>
+            <tr><td><code>cancel(consumerTag)</code></td><td>Deja de consumir sin borrar la cola ni su backlog</td></tr>
+            <tr><td><code>mandatory: true</code></td><td>Devuelve el mensaje si ningún binding lo enruta</td></tr>
+            <tr><td><code>eventId</code></td><td>Clave de deduplicación del consumidor</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No es más simple usar una cola por servicio pero con el mismo nombre de binding?</summary>
+            <div>
+              <p>El binding no tiene nombre: es la pareja exchange-cola. Lo que debe ser único es la <strong>cola</strong>. Puedes vincular varias colas al mismo fanout sin problema; lo que no puedes es que dos servicios consuman de la misma cola esperando copias distintas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto tiempo guarda RabbitMQ un evento si el consumidor está caído?</summary>
+            <div>
+              <p>Indefinidamente, mientras la cola exista y no tenga TTL ni límite de longitud. Eso puede llenar el disco. Configura <code>x-message-ttl</code>, <code>x-max-length</code> o una política y decide qué hacer con lo descartado. La retención es una decisión de negocio: «siete días de eventos» se implementa con TTL, no con una promesa.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si un consumidor procesa el evento y cae antes del <code>ack</code>, ¿lo recibe otra vez?</summary>
+            <div>
+              <p>Sí. El broker no sabe que el efecto se produjo; solo sabe que no hubo confirmación. Por eso cada consumidor debe deduplicar por <code>eventId</code> o por clave de negocio. Es el precio de at-least-once, y es más barato que perder eventos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar un topic exchange para pub/sub?</summary>
+            <div>
+              <p>Sí, y suele ser mejor cuando los suscriptores solo quieren un subconjunto. La diferencia es que el topic decide por routing key; el fanout entrega todo a todos. Empieza con fanout si el evento interesa entero a cada servicio; pasa a topic cuando el filtrado sea una necesidad real, no una optimización prematura.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los suscriptores deben compartir el mismo esquema de evento?</summary>
+            <div>
+              <p>Comparten el contrato, no el código. Versiona el sobre, añade campos de forma opcional y no cambies el significado de los existentes. Si un consumidor necesita un campo que no existe, es una versión nueva del evento, no un parche silencioso en el productor.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

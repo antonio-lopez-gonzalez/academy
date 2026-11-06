@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-cdn-y-cache">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CDN y caché — Módulo 6 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>CDN y caché</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Integración</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Servir objetos desde MinIO funciona hasta que llegan usuarios de tres continentes o un pico de tráfico golpea el mismo PDF mil veces por minuto. Entonces aparece la CDN: una capa de caché delante del origen que acerca el contenido y absorbe las peticiones repetidas. Configurarla mal es peor que no tenerla: puedes servir datos privados a quien no debe, cachear errores o dejar contenido obsoleto durante días.</p>
+        <p>La caché no se «activa»: se diseña. Depende de las cabeceras que MinIO devuelve, de cómo se construye la clave del objeto y de si la URL lleva firma o no. Un objeto inmutable con nombre versionado es el paraíso de una CDN; una URL presignada es exactamente lo contrario y debe quedar fuera de la caché.</p>
+        <p>En esta lección veremos las reglas que gobiernan la caché HTTP, cómo nombrar objetos para no tener que invalidar, cómo poner nginx delante de MinIO y cómo combinar presigned URLs con un CDN sin filtrar credenciales ni romper la firma.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el almacenamiento de objetos barato se vuelve caro cuando todo el tráfico sale del origen. La CDN reduce latencia y coste, pero solo si acierta. Un <em>hit ratio</em> bajo es dinero tirado; una política de caché laxa es un incidente de privacidad.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El camino de una petición</h3>
+        <pre><code class="language-text"> navegador                CDN edge                 origen (nginx)          MinIO
+     |                       |                          |                     |
+     | GET /public/a.v3.pdf  |                          |                     |
+     +----------------------&gt;|  HIT -&gt; responde         |                     |
+                             |  MISS -------------------&gt;|  proxy_cache MISS  |
+                             |                          +--------------------&gt;|
+                             |                          |&lt;--------------------+
+                             |&lt;-------------------------+  guarda y responde  |
+                             |  guarda en su caché      |                     |
+                             |&lt;-------------------------+                     |
+</code></pre>
+        <p>Hay dos cachés: la del CDN y, si lo configuras, la del proxy de origen. Cada una decide con sus propias reglas. Lo que una guarda no obliga a la otra, y una cabecera mal puesta puede hacer que la primera cachee algo que la segunda considera privado.</p>
+
+        <h3>La clave de caché</h3>
+        <p>Una caché no guarda «el archivo»: guarda una respuesta asociada a una clave. En HTTP, la clave suele ser método + host + ruta + query, con variaciones según <code>Vary</code>. Dos URLs distintas son dos entradas distintas aunque devuelvan el mismo contenido.</p>
+        <pre><code class="language-text">/public/2026/informe.pdf                     -&gt; clave A
+/public/2026/informe.pdf?X-Amz-Signature=…   -&gt; clave B (distinta en cada firma)
+/public/2026/informe.pdf?v=3                 -&gt; clave C (versionado explícito)</code></pre>
+        <p>De ahí sale la primera regla: <strong>las URLs firmadas no se cachean</strong>. La firma cambia por usuario, por fecha y por expiración; cada petición sería un fallo de caché. Peor aún, cachear la respuesta de una URL firmada puede servir el objeto a alguien cuya firma no se validó.</p>
+
+        <h3>Cabeceras que mandan</h3>
+        <table>
+          <thead><tr><th>Cabecera</th><th>Significado</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>Cache-Control: public, max-age=31536000, immutable</code></td><td>Cualquier caché puede guardarlo un año; el contenido no cambiará</td><td>Assets con nombre versionado</td></tr>
+            <tr><td><code>Cache-Control: private, max-age=0, no-store</code></td><td>Solo el navegador, sin almacenamiento</td><td>Documentos con datos personales</td></tr>
+            <tr><td><code>s-maxage=600</code></td><td>Tiempo para cachés compartidas; prevalece sobre <code>max-age</code> en el CDN</td><td>Contenido público que cambia poco</td></tr>
+            <tr><td><code>stale-while-revalidate=60</code></td><td>Sirve algo viejo mientras revalida en segundo plano</td><td>Portadas y listados</td></tr>
+            <tr><td><code>ETag</code> / <code>Last-Modified</code></td><td>Permiten revalidar con <code>If-None-Match</code></td><td>Contenido que cambia</td></tr>
+            <tr><td><code>Vary: Accept-Encoding</code></td><td>Separa variantes comprimidas y sin comprimir</td><td>Texto, JSON, SVG</td></tr>
+            <tr><td><code>Content-Encoding: gzip</code></td><td>El cuerpo va comprimido</td><td>Solo si lo comprimiste tú o el proxy</td></tr>
+          </tbody>
+        </table>
+        <p><code>immutable</code> es una promesa: si el contenido cambia, cambia la URL. No la uses en un objeto que sobrescribes en el mismo sitio, porque los navegadores no volverán a preguntar durante el tiempo indicado.</p>
+
+        <h3>Versionar claves en lugar de invalidar</h3>
+        <p>Invalidar una caché es caro, lento y propenso a olvidos. La alternativa es que la URL cambie cuando cambia el contenido:</p>
+        <pre><code class="language-text">public/logo.v1.svg
+public/logo.v2.svg
+public/2026/informe-9f3c2ab.pdf     &lt;- hash corto del contenido
+</code></pre>
+        <p>El objeto antiguo puede quedarse ahí; el lifecycle lo expira cuando ya no se pide. Los enlaces nuevos apuntan a la clave nueva, y la caché acierta desde el primer momento. Esto encaja perfectamente con un almacén de documentos: cada versión publicada tiene su propia clave y su propio <code>versionId</code>.</p>
+
+        <h3>Presigned URLs y CDN: tres patrones</h3>
+        <table>
+          <thead><tr><th>Patrón</th><th>Cómo funciona</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td>Bypass de firmadas</td><td>El CDN detecta <code>X-Amz-Signature</code> y no cachea; reenvía al origen</td><td>Descargas privadas puntuales</td></tr>
+            <tr><td>URL firmada del CDN</td><td>El CDN firma su propia URL; el origen confía en el CDN</td><td>Contenido privado con mucho tráfico</td></tr>
+            <tr><td>Prefijo público + token</td><td>Objetos públicos con nombre no adivinable y validación en el edge</td><td>Assets públicos, no documentos sensibles</td></tr>
+          </tbody>
+        </table>
+        <p>La opción segura por defecto es la primera: el CDN reenvía la petición firmada sin almacenarla. La segunda es la adecuada si necesitas cachear contenido privado; implica que el bucket no sea público y que el CDN tenga credenciales de origen acotadas. El detalle de firma y expiración está en <a href="../03-seguridad/03-presigned-urls.html">Presigned URLs</a>.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Nunca firmes con root para el CDN</p>
+          <p>Si el CDN firma con credenciales root, cualquier error de configuración expone el almacén entero. Crea un usuario con permisos solo de lectura sobre el prefijo público y úsalo para el origen. Y no pongas la clave en el repositorio: va en el gestor de secretos del CDN.</p>
+        </div>
+
+        <h3>Range requests y compresión</h3>
+        <p>Los navegadores piden rangos para vídeo, PDFs grandes y descargas reanudables. MinIO responde <code>206 Partial Content</code> con <code>Content-Range</code> y <code>Accept-Ranges: bytes</code>. Un CDN puede cachear rangos, pero no todos lo hacen bien: algunos almacenan el objeto completo en la primera petición parcial, otros no cachean <code>206</code>. Comprueba el comportamiento de tu proveedor antes de asumir que un vídeo se sirve desde el edge.</p>
+        <p>La compresión tiene la misma trampa. Comprimir un JPEG, un PDF o un MP4 no reduce tamaño y puede romper el rango. Comprime solo texto, JSON, SVG, JS y CSS; deja que el CDN lo haga con <code>Vary: Accept-Encoding</code> o hazlo en el build. Nunca comprimas dos veces: un <code>Content-Encoding: gzip</code> sobre un cuerpo ya comprimido es un error difícil de diagnosticar.</p>
+
+        <h3>Seguridad y coste</h3>
+        <ul>
+          <li><strong>TLS en todo el camino</strong>: navegador-CDN y CDN-origen. Sin lo segundo, el tráfico interno viaja en claro.</li>
+          <li><strong>Origen no expuesto</strong>: el bucket no debe ser público; el CDN accede con credenciales o con una red privada.</li>
+          <li><strong>Separar dominios</strong>: usa un dominio distinto para contenido público y para la API; así una política de caché no afecta a la otra.</li>
+          <li><strong>Control de hotlinking</strong>: tokens, referer o firmas para evitar que terceros consuman tu ancho de banda.</li>
+          <li><strong>Coste</strong>: el <em>hit ratio</em> es la métrica clave. Un 95 % de aciertos reduce drásticamente el egress del origen; un 40 % paga CDN y origen.</li>
+          <li><strong>Invalidaciones</strong>: muchas CDN cobran por purga. Versionar claves evita pagar por algo que el diseño puede resolver.</li>
+        </ul>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Sube un objeto con una política de caché explícita y comprueba las cabeceras que devuelve MinIO. El nombre incluye una versión: si cambias el contenido, cambias la clave.</p>
+        <pre><code class="language-bash">mc cp logo.svg local/documentos/public/logo.v3.svg \
+  --attr "Cache-Control=public, max-age=31536000, immutable" \
+  --attr "Content-Type=image/svg+xml"
+
+mc stat local/documentos/public/logo.v3.svg
+</code></pre>
+        <pre><code class="language-text">Name      : logo.v3.svg
+Date      : 2026-11-05 10:20:00 CET
+Size      : 4.2 KiB
+ETag      : 9f3c2ab1c4d5e6f708192a3b4c5d6e7f
+Type      : image/svg+xml
+Metadata  :
+  Cache-Control: public, max-age=31536000, immutable
+</code></pre>
+        <p>Para ver la respuesta HTTP real necesitas una URL alcanzable. Con lectura anónima limitada al prefijo <code>public/</code>, <code>curl -I</code> muestra las cabeceras sin exponer el resto del bucket:</p>
+        <pre><code class="language-bash">mc anonymous set download local/documentos/public
+curl -sI http://localhost:9000/documentos/public/logo.v3.svg
+</code></pre>
+        <pre><code class="language-text">HTTP/1.1 200 OK
+Content-Type: image/svg+xml
+Content-Length: 4301
+Cache-Control: public, max-age=31536000, immutable
+ETag: "9f3c2ab1c4d5e6f708192a3b4c5d6e7f"
+Accept-Ranges: bytes
+</code></pre>
+        <p>Si el objeto es privado, la petición anterior devuelve <code>403</code>. No lo arregles haciendo el bucket público: genera una URL firmada y verifica las cabeceras con ella. Lo importante es que <code>Cache-Control</code> viaja desde el metadato del objeto, no se inventa en el CDN.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El document store sirve dos tipos de contenido: assets públicos (logotipos, plantillas, documentación) y documentos privados. Los primeros pasan por una caché nginx; los segundos se sirven con presigned URLs y <strong>no se cachean</strong>. Este es el bloque de nginx que implementa ambas políticas:</p>
+        <pre><code class="language-text">proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=s3cache:100m
+                 max_size=10g inactive=60m use_temp_path=off;
+
+map $args $is_presigned {
+    default 0;
+    "~X-Amz-Signature=" 1;
+}
+
+server {
+    listen 8081;
+    server_name localhost;
+
+    location / {
+        proxy_pass http://minio:9000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+
+        proxy_cache s3cache;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_valid 200 206 10m;
+        proxy_cache_valid 404 1m;
+        proxy_cache_bypass $is_presigned;
+        proxy_no_cache $is_presigned;
+        add_header X-Cache-Status $upstream_cache_status always;
+
+        proxy_set_header Range $http_range;
+        proxy_set_header If-Range $http_if_range;
+    }
+}
+</code></pre>
+        <p>Por qué cada línea importa:</p>
+        <ul>
+          <li><code>proxy_cache_key</code> incluye la ruta y la query: dos versiones del mismo asset son claves distintas.</li>
+          <li><code>proxy_cache_bypass</code> y <code>proxy_no_cache</code> se activan con cualquier URL que lleve <code>X-Amz-Signature</code>: ni se lee ni se escribe caché para contenido firmado.</li>
+          <li><code>proxy_set_header Host $http_host</code> conserva el host público. Si lo reescribes, la firma de las peticiones firmadas deja de cuadrar.</li>
+          <li><code>Range</code> e <code>If-Range</code> se reenvían para que las descargas parciales funcionen.</li>
+          <li><code>X-Cache-Status</code> es tu instrumento de medida: <code>MISS</code>, <code>HIT</code>, <code>BYPASS</code>.</li>
+        </ul>
+        <p>El bucket no se hace público: solo el prefijo <code>public/</code> tiene lectura anónima. nginx no firma peticiones SigV4, así que la caché cubre únicamente ese prefijo; los documentos privados se sirven con presigned URLs directas o con un CDN que firme por su cuenta. Para los assets públicos, la aplicación genera la URL pública; para los documentos, una presigned URL contra el host público (<code>http://localhost:8081</code> en el laboratorio, el dominio de la CDN en producción).</p>
+        <table>
+          <thead><tr><th>Tipo de contenido</th><th>Clave</th><th>Cabecera</th><th>Caché</th></tr></thead>
+          <tbody>
+            <tr><td>Logo o plantilla</td><td><code>public/logo.v3.svg</code></td><td><code>public, max-age=31536000, immutable</code></td><td>Sí, un año</td></tr>
+            <tr><td>Documento privado</td><td><code>acme/2026/factura/01H…/factura.pdf</code></td><td><code>private, no-store</code></td><td>No</td></tr>
+            <tr><td>Miniatura pública</td><td><code>public/thumbs/01H….webp</code></td><td><code>public, s-maxage=86400</code></td><td>Sí, un día</td></tr>
+            <tr><td>Descarga firmada</td><td>Cualquiera + <code>X-Amz-Signature</code></td><td><code>private, no-store</code></td><td>Bypass explícito</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">Mide antes de optimizar</p>
+          <p>Con <code>X-Cache-Status</code> puedes calcular el <em>hit ratio</em> por prefijo. Si <code>public/</code> acierta el 95 % y <code>documentos/</code> el 0 %, no es un fallo: es que los documentos privados no deben cachearse. Optimiza el prefijo público y deja el privado fuera.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Versionar la clave y usar <code>immutable</code></td><td>Sobrescribir el mismo objeto y confiar en la purga</td><td>La caché acierta sin invalidaciones caras ni olvidos.</td></tr>
+            <tr><td>Excluir las URLs firmadas de la caché</td><td>Cachear respuestas con <code>X-Amz-Signature</code></td><td>Evita fugas y ataques de clave única.</td></tr>
+            <tr><td>Definir <code>Cache-Control</code> en el objeto</td><td>Dejar que el CDN aplique heurísticas</td><td>El comportamiento por defecto varía y puede ser demasiado largo.</td></tr>
+            <tr><td>Separar prefijos públicos y privados</td><td>Un único bucket con políticas mezcladas</td><td>Una regla de caché no contamina el contenido sensible.</td></tr>
+            <tr><td>Conservar <code>Host</code> y reenviar <code>Range</code></td><td>Reescribir cabeceras sin pensar en la firma o en el vídeo</td><td>Rompe SigV4 y las descargas parciales.</td></tr>
+            <tr><td>Comprimir solo texto y con <code>Vary</code></td><td>Gzip sobre JPEG, PDF o MP4</td><td>No reduce tamaño y puede corromper rangos.</td></tr>
+            <tr><td>Monitorizar <em>hit ratio</em>, latencia y egress</td><td>Asumir que la CDN «ya optimiza»</td><td>Sin métricas no sabes si estás pagando dos veces.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Cachear respuestas de URLs firmadas</h3>
+        <span class="code-label code-label--wrong">Mal — la firma forma parte de la clave y de la respuesta</span>
+        <pre><code class="language-text">GET /documentos/informe.pdf?X-Amz-Signature=aaa -&gt; MISS, se guarda
+GET /documentos/informe.pdf?X-Amz-Signature=bbb -&gt; otra clave, otro MISS
+y si el CDN ignora la query: sirve la respuesta de "aaa" a "bbb"</code></pre>
+        <span class="code-label code-label--right">Bien — bypass explícito de firmadas</span>
+        <pre><code class="language-text">map $args $is_presigned {
+    default 0;
+    "~X-Amz-Signature=" 1;
+}
+proxy_cache_bypass $is_presigned;
+proxy_no_cache $is_presigned;
+</code></pre>
+        <p>El problema no es solo el <em>hit ratio</em>: es que una respuesta privada puede quedar almacenada y servirse sin validar la firma de quien pregunta.</p>
+
+        <h3>2. No enviar <code>Cache-Control</code></h3>
+        <span class="code-label code-label--wrong">Mal — el CDN decide por ti</span>
+        <pre><code class="language-javascript">await client.putObject("documentos", "public/precio.pdf", stream, {
+  "Content-Type": "application/pdf",
+}); // sin Cache-Control: caché heurística e impredecible
+</code></pre>
+        <span class="code-label code-label--right">Bien — política explícita y adecuada al tipo</span>
+        <pre><code class="language-javascript">await client.putObject("documentos", "public/precio.v4.pdf", stream, {
+  "Content-Type": "application/pdf",
+  "Cache-Control": "public, max-age=86400, s-maxage=3600",
+});
+</code></pre>
+        <p>Un precio que cambia cada hora no puede llevar <code>max-age=31536000</code>. Un asset con hash sí. La política se decide por contenido, no por comodidad.</p>
+
+        <h3>3. Invalidar todo en cada despliegue</h3>
+        <span class="code-label code-label--wrong">Mal — purgas masivas y costosas</span>
+        <pre><code class="language-bash"># tras cada deploy
+curl -X POST "https://api.cdn.example/purge" -d '{"paths":["/*"]}'
+</code></pre>
+        <span class="code-label code-label--right">Bien — claves nuevas, purga mínima</span>
+        <pre><code class="language-text">public/app.9f3c2ab.js
+public/app.4d81e07.js
+# el HTML apunta a la nueva; la caché antigua expira sola</code></pre>
+        <p>La purga total tarda, cuesta y deja una ventana de fallos. Versionar reduce la invalidación a los pocos documentos que realmente cambian de nombre.</p>
+
+        <h3>4. Comprimir lo que ya está comprimido</h3>
+        <span class="code-label code-label--wrong">Mal — gzip sobre imágenes y PDFs</span>
+        <pre><code class="language-text">Content-Type: image/jpeg
+Content-Encoding: gzip      &lt;- doble compresión, rangos rotos
+</code></pre>
+        <span class="code-label code-label--right">Bien — comprimir solo texto y declarar la variante</span>
+        <pre><code class="language-text">Content-Type: application/json
+Content-Encoding: gzip
+Vary: Accept-Encoding</code></pre>
+        <p>La compresión de un JPEG suele aumentar el tamaño y confunde a clientes que piden rangos. Si el CDN comprime, no lo hagas también en el origen.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> poner una caché nginx delante de MinIO, comprobar <code>MISS</code>/<code>HIT</code>, verificar rangos y demostrar que una URL firmada no se cachea.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara el bucket y un asset versionado:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing local/documentos
+printf '&lt;svg xmlns="http://www.w3.org/2000/svg"&gt;&lt;text&gt;v3&lt;/text&gt;&lt;/svg&gt;\n' &gt; logo.v3.svg
+mc cp logo.v3.svg local/documentos/public/logo.v3.svg \
+  --attr "Cache-Control=public, max-age=31536000, immutable" \
+  --attr "Content-Type=image/svg+xml"
+mc stat local/documentos/public/logo.v3.svg
+</code></pre>
+          </li>
+          <li>
+            <strong>Concede lectura anónima solo al prefijo público y monta nginx</strong> con el bloque de la sección 4:
+            <pre><code class="language-bash">mc anonymous set download local/documentos/public
+docker compose up -d nginx
+docker compose logs --tail=20 nginx
+</code></pre>
+            <p>Añade el servicio a tu Compose con la red de MinIO y el puerto <code>8081:8081</code>. El resto del bucket sigue privado: nginx solo puede servir lo que sea anónimamente legible.</p>
+          </li>
+          <li>
+            <strong>Haz dos peticiones y observa la caché:</strong>
+            <pre><code class="language-bash">curl -sI http://localhost:8081/documentos/public/logo.v3.svg | grep -i x-cache
+curl -sI http://localhost:8081/documentos/public/logo.v3.svg | grep -i x-cache
+</code></pre>
+            <pre><code class="language-text">x-cache-status: MISS
+x-cache-status: HIT</code></pre>
+            <p>La primera llena la caché; la segunda se sirve desde nginx. Si ambas son <code>MISS</code>, revisa <code>proxy_cache_path</code> y los permisos del directorio.</p>
+          </li>
+          <li>
+            <strong>Prueba una descarga por rangos:</strong>
+            <pre><code class="language-bash">curl -s -D - -o /dev/null \
+  -H "Range: bytes=0-99" \
+  http://localhost:8081/documentos/public/logo.v3.svg
+</code></pre>
+            <p>Espera <code>206 Partial Content</code>, <code>Content-Range: bytes 0-99/…</code> y <code>Accept-Ranges: bytes</code>. Si recibes <code>200</code> con el objeto completo, el proxy no está reenviando <code>Range</code>.</p>
+          </li>
+          <li>
+            <strong>Firma una URL contra el host público y comprueba el bypass:</strong>
+            <pre><code class="language-bash">mc alias set edge http://localhost:8081 minioadmin minioadmin123
+SIGNED=$(mc share download edge/documentos/public/logo.v3.svg --expire 10m | grep -o 'http[^ ]*')
+curl -sI "$SIGNED" | grep -i x-cache
+curl -sI "$SIGNED" | grep -i x-cache
+</code></pre>
+            <p>Ambas deben ser <code>BYPASS</code>, no <code>HIT</code>. Si la firma se generó con <code>localhost:9000</code> y la petición va a <code>localhost:8081</code>, obtendrás <code>SignatureDoesNotMatch</code>: el host forma parte de la firma.</p>
+          </li>
+          <li>
+            <strong>Publica una versión nueva sin purgar:</strong> sube <code>logo.v4.svg</code> con la misma política, pide la URL nueva (será <code>MISS</code>) y vuelve a pedir la antigua (seguirá <code>HIT</code>). Ese es el objetivo: contenido nuevo con URL nueva, caché vieja intacta y cero invalidaciones.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Con <code>docker compose exec nginx du -sh /var/cache/nginx</code> verás crecer la caché. Si borras el objeto del origen, la copia cacheada seguirá sirviéndose hasta que expire: por eso el lifecycle del bucket no sustituye a la política de caché.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Dos audiencias, una CDN</h3>
+          <p>Diseña la estrategia de entrega para un document store que sirve assets públicos globales y documentos privados por suscripción. Debes conseguir: latencia baja para los públicos, privacidad estricta para los privados, URLs que caduquen y un coste de egress controlado. Decide qué se cachea, durante cuánto tiempo, con qué clave y cómo se invalida cuando un documento se marca como confidencial.</p>
+          <p>Incluye el diagrama de flujo, las cabeceras por tipo de contenido y una prueba de que una URL firmada caducada no puede servirse desde caché. Justifica si usarías una CDN con URLs firmadas propias o un bypass del origen, y qué le pasa al <em>hit ratio</em> en cada caso.</p>
+          <p><em>Pista: separa los dominios antes de separar las reglas. Si el mismo host sirve ambos mundos, una configuración de caché demasiado amplia termina aplicándose al contenido que no toca.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La caché guarda respuestas por clave: método, host, ruta y query forman parte de ella.</li>
+          <li>Las URLs firmadas cambian de clave en cada firma y nunca deben cachearse.</li>
+          <li><code>Cache-Control</code> se define en el objeto; <code>immutable</code> exige claves versionadas.</li>
+          <li>Versionar claves es más barato y fiable que invalidar la caché entera.</li>
+          <li>Conservar <code>Host</code> y reenviar <code>Range</code> evita romper SigV4 y las descargas parciales.</li>
+          <li>Comprime solo texto, con <code>Vary: Accept-Encoding</code>, y nunca dos veces.</li>
+          <li>Mide <em>hit ratio</em>, latencia y egress; el contenido privado no necesita caché.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Efecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>Cache-Control: public, max-age=…, immutable</code></td><td>Permite caché larga sin revalidar</td></tr>
+            <tr><td><code>Cache-Control: private, no-store</code></td><td>Excluye el objeto de cachés compartidas</td></tr>
+            <tr><td><code>s-maxage</code></td><td>Tiempo específico para cachés compartidas</td></tr>
+            <tr><td><code>proxy_cache_bypass $is_presigned</code></td><td>No lee ni escribe caché para URLs firmadas</td></tr>
+            <tr><td><code>X-Cache-Status</code></td><td>MISS, HIT o BYPASS para medir el acierto</td></tr>
+            <tr><td><code>Accept-Ranges</code> / <code>206</code></td><td>Descargas parciales y reanudables</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo cachear documentos privados en la CDN?</summary>
+            <div>
+              <p>Sí, pero no con URLs presignadas de MinIO. Usa URLs firmadas por la propia CDN o un mecanismo de token en el edge, con el bucket privado y credenciales de origen acotadas. La caché debe distinguir la autorización de la identidad del contenido; si la clave incluye la firma, el <em>hit ratio</em> será cero.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué <code>max-age</code> pongo a un PDF que cambia a veces?</summary>
+            <div>
+              <p>Si cambia, no lo trates como inmutable: usa una clave versionada o un <code>max-age</code> corto con revalidación por ETag. La pregunta correcta no es «cuánto tarda en cambiar», sino «qué pasa si alguien ve la versión anterior». Para contenido regulado, la respuesta suele ser que no puede pasar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El ETag sirve para validar integridad?</summary>
+            <div>
+              <p>En un PUT simple suele ser el MD5 del contenido, pero en multipart es un hash de los ETags de las partes y con cifrado puede no ser un hash del texto claro. Úsalo para revalidar caché y para comparar versiones, no como única prueba de integridad. Para eso, calcula tu propio checksum.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La CDN puede servir un objeto después de borrarlo del bucket?</summary>
+            <div>
+              <p>Sí, hasta que expire su entrada. Borrar en el origen no borra la copia del edge. Si el contenido debe desaparecer de inmediato, necesitas una purga explícita o claves que dejen de distribuirse; el lifecycle del bucket no controla la CDN.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Merece la pena una CDN para un almacén interno?</summary>
+            <div>
+              <p>Si los usuarios están en la misma red y el volumen es bajo, probablemente no. La CDN aporta cuando hay distancia geográfica, mucho tráfico repetido o necesidad de absorber picos. Mide latencia y egress antes de añadir una capa que también hay que operar.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

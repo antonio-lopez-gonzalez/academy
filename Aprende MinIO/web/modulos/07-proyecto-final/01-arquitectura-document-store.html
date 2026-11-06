@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-arquitectura-document-store">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura del document store — Módulo 7 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura del document store</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un almacén de documentos no es una carpeta compartida con una API delante. Es un sistema donde el objeto, sus metadatos y el catálogo evolucionan por separado; donde una subida puede fallar a medias; donde un borrado debe poder deshacerse; y donde el coste de equivocarse en la clave se paga durante años.</p>
+        <p>En este módulo construimos <code>documentos</code>, el almacén que hemos ido preparando: subida directa con presigned URLs, catálogo de metadatos, versionado, lifecycle, eventos y pruebas. El proyecto ejecutable vive en <code>proyectos/document-store/</code> y se levanta con un solo <code>docker compose up</code> más <code>npm run api</code>.</p>
+        <p>Esta primera lección no escribe la API: toma las decisiones. Qué buckets existen, cómo se llama cada objeto, qué guarda el catálogo, qué garantiza MinIO y qué tenemos que garantizar nosotros. El resto del módulo implementa ese contrato.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el 80 % de los problemas de un almacén vienen del modelo de datos, no del SDK. Una clave que depende del nombre original, un catálogo que se cree la fuente de verdad o un bucket público por comodidad se arreglan mal y tarde. Diseñarlo antes cuesta una hora; corregirlo en producción cuesta una migración.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Requisitos antes de tocar MinIO</h3>
+        <table>
+          <thead><tr><th>Requisito</th><th>Decisión</th><th>Consecuencia</th></tr></thead>
+          <tbody>
+            <tr><td>Multi-tenant</td><td>Un prefijo por tenant, un bucket compartido</td><td>Aislamiento lógico; políticas por prefijo.</td></tr>
+            <tr><td>Subida directa</td><td>Presigned PUT de 15 minutos</td><td>La API no transporta bytes; MinIO recibe la subida.</td></tr>
+            <tr><td>Tipos permitidos</td><td>Lista blanca en el servidor</td><td>PDF, imágenes, texto, ZIP y ofimática; nada ejecutable.</td></tr>
+            <tr><td>Tamaño máximo</td><td>25 MiB por objeto</td><td>Se valida al pedir la URL y otra vez al completar.</td></tr>
+            <tr><td>Recuperación</td><td>Versionado activo y borrado con delete marker</td><td>Un borrado accidental es reversible.</td></tr>
+            <tr><td>Limpieza</td><td>Lifecycle para <code>tmp/</code> y versiones no actuales</td><td>Los restos no crecen sin límite.</td></tr>
+            <tr><td>Trazabilidad</td><td>Catálogo de metadatos y eventos</td><td>Se consulta por tenant y fecha sin listar el bucket.</td></tr>
+            <tr><td>Operación</td><td>Compose de un nodo para el curso</td><td>Distribuido, solo con Operator o baremetal.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Modelo de claves: el contrato más duradero</h3>
+        <p>La clave es el identificador permanente del objeto. Debe ser única, estable, segura y fácil de listar por prefijo. El modelo canónico que buscamos es:</p>
+        <pre><code class="language-text">{tenant}/{año}/{tipo}/{id}-{nombre-seguro}
+acme/2026/factura/7f2c9a1e-informe.pdf</code></pre>
+        <p>El proyecto de referencia simplifica un nivel: usa el <strong>mes</strong> en lugar del tipo y guarda el tipo en el catálogo, porque un documento puede tener varios tipos de negocio y no queremos duplicar la fuente de verdad:</p>
+        <pre><code class="language-text">{tenant}/{AAAA}/{MM}/{uuid}-{nombre-seguro}
+acme/2026/11/7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e-informe.pdf</code></pre>
+        <p>Ambos cumplen los mismos principios: el <strong>tenant</strong> delimita el espacio, la <strong>fecha</strong> permite lifecycle y listados, el <strong>id</strong> lo genera el servidor y el <strong>nombre</strong> se sanea. El tipo es un atributo consultable, no una carpeta.</p>
+        <table>
+          <thead><tr><th>Componente</th><th>Regla</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>tenant</td><td><code>^[a-z0-9][a-z0-9-]{1,30}$</code></td><td>Evita mayúsculas, barras y traversal.</td></tr>
+            <tr><td>año/mes</td><td>UTC, dos dígitos el mes</td><td>Listados estables y lifecycle por prefijo.</td></tr>
+            <tr><td>id</td><td>UUID generado por el servidor</td><td>El cliente no elige la ruta ni puede adivinarla.</td></tr>
+            <tr><td>nombre</td><td>NFD, sin acentos, <code>[a-zA-Z0-9._-]</code>, 120 caracteres</td><td>Compatible, legible y sin sorpresas.</td></tr>
+            <tr><td>prefijo <code>tmp/</code></td><td>Reservado para restos y pruebas</td><td>Lifecycle lo expira sin tocar documentos reales.</td></tr>
+          </tbody>
+        </table>
+        <p>Un prefijo no es una carpeta: es una convención sobre cadenas. No hay renombrado ni movimiento atómico; «mover» un objeto es copiar y borrar. Diseña la clave para que nunca necesites renombrarla.</p>
+
+        <h3>Buckets y prefijos</h3>
+        <pre><code class="language-text">bucket: documentos
+├── acme/2026/11/7f2c…-informe.pdf
+├── acme/2026/11/9a1b…-contrato.pdf
+├── globex/2026/10/3c4d…-factura.pdf
+└── tmp/                      &lt;- lifecycle: expira en 1 día</code></pre>
+        <p>Un solo bucket simplifica políticas, réplica y backup. Los tenants se separan por prefijo y las políticas IAM pueden limitar el acceso a <code>arn:aws:s3:::documentos/acme/*</code>. Un bucket por tenant solo se justifica si necesitas cuotas, cifrado o retención radicalmente distintos, o si el número de tenants es pequeño y estable.</p>
+        <p>Para cuarentena o derivados, añade buckets separados (<code>documentos-cuarentena</code>, <code>documentos-derivados</code>) con sus propias políticas. No mezcles contenido aprobado con contenido sin escanear en el mismo prefijo público.</p>
+
+        <h3>Tres capas de información</h3>
+        <table>
+          <thead><tr><th>Capa</th><th>Qué guarda</th><th>Se consulta</th></tr></thead>
+          <tbody>
+            <tr><td>Metadatos del sistema</td><td><code>Content-Type</code>, <code>Cache-Control</code>, tamaño, ETag</td><td>Con <code>HeadObject</code></td></tr>
+            <tr><td>Metadatos de usuario</td><td><code>x-amz-meta-*</code> (máx. ~2 KB)</td><td>Con <code>HeadObject</code>, no con búsquedas</td></tr>
+            <tr><td>Etiquetas</td><td>Hasta 10 pares clave/valor</td><td>Filtros de lifecycle y políticas</td></tr>
+            <tr><td>Catálogo</td><td>tenant, tipo, estado, fechas, versión, propietario</td><td>Consultas de la aplicación</td></tr>
+          </tbody>
+        </table>
+        <p>El catálogo del proyecto es un JSON con escritura atómica y una cola de mutaciones; es didáctico y suficiente para el curso. En producción sería PostgreSQL, con índices por tenant, estado y fecha. MinIO no sustituye a una base de datos: listar millones de objetos para filtrar por tipo es lento y caro.</p>
+        <pre><code class="language-json">{
+  "id": "7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e",
+  "tenant": "acme",
+  "filename": "informe.pdf",
+  "key": "acme/2026/11/7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e-informe.pdf",
+  "contentType": "application/pdf",
+  "size": 204800,
+  "status": "stored",
+  "etag": "9f3c2ab1c4d5e6f708192a3b4c5d6e7f",
+  "createdAt": "2026-11-05T10:00:00.000Z",
+  "completedAt": "2026-11-05T10:01:12.000Z"
+}</code></pre>
+
+        <h3>El flujo completo</h3>
+        <pre><code class="language-text">POST /documents            API: valida, genera id y clave, crea catálogo (pending)
+                           devuelve presigned PUT
+        |
+        v
+PUT uploadUrl              navegador -&gt; MinIO (sin credenciales)
+        |
+        v
+POST /documents/:id/complete
+                           API: statObject, valida tamaño real,
+                           catálogo -&gt; stored, webhook document.stored
+        |
+        v
+GET /documents/:id         API: ficha + presigned GET
+DELETE /documents/:id      API: removeObject -&gt; delete marker, catálogo -&gt; deleted</code></pre>
+        <p>Hay dos momentos de verdad: el objeto existe cuando MinIO responde al PUT, y el documento está «stored» cuando el catálogo lo confirma tras <code>statObject</code>. Entre ambos, el estado es <code>pending</code> y la descarga no debe anunciarse como disponible.</p>
+
+        <h3>Consistencia y reconciliación</h3>
+        <p>MinIO es fuertemente consistente para las operaciones de objeto: un PUT confirmado se lee después. El catálogo, en cambio, es otro sistema y puede fallar entre la escritura del objeto y la del registro. Por eso el estado <code>pending</code> es explícito y el reconciliador compara:</p>
+        <ul>
+          <li>Documentos <code>pending</code> con objeto existente y tamaño válido → completar.</li>
+          <li>Documentos <code>stored</code> sin objeto → marcar <code>missing</code> y alertar.</li>
+          <li>Objetos en el bucket sin registro → crear un registro huérfano para investigar.</li>
+        </ul>
+        <p>Esta rutina es la que convierte un sistema «que funciona cuando todo va bien» en uno operable. Se ejecuta al arrancar y periódicamente; nunca borra datos por su cuenta.</p>
+
+        <h3>Seguridad y límites</h3>
+        <table>
+          <thead><tr><th>Riesgo</th><th>Control</th></tr></thead>
+          <tbody>
+            <tr><td>Bucket público por comodidad</td><td>Bucket privado; descargas solo con presigned GET corto</td></tr>
+            <tr><td>Clave elegida por el cliente</td><td>UUID y ruta generados en el servidor</td></tr>
+            <tr><td>URL de larga duración</td><td>900 s por defecto; se acorta en producción</td></tr>
+            <tr><td>Credenciales root en la API</td><td>Usuario de mínimo privilegio sobre el prefijo del tenant</td></tr>
+            <tr><td>Sin límite de tamaño</td><td>Validación en la creación y <code>statObject</code> al completar</td></tr>
+            <tr><td>Borrado irreversible</td><td>Versionado + delete marker; lifecycle solo para no actuales</td></tr>
+            <tr><td>Escalado del catálogo</td><td>JSON solo para el curso; SQL en producción</td></tr>
+            <tr><td>Distribución</td><td>Compose es un nodo; HA con Operator o baremetal</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Decisiones y alternativas</h3>
+        <table>
+          <thead><tr><th>Decisión</th><th>Alternativa descartada</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td>Bucket único + prefijo por tenant</td><td>Un bucket por tenant</td><td>Menos políticas y operación; el prefijo basta para el curso.</td></tr>
+            <tr><td>UUID en la clave</td><td>Nombre original como clave</td><td>Colisiones, traversal y caracteres imposibles.</td></tr>
+            <tr><td>Mes en la clave</td><td>Tipo en la clave</td><td>El tipo cambia con el negocio; la fecha es estable.</td></tr>
+            <tr><td>Catálogo JSON</td><td>Listar el bucket para buscar</td><td>Las consultas por metadatos no escalan en S3.</td></tr>
+            <tr><td>Versionado activo</td><td>Copias manuales</td><td>Recuperación real ante borrados y sobrescrituras.</td></tr>
+            <tr><td>Presigned PUT directo</td><td>Proxy de subida por la API</td><td>Menos carga y menos memoria; el objeto no pasa dos veces.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El proyecto ya trae el bucket, el versionado y el lifecycle. Levántalo y comprueba el estado con tres órdenes:</p>
+        <pre><code class="language-bash">cd proyectos/document-store
+docker compose up -d
+npm install
+npm run bootstrap
+</code></pre>
+        <pre><code class="language-text">bucket documentos listo en 127.0.0.1:9000
+versionado: Enabled
+reglas de lifecycle: expire-tmp, expire-noncurrent</code></pre>
+        <p>Ese resultado confirma las tres decisiones estructurales: un bucket, versionado activo y dos reglas de lifecycle. Puedes verlo también con <code>mc</code>:</p>
+        <pre><code class="language-bash">mc alias set local http://localhost:9000 minioadmin minioadmin123
+mc version info local/documentos
+mc ilm rule ls local/documentos
+</code></pre>
+        <p>Y una clave de ejemplo, generada con las reglas del proyecto, se ve así:</p>
+        <pre><code class="language-javascript">import { documentKey } from "./src/keys.mjs";
+
+documentKey({
+  tenant: "acme",
+  filename: "../../Informe Año.pdf",
+  id: "7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e",
+  date: new Date("2026-11-05T12:00:00Z"),
+});
+// acme/2026/11/7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e-Informe-Ano.pdf
+</code></pre>
+        <p>Fíjate en lo que desapareció: <code>../../</code>, los acentos y los espacios. La clave no puede escapar del prefijo del tenant aunque el nombre original lo intente.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Así se ve un documento recorriendo el sistema desde que el usuario lo elige hasta que otro usuario lo descarga. Los estados del catálogo son la columna vertebral:</p>
+        <table>
+          <thead><tr><th>Momento</th><th>Objeto en MinIO</th><th>Catálogo</th><th>Qué puede hacer la API</th></tr></thead>
+          <tbody>
+            <tr><td>Se crea la ficha</td><td>No existe</td><td><code>pending</code></td><td>Devolver la URL de subida; no descargar.</td></tr>
+            <tr><td>El navegador sube</td><td>Existe, aún sin validar</td><td><code>pending</code></td><td>Nada nuevo; la URL de subida ya se usó.</td></tr>
+            <tr><td>Se completa</td><td>Existe y se verifica</td><td><code>stored</code></td><td>Ficha, descarga, listado.</td></tr>
+            <tr><td>Se borra</td><td>Delete marker</td><td><code>deleted</code></td><td>Ficha histórica; la descarga falla hasta restaurar.</td></tr>
+            <tr><td>Se restaura</td><td>Versión recuperada</td><td><code>stored</code></td><td>Descarga de nuevo.</td></tr>
+          </tbody>
+        </table>
+        <p>La API del proyecto separa las operaciones en dos grupos: las que hablan con el catálogo y las que hablan con MinIO. Esa separación permite probar la validación sin servidor y sustituir el catálogo sin tocar el almacenamiento.</p>
+        <pre><code class="language-text">src/keys.mjs      reglas puras: tenant, nombre, tipo, tamaño, clave
+src/catalog.mjs   persistencia del catálogo (JSON atómico)
+src/storage.mjs   MinIO: bucket, versionado, lifecycle, presign, stat
+src/api.mjs       HTTP: rutas, estados, errores
+test/*.test.mjs   node --test, sin MinIO</code></pre>
+        <p>Un detalle que marca la diferencia en operación: la API nunca confía en el tamaño declarado por el cliente. Al completar hace <code>statObject</code> y compara el tamaño real con el máximo. Si el objeto no existe, devuelve <code>409</code>; si supera el límite, <code>413</code>. El cliente puede mentir en el JSON, pero no en los bytes que MinIO almacenó.</p>
+        <p>Para el tenant <code>acme</code>, la política de producción debería permitir solo su prefijo. En el curso se usa root por comodidad; el README lo advierte y la lección <a href="../03-seguridad/02-usuarios-y-politicas.html">Usuarios y políticas</a> explica cómo crear el usuario acotado. El código no cambia: cambian las credenciales del entorno.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">El tipo, en el catálogo</p>
+          <p>El proyecto no incluye el tipo en la clave porque un mismo documento puede clasificarse de varias formas con el tiempo. Si tu dominio exige que el tipo sea parte de la ruta (por ejemplo, para lifecycle por tipo), usa <code>{tenant}/{año}/{tipo}/{id}-{nombre}</code> y asume que cambiar de tipo implica una nueva clave.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Generar id y clave en el servidor</td><td>Aceptar la ruta del cliente</td><td>Evita traversal, colisiones y sobreescrituras.</td></tr>
+            <tr><td>Guardar el tipo y el estado en el catálogo</td><td>Deducirlos del nombre o del prefijo</td><td>El nombre es una etiqueta, no una base de datos.</td></tr>
+            <tr><td>Versionar el bucket antes de la primera subida</td><td>Activarlo «cuando haga falta»</td><td>Las versiones anteriores al cambio no existen.</td></tr>
+            <tr><td>Lifecycle sobre <code>tmp/</code> y versiones no actuales</td><td>Expirar objetos corrientes</td><td>Una regla mal filtrada borra documentos reales.</td></tr>
+            <tr><td>Reconciliar catálogo y bucket</td><td>Confiar en que ambos cambian juntos</td><td>No hay transacción entre MinIO y la base de datos.</td></tr>
+            <tr><td>Probar claves y validaciones sin servidor</td><td>Probar solo con el entorno completo</td><td>Los tests rápidos cubren los errores que más duelen.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Usar el nombre original como clave</h3>
+        <span class="code-label code-label--wrong">Mal — colisiones y traversal</span>
+        <pre><code class="language-javascript">const key = `${tenant}/${body.filename}`;
+// acme/../../etc/passwd
+// acme/informe.pdf  (dos tenants suben el mismo nombre y se pisan)
+</code></pre>
+        <span class="code-label code-label--right">Bien — id del servidor y nombre saneado</span>
+        <pre><code class="language-javascript">const id = crypto.randomUUID();
+const key = documentKey({ tenant, filename, id });
+// acme/2026/11/7f2c…-informe.pdf
+</code></pre>
+        <p>El nombre visible para el usuario se guarda en el catálogo; la clave es un identificador, no una ruta de confianza.</p>
+
+        <h3>2. Suponer que prefijo es carpeta</h3>
+        <span class="code-label code-label--wrong">Mal — «mover» renombrando</span>
+        <pre><code class="language-bash"># ❌ no existe un rename de objetos
+mc mv local/documentos/acme/2026/11/informe.pdf local/documentos/acme/2026/11/final.pdf
+</code></pre>
+        <span class="code-label code-label--right">Bien — copiar y borrar, o mejor: no renombrar</span>
+        <pre><code class="language-bash">mc cp local/documentos/acme/2026/11/informe.pdf \
+      local/documentos/acme/2026/11/final.pdf
+mc rm local/documentos/acme/2026/11/informe.pdf
+</code></pre>
+        <p>Cada «movimiento» crea una versión nueva y deja la anterior. Si el nombre puede cambiar, guarda el nombre de presentación en el catálogo y deja la clave estable.</p>
+
+        <h3>3. Confiar en el tamaño que declara el cliente</h3>
+        <span class="code-label code-label--wrong">Mal — validar solo el JSON de entrada</span>
+        <pre><code class="language-javascript">assertSize(body.size, MAX); // el cliente puede decir 1024 y subir 2 GB
+</code></pre>
+        <span class="code-label code-label--right">Bien — verificar el objeto real al completar</span>
+        <pre><code class="language-javascript">const stat = await statObject(client, config, doc.key);
+if (!stat) throw new HttpError(409, "objeto no subido");
+if (stat.size &gt; config.maxUploadBytes) throw new HttpError(413, "demasiado grande");
+</code></pre>
+        <p>La validación de entrada evita trabajo inútil; la verificación de salida es la que protege el almacén.</p>
+
+        <h3>4. Hacer público el bucket para descargar</h3>
+        <span class="code-label code-label--wrong">Mal — permiso de lectura global</span>
+        <pre><code class="language-bash">mc anonymous set download local/documentos
+# cualquiera con la clave puede leer todos los tenants
+</code></pre>
+        <span class="code-label code-label--right">Bien — bucket privado y URL firmada por documento</span>
+        <pre><code class="language-javascript">const url = await client.presignedGetObject("documentos", doc.key, 300);
+</code></pre>
+        <p>La URL caduca y solo permite GET sobre esa clave. El bucket sigue cerrado y la política se puede auditar.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> levantar la infraestructura del proyecto, comprobar el modelo de claves y verificar que el bucket nace con versionado y lifecycle.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca MinIO y la API:</strong>
+            <pre><code class="language-bash">cd proyectos/document-store
+docker compose up -d
+npm install
+npm run api
+</code></pre>
+            <p>La API escucha en <code>http://localhost:7072</code>. En otra terminal, <code>curl http://localhost:7072/health</code> debe devolver <code>{"status":"ok","bucket":"documentos"}</code>.</p>
+          </li>
+          <li>
+            <strong>Comprueba versionado y lifecycle:</strong>
+            <pre><code class="language-bash">mc alias set local http://localhost:9000 minioadmin minioadmin123
+mc version info local/documentos
+mc ilm rule ls local/documentos
+</code></pre>
+            <p>Espera <code>Enabled</code> y las reglas <code>expire-tmp</code> (1 día) y <code>expire-noncurrent</code> (30 días).</p>
+          </li>
+          <li>
+            <strong>Prueba las reglas de clave en Node:</strong>
+            <pre><code class="language-bash">node --input-type=module -e "
+import { documentKey } from './src/keys.mjs';
+console.log(documentKey({ tenant: 'acme', filename: '../Año.pdf', id: '123e4567-e89b-12d3-a456-426614174000', date: new Date('2026-11-05') }));
+"
+</code></pre>
+            <p>Salida esperada: <code>acme/2026/11/123e4567-e89b-12d3-a456-426614174000-Ano.pdf</code>. No aparece <code>..</code> ni el acento.</p>
+          </li>
+          <li>
+            <strong>Crea un documento y observa la clave:</strong>
+            <pre><code class="language-bash">curl -s -X POST http://localhost:7072/documents \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"acme","filename":"informe.pdf","contentType":"application/pdf","size":2048}'
+</code></pre>
+            <p>La respuesta incluye <code>key</code> con el patrón <code>acme/2026/11/&lt;uuid&gt;-informe.pdf</code> y una <code>uploadUrl</code> que caduca en 900 s.</p>
+          </li>
+          <li>
+            <strong>Lista el prefijo del tenant:</strong>
+            <pre><code class="language-bash">mc ls --recursive local/documentos/acme/
+</code></pre>
+            <p>Verás los objetos por año y mes. Ese es el único «árbol» que existe: una convención de prefijos, no carpetas reales.</p>
+          </li>
+          <li>
+            <strong>Revisa el catálogo:</strong>
+            <pre><code class="language-bash">cat data/catalog.json
+</code></pre>
+            <p>Comprueba que el documento está en <code>pending</code> hasta completar la subida. El catálogo y el bucket son dos sistemas: mantenerlos coherentes es el trabajo de la API y del reconciliador.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un modelo para dos negocios incompatibles</h3>
+          <p>La empresa A necesita que los documentos se organicen por tipo (<code>factura</code>, <code>contrato</code>, <code>informe</code>) y que el lifecycle expire las facturas a los siete años. La empresa B necesita que el tipo cambie con el tiempo y que nada se borre antes de una auditoría. Diseña un único modelo de claves y catálogo que soporte ambos sin duplicar buckets ni romper el versionado.</p>
+          <p>Decide si el tipo va en la clave, en una etiqueta o solo en el catálogo; cómo aplicas lifecycle por tipo sin una regla por tenant; y qué pasa cuando un documento cambia de tipo. Justifica la respuesta con el coste de migración y con la reversibilidad de cada opción.</p>
+          <p><em>Pista: el lifecycle filtra por prefijo y por etiquetas, no por columnas de una base de datos. Si el tipo debe gobernar la retención, probablemente tenga que existir en el objeto, no solo en el catálogo.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La clave es un identificador permanente: tenant, fecha, UUID y nombre saneado.</li>
+          <li>Un prefijo no es una carpeta; no hay renombrado atómico ni movimiento.</li>
+          <li>El bucket es privado; las descargas usan presigned GET cortos.</li>
+          <li>El catálogo guarda lo que MinIO no puede consultar: tipo, estado, propietario y fechas.</li>
+          <li>El estado <code>pending</code> y el reconciliador cubren el hueco entre objeto y catálogo.</li>
+          <li>Versionado y lifecycle se configuran antes de la primera subida real.</li>
+          <li>Compose es un nodo; el modo distribuido va con Operator o baremetal.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Valor en el proyecto</th></tr></thead>
+          <tbody>
+            <tr><td>Bucket</td><td><code>documentos</code></td></tr>
+            <tr><td>Clave</td><td><code>{tenant}/{AAAA}/{MM}/{uuid}-{nombre}</code></td></tr>
+            <tr><td>API</td><td><code>http://localhost:7072</code></td></tr>
+            <tr><td>Límite</td><td>25 MiB (<code>MAX_UPLOAD_BYTES</code>)</td></tr>
+            <tr><td>Presign</td><td>900 s (<code>PRESIGN_EXPIRY_SECONDS</code>)</td></tr>
+            <tr><td>Lifecycle</td><td><code>tmp/</code> 1 día; no actuales 30 días</td></tr>
+            <tr><td>Catálogo</td><td><code>data/catalog.json</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Por qué no un bucket por tenant?</summary>
+            <div>
+              <p>Porque multiplica políticas, réplica, backup y operación sin aportar aislamiento real en este caso. El prefijo permite políticas por tenant y el catálogo filtra por tenant. Un bucket por tenant se justifica si necesitas cuotas o retención legales muy distintas, o si el número de tenants es pequeño y estable.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Dónde guardo el tipo de documento?</summary>
+            <div>
+              <p>En el catálogo, como atributo consultable. Si además debe gobernar lifecycle o políticas, añade una etiqueta o inclúyelo en la clave. La regla es no duplicar la verdad: elige una fuente principal y deriva el resto de forma controlada.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El catálogo JSON sirve para producción?</summary>
+            <div>
+              <p>No. Es didáctico: escribe un archivo completo en cada cambio y no soporta consultas concurrentes serias. En producción usa PostgreSQL u otra base con transacciones, índices y backups. La API del proyecto está separada para que sustituirlo no afecte a MinIO.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si subo el objeto pero nunca llamo a <code>/complete</code>?</summary>
+            <div>
+              <p>Queda <code>pending</code> y ocupa espacio. El lifecycle de <code>tmp/</code> no lo limpia si está en el prefijo del tenant. Necesitas una regla o un reconciliador que detecte pending antiguos y decida expirarlos. Es una de las razones por las que conviene subir primero a un prefijo temporal.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no guardo los bytes en la API?</summary>
+            <div>
+              <p>Porque la API tendría que recibir, bufferizar y reenviar cada archivo, consumiendo memoria y ancho de banda. Con presigned PUT el navegador habla directamente con MinIO y la API solo firma y verifica. Menos carga, menos timeouts y una ruta de subida más escalable.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

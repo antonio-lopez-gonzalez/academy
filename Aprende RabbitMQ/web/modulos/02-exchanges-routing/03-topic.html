@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-topic">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Topic: rutas con comodines — Módulo 2 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Topic: rutas con comodines</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Exchanges y routing</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Con direct, cada evento nuevo exige una binding nueva y cada consumidor tiene que conocer el nombre exacto. El taller crece: <code>pedido.creado</code>, <code>pedido.pagado</code>, <code>pedido.cancelado</code>, <code>pedido.enviado</code>, <code>factura.emitida</code>, <code>factura.anulada</code>. Facturación quiere «todo lo de pedidos que afecte al cobro», analítica quiere «todo lo de pedidos» y auditoría quiere «todo». Mantener eso con direct es una lista que crece sin parar.</p>
+        <p>El exchange <strong>topic</strong> resuelve ese problema con una idea sencilla: la routing key es una <strong>jerarquía de palabras separadas por puntos</strong> y las bindings pueden usar dos comodines. <code>*</code> coincide con <em>exactamente una</em> palabra; <code>#</code> coincide con <em>cero o más</em>. El productor publica un valor concreto; el consumidor declara el patrón que le interesa. El filtro vive en la topología, no en un <code>if</code> dentro del consumidor.</p>
+        <p>Su potencia tiene un precio: los patrones se solapan, las taxonomías se diseñan mal y el resultado es un sistema donde nadie sabe qué cola recibe qué. En esta lección aprenderás la semántica exacta —incluido el caso de <code>#</code> con cero palabras—, la regla de una sola copia por cola, y cómo diseñar una taxonomía de eventos que siga siendo legible dentro de un año.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Topic es el exchange por defecto de casi todas las arquitecturas de eventos, y también donde más se abusa de <code>#</code>. Entender que <code>*</code> no es «cualquier cosa» y que los comodines solo existen en el binding evita los tres fallos clásicos: patrones que no matchean, patrones que matchean de más y consumidores que creen recibir un evento cuando reciben tres versiones del mismo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Palabras, puntos y dos comodines</h3>
+        <p>Para el routing, la key se parte por <code>.</code>. Cada trozo es una palabra. Una binding coincide si cada palabra del patrón encaja con la key:</p>
+        <ul>
+          <li><code>*</code> sustituye a <strong>una</strong> palabra. <code>pedido.*</code> coincide con <code>pedido.creado</code>, pero no con <code>pedido</code> ni con <code>pedido.creado.v2</code>.</li>
+          <li><code>#</code> sustituye a <strong>cero o más</strong> palabras. <code>pedido.#</code> coincide con <code>pedido</code>, <code>pedido.creado</code> y <code>pedido.creado.v2</code>.</li>
+          <li>Una palabra normal debe ser <strong>idéntica</strong>. No hay mayúsculas ignoradas ni prefijos.</li>
+        </ul>
+        <pre><code class="language-text">                       pedidos.topic
+        binding:  pedido.*     pedido.#      #.creado
+                       \          |            /
+                        v         v           v
+                  +-----------+ +----------+ +-------------+
+                  |inventario | |analitica | |seguimiento  |
+                  +-----------+ +----------+ +-------------+</code></pre>
+        <pre><code class="language-text">binding key          pedido   pedido.creado   pedido.creado.v2   factura.creado
+--------------------------------------------------------------------------------
+pedido.creado          ✗           ✓                ✗                ✗
+pedido.*               ✗           ✓                ✗                ✗
+pedido.#               ✓           ✓                ✓                ✗
+*.creado               ✗           ✓                ✗                ✓
+#.creado               ✗           ✓                ✗                ✓
+#                      ✓           ✓                ✓                ✓
+pedido.*.v2            ✗           ✗                ✓                ✗</code></pre>
+        <p>Los comodines son <strong>solo del binding</strong>. Si publicas con routing key <code>pedido.*</code>, el asterisco es una palabra literal y solo coincidirá con un binding que también tenga <code>pedido.*</code> (o con <code>pedido.#</code>). Publicar patrones es un error de diseño, no una forma de «mandar a varios».</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Límites y detalles del protocolo</p>
+          <p>La routing key puede llegar a 255 bytes. Evita palabras vacías por puntos consecutivos (<code>pedido..creado</code>): son válidas, pero se comportan como una palabra vacía y sorprenden a quien lee el patrón. Tampoco uses espacios: no son separadores, forman parte de la palabra.</p>
+        </div>
+
+        <h3>Solapamientos: una cola recibe una sola copia</h3>
+        <p>Una cola puede tener varias bindings en el mismo exchange. Si dos coinciden con el mismo mensaje, el broker entrega <strong>una sola copia</strong> a esa cola: el routing calcula un conjunto de destinos, no una lista de entregas. Es la misma regla que viste en <a href="01-direct-y-default.html">direct</a>, y aquí importa más porque los solapamientos son fáciles de crear sin darse cuenta.</p>
+        <pre><code class="language-text">analitica bound to:  pedido.#      y      pedido.*
+
+publish pedido.creado
+  pedido.#    → coincide
+  pedido.*    → coincide
+  resultado   → 1 mensaje en analitica (no 2)</code></pre>
+        <p>Esto no es deduplicación por contenido: si publicas el mismo cuerpo dos veces, recibirás dos mensajes. Es deduplicación <strong>por destino dentro de una publicación</strong>.</p>
+
+        <h3>Diseñar la taxonomía, no solo el patrón</h3>
+        <p>Un topic exchange es tan bueno como la jerarquía que le des. Tres reglas que evitan dolores futuros:</p>
+        <ol>
+          <li><strong>De lo general a lo específico.</strong> <code>dominio.entidad.accion</code> permite <code>pedido.#</code> y <code>pedido.creado</code> con la misma key. Si empiezas por el ID (<code>P-1001.creado</code>), ningún consumidor puede agrupar.</li>
+          <li><strong>Eventos en pasado, hechos consumados.</strong> <code>pedido.creado</code> describe algo que ya ocurrió; <code>pedido.crear</code> parece un comando y invita a confundir evento con instrucción. Los comandos van por una cola de trabajo, no por un topic de eventos.</li>
+          <li><strong>Nada de cardinalidad ilimitada.</strong> El ID del pedido va en el payload, no en la key. Si cada pedido tiene su palabra, necesitarías una binding por pedido y el exchange se vuelve una tabla enorme.</li>
+        </ol>
+        <table>
+          <thead><tr><th>Key</th><th>Evaluación</th><th>Problema</th></tr></thead>
+          <tbody>
+            <tr><td><code>pedido.creado</code></td><td>Buena</td><td>Ninguno: dominio, entidad, acción.</td></tr>
+            <tr><td><code>P-1001.creado</code></td><td>Mala</td><td>El ID impide agrupar y multiplica las bindings.</td></tr>
+            <tr><td><code>pedido-creado</code></td><td>Mala</td><td>Sin puntos es una sola palabra: <code>pedido.*</code> no la verá.</td></tr>
+            <tr><td><code>pedido.creado.v2</code></td><td>Aceptable</td><td>Versionar está bien, pero <code>pedido.*</code> deja de coincidir: usa <code>pedido.#</code> o un campo de versión.</td></tr>
+            <tr><td><code>pedido.creado</code> publicado como <code>pedido.*</code></td><td>Incorrecta</td><td>Los comodines no se publican.</td></tr>
+            <tr><td><code>pedidos.creado</code> vs <code>pedido.creado</code></td><td>Inconsistente</td><td>Plural y singular conviviendo: dos taxonomías en el mismo exchange.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Topic frente a direct y fanout</h3>
+        <table>
+          <thead><tr><th>Criterio</th><th>Topic</th><th>Direct</th><th>Fanout</th></tr></thead>
+          <tbody>
+            <tr><td>Selección</td><td>Por patrón jerárquico</td><td>Por igualdad exacta</td><td>Ninguna: todo</td></tr>
+            <tr><td>Bindings necesarias</td><td>Pocas y estables</td><td>Una por key y cola</td><td>Una por cola</td></tr>
+            <tr><td>Evolución</td><td>Alta: nuevos eventos encajan si respetas la jerarquía</td><td>Baja: cada key nueva se añade a mano</td><td>Nula: todo llega siempre</td></tr>
+            <tr><td>Riesgo</td><td>Patrones demasiado amplios (<code>#</code>)</td><td>Typos silenciosos</td><td>Ruido y acoplamiento al exchange</td></tr>
+          </tbody>
+        </table>
+        <p>No hay un «mejor» exchange: hay un contrato distinto. Topic gana cuando el consumidor quiere <em>una familia</em> de eventos y esa familia se puede nombrar.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-most-once hacia el broker (sin confirms) y mensajes no persistentes. El objetivo es ver el matching, no la fiabilidad. Para producción, añade confirms, colas durables y <code>ack</code> manual.</p>
+        <p>Tres colas con patrones distintos, una de ellas con dos bindings solapados a propósito:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const EX = 'pedidos.topic';
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertExchange(EX, 'topic', { durable: true });
+
+const bindings = {
+  facturacion: ['pedido.pagado'],
+  inventario: ['pedido.creado', 'pedido.cancelado'],
+  analitica: ['pedido.#', 'pedido.*'], // solapadas a propósito
+};
+
+for (const [cola, patrones] of Object.entries(bindings)) {
+  await ch.assertQueue(cola, { durable: true });
+  for (const patron of patrones) await ch.bindQueue(cola, EX, patron);
+}
+
+const eventos = [
+  'pedido.creado',
+  'pedido.pagado',
+  'pedido.cancelado',
+  'pedido.creado.v2',
+  'factura.emitida',
+];
+
+for (const key of eventos) {
+  ch.publish(EX, key, Buffer.from(JSON.stringify({ key })), { persistent: true });
+}
+
+await new Promise((resolve) =&gt; setTimeout(resolve, 200));
+for (const cola of Object.keys(bindings)) {
+  const info = await ch.checkQueue(cola);
+  console.log(cola, '→', info.messageCount);
+}
+
+await ch.close();
+await conn.close();
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">facturacion → 1     (pedido.pagado)
+inventario  → 2     (pedido.creado, pedido.cancelado)
+analitica   → 4     (los cuatro pedido.*; factura.emitida no)</code></pre>
+        <p>Analiza los dos puntos importantes:</p>
+        <ul>
+          <li><code>pedido.creado.v2</code> llega a analítica por <code>pedido.#</code> (cero o más), pero <strong>no</strong> a inventario, que solo tiene <code>pedido.creado</code>. Si versionas la key, revisa todos los bindings exactos.</li>
+          <li>Analítica tiene dos bindings que coinciden con <code>pedido.creado</code>, y aun así recibe <strong>un</strong> mensaje. Comprueba el contador: 4, no 7.</li>
+        </ul>
+        <p>Cambia <code>pedido.#</code> por <code>pedido.*</code> en analítica y repite: el contador bajará a 3 (los tres eventos de una palabra) y <code>pedido.creado.v2</code> dejará de llegar. Ese es el experimento que distingue <code>*</code> de <code>#</code>.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller unifica sus eventos en un topic <code>taller.eventos</code>. La taxonomía es <code>dominio.entidad.accion</code> y los eventos son hechos en pasado:</p>
+        <pre><code class="language-text">pedido.creado        pedido.pagado        pedido.cancelado
+pedido.preparado     pedido.enviado       pedido.entregado
+factura.emitida      factura.anulada      stock.agotado
+
+consumidores y patrones:
+  facturacion  ← pedido.pagado, pedido.cancelado, factura.#
+  inventario   ← pedido.creado, pedido.cancelado, pedido.enviado, stock.#
+  analitica    ← pedido.#, factura.#, stock.#
+  auditoria    ← #                     (todo, sin excepción)</code></pre>
+        <p>La topología se declara una vez y se importa. Fíjate en que <code>auditoria</code> con <code>#</code> recibe todo, y en que <code>analitica</code> recibe los mismos eventos que facturación e inventario sin que el productor sepa que existe:</p>
+        <pre><code class="language-javascript">// topologia.js
+export const EXCHANGE = 'taller.eventos';
+
+export const EVENTOS = Object.freeze({
+  PEDIDO_CREADO: 'pedido.creado',
+  PEDIDO_PAGADO: 'pedido.pagado',
+  PEDIDO_CANCELADO: 'pedido.cancelado',
+  PEDIDO_ENVIADO: 'pedido.enviado',
+  FACTURA_EMITIDA: 'factura.emitida',
+});
+
+const SUSCRIPCIONES = {
+  facturacion: ['pedido.pagado', 'pedido.cancelado', 'factura.#'],
+  inventario: ['pedido.creado', 'pedido.cancelado', 'pedido.enviado', 'stock.#'],
+  analitica: ['pedido.#', 'factura.#', 'stock.#'],
+  auditoria: ['#'],
+};
+
+export async function declararTopologia(ch) {
+  await ch.assertExchange(EXCHANGE, 'topic', { durable: true });
+  for (const [cola, patrones] of Object.entries(SUSCRIPCIONES)) {
+    await ch.assertQueue(cola, { durable: true });
+    for (const patron of patrones) await ch.bindQueue(cola, EXCHANGE, patron);
+  }
+}
+</code></pre>
+        <p>El productor solo conoce el exchange y el nombre del evento; publica con confirm y deja que la topología decida:</p>
+        <pre><code class="language-javascript">const ch = await conn.createConfirmChannel();
+await declararTopologia(ch);
+
+ch.publish(EXCHANGE, EVENTOS.PEDIDO_PAGADO, Buffer.from(JSON.stringify({
+  pedidoId: 'P-1001',
+  total: 121.5,
+  moneda: 'EUR',
+  ocurridoEn: new Date().toISOString(),
+})), {
+  persistent: true,
+  contentType: 'application/json',
+  messageId: 'pedido-P-1001-pagado-v1',
+}, (err) =&gt; {
+  if (err) console.error('publicación rechazada:', err.message);
+});
+</code></pre>
+        <p>El consumidor de auditoría recibe <em>todo</em>, incluidos eventos que aún no existían cuando se escribió. Ese es el valor de <code>#</code> y también su peligro: si un día publicas un evento con datos sensibles, auditoría lo recibe sin que nadie lo haya decidido explícitamente. Trata <code>#</code> como una decisión de seguridad, no como comodín de conveniencia.</p>
+
+        <h3>Cuando el patrón se queda corto</h3>
+        <p>Topic filtra por <strong>nombre</strong>, no por contenido. «Pedidos de más de 100 €» o «solo de la región norte» no se expresan con <code>*</code> y <code>#</code>. Opciones: publicar en keys más específicas (<code>pedido.creado.norte</code>), usar headers para atributos, o filtrar en el consumidor asumiendo el coste. Lo verás en <a href="04-headers-y-alternate.html">la siguiente lección</a>.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Fijar una taxonomía <code>dominio.entidad.accion</code></td><td>Mezclar <code>pedido.creado</code> con <code>P-1001.creado</code></td><td>Permite agrupar por dominio y mantiene las bindings pequeñas.</td></tr>
+            <tr><td>Usar eventos en pasado</td><td><code>crear.pedido</code> o <code>pedido.crear</code></td><td>Un evento describe un hecho; un comando pide una acción y merece otra cola.</td></tr>
+            <tr><td>Empezar los patrones por la parte más general</td><td><code>*.*.creado</code></td><td>Los patrones se leen de izquierda a derecha; la jerarquía debe reflejar el negocio.</td></tr>
+            <tr><td>Revisar los bindings exactos al versionar una key</td><td>Añadir <code>.v2</code> y olvidar <code>pedido.creado</code></td><td><code>pedido.*</code> deja de coincidir con tres palabras; los consumidores se quedan mudos.</td></tr>
+            <tr><td>Tratar <code>#</code> como una suscripción total consciente</td><td>Bindear <code>#</code> «para no perder nada» en cada servicio</td><td>Recibirás también eventos internos, datos sensibles y ruido futuro.</td></tr>
+            <tr><td>Probar los patrones con una tabla de casos</td><td>Confiar en la intuición</td><td><code>*</code> y <code>#</code> difieren en los extremos (cero palabras, keys vacías).</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Escribir <code>pedido*</code> en lugar de <code>pedido.*</code></h3>
+        <span class="code-label code-label--wrong">Mal — el comodín no está solo</span>
+        <pre><code class="language-javascript">await ch.bindQueue('inventario', 'pedidos.topic', 'pedido*');
+// Solo coincide con la key literal "pedido*". No hay prefijos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — palabra completa y punto</span>
+        <pre><code class="language-javascript">await ch.bindQueue('inventario', 'pedidos.topic', 'pedido.*');   // una palabra
+await ch.bindQueue('analitica', 'pedidos.topic', 'pedido.#');     // cero o más
+</code></pre>
+        <p>Los comodines ocupan una palabra entera. Pegados a texto son caracteres literales.</p>
+
+        <h3>2. Usar <code>#</code> cuando se quería <code>*</code></h3>
+        <span class="code-label code-label--wrong">Mal — el consumidor recibe de más</span>
+        <pre><code class="language-javascript">// «Solo eventos de pedido de una palabra»
+await ch.bindQueue('resumen', 'pedidos.topic', 'pedido.#');
+// También recibe pedido.creado.v2, pedido.creado.urgente, pedido...
+</code></pre>
+        <span class="code-label code-label--right">Bien — el patrón mínimo que expresa la intención</span>
+        <pre><code class="language-javascript">await ch.bindQueue('resumen', 'pedidos.topic', 'pedido.*');
+// Una palabra tras el dominio; lo demás no interesa.
+</code></pre>
+        <p>Empieza con el patrón más restrictivo y ábrelo solo cuando un caso real lo justifique.</p>
+
+        <h3>3. Publicar un patrón</h3>
+        <span class="code-label code-label--wrong">Mal — creer que <code>pedido.*</code> publica a todos los pedidos</span>
+        <pre><code class="language-javascript">ch.publish('pedidos.topic', 'pedido.*', body);
+// El asterisco es una palabra literal; solo matchea bindings con "pedido.*".
+</code></pre>
+        <span class="code-label code-label--right">Bien — el productor publica valores concretos</span>
+        <pre><code class="language-javascript">ch.publish('pedidos.topic', 'pedido.creado', body);
+</code></pre>
+        <p>La publicación no negocia patrones. Si el productor no sabe qué evento es, el problema está antes del broker.</p>
+
+        <h3>4. Meter el ID en la routing key</h3>
+        <span class="code-label code-label--wrong">Mal — una binding por pedido</span>
+        <pre><code class="language-javascript">await ch.bindQueue('seguimiento', 'pedidos.topic', 'P-1001.#');
+// Y otra para P-1002, P-1003... el exchange se convierte en una tabla enorme.
+</code></pre>
+        <span class="code-label code-label--right">Bien — el ID va en el payload</span>
+        <pre><code class="language-javascript">ch.publish('pedidos.topic', 'pedido.creado', Buffer.from(JSON.stringify({
+  pedidoId: 'P-1001',
+})));
+</code></pre>
+        <p>Las bindings se declaran por <em>tipo</em> de evento, no por instancia. Si necesitas seguir un pedido concreto, filtra en el consumidor o usa una cola dedicada con direct.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar la diferencia entre <code>*</code> y <code>#</code>, el solapamiento de bindings y la ausencia de duplicados por cola.</p>
+        <ol class="steps">
+          <li>
+            <strong>Ejecuta el ejemplo mínimo</strong> y anota los tres contadores. Deben ser 1, 2 y 4.
+          </li>
+          <li>
+            <strong>Cambia <code>pedido.#</code> por <code>pedido.*</code></strong> en analítica, borra las colas y repite. Esperado: 3 en analítica; <code>pedido.creado.v2</code> ya no llega.
+          </li>
+          <li>
+            <strong>Añade una binding solapada</strong> a facturación: <code>pedido.#</code>. Publica <code>pedido.pagado</code> y comprueba que facturación recibe <strong>un</strong> mensaje, no dos, aunque ambas bindings coincidan.
+          </li>
+          <li>
+            <strong>Prueba los extremos de <code>#</code></strong>: publica la key <code>pedido</code> (sin acción) y luego <code>pedido.creado.urgente.v2</code>. Con <code>pedido.#</code>, ambas llegan; con <code>pedido.*</code>, ninguna.
+          </li>
+          <li>
+            <strong>Audita la topología</strong>:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_bindings source_name destination_name routing_key
+</code></pre>
+            <p>Identifica qué binding produce cada entrega. Si una cola tiene dos patrones, pregúntate si ambos son necesarios o si uno es residuo de una prueba.</p>
+          </li>
+          <li>
+            <strong>Diseña un caso nuevo</strong>: añade <code>devolucion.solicitada</code> y <code>devolucion.aprobada</code>. ¿Qué patrón usarías para un consumidor que quiere solo devoluciones aprobadas? ¿Y para uno que quiere todas? Escríbelo y verifícalo con dos publicaciones.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Una taxonomía para un marketplace multi-tenant</h3>
+          <p>El taller se convierte en marketplace: hay varios <strong>vendedores</strong>, cada uno con sus pedidos, y varios <strong>almacenes</strong> por región. Los eventos deben permitir que: un vendedor reciba solo sus pedidos, un almacén reciba solo los pedidos que debe preparar en su región, y analítica reciba todo sin duplicados. El ID del vendedor y la región son datos conocidos en el momento de publicar.</p>
+          <p>Diseña la routing key y los bindings. Después responde: ¿qué pasa cuando un vendedor nuevo se da de alta a las 3 de la mañana? ¿Cuántas bindings crecen con 10.000 vendedores? ¿Merece la pena topic para esto o hay una combinación mejor con headers o exchanges por dominio?</p>
+          <p><em>Pista: cuenta el número de bindings, no el número de eventos. Si crece con los datos y no con los tipos, probablemente estás usando el exchange como base de datos.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Topic parte la routing key por puntos: <code>*</code> es <strong>una</strong> palabra y <code>#</code> es <strong>cero o más</strong>.</li>
+          <li>Los comodines solo existen en la binding; el productor publica valores literales.</li>
+          <li>Una cola recibe <strong>una sola copia</strong> aunque varias bindings coincidan con el mismo mensaje.</li>
+          <li>La taxonomía importa: general → específico, eventos en pasado y sin IDs en la key.</li>
+          <li><code>#</code> es una suscripción total: úsalo a conciencia, no como red de seguridad.</li>
+          <li>Topic filtra por nombre, no por contenido ni por atributos del mensaje.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Patrón</th><th>Coincide con</th><th>No coincide con</th></tr></thead>
+          <tbody>
+            <tr><td><code>pedido.*</code></td><td><code>pedido.creado</code></td><td><code>pedido</code>, <code>pedido.creado.v2</code></td></tr>
+            <tr><td><code>pedido.#</code></td><td><code>pedido</code>, <code>pedido.creado.v2</code></td><td><code>factura.creado</code></td></tr>
+            <tr><td><code>*.creado</code></td><td><code>pedido.creado</code>, <code>factura.creado</code></td><td><code>pedido.creado.v2</code></td></tr>
+            <tr><td><code>#</code></td><td>Cualquier key, incluida la vacía</td><td>Nada</td></tr>
+            <tr><td><code>pedido.*.v2</code></td><td><code>pedido.creado.v2</code></td><td><code>pedido.v2</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿<code>#</code> coincide con una key vacía?</summary>
+            <div>
+              <p>Sí. <code>#</code> representa cero o más palabras, así que también coincide con la cadena vacía. En la práctica no publiques keys vacías en un topic: si un consumidor tiene <code>#</code>, la recibirá, y si espera una estructura de tres palabras, fallará al parsearla.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar dos comodines seguidos, como <code>pedido.#.*</code>?</summary>
+            <div>
+              <p>Sí, es válido, pero su significado es difícil de leer: <code>#</code> puede comerse cero o más palabras y <code>*</code> exige una al final. Suele indicar que la taxonomía no está bien definida. Si necesitas ese patrón, probablemente estés intentando expresar una condición que no es jerárquica.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si dos consumidores tienen el mismo patrón?</summary>
+            <div>
+              <p>Si comparten la misma cola, compiten y se reparten los mensajes. Si cada uno tiene su propia cola, ambos reciben una copia. El patrón no decide el reparto: lo decide la topología de colas. Es la diferencia entre «dos workers» y «dos servicios».</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Topic garantiza el orden de los mensajes?</summary>
+            <div>
+              <p>Una cola entrega en orden FIFO mientras haya un solo consumidor y no haya redeliveries. Con varios consumidores compitiendo, el orden de procesamiento efectivo deja de estar garantizado. El exchange no añade orden: solo enruta. Si el orden es un requisito de negocio, necesitarás una clave de partición y una sola cola por clave, o serializar en el consumidor.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántas bindings puede soportar un topic exchange?</summary>
+            <div>
+              <p>RabbitMQ indexa los patrones, pero el coste crece con el número de bindings y con la longitud de las keys. No hay un límite mágico: mide con tu topología real. La señal de alarma es diseñar bindings que crezcan con los datos (una por cliente, una por pedido); eso se resuelve con headers o con una clave en el payload, no con más patrones.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

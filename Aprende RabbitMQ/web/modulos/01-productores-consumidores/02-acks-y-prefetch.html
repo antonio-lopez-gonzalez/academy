@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="02-acks-y-prefetch">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>acks y prefetch — Módulo 1 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>acks y prefetch</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Productores y consumidores</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Recibir un mensaje no es procesarlo. Entre el instante en que el broker lo envía y el instante en que tu código termina el trabajo hay una ventana en la que el proceso puede morir, la base de datos puede fallar o el proveedor externo puede colgarse. El <code>ack</code> es la forma de decir «ya está»; todo lo anterior es trabajo en vuelo.</p>
+        <p>Si confirmas demasiado pronto, pierdes mensajes. Si no confirmas nunca, la cola se llena de mensajes <em>unacked</em> y el consumidor deja de recibir. Si confirmas en bucle sin límite, un mensaje venenoso puede tumbar el worker. El <code>prefetch</code> controla cuánto trabajo en vuelo aceptas; el <code>ack</code>, cuándo lo das por terminado.</p>
+        <p>Esta lección es la bisagra entre «funciona en mi portátil» y «aguanta un despliegue». Veremos el ciclo de vida de una entrega, la diferencia entre <code>nack</code> y <code>reject</code>, qué significa <code>redelivered</code> y cómo elegir un prefetch que no convierta a un worker lento en un cuello de botella.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La garantía la sostiene el consumidor</p>
+          <p>El broker puede guardar el mensaje y reenviarlo, pero no sabe si tu efecto de negocio se completó. Solo tú puedes confirmarlo. Por eso at-least-once no es una propiedad del broker: es un contrato entre un consumidor que confirma después del efecto y un broker que reentrega si no llega el <code>ack</code>.</p>
+        </div>
+      </section>
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El ciclo de vida de una entrega</h3>
+        <pre><code class="language-text">                 basic.deliver
+   [ready] ──────────────────────▶ [unacked]
+      ▲                                │
+      │                                ├── ack ─────────▶ eliminado
+      │                                │
+      │        nack(requeue=true)      │
+      └────────────────────────────────┤
+                                       │
+                                       ├── nack(requeue=false) ──▶ DLX o descarte
+                                       └── reject(requeue=false) ─▶ DLX o descarte
+
+Si el canal o la conexión se cierran, todos los unacked vuelven a ready
+y se marcan como redelivered en la siguiente entrega.</code></pre>
+        <p>Mientras está en <code>unacked</code>, el mensaje no está disponible para otro consumidor de la misma cola. Eso es lo que evita que dos workers hagan el mismo trabajo a la vez, y también lo que permite que un worker lento bloquee mensajes si su prefetch es demasiado alto.</p>
+        <h3><code>ack</code>, <code>nack</code> y <code>reject</code></h3>
+        <table>
+          <thead><tr><th>Método</th><th>Firma en amqplib</th><th>Efecto</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>ack</code></td><td><code>ack(msg, allUpTo = false)</code></td><td>Confirma uno o todos los anteriores del canal.</td><td>El efecto de negocio terminó.</td></tr>
+            <tr><td><code>ack(msg, true)</code></td><td><code>ack(message, allUpTo)</code></td><td>Confirma el mensaje y todos los anteriores.</td><td>Procesamiento por lotes homogéneo; rara vez en concurrencia.</td></tr>
+            <tr><td><code>nack</code></td><td><code>nack(msg, allUpTo = false, requeue = true)</code></td><td>Rechaza uno o varios, con o sin reencolar.</td><td>Fallo transitorio o permanente; AMQP 0-9-1 extendido.</td></tr>
+            <tr><td><code>reject</code></td><td><code>reject(msg, requeue = true)</code></td><td>Rechaza un solo mensaje.</td><td>Un mensaje inválido; no permite múltiples.</td></tr>
+          </tbody>
+        </table>
+        <p><code>requeue: true</code> devuelve el mensaje a la cola. No garantiza que vuelva al principio ni a la misma posición: puede entregarse a otro consumidor. <code>requeue: false</code> lo descarta, salvo que la cola tenga un dead-letter exchange configurado, en cuyo caso se enruta allí.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Reencolar sin límite es un bucle tóxico</p>
+          <p>Si un mensaje siempre falla y siempre haces <code>nack(requeue: true)</code>, vuelve una y otra vez, consume CPU, llena los logs y bloquea a los mensajes sanos. En el módulo 3 lo mandaremos a una cola de reintento con backoff o a una DLQ. Aquí solo veremos el mecanismo y su riesgo.</p>
+        </div>
+        <h3><code>redelivered</code> y los mensajes unacked</h3>
+        <p>Cuando el broker reentrega un mensaje que ya había enviado, pone <code>msg.fields.redelivered = true</code>. No significa «este mensaje es un duplicado de negocio»: significa «ya te lo entregué antes y no vi tu <code>ack</code>». Puede ser porque el consumidor murió, porque el canal se cerró o porque hiciste <code>nack</code> con <code>requeue</code>.</p>
+        <pre><code class="language-text">consumidor recibe tag=7, redelivered=false
+   │
+   ├── procesa, pero el proceso muere antes de ack
+   │
+   ▼
+broker devuelve tag=7 a ready
+   │
+   ▼
+otro consumidor recibe tag=1, redelivered=true
+</code></pre>
+        <p>El <code>deliveryTag</code> cambia porque pertenece al canal; <code>redelivered</code> es la señal de que el mensaje ya viajó. Un consumidor idempotente no debería comportarse distinto por ello, salvo para métricas o para evitar reintentos infinitos.</p>
+        <h3>prefetch: cuánto trabajo en vuelo</h3>
+        <p><code>channel.prefetch(n)</code> limita cuántos mensajes <strong>sin confirmar</strong> puede tener un consumidor. El broker deja de enviarle mientras tenga <code>n</code> en vuelo. Es la herramienta principal para repartir trabajo entre workers y para proteger la memoria.</p>
+        <table>
+          <thead><tr><th>prefetch</th><th>Efecto</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td><code>0</code></td><td>Sin límite: el broker envía todo lo que pueda.</td><td>Casi nunca; un worker lento acapara la cola.</td></tr>
+            <tr><td><code>1</code></td><td>Reparto justo: cada worker tiene como máximo un mensaje en vuelo.</td><td>Trabajos lentos o heterogéneos; maximiza el reparto.</td></tr>
+            <tr><td><code>10</code></td><td>Buffer pequeño para amortizar latencia de red.</td><td>Trabajos rápidos y homogéneos.</td></tr>
+            <tr><td><code>100+</code></td><td>Alto rendimiento, pero un worker lento puede quedarse con muchos mensajes.</td><td>Solo si el procesamiento es muy rápido y el reparto importa menos.</td></tr>
+          </tbody>
+        </table>
+        <p>El segundo argumento <code>global</code> cambia el ámbito: <code>prefetch(n, false)</code> es por consumidor (el valor por defecto) y <code>prefetch(n, true)</code> es por canal. El modo global no sustituye un diseño de prefetch por consumidor: oculta qué consumidor está saturado y no existe en quorum queues. Usa el modo por consumidor.</p>
+        <p>El prefetch se aplica a <strong>nuevas entregas</strong>. Si lo bajas mientras hay mensajes en vuelo, esos siguen ahí hasta que los confirmes. Tampoco cuenta los mensajes que ya estaban <em>unacked</em> antes de cambiarlo.</p>
+        <h3>El consumidor lento</h3>
+        <p>Un consumidor lento con prefetch alto produce un patrón engañoso: la cola parece vacía porque los mensajes están en <code>unacked</code>, pero el trabajo no avanza. Los demás workers no pueden ayudar porque esos mensajes ya están reservados. Señales típicas:</p>
+        <ul>
+          <li><code>messages_ready = 0</code> y <code>messages_unacknowledged</code> alto.</li>
+          <li>La tasa de <code>ack</code> no sigue a la de <code>deliver</code>.</li>
+          <li>El worker tiene picos de memoria o timeouts del proveedor externo.</li>
+          <li>Al reiniciar el worker, los mensajes reaparecen como <code>redelivered</code>.</li>
+        </ul>
+        <p>La solución no es solo bajar el prefetch: hay que poner timeouts al trabajo, acotar la concurrencia interna y decidir qué hacer cuando el efecto tarda demasiado. Un mensaje que se queda colgado sin <code>ack</code> ni <code>nack</code> es peor que un fallo explícito.</p>
+        <h3>autoAck: la comodidad que pierde mensajes</h3>
+        <p>Con <code>noAck: true</code> (o <code>autoAck</code> en otros clientes), el broker considera entregado el mensaje en cuanto lo escribe en el socket. Si el consumidor cae antes de procesarlo, no hay reentrega: el mensaje se perdió. Es <strong>at-most-once</strong> y solo tiene sentido para datos efímeros donde perder una muestra es aceptable.</p>
+        <pre><code class="language-javascript">// ❌ at-most-once: el broker no espera nada
+await channel.consume(queue, (msg) =&gt; {
+  procesar(msg); // si esto lanza o el proceso muere, el mensaje ya no existe
+}, { noAck: true });
+</code></pre>
+        <p>En trabajo de negocio, <code>noAck: false</code> y <code>ack</code> manual. La regla del curso es simple: <strong>nunca autoAck en producción</strong>.</p>
+        <h3>Tabla de decisión</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>Acción</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Procesado correctamente</td><td><code>ack(msg)</code></td><td>El broker elimina el mensaje.</td></tr>
+            <tr><td>Fallo transitorio (red, timeout, 503)</td><td><code>nack(msg, false, true)</code></td><td>Vuelve a la cola; puede duplicar y reintentar en bucle.</td></tr>
+            <tr><td>Fallo permanente (datos inválidos)</td><td><code>nack(msg, false, false)</code></td><td>DLX o descarte; no bloquea la cola.</td></tr>
+            <tr><td>Mensaje venenoso sin DLX</td><td><code>reject(msg, false)</code></td><td>Se descarta; registra el incidente.</td></tr>
+            <tr><td>Lote homogéneo ya persistido</td><td><code>ack(msg, true)</code></td><td>Confirma todos los anteriores; cuidado con la concurrencia.</td></tr>
+            <tr><td>Apagado ordenado</td><td><code>cancel</code>, esperar en vuelo, <code>close</code></td><td>Los no confirmados se reencolan.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a ver el prefetch en acción: seis mensajes, un consumidor con <code>prefetch(2)</code> y 800 ms de trabajo por mensaje. Solo dos estarán en vuelo a la vez.</p>
+        <pre><code class="language-javascript">// consumidor-prefetch.mjs
+import amqp from "amqplib";
+
+const connection = await amqp.connect("amqp://guest:guest@localhost:5672");
+const channel = await connection.createChannel();
+await channel.assertQueue("facturacion", { durable: true });
+await channel.prefetch(2);
+
+const hora = () =&gt; new Date().toISOString().slice(11, 19);
+
+await channel.consume("facturacion", async (msg) =&gt; {
+  if (!msg) return;
+  const tag = msg.fields.deliveryTag;
+  console.log(`[${hora()}] empieza tag=${tag}`);
+
+  await new Promise((resolve) =&gt; setTimeout(resolve, 800));
+
+  console.log(`[${hora()}] termina tag=${tag}`);
+  channel.ack(msg);
+}, { noAck: false });
+</code></pre>
+        <pre><code class="language-javascript">// productor-seis.mjs
+import amqp from "amqplib";
+
+const connection = await amqp.connect("amqp://guest:guest@localhost:5672");
+const channel = await connection.createChannel();
+await channel.assertQueue("facturacion", { durable: true });
+
+for (let i = 1; i &lt;= 6; i++) {
+  channel.sendToQueue("facturacion", Buffer.from(JSON.stringify({ id: String(1000 + i) })), {
+    persistent: true,
+    contentType: "application/json",
+    messageId: `evt-${1000 + i}`,
+  });
+}
+
+await channel.close();
+await connection.close();
+</code></pre>
+        <p>Salida esperada (las horas exactas variarán):</p>
+        <pre><code class="language-text">[12:00:01] empieza tag=1
+[12:00:01] empieza tag=2
+[12:00:01] termina tag=1
+[12:00:01] empieza tag=3
+[12:00:01] termina tag=2
+[12:00:01] empieza tag=4
+...
+</code></pre>
+        <p>Nunca hay más de dos «empieza» sin su «termina». Ese es el prefetch: el broker no envía el tercero hasta que confirmas uno de los dos primeros. Si quitas <code>prefetch(2)</code>, verás los seis «empieza» casi juntos y el worker tardará lo mismo, pero acaparará toda la cola.</p>
+        <p>Durante la ejecución, en otra terminal:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+        <pre><code class="language-text">name          messages_ready  messages_unacknowledged  consumers
+facturacion   4               2                        1
+</code></pre>
+        <p>Cuatro listos, dos en vuelo, un consumidor. Si el consumidor muere ahora, los dos unacked vuelven a ready y el siguiente consumidor los recibe con <code>redelivered=true</code>.</p>
+      </section>
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, la generación de facturas puede fallar por un timeout del servicio de PDF. Simulamos un fallo para el pedido 1043: la primera entrega se reencola; la segunda, marcada como <code>redelivered</code>, se procesa.</p>
+        <pre><code class="language-javascript">await channel.prefetch(1);
+
+await channel.consume("facturacion", async (msg) =&gt; {
+  if (!msg) return;
+  const pedido = JSON.parse(msg.content.toString());
+
+  if (pedido.total &gt; 100 &amp;&amp; !msg.fields.redelivered) {
+    console.log(`[facturacion] fallo simulado en ${pedido.id}; reencolando`);
+    channel.nack(msg, false, true);
+    return;
+  }
+
+  console.log(`[facturacion] ${pedido.id} procesado (redelivered=${msg.fields.redelivered})`);
+  channel.ack(msg);
+}, { noAck: false });
+</code></pre>
+        <pre><code class="language-text">[facturacion] fallo simulado en 1043; reencolando
+[facturacion] 1043 procesado (redelivered=true)
+[facturacion] 1042 procesado (redelivered=false)
+[facturacion] 1044 procesado (redelivered=false)
+</code></pre>
+        <p>Fíjate en el orden: el 1043 vuelve a la cola y puede ser el siguiente o el último, según cómo lo coloque el broker. <strong>No asumas que un <code>nack(requeue)</code> conserva la posición original</strong>; si el orden importa, necesitas otro diseño (una sola cola por clave, un consumidor, o un patrón de reintento con cola dedicada).</p>
+        <table>
+          <thead><tr><th>Fallo</th><th>Acción en el ejemplo</th><th>Acción de producción (módulo 3)</th></tr></thead>
+          <tbody>
+            <tr><td>Timeout transitorio del PDF</td><td><code>nack(requeue: true)</code> una vez.</td><td>Cola de reintento con TTL/backoff y límite de intentos.</td></tr>
+            <tr><td>Pedido con datos inválidos</td><td>No se cubre aquí.</td><td><code>nack(requeue: false)</code> a DLQ con motivo.</td></tr>
+            <tr><td>Servicio caído mucho tiempo</td><td>El mensaje vuelve y falla otra vez.</td><td>Backoff exponencial y alarma de DLQ.</td></tr>
+            <tr><td>Worker muere a mitad</td><td>El broker reentrega con <code>redelivered=true</code>.</td><td>Idempotencia por clave de negocio.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">El ejemplo no es la política de reintentos</p>
+          <p>Reencolar una vez y comprobar <code>redelivered</code> sirve para ver el mecanismo, no para producción. Un fallo que dura horas reencolará en bucle. La política real combina límite de intentos, espera creciente y DLQ; se construye en el módulo 3.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Confirmar después de persistir el efecto de negocio.</td><td><code>ack</code> al entrar al callback.</td><td>Si el proceso muere después, el mensaje ya no se reentrega.</td></tr>
+            <tr><td>Hacer el efecto idempotente por clave de negocio.</td><td>Asumir que <code>redelivered=false</code> significa «primera vez».</td><td>Un <code>ack</code> perdido o un <code>nack</code> producen duplicados legítimos.</td></tr>
+            <tr><td>Elegir prefetch según la latencia y la heterogeneidad del trabajo.</td><td><code>prefetch(0)</code> o valores de cientos «para ir rápido».</td><td>Un worker lento acapara mensajes y bloquea a los demás.</td></tr>
+            <tr><td>Poner timeout al trabajo externo y decidir <code>nack</code>/<code>ack</code>.</td><td>Dejar un mensaje unacked para siempre.</td><td>El prefetch se agota y el consumidor deja de recibir.</td></tr>
+            <tr><td>Monitorizar <code>messages_unacknowledged</code> y la tasa de <code>ack</code>.</td><td>Mirar solo <code>messages_ready</code>.</td><td>El trabajo atascado suele estar en vuelo, no en la cola.</td></tr>
+            <tr><td>Drenar en el apagado: cancelar, esperar en vuelo, cerrar.</td><td><code>process.exit()</code> inmediato.</td><td>Los no confirmados se reencolan y el trabajo a medias se repite.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Usar <code>noAck: true</code> en trabajo de negocio</h3>
+        <span class="code-label code-label--wrong">Mal — el broker no espera confirmación</span>
+        <pre><code class="language-javascript">await channel.consume(queue, (msg) =&gt; {
+  procesar(msg); // si falla, el mensaje ya no existe
+}, { noAck: true });
+</code></pre>
+        <span class="code-label code-label--right">Bien — ack manual tras el efecto</span>
+        <pre><code class="language-javascript">await channel.consume(queue, async (msg) =&gt; {
+  if (!msg) return;
+  await procesar(msg);
+  channel.ack(msg);
+}, { noAck: false });
+</code></pre>
+        <p>Con <code>noAck: true</code> no hay reentrega posible. Es at-most-once y solo vale para datos efímeros.</p>
+
+        <h3>2. Olvidar el <code>ack</code> y llenar la cola de unacked</h3>
+        <span class="code-label code-label--wrong">Mal — procesar sin confirmar</span>
+        <pre><code class="language-javascript">await channel.consume(queue, (msg) =&gt; {
+  console.log("procesado"); // falta channel.ack(msg)
+}, { noAck: false });
+</code></pre>
+        <span class="code-label code-label--right">Bien — confirmar o rechazar siempre</span>
+        <pre><code class="language-javascript">try {
+  await procesar(msg);
+  channel.ack(msg);
+} catch (error) {
+  channel.nack(msg, false, false);
+}
+</code></pre>
+        <p>Si no confirmas, el mensaje se queda <em>unacked</em> hasta que el canal se cierre. Con <code>prefetch(1)</code>, un solo olvido detiene el consumo por completo.</p>
+
+        <h3>3. Reencolar un mensaje venenoso sin límite</h3>
+        <span class="code-label code-label--wrong">Mal — bucle infinito</span>
+        <pre><code class="language-javascript">catch (error) {
+  channel.nack(msg, false, true); // vuelve, falla, vuelve…
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — distinguir transitorio y permanente</span>
+        <pre><code class="language-javascript">catch (error) {
+  const transitorio = error.code === "ETIMEDOUT";
+  channel.nack(msg, false, transitorio); // el permanente va a DLX
+}
+</code></pre>
+        <p>Sin DLX, <code>requeue: false</code> descarta el mensaje. Es preferible perder un mensaje inválido y registrarlo que bloquear la cola entera; en el módulo 3 lo mandaremos a una DLQ para no perderlo.</p>
+
+        <h3>4. Poner un prefetch enorme para «ir más rápido»</h3>
+        <span class="code-label code-label--wrong">Mal — un worker acapara la cola</span>
+        <pre><code class="language-javascript">await channel.prefetch(1000);
+</code></pre>
+        <span class="code-label code-label--right">Bien — empezar bajo y medir</span>
+        <pre><code class="language-javascript">await channel.prefetch(2);
+// subir solo si la latencia de red domina y el trabajo es homogéneo
+</code></pre>
+        <p>El throughput no depende solo del prefetch: depende del trabajo, de la base de datos y de cuántos workers haya. Un prefetch alto con un worker lento convierte la cola en un montón de mensajes reservados que nadie más puede procesar.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver los mensajes en vuelo, matar al consumidor a mitad y comprobar la reentrega con <code>redelivered=true</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Publica seis mensajes</strong> con la cola <code>facturacion</code> vacía y sin consumidores.
+            <pre><code class="language-bash">node productor-seis.mjs
+docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged
+</code></pre>
+            <pre><code class="language-text">name          messages_ready  messages_unacknowledged
+facturacion   6               0
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Arranca el consumidor con <code>prefetch(2)</code>:</strong>
+            <pre><code class="language-bash">node consumidor-prefetch.mjs
+</code></pre>
+            <p>Mientras procesa, en otra terminal:</p>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+            <pre><code class="language-text">name          messages_ready  messages_unacknowledged  consumers
+facturacion   4               2                        1
+</code></pre>
+            <p>Dos en vuelo, cuatro esperando. No hay más de dos «empieza» sin «termina» en los logs.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Mata el consumidor con Ctrl+C a mitad de un mensaje.</strong> Los dos unacked vuelven a ready:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+            <pre><code class="language-text">name          messages_ready  messages_unacknowledged  consumers
+facturacion   6               0                        0
+</code></pre>
+            <p>Si el cierre fue ordenado y esperó los mensajes en vuelo, puede que solo queden 4; lo importante es que ningún mensaje se pierde.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Vuelve a arrancar el consumidor:</strong> los mensajes que no se confirmaron llegan con <code>redelivered=true</code>. Añade el campo al log para verlo.
+            <pre><code class="language-javascript">console.log(`empieza tag=${tag} redelivered=${msg.fields.redelivered}`);
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 5 — Cambia el prefetch a 1 y repite:</strong> verás un solo «empieza» por vez. Con 6, el reparto es más rápido pero un worker lento acapara. Anota la diferencia en una tabla de tres filas: prefetch 1, 2 y 6.</li>
+          <li>
+            <strong>Paso 6 — Simula un fallo permanente:</strong> publica un mensaje cuyo cuerpo no sea JSON válido, procesa con <code>try/catch</code> y <code>nack(msg, false, false)</code>. Comprueba que la cola no se bloquea. Sin DLX, el mensaje se descarta: es el comportamiento que corregiremos en el módulo 3.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Si <code>messages_unacknowledged</code> se queda clavado y <code>consumers</code> sigue en 1, el consumidor está vivo pero no confirma. Revisa el <code>try/catch</code>, los timeouts y si algún <code>await</code> se quedó esperando para siempre.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Tres cargas, tres prefetch</h3>
+          <p>Tienes tres colas: <code>emails</code> (trabajo de 50 ms, muy homogéneo), <code>pdf</code> (trabajo de 3 s, mucha CPU) y <code>reports</code> (mezcla de 100 ms y 20 s). Propón un prefetch para cada una y justifica el número con la latencia, la memoria y el reparto entre workers.</p>
+          <p>Después responde: si un worker de <code>pdf</code> se queda colgado 10 minutos con prefetch 50, ¿qué le pasa a la cola? ¿Cómo lo detectarías antes de que un usuario se queje? ¿Qué cambiarías en el diseño además del prefetch?</p>
+          <p><em>Pista: el prefetch no arregla un trabajo que no termina. Piensa en timeouts, en separar trabajos lentos de rápidos y en una DLQ para los que superan el límite.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <code>ack</code> marca el final del procesamiento; hasta entonces el mensaje está <em>unacked</em> y no se entrega a otro consumidor de la misma cola.</li>
+          <li><code>nack</code> permite rechazar varios; <code>reject</code> solo uno. <code>requeue: true</code> devuelve el mensaje; <code>false</code> lo descarta o lo manda a la DLX.</li>
+          <li><code>redelivered=true</code> significa que el broker ya lo había entregado; no es una garantía de que sea un duplicado de negocio, pero sí una señal de reintento.</li>
+          <li><code>prefetch(n)</code> limita los mensajes en vuelo por consumidor. Empieza bajo y sube con medidas, no por intuición.</li>
+          <li><code>noAck: true</code> es at-most-once: si el consumidor cae, el mensaje se pierde. No lo uses para trabajo de negocio.</li>
+          <li>Reencolar sin límite es un bucle tóxico; la política real necesita backoff, límite y DLQ.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Método / métrica</th><th>Qué hace o qué mide</th></tr></thead>
+          <tbody>
+            <tr><td><code>ack(msg)</code></td><td>Confirma un mensaje; el broker lo elimina.</td></tr>
+            <tr><td><code>ack(msg, true)</code></td><td>Confirma todos los anteriores hasta ese tag.</td></tr>
+            <tr><td><code>nack(msg, false, true)</code></td><td>Reencola para otro intento.</td></tr>
+            <tr><td><code>nack(msg, false, false)</code></td><td>Rechaza sin reencolar; DLX o descarte.</td></tr>
+            <tr><td><code>reject(msg, false)</code></td><td>Rechaza un solo mensaje sin reencolar.</td></tr>
+            <tr><td><code>prefetch(n)</code></td><td>Máximo de mensajes sin confirmar por consumidor.</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>Trabajo entregado y aún no confirmado.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Qué pasa si el canal se cierra con mensajes unacked?</summary>
+            <div>
+              <p>El broker los devuelve a la cola y los marca como <code>redelivered</code> en la siguiente entrega. No se pierden, pero el trabajo que ya habías hecho puede repetirse. Por eso el consumidor debe ser idempotente y el <code>ack</code> debe ir después del efecto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>nack(requeue: true)</code> conserva el orden de la cola?</summary>
+            <div>
+              <p>No está garantizado. El mensaje vuelve a estar disponible y puede entregarse a otro consumidor o en otra posición. Si el orden por clave es un requisito, necesitas una sola cola por clave y un solo consumidor por cola, o un diseño que no dependa del orden global.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un prefetch de 1 no es demasiado lento?</summary>
+            <div>
+              <p>Depende del trabajo. Para tareas de segundos, el coste de red es despreciable y el reparto justo importa más. Para tareas de milisegundos, un prefetch de 10 o 20 amortiza mejor la latencia. Mide el throughput y el reparto; no hay un número universal.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar el prefetch mientras consumo?</summary>
+            <div>
+              <p>Sí, <code>prefetch</code> se puede llamar de nuevo, pero solo afecta a nuevas entregas. Los mensajes que ya están <em>unacked</em> siguen contando hasta que los confirmes. Bajar el prefetch no libera trabajo ya reservado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuándo tiene sentido <code>autoAck</code>?</summary>
+            <div>
+              <p>Cuando perder mensajes es aceptable: telemetría de alta frecuencia, métricas aproximadas, notificaciones efímeras de presencia. Nunca para pedidos, pagos, facturas o cualquier efecto que no puedas reconstruir. En este curso no lo usamos en ejemplos de producción.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

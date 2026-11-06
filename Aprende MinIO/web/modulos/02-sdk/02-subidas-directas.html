@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-subidas-directas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Subidas directas con presigned URLs — Módulo 2 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Subidas directas con presigned URLs</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · SDK y aplicación</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El patrón obvio para subir un archivo es <code>navegador → tu API → MinIO</code>. Funciona en una demo y duele en cuanto el archivo pesa: la API ocupa memoria o disco temporal, consume ancho de banda dos veces, mantiene una petición abierta durante minutos y aparece el primer timeout del proxy. Y todo eso para no mirar los bytes: solo los reenvía.</p>
+        <p>La alternativa es que el navegador hable <strong>directamente</strong> con MinIO. El servidor no transporta el archivo; solo emite un permiso temporal y acotado: una <strong>presigned URL</strong>. El navegador sube contra MinIO, y después la API comprueba qué llegó. Es el mismo mecanismo que usan S3, R2, GCS y casi cualquier producto con archivos.</p>
+        <p>Ese cambio de flujo introduce tres responsabilidades nuevas: la clave del objeto la genera el servidor, los límites de tamaño y tipo hay que imponerlos en la firma, y nada es válido hasta que se valida después de la subida. Esta lección monta el flujo completo y explica dónde están las trampas.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué no basta con «firmar una URL»</p>
+          <p>Una presigned URL es una capability: quien la tenga puede usarla hasta que expire. Si firma el objeto equivocado, con un tipo equivocado o con root, el problema no es el transporte: es el alcance del permiso. Aquí aprendes a construir ese alcance.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El flujo, sin la API en medio</h3>
+        <pre><code class="language-text">NAVEGADOR                      API (Node)                     MINIO
+    |                             |                             |
+    | POST /api/uploads           |                             |
+    |---------------------------->| valida sesión, tipo y cupo  |
+    |                             | genera key + firma          |
+    |&lt;----------------------------| { postURL, fields, key }    |
+    |                             |                             |
+    | POST multipart/form-data (el archivo va aquí)             |
+    |---------------------------------------------------------->|
+    |&lt;----------------------------------------------------------| 204
+    |                             |                             |
+    | POST /api/uploads/complete  |                             |
+    |---------------------------->| statObject + magic bytes    |
+    |                             |---------------------------->|
+    |&lt;----------------------------| { ok, size, etag }          |
+
+La API nunca ve el cuerpo del archivo. Solo firma y valida metadatos.</code></pre>
+        <p>Hay dos momentos de verdad distintos: la <strong>autorización</strong> (antes de subir, cuando se firma) y la <strong>aceptación</strong> (después de subir, cuando se inspecciona el objeto). Confundirlos es el error de diseño más común: se firma con demasiada libertad y no se valida nada al final.</p>
+
+        <h3>Presigned PUT frente a POST policy</h3>
+        <table>
+          <thead><tr><th></th><th>Presigned PUT</th><th>POST policy</th></tr></thead>
+          <tbody>
+            <tr><td>Método</td><td><code>PUT /bucket/key?...</code></td><td><code>POST /bucket</code> con formulario</td></tr>
+            <tr><td>Qué se firma</td><td>Método, ruta, host y expiración</td><td>Bucket, clave y <strong>condiciones</strong> del formulario</td></tr>
+            <tr><td>Límite de tamaño</td><td>No se puede imponer</td><td><code>content-length-range</code></td></tr>
+            <tr><td>Content-Type</td><td>No se puede imponer</td><td><code>eq $Content-Type</code> o prefijo permitido</td></tr>
+            <tr><td>Uso típico</td><td>Subida simple, cliente controlado</td><td>Formulario web, cuotas y tipos</td></tr>
+          </tbody>
+        </table>
+        <p>La diferencia clave: una URL PUT firmada solo demuestra que el firmante autorizó <em>esa clave</em>. No dice nada del contenido. Una POST policy, en cambio, incluye condiciones que el servidor verifica antes de aceptar el cuerpo. Para un formulario público, usa POST.</p>
+
+        <h3>Qué contiene la URL firmada</h3>
+        <pre><code class="language-text">http://localhost:9000/documentos/acme/2026/11/informe.pdf
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &amp;X-Amz-Credential=documentos-app%2F20261105%2Fus-east-1%2Fs3%2Faws4_request
+  &amp;X-Amz-Date=20261105T101500Z
+  &amp;X-Amz-Expires=600
+  &amp;X-Amz-SignedHeaders=host
+  &amp;X-Amz-Signature=4f1c9d...</code></pre>
+        <p>La firma cubre el método, la ruta, el host, la fecha y la expiración. Cambiar cualquiera de esos elementos invalida la URL. Pero fíjate en lo que <strong>no</strong> aparece: ni el tamaño, ni el tipo, ni un límite de usos. Una URL PUT se puede reutilizar todas las veces que quieras dentro de su ventana de validez, y cada uso sobrescribe la clave.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">La expiración no es un temporizador de borrado</p>
+          <p>Cuando la URL expira, deja de aceptar peticiones. El objeto que ya se subió sigue ahí. La expiración protege el <em>permiso</em>, no el dato; para el dato existen lifecycle y borrado explícito.</p>
+        </div>
+
+        <h3>La clave la genera el servidor</h3>
+        <p>Nunca aceptes la clave desde el navegador. Si el cliente elige <code>acme/2026/11/informe.pdf</code>, puede elegir también <code>otro-tenant/2026/11/informe.pdf</code>, sobrescribir un documento existente o usar caracteres que rompan tu lógica. Genera tú la clave y devuélvela como identificador opaco:</p>
+        <pre><code class="language-text">acme/2026/11/0f4c2a1e-8b3d-4f7a-9c21-6e5d8a7b1c90-informe.pdf
+^    ^    ^                       ^
+tenant año tipo                uuid + nombre saneado</code></pre>
+        <p>El prefijo codifica la organización; el UUID garantiza unicidad; el nombre original se conserva solo como metadato y como sufijo legible. Si el nombre trae <code>../</code> o barras, se sanea antes de usarlo.</p>
+
+        <h3>Validar después: el segundo control</h3>
+        <p>Con POST policy puedes limitar mucho, pero no todo. El content-type declarado por el navegador es una promesa, no una prueba: renombrar un ejecutable a <code>.pdf</code> no cambia sus primeros bytes. Después de la subida:</p>
+        <ol>
+          <li><code>statObject</code> para confirmar tamaño, content-type y metadatos.</li>
+          <li>Leer los primeros bytes con <code>getPartialObject</code> y comprobar la firma real (<code>%PDF-</code>, <code>PK\x03\x04</code>, etc.).</li>
+          <li>Si no cumple, borrar el objeto y marcar la subida como rechazada.</li>
+          <li>Opcional: calcular un checksum y guardarlo como metadato para verificaciones posteriores.</li>
+        </ol>
+
+        <h3>CORS: por qué funciona sin configurar nada</h3>
+        <p>MinIO responde por defecto con CORS abierto para todos los orígenes y verbos, así que una web servida en <code>http://localhost:5173</code> puede hacer <code>PUT</code> contra <code>http://localhost:9000</code>. Eso no es un control de seguridad: CORS lo aplica el navegador, y <code>curl</code> lo ignora. La protección real es la expiración corta y la clave única.</p>
+        <p>Si quieres restringir orígenes como defensa en profundidad, MinIO permite fijarlos en la configuración de su API, pero recuerda que un atacante con la URL no necesita un navegador. No diseñes la seguridad alrededor de CORS.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Firmar una URL PUT y subir con <code>curl</code>. Sin API, sin navegador: solo el permiso y el cliente HTTP.</p>
+        <pre><code class="language-javascript">// firmar.mjs
+import * as Minio from 'minio'
+
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+})
+
+const url = await client.presignedPutObject(
+  'documentos',
+  'acme/2026/11/informe.pdf',
+  10 * 60, // segundos
+)
+console.log(url)</code></pre>
+        <pre><code class="language-bash">node --env-file=.env firmar.mjs
+curl -i -X PUT --upload-file informe.pdf \
+  -H 'Content-Type: application/pdf' \
+  "http://localhost:9000/documentos/acme/2026/11/informe.pdf?X-Amz-Algorithm=..."</code></pre>
+        <pre><code class="language-text">HTTP/1.1 200 OK
+ETag: "5d41402abc4b2a76b9719d911017c592"
+x-amz-request-id: 17B9C2F4A1E3D5B7
+Content-Length: 0</code></pre>
+        <p>Qué ha pasado:</p>
+        <ul>
+          <li><code>presignedPutObject</code> no sube nada: solo calcula la firma y devuelve la URL.</li>
+          <li>El tercer argumento son <strong>segundos</strong>, no milisegundos. El máximo es <code>604800</code> (7 días).</li>
+          <li><code>curl</code> hace el <code>PUT</code> real; MinIO comprueba firma, fecha y expiración.</li>
+          <li>El <code>Content-Type</code> enviado se guarda como metadato, pero <strong>no estaba firmado</strong>: podrías haber enviado otro.</li>
+          <li>El objeto ya existe aunque nadie de tu API lo sepa. Ese hueco lo cierra el paso de validación.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos emite una POST policy para cada subida. El servidor decide la clave, impone tipo y tamaño, y añade metadatos que el navegador no puede cambiar.</p>
+        <pre><code class="language-javascript">// src/uploads.mjs
+import express from 'express'
+import * as Minio from 'minio'
+import { randomUUID } from 'node:crypto'
+import { basename } from 'node:path'
+
+const BUCKET = 'documentos'
+const MAX_BYTES = 20 * 1024 * 1024
+const TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png'])
+
+const client = new Minio.Client({ /* configuración de la lección 1 */ })
+const app = express()
+app.use(express.json())
+
+app.post('/api/uploads', async (req, res) =&gt; {
+  const tenant = req.user.tenant            // de la sesión, nunca del body
+  const { kind, filename, contentType, size } = req.body
+
+  if (!TYPES.has(contentType)) {
+    return res.status(415).json({ error: 'tipo no permitido' })
+  }
+  if (!Number.isInteger(size) || size &lt; 1 || size &gt; MAX_BYTES) {
+    return res.status(413).json({ error: 'tamaño fuera de rango' })
+  }
+
+  const safe = basename(filename).replace(/[^\w.-]+/g, '-').toLowerCase()
+  const key = `${tenant}/${new Date().getUTCFullYear()}/${kind}/${randomUUID()}-${safe}`
+
+  const policy = client.newPostPolicy()
+  policy.setBucket(BUCKET)
+  policy.setKey(key)
+  policy.setExpires(new Date(Date.now() + 10 * 60 * 1000))
+  policy.setContentType(contentType)
+  policy.setContentLengthRange(1, MAX_BYTES)
+  policy.setUserMetaData({ tenant, kind })
+  const { postURL, formData } = await client.presignedPostPolicy(policy)
+  res.status(201).json({ key, postURL, fields: formData })
+})</code></pre>
+        <p>Los detalles que importan: <code>setKey</code> fija una clave exacta, <code>setContentType</code> exige ese tipo, <code>setContentLengthRange</code> corta en el servidor antes de escribir y <code>setUserMetaData</code> añade <code>x-amz-meta-tenant</code> y <code>x-amz-meta-kind</code> como condiciones. Si el formulario no envía esos campos con esos valores, MinIO rechaza la petición.</p>
+        <pre><code class="language-javascript">// src/uploads.mjs (continuación)
+app.post('/api/uploads/complete', async (req, res) =&gt; {
+  const { key } = req.body
+  if (!key.startsWith(`${req.user.tenant}/`)) {
+    return res.status(403).json({ error: 'clave fuera del tenant' })
+  }
+
+  const stat = await client.statObject(BUCKET, key)
+  const head = await readFirstBytes(key, 5)
+  const looksLikePdf = head.toString('latin1') === '%PDF-'
+
+  if (stat.metaData['content-type'] !== 'application/pdf' || !looksLikePdf) {
+    await client.removeObject(BUCKET, key)
+    return res.status(415).json({ error: 'el contenido no es un PDF' })
+  }
+
+  res.json({ key, size: stat.size, etag: stat.etag })
+})
+
+async function readFirstBytes(key, length) {
+  const chunks = []
+  const stream = await client.getPartialObject(BUCKET, key, 0, length)
+  for await (const chunk of stream) chunks.push(chunk)
+  return Buffer.concat(chunks)
+}</code></pre>
+        <p>Y este es el lado del navegador. El orden importa: primero los campos, el archivo al final. El nombre del campo de archivo debe ser <code>file</code>, que es el que espera la política por defecto de MinIO.</p>
+        <pre><code class="language-javascript">// public/upload.js
+const file = document.querySelector('#file').files[0]
+const meta = await fetch('/api/uploads', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    kind: 'pdf',
+    filename: file.name,
+    contentType: file.type,
+    size: file.size,
+  }),
+}).then((r) =&gt; r.json())
+
+const body = new FormData()
+for (const [name, value] of Object.entries(meta.fields)) {
+  body.append(name, value)
+}
+body.append('Content-Type', file.type)
+body.append('file', file) // siempre el último
+
+const upload = await fetch(meta.postURL, { method: 'POST', body })
+if (!upload.ok) throw new Error(`subida fallida: ${upload.status}`)
+
+await fetch('/api/uploads/complete', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ key: meta.key }),
+})</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">No pongas <code>Content-Type</code> a mano en el <code>fetch</code></p>
+          <p>Al enviar un <code>FormData</code>, el navegador genera el <em>boundary</em> del multipart. Si fijas la cabecera <code>Content-Type</code>, eliminas ese boundary y MinIO no puede parsear el formulario. El campo <code>Content-Type</code> del cuerpo es otra cosa: ese sí se añade como campo.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Generar la clave en el servidor con UUID</td><td>Aceptar la ruta que propone el navegador</td><td>Evita colisiones, sobreescrituras y saltos de prefijo entre tenants.</td></tr>
+            <tr><td>Expirar en 5–15 minutos</td><td>Firmar con el máximo de 7 días «por si acaso»</td><td>Una URL filtrada vale lo mismo que un permiso: cuanto menos dure, menos daño hace.</td></tr>
+            <tr><td>Usar POST policy para formularios</td><td>Presigned PUT con límites solo en el cliente</td><td>El servidor valida tamaño y tipo antes de aceptar el cuerpo, no después.</td></tr>
+            <tr><td>Validar con <code>statObject</code> y bytes reales</td><td>Confiar en la extensión o en el content-type declarado</td><td>El tipo declarado es una promesa del cliente; los primeros bytes no mienten.</td></tr>
+            <tr><td>Guardar la intención de subida en tu base de datos</td><td>Relacionar objetos por el nombre del archivo</td><td>Permite reconciliar huérfanos, reintentar y auditar quién subió qué.</td></tr>
+            <tr><td>Servir la web y la API por HTTPS</td><td>Firmar por HTTP fuera de local</td><td>La URL contiene una firma; por HTTP viaja en claro y cualquiera en la red la reutiliza.</td></tr>
+            <tr><td>Dar al usuario solo <code>s3:PutObject</code> en su prefijo</td><td>Firmar con root o con <code>s3:*</code></td><td>Una URL PUT no permite listar ni leer, pero una firma amplia sí amplía el daño.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Dejar que el cliente elija la clave</h3>
+        <span class="code-label code-label--wrong">Mal — el navegador propone la ruta</span>
+        <pre><code class="language-javascript">const key = req.body.key // "acme/2026/11/../../otro-tenant/x.pdf"
+const url = await client.presignedPutObject(BUCKET, key, 600)</code></pre>
+        <span class="code-label code-label--right">Bien — el servidor compone la clave</span>
+        <pre><code class="language-javascript">const key = `${tenant}/2026/11/${randomUUID()}-${safeName}`
+const url = await client.presignedPutObject(BUCKET, key, 600)</code></pre>
+        <p>Una clave con <code>../</code> no «escapa» del bucket en S3, pero sí puede salir del prefijo que tu lógica considera del tenant. Y una clave repetida sobrescribe el documento anterior sin avisar.</p>
+
+        <h3>2. Confiar en el tamaño que envía el navegador</h3>
+        <span class="code-label code-label--wrong">Mal — validar solo en el cliente</span>
+        <pre><code class="language-javascript">if (file.size &gt; 20_000_000) return alert('demasiado grande')
+// ❌ el cliente puede saltarse esta comprobación</code></pre>
+        <span class="code-label code-label--right">Bien — imponerlo en la política firmada</span>
+        <pre><code class="language-javascript">policy.setContentLengthRange(1, MAX_BYTES)
+// MinIO rechaza el cuerpo antes de escribirlo</code></pre>
+        <p>Con presigned PUT no puedes imponer el tamaño. Con POST policy sí: la condición <code>content-length-range</code> viaja firmada y el servidor la verifica.</p>
+
+        <h3>3. No validar nada después de la subida</h3>
+        <span class="code-label code-label--wrong">Mal — dar por bueno lo que llegó</span>
+        <pre><code class="language-javascript">await client.presignedPostPolicy(policy)
+res.json({ ok: true }) // ❌ todavía no ha subido nadie</code></pre>
+        <span class="code-label code-label--right">Bien — comprobar el objeto y borrar si no cumple</span>
+        <pre><code class="language-javascript">const stat = await client.statObject(BUCKET, key)
+const head = await readFirstBytes(key, 5)
+if (!looksLikePdf(head)) {
+  await client.removeObject(BUCKET, key)
+  return res.status(415).json({ error: 'contenido inválido' })
+}</code></pre>
+        <p>Entre la firma y la subida puede pasar cualquier cosa: el usuario cierra la pestaña, sube otro archivo o manda uno gigante si no pusiste límites. La validación posterior es la que convierte «hay un objeto» en «hay un documento aceptado».</p>
+
+        <h3>4. Registrar la URL firmada en los logs</h3>
+        <span class="code-label code-label--wrong">Mal — la firma acaba en texto plano</span>
+        <pre><code class="language-javascript">console.log('upload url', url) // ❌ queda en logs y en el APM</code></pre>
+        <span class="code-label code-label--right">Bien — registrar solo la clave y el resultado</span>
+        <pre><code class="language-javascript">logger.info({ key, tenant, expiresIn: 600 }, 'presigned upload emitida')</code></pre>
+        <p>Quien lea el log durante la ventana de validez puede subir a esa clave. Loguea identificadores, no capacidades.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> firmar una subida, ejecutarla sin pasar por la API y comprobar que MinIO aplica las condiciones de la política.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara un PDF de prueba y el proyecto:</strong>
+            <pre><code class="language-bash">mkdir laboratorio-presigned &amp;&amp; cd laboratorio-presigned
+npm init -y &amp;&amp; npm pkg set type=module
+npm install minio@^8.0.7 express@^5.3.0
+printf '%%PDF-1.7\nprueba\n' &gt; informe.pdf</code></pre>
+            <p>El fichero empieza por <code>%PDF-</code>, que es lo que buscará la validación.</p>
+          </li>
+          <li>
+            <strong>Firma una URL PUT con el código de la sección 3 y súbela:</strong>
+            <pre><code class="language-bash">node --env-file=.env firmar.mjs
+curl -i -X PUT --upload-file informe.pdf \
+  -H 'Content-Type: application/pdf' "http://localhost:9000/..."</code></pre>
+            <pre><code class="language-text">HTTP/1.1 200 OK
+ETag: "5d41402abc4b2a76b9719d911017c592"</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba el objeto con <code>mc</code>:</strong>
+            <pre><code class="language-bash">mc stat local/documentos/acme/2026/11/informe.pdf</code></pre>
+            <pre><code class="language-text">Name      : informe.pdf
+Size      : 16 B
+ETag      : 5d41402abc4b2a76b9719d911017c592
+Type      : application/pdf</code></pre>
+          </li>
+          <li>
+            <strong>Repite la subida con otro contenido:</strong> cambia el fichero y vuelve a usar la misma URL mientras no haya expirado. El <code>ETag</code> cambia y el objeto se sobrescribe. Conclusión: la URL es un permiso reutilizable, no un <em>nonce</em> de un solo uso.</li>
+          <li>
+            <strong>Prueba una POST policy con límite de tamaño:</strong> levanta la API de la sección 4, pide la firma declarando <code>size: 1000</code> y luego sube un fichero de 25 MB. La condición <code>content-length-range</code> de MinIO debe rechazarlo con <code>400 EntityTooLarge</code>, aunque la API te haya firmado. Si declaras los 25 MB de verdad, la API te corta antes con <code>413</code>: el interés del paso es mentir sobre el tamaño.</li>
+          <li>
+            <strong>Intenta colar un tipo distinto:</strong> con la misma política, envía el PDF declarando <code>text/plain</code> en el campo <code>Content-Type</code>. La condición <code>eq $Content-Type</code> debe rechazarlo con <code>403</code>. Anota el código exacto y compáralo con el de la lección 3.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Después de cada subida, <code>mc ls</code> debe mostrar exactamente una clave nueva. Si aparecen objetos en <code>_incoming/</code> o con sufijos raros, revisa el orden de los campos del formulario y el nombre <code>file</code>.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cuarentena y promoción</h3>
+          <p>Diseña un flujo en el que toda subida directa aterrice en <code>_incoming/&lt;tenant&gt;/&lt;uuid&gt;</code> y solo se mueva al prefijo definitivo <code>&lt;tenant&gt;/2026/11/...</code> después de pasar la validación. La promoción debe conservar los metadatos, ser idempotente y no dejar nunca un objeto huérfano si el proceso se cae a mitad.</p>
+          <p>Añade además una regla de lifecycle que borre lo que lleve más de 24 horas en <code>_incoming/</code>, y explica cómo reconciliarías las subidas que el navegador completó pero cuya llamada a <code>/complete</code> nunca llegó.</p>
+          <p><em>Pista: no existe un <code>rename</code> en S3. Piensa en <code>copyObject</code> más <code>removeObject</code>, y en qué orden deja el sistema un estado recuperable si falla entre los dos pasos.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La subida directa evita que tu API transporte bytes: el navegador habla con MinIO y la API solo firma y valida.</li>
+          <li>Presigned PUT autoriza una clave, pero no impone tamaño ni tipo; POST policy sí añade condiciones firmadas.</li>
+          <li>La clave siempre la genera el servidor: UUID, prefijo por tenant y nombre saneado.</li>
+          <li>La expiración se mide en segundos y tiene un máximo de 7 días.</li>
+          <li>La URL es reutilizable dentro de su ventana: no es un permiso de un solo uso.</li>
+          <li>Nada se acepta hasta que <code>statObject</code> y los primeros bytes confirman el contenido.</li>
+          <li>CORS abierto es lo cómodo por defecto, no una frontera de seguridad.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Dónde se decide</th><th>Qué protege</th></tr></thead>
+          <tbody>
+            <tr><td>Clave del objeto</td><td>Servidor</td><td>Colisiones y saltos de prefijo</td></tr>
+            <tr><td>Método permitido</td><td>Firma</td><td>Que una URL de subida no sirva para leer</td></tr>
+            <tr><td>Tamaño máximo</td><td><code>content-length-range</code></td><td>Cuota de disco y abuso</td></tr>
+            <tr><td>Content-Type</td><td><code>eq $Content-Type</code></td><td>Que no se declaren tipos arbitrarios</td></tr>
+            <tr><td>Expiración</td><td><code>X-Amz-Expires</code></td><td>Ventana de uso de una URL filtrada</td></tr>
+            <tr><td>Contenido real</td><td>Validación posterior</td><td>Archivos que mienten sobre su tipo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo limitar el Content-Type con una presigned PUT?</summary>
+            <div>
+              <p>No de forma fiable. La firma de <code>presignedPutObject</code> cubre método, ruta, host y expiración; la cabecera <code>Content-Type</code> no entra en la firma, así que el cliente puede cambiarla. Si necesitas imponerla, usa <code>presignedPostPolicy</code> con <code>setContentType</code> y valida los bytes después.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto debe durar una URL de subida?</summary>
+            <div>
+              <p>Lo que tarde un usuario en elegir el archivo y subirlo: entre 5 y 15 minutos suele sobrar. Para ficheros muy grandes con conexiones lentas puede necesitarse más, pero entonces conviene pasar a multipart con URLs por parte. El máximo de SigV4 es 7 días y no deberías acercarte a él.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si la subida funciona pero <code>/complete</code> falla, ¿pierdo el archivo?</summary>
+            <div>
+              <p>No: el objeto está en MinIO, pero tu base de datos no lo sabe. Por eso conviene guardar la intención antes de firmar y reconciliar después: listar el prefijo, comparar con las subidas pendientes y validar las que no tengan registro. Un objeto sin fila es un huérfano; una fila sin objeto es un puntero roto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no veo errores de CORS si mi web está en otro puerto?</summary>
+            <div>
+              <p>Porque MinIO habilita CORS para todos los orígenes por defecto. Si añades un proxy inverso o una configuración restrictiva, aparecerán preflight <code>OPTIONS</code> y cabeceras <code>Access-Control-Allow-*</code>. Recuerda que CORS no impide que alguien use la URL desde fuera del navegador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Y si el archivo supera el límite de una subida simple?</summary>
+            <div>
+              <p>MinIO acepta objetos grandes, pero una sola petición PUT tiene límites prácticos y no se puede reanudar. Para más de unos cientos de MB se usa multipart: el cliente pide una URL por parte y las sube en paralelo. Lo veremos en el <a href="../01-objetos/03-multipart-y-streaming.html">módulo de objetos</a> y en el proyecto final.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

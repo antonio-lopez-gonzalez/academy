@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="00" data-lesson="02-modelo-amqp">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>El modelo AMQP 0-9-1 — Módulo 0 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>El modelo AMQP 0-9-1</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 0 · Fundamentos</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El error más común al empezar con RabbitMQ es creer que un productor «envía un mensaje a una cola». En AMQP 0-9-1 no funciona así. El productor publica en un <strong>exchange</strong>; el exchange decide, según sus <strong>bindings</strong> y la <strong>routing key</strong>, en qué colas depositar una copia. La cola es el buzón; el exchange es la regla de reparto.</p>
+        <p>Esa separación es la que permite desacoplar: el productor no conoce las colas, y añadir un consumidor nuevo no obliga a tocar al productor. También es la fuente de la mayoría de los «mi mensaje desapareció»: publicaste en un exchange sin binding, o con una routing key que no encajaba.</p>
+        <p>En esta lección montamos el mapa completo: broker, vhost, conexión, canal, exchange, cola, binding y propiedades. No hace falta memorizar la terminología; hace falta entender <strong>quién guarda qué</strong> y <strong>qué garantía da cada pieza</strong>.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Todo el curso se apoya en cuatro verbos: <code>assert</code> (declarar), <code>bind</code> (enlazar), <code>publish</code> (publicar) y <code>consume</code> (consumir). Si confundes exchange con cola, los ejemplos de fanout, topic y DLQ se convierten en recetas sin sentido. Con el modelo claro, cada tipo de exchange es una respuesta a «¿quién debe recibir esto?».</p>
+        </div>
+      </section>
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Las piezas del modelo</h3>
+        <table>
+          <thead><tr><th>Pieza</th><th>Qué es</th><th>Quién la crea</th><th>Vive hasta…</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Broker</strong></td><td>Proceso RabbitMQ que acepta conexiones, almacena mensajes y los enruta.</td><td>Infraestructura (Docker, servidor gestionado).</td><td>Se reinicia o se destruye.</td></tr>
+            <tr><td><strong>vhost</strong></td><td>Espacio de nombres aislado: exchanges, colas y permisos propios.</td><td>Administrador.</td><td>Se borra explícitamente.</td></tr>
+            <tr><td><strong>Connection</strong></td><td>Socket TCP autenticado contra un vhost, con heartbeat.</td><td>Cliente (<code>amqp.connect</code>).</td><td>Se cierra o se cae la red.</td></tr>
+            <tr><td><strong>Channel</strong></td><td>Multiplexor ligero dentro de una conexión; casi toda la API opera aquí.</td><td>Cliente (<code>createChannel</code>).</td><td>Se cierra el canal o la conexión.</td></tr>
+            <tr><td><strong>Exchange</strong></td><td>Regla de enrutado; no almacena mensajes.</td><td>Cliente o administrador.</td><td>Se borra o el broker pierde el metadata store.</td></tr>
+            <tr><td><strong>Queue</strong></td><td>Buffer ordenado que sí almacena mensajes hasta su consumo.</td><td>Cliente o administrador.</td><td>Se borra, se auto-borra o el broker reinicia sin persistencia.</td></tr>
+            <tr><td><strong>Binding</strong></td><td>Relación «este exchange entrega a esta cola con esta clave».</td><td>Cliente o administrador.</td><td>Se desenlaza o se borra la cola/exchange.</td></tr>
+            <tr><td><strong>Mensaje</strong></td><td>Cuerpo opaco + propiedades + routing key de publicación.</td><td>Productor.</td><td>Se confirma su consumo o se descarta.</td></tr>
+          </tbody>
+        </table>
+        <h3>El flujo completo</h3>
+        <pre><code class="language-text">productor
+   │  publish(exchange="pedidos", routingKey="pedido.creado", body)
+   ▼
+┌──────────────────────────────────────────────┐
+│ exchange "pedidos" (topic, durable)          │
+│                                              │
+│  binding "pedido.creado" ──▶ cola facturacion│
+│  binding "pedido.creado" ──▶ cola inventario │
+│  binding "pedido.#"      ──▶ cola auditoria  │
+└──────────────────────────────────────────────┘
+   │                    │                    │
+   ▼                    ▼                    ▼
+consumidor A        consumidor B        consumidor C
+(ack)               (ack)               (ack)
+</code></pre>
+        <p>El exchange copia el mensaje a <strong>cada cola</strong> que case, no a cada consumidor. Si dos consumidores comparten una cola, compiten por los mismos mensajes; si quieres que ambos reciban una copia, necesitan colas distintas enlazadas al mismo exchange.</p>
+        <h3>Conexión y canal: dos niveles distintos</h3>
+        <p>Una <strong>connection</strong> es un socket TCP con TLS opcional, autenticación, selección de vhost y heartbeat. Es caro de abrir y se comparte en todo el proceso. Un <strong>channel</strong> es un multiplexor dentro de esa conexión: decenas o cientos de operaciones concurrentes viajan por el mismo socket, etiquetadas con su canal.</p>
+        <table>
+          <thead><tr><th>Connection</th><th>Channel</th></tr></thead>
+          <tbody>
+            <tr><td>Una por proceso (o pocas).</td><td>Una por tarea lógica: un productor, un consumidor, un RPC.</td></tr>
+            <tr><td>Autentica y selecciona el vhost.</td><td>Declara, publica, consume y confirma.</td></tr>
+            <tr><td>Su cierre afecta a todos los canales.</td><td>Su cierre no tumba la conexión ni los demás canales.</td></tr>
+            <tr><td>Los <code>deliveryTag</code> no viven aquí.</td><td>Los <code>deliveryTag</code> son <strong>por canal</strong> y empiezan en 1.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Un canal no es thread-safe</p>
+          <p>No compartas un mismo canal entre dos tareas que publican o consumen a la vez. En Node hay un solo hilo, pero las promesas y los callbacks se intercalan: los <code>ack</code>, los confirms y los tags pueden mezclarse. Usa un canal por rol o serializa el acceso. Abrir canales es barato; depurar un <code>ack</code> cruzado no.</p>
+        </div>
+
+        <h3>Exchange, cola, binding y routing key</h3>
+        <ul>
+          <li><strong>Exchange</strong>: recibe publicaciones y aplica reglas. Nunca guarda el mensaje; si ninguna cola casa, lo descarta (salvo <code>mandatory</code> o alternate exchange).</li>
+          <li><strong>Cola</strong>: guarda copias hasta que un consumidor las confirme. Tiene nombre, durabilidad, argumentos y consumidores.</li>
+          <li><strong>Binding</strong>: arista exchange → cola con una <em>binding key</em>. Es la tabla de rutas.</li>
+          <li><strong>Routing key</strong>: cadena que el productor pone en cada publicación. El exchange la compara con las binding keys según su tipo.</li>
+        </ul>
+        <p>Un mensaje puede acabar en cero, una o varias colas. Si acaba en varias, son <strong>copias independientes</strong>: cada cola tiene su ciclo de vida, su <code>ack</code> y su redelivery.</p>
+
+        <h3>Tipos de exchange</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Cómo enruta</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>direct</code></td><td>Binding key exactamente igual a la routing key.</td><td>Un destino concreto por clave: <code>pedido.creado</code>.</td></tr>
+            <tr><td><code>fanout</code></td><td>Ignora la routing key: copia a todas las colas enlazadas.</td><td>Pub/sub y eventos que varios servicios deben recibir.</td></tr>
+            <tr><td><code>topic</code></td><td>Patrón con <code>*</code> (una palabra) y <code>#</code> (cero o más palabras).</td><td>Jerarquías: <code>pedido.*</code>, <code>pedido.#</code>, <code>*.cancelado</code>.</td></tr>
+            <tr><td><code>headers</code></td><td>Compara cabeceras, no la routing key.</td><td>Atributos complejos o múltiples criterios.</td></tr>
+            <tr><td><code>""</code> (default)</td><td>Direct implícito: routing key = nombre de la cola.</td><td>Publicar a una cola concreta sin declarar exchange.</td></tr>
+          </tbody>
+        </table>
+        <p>El exchange por defecto no se puede borrar ni declarar; existe en todo vhost. <code>sendToQueue(queue, body)</code> es azúcar para <code>publish("", queue, body)</code>. Es cómodo para el primer mensaje y para RPC, pero acopla el productor al nombre de la cola.</p>
+
+        <h3>Anatomía de un mensaje</h3>
+        <p>El cuerpo es un <code>Buffer</code> opaco: el broker no sabe si es JSON, texto o una imagen. Las propiedades son metadatos que el broker sí entiende o reenvía:</p>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Para qué sirve</th></tr></thead>
+          <tbody>
+            <tr><td><code>deliveryMode</code> / <code>persistent</code></td><td><code>2</code> o <code>persistent: true</code> pide persistir el mensaje en disco (si la cola es durable).</td></tr>
+            <tr><td><code>contentType</code></td><td>Declara el formato: <code>application/json</code>, <code>text/plain</code>.</td></tr>
+            <tr><td><code>messageId</code></td><td>Identificador del mensaje para trazas y deduplicación (no sustituye una clave de negocio).</td></tr>
+            <tr><td><code>correlationId</code></td><td>Une una respuesta con su petición en RPC.</td></tr>
+            <tr><td><code>replyTo</code></td><td>Cola donde el consumidor debe responder.</td></tr>
+            <tr><td><code>timestamp</code></td><td>Momento de publicación, en segundos Unix.</td></tr>
+            <tr><td><code>expiration</code></td><td>TTL del mensaje en milisegundos, como cadena.</td></tr>
+            <tr><td><code>headers</code></td><td>Mapa libre para metadatos, filtros o contadores de reintento.</td></tr>
+          </tbody>
+        </table>
+        <p>Las propiedades viajan con el mensaje, pero no son gratis: cabeceras enormes se copian en cada entrega y en cada persistencia. Para datos de negocio, el cuerpo; para enrutado y trazabilidad, las propiedades.</p>
+
+        <h3>Declarar es idempotente, pero no libre</h3>
+        <p><code>assertExchange</code>, <code>assertQueue</code> y <code>bindQueue</code> crean si no existe y no fallan si ya existe con las mismas características. Eso permite declarar la topología en el arranque de cada servicio. Pero <strong>no son un «upsert»</strong>: si la cola existe con otro tipo, otra durabilidad u otros argumentos, el broker responde con <code>406 PRECONDITION_FAILED</code> y cierra el canal.</p>
+        <pre><code class="language-text">assertQueue("facturacion", { durable: true })
+  → no existe: la crea
+  → existe durable: OK, no hace nada
+  → existe no durable: 406 PRECONDITION_FAILED - inequivalent arg 'durable'
+
+assertQueue("facturas", { arguments: { "x-queue-type": "quorum" } })
+  → existe como classic: 406 PRECONDITION_FAILED - inequivalent arg 'x-queue-type'
+</code></pre>
+        <p>La topología es un contrato inmutable en lo que respecta a sus atributos. Cambiar el tipo de una cola exige borrarla y recrearla (con pérdida de mensajes) o crear una nueva y migrar. Por eso conviene pensar los nombres y argumentos antes de producción.</p>
+
+        <h3>Publicar y consumir son garantías distintas</h3>
+        <table>
+          <thead><tr><th>Etapa</th><th>Pregunta</th><th>Quién la garantiza</th><th>Mecanismo</th></tr></thead>
+          <tbody>
+            <tr><td>Publicación aceptada</td><td>¿El broker recibió el mensaje?</td><td>Productor + broker</td><td>Publisher confirm (módulo 3).</td></tr>
+            <tr><td>Enrutado</td><td>¿Acabó en alguna cola?</td><td>Exchange + bindings</td><td><code>mandatory</code> + <code>basic.return</code> o alternate exchange.</td></tr>
+            <tr><td>Almacenado</td><td>¿Sobrevive a un reinicio?</td><td>Broker</td><td>Cola durable + mensaje persistente + quorum.</td></tr>
+            <tr><td>Entregado</td><td>¿Llegó a un consumidor?</td><td>Broker + consumidor</td><td><code>basic.consume</code>, <code>prefetch</code>, <code>ack</code>.</td></tr>
+            <tr><td>Procesado</td><td>¿Se completó el efecto?</td><td>Consumidor</td><td><code>ack</code> después del efecto e idempotencia.</td></tr>
+          </tbody>
+        </table>
+        <p>Un <code>publish</code> que no lanza excepción no significa que el mensaje esté en una cola. Significa que salió del cliente. Cada fila de la tabla es una garantía independiente que hay que elegir y verificar.</p>
+
+        <h3>vhost: el aislamiento</h3>
+        <p>Un <strong>vhost</strong> es un RabbitMQ dentro de RabbitMQ. Tiene sus exchanges, colas, bindings y permisos. Dos vhosts pueden tener una cola llamada <code>facturacion</code> sin colisionar. El vhost se elige al abrir la conexión (<code>amqp://user:pass@host:5672/taller</code>) y no se puede cambiar en un canal.</p>
+        <p>La convención habitual es un vhost por entorno (<code>dev</code>, <code>staging</code>, <code>prod</code>) o por dominio, con permisos separados. El vhost por defecto es <code>/</code>; en la API HTTP se codifica como <code>%2F</code>.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Este script declara la topología del taller y termina. No publica ni consume: solo asegura que el contrato existe. Es lo que hará cada servicio al arrancar.</p>
+        <pre><code class="language-javascript">// topologia.mjs — declara exchange, colas y bindings
+import amqp from "amqplib";
+
+const url = process.env.AMQP_URL ?? "amqp://guest:guest@localhost:5672";
+const connection = await amqp.connect(url);
+const channel = await connection.createChannel();
+
+await channel.assertExchange("pedidos", "topic", { durable: true });
+
+await channel.assertQueue("facturacion", { durable: true });
+await channel.assertQueue("inventario", { durable: true });
+await channel.assertQueue("auditoria", { durable: true });
+
+await channel.bindQueue("facturacion", "pedidos", "pedido.creado");
+await channel.bindQueue("inventario", "pedidos", "pedido.creado");
+await channel.bindQueue("auditoria", "pedidos", "pedido.#");
+
+console.log("topología lista");
+await channel.close();
+await connection.close();
+</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>amqp.connect</code> abre la conexión TCP, autentica y selecciona el vhost <code>/</code>.</li>
+          <li><code>createChannel</code> abre el multiplexor donde se declara y se opera.</li>
+          <li><code>assertExchange("pedidos", "topic", …)</code>: si no existe, la crea; si existe con otro tipo, falla con 406.</li>
+          <li><code>assertQueue</code>: crea las colas durables. En el módulo 1 veremos por qué una cola de trabajo debería ser <em>quorum</em>; aquí usamos classic para no mezclar conceptos.</li>
+          <li><code>bindQueue(cola, exchange, key)</code>: crea la arista. El tercer argumento es la binding key.</li>
+          <li><code>close()</code> ordenado: primero el canal, después la conexión.</li>
+        </ul>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">topología lista
+</code></pre>
+        <p>Compruébalo desde el broker (salida recortada: omito los exchanges del sistema):</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_exchanges name type durable
+docker exec rabbitmq rabbitmqctl list_queues name type messages consumers
+docker exec rabbitmq rabbitmqctl list_bindings source_name destination_name routing_key
+</code></pre>
+        <pre><code class="language-text">name       type    durable
+pedidos    topic   true
+amq.topic  topic   true
+
+name          type     messages  consumers
+auditoria     classic  0         0
+facturacion   classic  0         0
+inventario    classic  0         0
+
+source_name  destination_name  routing_key
+pedidos      auditoria         pedido.#
+pedidos      facturacion       pedido.creado
+pedidos      inventario        pedido.creado
+</code></pre>
+        <p>Las colas están vacías y sin consumidores: declarar no publica nada. Ejecuta el script dos veces y verás que no falla ni duplica bindings; esa es la idempotencia de <code>assert</code>/<code>bind</code>.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, el exchange <code>pedidos</code> recibe tres eventos. Las bindings deciden quién se entera de cada uno:</p>
+        <table>
+          <thead><tr><th>Routing key publicada</th><th>facturacion</th><th>inventario</th><th>auditoria</th></tr></thead>
+          <tbody>
+            <tr><td><code>pedido.creado</code></td><td>✅ recibe</td><td>✅ recibe</td><td>✅ recibe (<code>pedido.#</code>)</td></tr>
+            <tr><td><code>pedido.cancelado</code></td><td>—</td><td>—</td><td>✅ recibe (<code>pedido.#</code>)</td></tr>
+            <tr><td><code>pedido.pagado</code></td><td>—</td><td>—</td><td>✅ recibe (<code>pedido.#</code>)</td></tr>
+            <tr><td><code>pago.rechazado</code></td><td>—</td><td>—</td><td>— no enruta</td></tr>
+          </tbody>
+        </table>
+        <p>La última fila es la clave: el exchange no «avisa a alguien por si acaso». Si ninguna binding casa, el mensaje se descarta. En el módulo 2 veremos <code>alternate-exchange</code> para capturarlo; en el módulo 3, <code>mandatory</code> y <code>basic.return</code> para que el productor se entere.</p>
+        <pre><code class="language-text">publish("pedidos", "pedido.cancelado", body)
+   │
+   ├─ binding "pedido.creado"  ✗ no casa
+   ├─ binding "pedido.creado"  ✗ no casa
+   └─ binding "pedido.#"        ✓ casa  ──▶ auditoria
+</code></pre>
+        <p>Fíjate también en lo que <strong>no</strong> ocurre: facturación no recibe la cancelación porque su binding es exacta. Si mañana el negocio necesita que facturación reaccione a cancelaciones, se añade una binding; no se toca al productor. Ese es el desacoplamiento que buscábamos.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Una binding no reproduce el pasado</p>
+          <p>Si publicas <code>pedido.creado</code> y después creas la binding, la cola <strong>no</strong> recibe el mensaje anterior. Las bindings solo afectan a publicaciones futuras. Por eso la topología se declara al arrancar, antes de publicar.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar exchanges, colas y bindings en código, al arrancar cada servicio.</td><td>Crearlos a mano en la management UI y confiar en que siguen ahí.</td><td>La topología se versiona, se revisa y se reproduce en cualquier entorno.</td></tr>
+            <tr><td>Nombres estables y jerárquicos: <code>pedidos</code>, <code>pedido.creado</code>.</td><td>Nombres con fechas, versiones o nombres de host.</td><td>Las bindings y los consumidores dependen del nombre; renombrar rompe el contrato.</td></tr>
+            <tr><td>Un canal por rol: uno para publicar, otro para consumir.</td><td>Compartir un canal entre tareas concurrentes.</td><td>Los tags y confirms son estado del canal; mezclarlos produce errores difíciles de reproducir.</td></tr>
+            <tr><td>Un vhost por entorno y permisos acotados.</td><td>Usar <code>/</code> para todo con el usuario <code>guest</code>.</td><td>Aísla entornos y reduce el radio de un error o una credencial filtrada.</td></tr>
+            <tr><td>Pensar la routing key como parte del contrato público.</td><td>Cambiarla sin avisar a los consumidores.</td><td>Los consumidores se despliegan por separado; una clave nueva puede dejar colas mudas.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Publicar «a la cola» en un exchange con nombre</h3>
+        <span class="code-label code-label--wrong">Mal — usar el nombre de la cola como routing key de un topic</span>
+        <pre><code class="language-javascript">await ch.assertExchange("pedidos", "topic", { durable: true });
+ch.publish("pedidos", "facturacion", body); // no hay binding "facturacion"
+</code></pre>
+        <span class="code-label code-label--right">Bien — publicar la clave que las bindings esperan</span>
+        <pre><code class="language-javascript">ch.publish("pedidos", "pedido.creado", body);
+// binding: facturacion ── "pedido.creado"
+</code></pre>
+        <p>El mensaje no da error: el exchange no encuentra ninguna cola y lo descarta. Sin <code>mandatory</code> ni confirms, el productor cree que todo fue bien.</p>
+
+        <h3>2. Redeclarar la misma cola con otros argumentos</h3>
+        <span class="code-label code-label--wrong">Mal — cambiar el tipo sobre una cola existente</span>
+        <pre><code class="language-javascript">await ch.assertQueue("facturas", { durable: true }); // ya existe como quorum
+await ch.assertQueue("facturas", {
+  durable: true,
+  arguments: { "x-queue-type": "quorum" },
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — borrar y recrear, o usar un nombre nuevo</span>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl delete_queue facturas
+# y volver a declararla con el tipo correcto
+</code></pre>
+        <p>El broker responde <code>406 PRECONDITION_FAILED - inequivalent arg 'x-queue-type'</code> y cierra el canal. La cola no cambia de tipo: los atributos son inmutables.</p>
+
+        <h3>3. Compartir un canal entre dos tareas</h3>
+        <span class="code-label code-label--wrong">Mal — publicar y consumir en el mismo canal desde flujos distintos</span>
+        <pre><code class="language-javascript">const ch = await conn.createChannel();
+await consumir(ch);   // registra un consumer
+publicarCadaSegundo(ch); // y publica en el mismo canal
+</code></pre>
+        <span class="code-label code-label--right">Bien — canales separados por rol</span>
+        <pre><code class="language-javascript">const chConsumo = await conn.createChannel();
+const chPublicacion = await conn.createChannel();
+</code></pre>
+        <p>Un canal no es thread-safe. Los <code>deliveryTag</code> y los confirms pertenecen al canal; si dos flujos lo usan, un <code>ack</code> puede referirse al mensaje equivocado o un confirm puede resolverse fuera de orden.</p>
+
+        <h3>4. Esperar que una binding reciba mensajes antiguos</h3>
+        <span class="code-label code-label--wrong">Mal — publicar antes de crear la topología</span>
+        <pre><code class="language-javascript">ch.publish("pedidos", "pedido.creado", body); // aún no hay binding
+await ch.bindQueue("facturacion", "pedidos", "pedido.creado");
+</code></pre>
+        <span class="code-label code-label--right">Bien — declarar y enlazar antes de publicar</span>
+        <pre><code class="language-javascript">await ch.bindQueue("facturacion", "pedidos", "pedido.creado");
+ch.publish("pedidos", "pedido.creado", body);
+</code></pre>
+        <p>Las bindings no son un registro histórico: solo afectan a lo que se publique después. Un despliegue que publica antes de declarar pierde esos mensajes.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> declarar la topología, comprobar que es idempotente y ver cómo una binding nueva cambia el reparto sin tocar al productor.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Guarda el script:</strong> crea <code>topologia.mjs</code> con el ejemplo mínimo y ejecútalo.
+            <pre><code class="language-bash">node topologia.mjs
+</code></pre>
+            <pre><code class="language-text">topología lista
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Ejecútalo otra vez:</strong> no debe fallar ni duplicar bindings.
+            <pre><code class="language-bash">node topologia.mjs
+docker exec rabbitmq rabbitmqctl list_bindings source_name destination_name routing_key
+</code></pre>
+            <p>Salida esperada: exactamente tres bindings de <code>pedidos</code>, no seis.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Inspecciona el exchange y las colas:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_exchanges name type durable
+docker exec rabbitmq rabbitmqctl list_queues name type messages consumers
+</code></pre>
+            <pre><code class="language-text">name       type    durable
+pedidos    topic   true
+
+name          type     messages  consumers
+auditoria     classic  0         0
+facturacion   classic  0         0
+inventario    classic  0         0
+</code></pre>
+            <p>Todo existe, nada tiene mensajes: declarar no publica.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Añade una binding y vuelve a ejecutar:</strong> enlaza <code>facturacion</code> también a <code>pedido.cancelado</code>.
+            <pre><code class="language-javascript">await channel.bindQueue("facturacion", "pedidos", "pedido.cancelado");
+</code></pre>
+            <pre><code class="language-bash">node topologia.mjs
+docker exec rabbitmq rabbitmqctl list_bindings source_name destination_name routing_key
+</code></pre>
+            <p>Ahora hay cuatro bindings. El productor no ha cambiado: sigue publicando <code>pedido.cancelado</code>. El exchange hace el resto.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Rompe el contrato a propósito:</strong> intenta declarar <code>facturacion</code> con <code>durable: false</code> en otro script. Observa el error <code>406 PRECONDITION_FAILED</code> y explica por qué el canal se cierra aunque la conexión siga viva.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Borra <code>inventario</code> con <code>rabbitmqctl delete_queue inventario</code> y vuelve a ejecutar <code>topologia.mjs</code>. La cola reaparece vacía y la binding se recrea: la topología declarativa es reproducible. Los mensajes que hubiera, no.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un evento de pago, tres destinos</h3>
+          <p>El taller va a publicar <code>pedido.pagado</code>. Deben recibirlo <strong>facturación</strong> (para marcar la factura como cobrada), <strong>auditoría</strong> (para el registro) y un nuevo servicio de <strong>fidelización</strong> que aún no existe. Facturación solo quiere eventos de pago; auditoría quiere todos los <code>pedido.*</code>; fidelización solo los pagos y las cancelaciones.</p>
+          <p>Diseña el exchange, las bindings y las routing keys. Decide si basta con <code>topic</code> o si necesitas otro tipo. Después responde: si mañana se añade <code>pedido.reembolsado</code>, ¿qué consumidores lo reciben sin tocar código, y cuáles exigirían una binding nueva?</p>
+          <p><em>Pista: dibuja primero la tabla de «evento × cola» como hicimos en el ejemplo real. Las bindings son la implementación de esa tabla, no al revés.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El productor publica en un <strong>exchange</strong>; el exchange copia a las <strong>colas</strong> que casan con la routing key y las bindings.</li>
+          <li>La <strong>cola</strong> almacena; el <strong>exchange</strong> no. Un mensaje sin binding se descarta.</li>
+          <li>Una <strong>connection</strong> es el socket autenticado; un <strong>channel</strong> es el multiplexor donde se opera. Los canales no son thread-safe.</li>
+          <li><code>assert</code> y <code>bind</code> son idempotentes, pero los atributos de una cola son inmutables: cambiarlos produce <code>406</code>.</li>
+          <li>Publicar, enrutar, almacenar, entregar y procesar son <strong>cinco garantías distintas</strong>; cada una tiene su mecanismo.</li>
+          <li>El <strong>vhost</strong> aísla exchanges, colas y permisos; se elige al conectar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>En una frase</th></tr></thead>
+          <tbody>
+            <tr><td><code>assertExchange</code></td><td>Declara el exchange; falla si existe con otro tipo o durabilidad.</td></tr>
+            <tr><td><code>assertQueue</code></td><td>Declara la cola; falla si los argumentos no coinciden.</td></tr>
+            <tr><td><code>bindQueue</code></td><td>Enlaza una cola a un exchange con una binding key.</td></tr>
+            <tr><td><code>publish</code></td><td>Publica un <code>Buffer</code> con propiedades en un exchange y una routing key.</td></tr>
+            <tr><td><code>sendToQueue</code></td><td>Atajo al exchange por defecto: la routing key es el nombre de la cola.</td></tr>
+            <tr><td><code>list_bindings</code></td><td>Muestra la tabla de rutas real del broker.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuál es la diferencia entre conexión y canal?</summary>
+            <div>
+              <p>La conexión es el socket TCP autenticado contra un vhost; es cara y se comparte. El canal es un multiplexor ligero dentro de ella donde ocurren las declaraciones, publicaciones y consumos. Abre una conexión por proceso y un canal por tarea lógica; no compartas un canal entre flujos concurrentes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si un mensaje casa con tres bindings, ¿se entrega tres veces al mismo consumidor?</summary>
+            <div>
+              <p>Se deposita una copia en cada una de las tres colas. Si las tres colas tienen consumidores distintos, cada uno recibe su copia. Si dos consumidores comparten la misma cola, compiten y solo uno procesa cada mensaje. El exchange copia por cola, no por consumidor.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si publico y ninguna binding coincide?</summary>
+            <div>
+              <p>El exchange descarta el mensaje. No hay error ni reintento. Para detectarlo necesitas <code>mandatory: true</code> y escuchar el evento <code>return</code>, o configurar un alternate exchange que recoja lo no enrutado. Lo veremos en el módulo 2.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los nombres de cola son globales?</summary>
+            <div>
+              <p>Dentro de un vhost, sí: no puede haber dos colas con el mismo nombre. En vhosts distintos pueden repetirse sin conflicto, porque son espacios de nombres separados. El exchange por defecto también es por vhost.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

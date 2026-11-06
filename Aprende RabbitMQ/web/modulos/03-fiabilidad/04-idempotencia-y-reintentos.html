@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-idempotencia-y-reintentos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Idempotencia y reintentos — Módulo 3 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Idempotencia y reintentos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Fiabilidad</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Con publisher confirms y <code>ack</code> manual has conseguido <strong>at-least-once</strong>: el mensaje no se pierde, pero puede entregarse más de una vez. Esa es la garantía que ofrece un broker ante fallos reales. El problema es que «más de una vez» incluye el caso en que el consumidor ya cobró, ya descontó stock o ya envió el email, y el <code>ack</code> se perdió por la red.</p>
+        <p>La consecuencia es incómoda: <strong>la idempotencia no es opcional</strong>. No la añades «si hay tiempo»; es la otra mitad del contrato at-least-once. Y va acompañada de reintentos bien diseñados: un fallo transitorio debe esperar y volver a intentarse, un fallo definitivo debe acabar en la DLQ, y ninguno de los dos debe bloquear la cola ni multiplicar efectos.</p>
+        <p>Esta lección cubre las dos caras del mismo problema: cómo reconocer un duplicado (clave de negocio, tabla de idempotencia, transacción) y cómo reintentar sin crear bucles (cola de espera con TTL, backoff exponencial, jitter, límite de intentos y DLQ). Al final tendrás una tabla de decisión para elegir la estrategia según el tipo de fallo.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>«Exactamente una vez» no se consigue configurando una casilla: se consigue haciendo que repetir una operación sea inofensivo. Ese es el único diseño que sobrevive a un <code>ack</code> perdido, a un reintento del productor y a un despliegue en mitad de un lote.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>De dónde salen los duplicados</h3>
+        <table>
+          <thead><tr><th>Origen</th><th>Qué pasó</th><th>¿Quién puede evitarlo?</th></tr></thead>
+          <tbody>
+            <tr><td>Reintento del productor</td><td>No llegó el confirm; republicó el mismo evento</td><td>Productor con clave estable + consumidor idempotente</td></tr>
+            <tr><td><code>ack</code> perdido</td><td>El consumidor procesó, pero el broker no recibió el ack y reentrega</td><td>Solo el consumidor, deduplicando</td></tr>
+            <tr><td>Caída tras el efecto</td><td>Se cobró y el proceso murió antes del <code>ack</code></td><td>Solo el consumidor, con estado transaccional</td></tr>
+            <tr><td>Relay de outbox</td><td>Publicó y no llegó a marcar la fila como enviada</td><td>Clave estable + consumidor idempotente</td></tr>
+          </tbody>
+        </table>
+        <p>Ningún mecanismo del broker elimina estos casos. Los confirms reducen la ventana; el <code>ack</code> manual la reduce más; la idempotencia la cierra.</p>
+        <h3>La clave de idempotencia</h3>
+        <p>Una clave de idempotencia es un identificador <strong>estable</strong> del efecto que quieres aplicar una sola vez. Estable significa que el mismo evento, reintentado, produce la misma clave. Si el productor genera un UUID nuevo en cada reintento, no hay nada que deduplicar.</p>
+        <pre><code class="language-text">bien:  pedido-P-1001-pagado-v1
+bien:  factura-F-88-emitida
+mal:   crypto.randomUUID()   // distinto en cada reintento
+mal:   Date.now()            // distinto en cada milisegundo</code></pre>
+        <p><code>messageId</code> sirve si el productor lo mantiene estable entre reintentos. Si no, deriva la clave de los datos de negocio: tipo de evento + id de entidad + versión. La clave debe ser única <strong>por consumidor</strong>: dos servicios distintos que procesan el mismo evento necesitan cada uno su propio registro.</p>
+        <h3>Tabla de idempotencia</h3>
+        <pre><code class="language-sql">CREATE TABLE processed_messages (
+  idempotency_key text NOT NULL,
+  consumer        text NOT NULL,
+  processed_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (idempotency_key, consumer)
+);
+
+INSERT INTO processed_messages (idempotency_key, consumer)
+VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING idempotency_key;</code></pre>
+        <p>Hay dos formas de usarla, y la diferencia importa:</p>
+        <ul>
+          <li><strong>Reclamar antes de procesar</strong>: insertas la clave, si funciona procesas, si no, es duplicado. Si el proceso cae después de insertar y antes del efecto, el mensaje se pierde: la clave quedó marcada sin trabajo hecho.</li>
+          <li><strong>Insertar en la misma transacción que el efecto</strong>: el <code>INSERT</code> y el <code>UPDATE</code> del pedido se confirman juntos. Si algo falla, ambos se revierten y el reintento vuelve a empezar. Es la opción correcta cuando el efecto vive en la misma base de datos.</li>
+        </ul>
+        <p>Para efectos externos (una pasarela de pago, un email) no hay transacción común. Ahí se usa un estado <code>processing</code>/<code>done</code>, una clave de idempotencia enviada al proveedor y una compensación si el estado queda a medias. La tabla te dice qué pasó; no puede hacer magia distribuida.</p>
+        <h3>Reintentos: el problema del <code>requeue</code> inmediato</h3>
+        <p><code>nack(msg, false, true)</code> devuelve el mensaje a la cola al instante. Si el fallo es transitorio y el broker está sano, el mensaje vuelve a fallar en milisegundos, consume CPU y adelanta a mensajes que sí podrían procesarse. Con varios workers, es una tormenta perfecta.</p>
+        <p>El patrón correcto es una <strong>cola de espera</strong>: publicar el mensaje en una cola sin consumidores, con un TTL, y configurar su DLX para que vuelva a la cola de trabajo cuando expire. Mientras tanto, el mensaje no compite por los workers.</p>
+        <pre><code class="language-text">fallo transitorio
+      |
+      v
+trabajos.retry.5s   (TTL 5 s, sin consumidores)
+      |  expira
+      v
+trabajos (direct) → trabajos.pedidos → reintento
+
+fallo definitivo o intentos agotados
+      |
+      v
+pedidos.dlx (fanout) → pedidos.dlq</code></pre>
+        <p>Para backoff exponencial se usan varios niveles, cada uno con su TTL: 5 s, 30 s, 2 min, 10 min. Un solo nivel con TTL por mensaje parece más simple, pero sufre el mismo bloqueo de cabeza que viste en <a href="03-ttl-y-limites.html">TTL y límites</a>: un mensaje con 10 minutos delante bloquea a uno con 5 segundos.</p>
+        <table>
+          <thead><tr><th>Intento</th><th>Espera</th><th>Cola</th></tr></thead>
+          <tbody>
+            <tr><td>1.ª entrega</td><td>Inmediata</td><td><code>trabajos.pedidos</code></td></tr>
+            <tr><td>2.º</td><td>5 s</td><td><code>trabajos.retry.5s</code></td></tr>
+            <tr><td>3.º</td><td>30 s</td><td><code>trabajos.retry.30s</code></td></tr>
+            <tr><td>4.º</td><td>2 min</td><td><code>trabajos.retry.2m</code></td></tr>
+            <tr><td>5.º</td><td>10 min</td><td><code>trabajos.retry.10m</code></td></tr>
+            <tr><td>6.º</td><td>No se reintenta</td><td><code>pedidos.dlq</code></td></tr>
+          </tbody>
+        </table>
+        <h3>Jitter y límite de intentos</h3>
+        <p>Si mil mensajes fallan a la vez y todos esperan exactamente 30 segundos, mil mensajes vuelven a la vez. Eso es un <strong>retry storm</strong>. El <em>jitter</em> añade una variación aleatoria al intervalo (por ejemplo, ±20 %) para repartir la carga. Con colas de TTL fijo, se implementa eligiendo el nivel con una pequeña variación o añadiendo un retardo aleatorio antes de republicar; la alternativa limpia es el plugin de mensajes retardados, que permite TTL por mensaje sin el problema de cabeza.</p>
+        <p>El límite de intentos es obligatorio: sin él, un mensaje venenoso se reintenta para siempre. Lleva tu propio contador en una cabecera (<code>x-attempts</code>) porque <code>x-death.count</code> se comprime por cola y motivo y no siempre refleja «intentos de negocio». En quorum queues, además, existe <code>delivery-limit</code> (20 por defecto en RabbitMQ 4.x), pero no todos los reencolados incrementan el contador; no lo uses como única fuente de verdad.</p>
+        <h3>Outbox: cerrar la brecha del productor</h3>
+        <p>La idempotencia protege al consumidor. El <strong>outbox</strong> protege al productor: escribe el cambio de negocio y el evento pendiente en la misma transacción, y un relay publica después con confirms. Si el relay cae, la fila sigue pendiente; si publica dos veces, el consumidor deduplica. Es el patrón que conecta «no perder» con «no duplicar».</p>
+        <h3>Elegir estrategia según el fallo</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>Estrategia</th><th>Señal</th></tr></thead>
+          <tbody>
+            <tr><td>Duplicado por reentrega</td><td>Tabla de idempotencia con clave de negocio</td><td>Ya procesado, <code>ack</code> sin repetir efecto</td></tr>
+            <tr><td>Fallo transitorio (timeout, 503)</td><td>Cola de espera con TTL y backoff</td><td>Reintento diferido, no bucle</td></tr>
+            <tr><td>Fallo definitivo (400, datos inválidos)</td><td><code>reject</code> sin requeue → DLQ</td><td>Mensaje en DLQ con motivo</td></tr>
+            <tr><td>Base de datos + publicación</td><td>Outbox + relay con confirms</td><td>Fila pendiente hasta confirmar</td></tr>
+            <tr><td>Efecto externo no transaccional</td><td>Clave de idempotencia del proveedor + estado</td><td>El proveedor deduplica</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-least-once. El consumidor recibe el mismo mensaje dos veces y solo aplica el efecto una. El registro en memoria es solo didáctico: no sobrevive a un reinicio ni se comparte entre workers.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertQueue('demo.idempotencia', { durable: true });
+
+const procesados = new Set();
+let efectos = 0;
+
+async function procesarUnaVez(clave, efecto) {
+  if (procesados.has(clave)) {
+    console.log('duplicado, se ignora:', clave);
+    return;
+  }
+  await efecto();
+  procesados.add(clave);   // solo después del efecto
+  efectos += 1;
+}
+
+await ch.consume('demo.idempotencia', async (msg) =&gt; {
+  if (!msg) return;
+  const evento = JSON.parse(msg.content.toString());
+  const clave = `${evento.tipo}:${evento.pedidoId}:v${evento.version}`;
+
+  await procesarUnaVez(clave, async () =&gt; {
+    console.log('aplicando efecto para', evento.pedidoId);
+  });
+  ch.ack(msg);
+}, { noAck: false });
+
+// El mismo evento se publica dos veces (simula un reintento del productor).
+const evento = { tipo: 'pedido.pagado', pedidoId: 'P-1001', version: 1 };
+const body = Buffer.from(JSON.stringify(evento));
+ch.sendToQueue('demo.idempotencia', body, { persistent: true, messageId: 'pedido-P-1001-pagado-v1' });
+ch.sendToQueue('demo.idempotencia', body, { persistent: true, messageId: 'pedido-P-1001-pagado-v1' });
+
+await new Promise((resolve) =&gt; setTimeout(resolve, 300));
+console.log('efectos aplicados:', efectos);   // 1
+</code></pre>
+        <p>Salida esperada:</p>
+        <pre><code class="language-text">aplicando efecto para P-1001
+duplicado, se ignora: pedido.pagado:P-1001:v1
+efectos aplicados: 1</code></pre>
+        <p>Dos detalles que hacen que esto sea un ejemplo y no una solución: el <code>Set</code> vive en memoria del proceso (dos workers no lo comparten) y crece sin límite. En producción, la clave va a una tabla con <code>PRIMARY KEY</code> y una política de limpieza. Y el orden importa: se marca <strong>después</strong> del efecto; si se marca antes y el efecto falla, el reintento se considera duplicado y el trabajo se pierde.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El worker de pedidos combina las dos piezas: una transacción que registra la clave y aplica el efecto, y una topología de reintentos con backoff. La tabla de idempotencia se limpia por antigüedad para no crecer sin fin.</p>
+        <pre><code class="language-javascript">import { pool } from './db.js';
+
+export async function procesarPedidoUnaVez(idempotencyKey, pedido, aplicar) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const claim = await client.query(
+      `INSERT INTO processed_messages (idempotency_key, consumer)
+       VALUES ($1, 'trabajos.pedidos')
+       ON CONFLICT DO NOTHING
+       RETURNING idempotency_key`,
+      [idempotencyKey],
+    );
+
+    if (claim.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { estado: 'duplicado' };
+    }
+
+    await aplicar(client, pedido);   // misma transacción: efecto + registro
+    await client.query('COMMIT');
+    return { estado: 'procesado' };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+</code></pre>
+        <p>La limpieza puede ser un job diario que borra claves de más de 30 días. El plazo debe cubrir la ventana máxima de reintentos: si borras una clave y el mensaje reaparece después, vuelves a procesar.</p>
+        <h3>Topología de reintentos</h3>
+        <pre><code class="language-javascript">const RETRY_LEVELS = [
+  { key: 'retry.5s',  ttl: 5_000 },
+  { key: 'retry.30s', ttl: 30_000 },
+  { key: 'retry.2m',  ttl: 120_000 },
+  { key: 'retry.10m', ttl: 600_000 },
+];
+const MAX_ATTEMPTS = 6;
+
+export async function declararReintentos(ch) {
+  await ch.assertExchange('trabajos.retry', 'direct', { durable: true });
+  await ch.assertExchange('pedidos.dlx', 'fanout', { durable: true });
+  await ch.assertQueue('pedidos.dlq', { durable: true });
+  await ch.bindQueue('pedidos.dlq', 'pedidos.dlx', '');
+
+  for (const { key, ttl } of RETRY_LEVELS) {
+    const cola = `trabajos.${key}`;
+    await ch.assertQueue(cola, {
+      durable: true,
+      arguments: {
+        'x-message-ttl': ttl,
+        'x-dead-letter-exchange': 'trabajos',
+        'x-dead-letter-routing-key': 'pedido.procesar',
+      },
+    });
+    await ch.bindQueue(cola, 'trabajos.retry', key);
+  }
+}
+</code></pre>
+        <p>El consumidor decide: si el error es transitorio, republica en el nivel que toca y hace <code>ack</code> del original; si es definitivo o se agotaron los intentos, <code>nack</code> sin requeue para que la DLX lo recoja.</p>
+        <pre><code class="language-javascript">await ch.consume('trabajos.pedidos', async (msg) =&gt; {
+  if (!msg) return;
+  const pedido = JSON.parse(msg.content.toString());
+  const intentos = Number(msg.properties.headers?.['x-attempts'] ?? 0);
+  const clave = msg.properties.messageId;
+
+  try {
+    const r = await procesarPedidoUnaVez(clave, pedido, aplicarPedido);
+    if (r.estado === 'duplicado') log.info({ clave }, 'evento duplicado, ack');
+    ch.ack(msg);
+  } catch (err) {
+    if (err.definitivo || intentos + 1 &gt;= MAX_ATTEMPTS) {
+      ch.nack(msg, false, false);   // DLQ, sin bucle
+      return;
+    }
+
+    const nivel = RETRY_LEVELS[Math.min(intentos, RETRY_LEVELS.length - 1)];
+    ch.publish('trabajos.retry', nivel.key, msg.content, {
+      persistent: true,
+      contentType: msg.properties.contentType,
+      messageId: clave,
+      headers: { ...msg.properties.headers, 'x-attempts': intentos + 1 },
+    });
+    ch.ack(msg);
+  }
+}, { noAck: false });
+</code></pre>
+        <p>La clave es <code>messageId</code> porque el productor la genera de forma estable. Si no lo hiciera, se derivaría del evento: <code>pedido.pagado:P-1001:v1</code>. Y el contador <code>x-attempts</code> viaja en el mensaje, así que sobrevive a la cola de espera y a un reinicio del worker.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Clave de negocio estable y única por consumidor</td><td><code>randomUUID()</code> en cada reintento</td><td>Sin estabilidad no hay nada que deduplicar.</td></tr>
+            <tr><td>Registrar la clave en la misma transacción que el efecto</td><td>Marcar como procesado antes de aplicar</td><td>Un fallo entre marca y efecto pierde el trabajo para siempre.</td></tr>
+            <tr><td>Reintentos con TTL y backoff en colas separadas</td><td><code>nack(requeue=true)</code> en bucle</td><td>El bucle calienta la CPU y adelanta trabajo sano.</td></tr>
+            <tr><td>Límite de intentos y DLQ</td><td>Reintentos infinitos</td><td>Un mensaje venenoso nunca se arregla reintentándolo.</td></tr>
+            <tr><td>Limpiar la tabla de idempotencia con una ventana mayor que los reintentos</td><td>Borrar claves a los pocos días</td><td>Un mensaje tardío volvería a aplicarse.</td></tr>
+            <tr><td>Outbox para la publicación crítica</td><td>Publicar dentro de la transacción de negocio</td><td>El broker no participa en tu transacción; el outbox sí cierra la brecha.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Generar la clave en el consumidor con un UUID nuevo</h3>
+        <span class="code-label code-label--wrong">Mal — cada entrega es «nueva»</span>
+        <pre><code class="language-javascript">const clave = crypto.randomUUID();
+await marcarProcesado(clave);   // nunca coincide con la anterior
+</code></pre>
+        <span class="code-label code-label--right">Bien — clave derivada del evento</span>
+        <pre><code class="language-javascript">const clave = `${evento.tipo}:${evento.pedidoId}:v${evento.version}`;
+</code></pre>
+        <p>La clave debe describir el efecto, no la entrega. Si cambia en cada intento, la tabla de idempotencia es decorativa.</p>
+        <h3>2. Marcar como procesado antes de procesar</h3>
+        <span class="code-label code-label--wrong">Mal — se pierde el trabajo si falla el efecto</span>
+        <pre><code class="language-javascript">await db.insertarClave(clave);   // commit
+await aplicarPedido(pedido);      // si esto falla, el reintento se ignora
+</code></pre>
+        <span class="code-label code-label--right">Bien — una transacción o un estado explícito</span>
+        <pre><code class="language-javascript">await db.transaction(async (tx) =&gt; {
+  await tx.insertarClave(clave);
+  await aplicarPedido(tx, pedido);
+});
+</code></pre>
+        <p>Si el efecto es externo y no puede compartir transacción, usa estado <code>processing</code> y una clave de idempotencia del proveedor. Lo que no vale es fingir atomicidad.</p>
+        <h3>3. Reintentar sin espera y sin límite</h3>
+        <span class="code-label code-label--wrong">Mal — bucle y tormenta</span>
+        <pre><code class="language-javascript">ch.nack(msg, false, true);   // vuelve ya, falla ya, otra vez
+</code></pre>
+        <span class="code-label code-label--right">Bien — cola de espera, contador y DLQ</span>
+        <pre><code class="language-javascript">if (intentos + 1 &gt;= MAX_ATTEMPTS) return ch.nack(msg, false, false);
+ch.publish('trabajos.retry', nivel.key, msg.content, {
+  persistent: true,
+  headers: { ...msg.properties.headers, 'x-attempts': intentos + 1 },
+});
+ch.ack(msg);
+</code></pre>
+        <p>La espera permite que el fallo transitorio se recupere; el límite evita que el venenoso viva para siempre.</p>
+        <h3>4. Usar una sola cola de reintentos con TTL por mensaje</h3>
+        <span class="code-label code-label--wrong">Mal — bloqueo de cabeza</span>
+        <pre><code class="language-text">retry.1cola:
+  mensaje A (TTL 10 min)  ← cabeza
+  mensaje B (TTL 5 s)     ← espera 10 min aunque su TTL ya pasó</code></pre>
+        <span class="code-label code-label--right">Bien — un nivel por intervalo</span>
+        <pre><code class="language-text">retry.5s   retry.30s   retry.2m   retry.10m
+cada una con su TTL fijo y DLX de vuelta a trabajos</code></pre>
+        <p>La expiración es perezosa: el TTL por mensaje no garantiza el orden de vencimiento. Con colas por nivel, cada TTL es uniforme y el drenaje es predecible.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> reproducir un duplicado, forzar un fallo transitorio y comprobar que el backoff y el límite funcionan.</p>
+        <ol class="steps">
+          <li>
+            <strong>Ejecuta el ejemplo mínimo</strong> y confirma que <code>efectos aplicados</code> es 1 aunque se hayan publicado dos mensajes.
+          </li>
+          <li>
+            <strong>Sustituye el <code>Set</code> por una tabla</strong>: crea <code>processed_messages</code> con <code>PRIMARY KEY (idempotency_key, consumer)</code>, ejecuta el consumidor dos veces y comprueba que la segunda devuelve <code>duplicado</code>.
+          </li>
+          <li>
+            <strong>Provoca un fallo transitorio</strong>: haz que el consumidor lance un error las dos primeras veces y funcione a la tercera. Con la topología de reintentos, mide cuánto tarda en procesarse. Esperado: ~5 s + ~30 s (o el nivel que hayas configurado).
+          </li>
+          <li>
+            <strong>Provoca un fallo definitivo</strong>: un mensaje con <code>pedidoId</code> inválido debe agotar los intentos y aparecer en <code>pedidos.dlq</code> con <code>x-death</code>. Comprueba que <code>x-attempts</code> llegó a <code>MAX_ATTEMPTS</code>.
+          </li>
+          <li>
+            <strong>Verifica la limpieza</strong>: borra una clave de <code>processed_messages</code>, republica el mismo evento y observa que se vuelve a procesar. Ese experimento demuestra por qué la ventana de retención debe cubrir los reintentos.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un efecto exactamente una vez, sin transacción común</h3>
+          <p>El worker debe cobrar con una pasarela externa (HTTP), guardar el resultado en tu base de datos y publicar <code>pedido.pagado</code>. La pasarela tarda, a veces responde 500 después de haber cobrado y no comparte transacción contigo. Diseña el flujo completo: clave de idempotencia, estado en base de datos, reintentos y compensación.</p>
+          <p>Responde: ¿qué pasa si la pasarela cobra y tu proceso muere antes de guardar? ¿Y si guardas y el publish no se confirma? ¿Cómo distingues «no cobrado» de «cobrado pero no registrado» sin preguntar a la pasarela? Implementa una tabla de estados y un job de reconciliación.</p>
+          <p><em>Pista: el estado no es un booleano. Necesitas al menos <code>pending</code>, <code>charged</code>, <code>failed</code> y una clave de idempotencia que envíes al proveedor en cada intento.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>At-least-once implica duplicados posibles: la idempotencia es parte del contrato, no un extra.</li>
+          <li>La clave debe ser <strong>estable</strong> y derivarse del negocio (tipo + entidad + versión), no de la entrega.</li>
+          <li>Registra la clave en la misma transacción que el efecto; si no puedes, usa estados y compensación.</li>
+          <li>Reintenta con una cola de espera TTL + DLX, no con <code>requeue: true</code> inmediato.</li>
+          <li>Al agotar intentos o ante un fallo definitivo, DLQ con alerta; nunca reintentos infinitos.</li>
+          <li>Outbox cierra la brecha entre la base de datos y la publicación; el consumidor idempotente cierra la del otro lado.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>idempotency_key</code></td><td>Clave única por consumidor y efecto</td></tr>
+            <tr><td><code>processed_messages</code></td><td>Tabla con <code>PRIMARY KEY</code> y ventana de limpieza</td></tr>
+            <tr><td><code>x-attempts</code></td><td>Contador propio que sobrevive a los reintentos</td></tr>
+            <tr><td><code>x-message-ttl</code> + DLX</td><td>Cola de espera que devuelve el mensaje tras el backoff</td></tr>
+            <tr><td><code>outbox</code></td><td>Atomicidad entre la base de datos y la publicación</td></tr>
+            <tr><td><code>nack(..., false, false)</code></td><td>Fallo definitivo hacia la DLQ</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿No puedo configurar «exactamente una vez» en RabbitMQ?</summary>
+            <div>
+              <p>No de forma mágica. RabbitMQ ofrece at-most-once o at-least-once según cómo publiques y confirmes; el «exactamente una vez» efectivo se consigue con idempotencia en el consumidor. Cualquier promesa de exactly-once sin deduplicación está ocultando una ventana de fallo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Vale el <code>messageId</code> como clave de idempotencia?</summary>
+            <div>
+              <p>Solo si el productor lo mantiene estable entre reintentos. Si se regenera en cada intento, no sirve. Además, dos servicios distintos que consumen el mismo mensaje necesitan claves separadas o un campo <code>consumer</code> en la tabla: el mismo evento debe procesarse una vez por servicio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no basta con <code>delivery-limit</code> de las quorum queues?</summary>
+            <div>
+              <p>Porque cuenta entregas fallidas según las reglas del broker, y no todos los reencolados lo incrementan. Si tu lógica de negocio necesita «tres intentos y a la DLQ», lleva tu propio <code>x-attempts</code>. <code>delivery-limit</code> es una red de seguridad, no la definición de tu política.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La tabla de idempotencia no se convierte en un problema de crecimiento?</summary>
+            <div>
+              <p>Sí, si no la limpias. Borra por antigüedad con una ventana mayor que el ciclo máximo de reintentos (por ejemplo, 30 días) y particiona o indexa por fecha si tiene millones de filas. También puedes usar una tabla de «últimas N claves» si el negocio tolera una ventana corta, pero entonces aceptas el riesgo de reprocesar un mensaje muy tardío.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

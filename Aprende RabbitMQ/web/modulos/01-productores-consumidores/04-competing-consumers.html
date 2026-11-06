@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="04-competing-consumers">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Consumidores en competencia — Módulo 1 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Consumidores en competencia</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Productores y consumidores</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora había un consumidor por cola. En producción, una sola instancia suele ser un punto único de fallo y un techo de capacidad. La solución es simple de enunciar: varios procesos consumen la <strong>misma cola</strong> y el broker reparte los mensajes. Cada mensaje va a <em>un</em> consumidor, no a todos. Eso es una <strong>work queue</strong> o cola de trabajo.</p>
+        <p>El diablo está en el reparto. Un worker lento con prefetch alto puede acaparar mensajes que otros podrían procesar. Un worker que muere después del efecto y antes del <code>ack</code> hace que otro repita el trabajo. Y si asumes que el orden global se mantiene, el primer despliegue con dos workers te lo rompe.</p>
+        <p>Esta lección cierra el módulo juntando las piezas: varios consumidores, prefetch, idempotencia, orden por cola y métricas. Es la base de la cola de trabajos del proyecto final y del patrón <a href="../04-patrones/01-work-queues.html">Work queues</a>.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Competir no es suscribirse</p>
+          <p>Si dos consumidores comparten una cola, compiten: cada mensaje se procesa una vez. Si quieres que dos servicios reciban el mismo evento, necesitan dos colas enlazadas al mismo exchange. Confundir estos dos patrones es el error de arquitectura más caro de esta lección.</p>
+        </div>
+      </section>
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El patrón</h3>
+        <pre><code class="language-text">                       ┌──────────────┐
+ productor ──publish──▶ │ facturas.    │
+                       │ pendientes   │  (una sola cola, quorum)
+                       └──────┬───────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+          worker-1        worker-2        worker-3
+          prefetch 1      prefetch 1      prefetch 1
+              │               │               │
+              └───────────────┴───────────────┘
+                 cada mensaje va a UNO solo</code></pre>
+        <p>El productor no cambia cuando añades workers. La cola actúa de distribuidor y de buffer. Si un worker cae, los mensajes que tenía sin confirmar vuelven a la cola y otro los recoge.</p>
+        <table>
+          <thead><tr><th>Quieres…</th><th>Configuración</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Repartir trabajo entre instancias</td><td>Varios consumidores en la misma cola.</td><td>Cada mensaje lo procesa uno; escala horizontal.</td></tr>
+            <tr><td>Que varios servicios reciban el mismo evento</td><td>Una cola por servicio, todas enlazadas al exchange.</td><td>Cada servicio recibe su copia; no compiten.</td></tr>
+            <tr><td>Priorizar trabajos urgentes</td><td>Cola separada con más workers o prioridad.</td><td>No mezclas latencias ni cuotas.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Reparto: round-robin y prefetch</h3>
+        <p>El broker entrega en orden a los consumidores disponibles, pero «disponible» depende del prefetch y de los <code>ack</code>. Con <code>prefetch(1)</code>, cada worker tiene como máximo un mensaje en vuelo: el reparto es justo y un worker lento no acumula. Con un prefetch alto, el broker puede llenar a un worker mientras los demás están libres.</p>
+        <pre><code class="language-text">prefetch = 1                        prefetch = 10
+worker-1: [msg]                     worker-1: [msg msg msg msg msg msg msg msg msg msg]
+worker-2: [msg]                     worker-2: [ ]
+worker-3: [ ]                       worker-3: [ ]
+
+El lento solo bloquea 1.            El lento bloquea 10 y los demás miran.</code></pre>
+        <p>No hay un prefetch universal. Para tareas de segundos, empieza en 1. Para tareas de milisegundos y mucha latencia de red, sube a 10 o 20 y mide. Lo importante es que el número sea una decisión medida, no un valor copiado.</p>
+
+        <h3>Orden: por cola, no global</h3>
+        <p>RabbitMQ mantiene el orden de una cola: los mensajes se entregan en el orden en que llegaron. Pero con varios consumidores, el orden de <strong>finalización</strong> no está garantizado: el mensaje 2 puede terminar antes que el 1 si cae en un worker más rápido. Y un <code>nack(requeue)</code> puede mover un mensaje a otra posición.</p>
+        <table>
+          <thead><tr><th>Requisito</th><th>¿Lo da una work queue?</th><th>Alternativa</th></tr></thead>
+          <tbody>
+            <tr><td>Procesar cada tarea una vez (salvo reintentos)</td><td>Sí, con <code>ack</code> manual e idempotencia.</td><td>—</td></tr>
+            <tr><td>Orden de finalización global</td><td>No con varios consumidores.</td><td>Un solo consumidor o aceptar el desorden.</td></tr>
+            <tr><td>Orden por cliente/pedido</td><td>No por defecto.</td><td>Una cola por clave o partición, un consumidor por partición.</td></tr>
+            <tr><td>Reintentos sin bloquear</td><td>No con <code>requeue</code> infinito.</td><td>Cola de reintento con backoff + DLQ (módulo 3).</td></tr>
+          </tbody>
+        </table>
+        <p>Si el negocio exige «los eventos del pedido 1042 en orden», la solución no es rezar para que caigan en el mismo worker: es enrutar todos los eventos de 1042 a la misma cola y consumirla con un solo consumidor, o usar una partición por clave. El orden global de todo el sistema no es gratis.</p>
+
+        <h3>Escalar no es solo añadir workers</h3>
+        <p>Añadir consumidores aumenta la capacidad de <em>procesamiento</em>, pero el cuello puede estar en otro sitio: la base de datos, el proveedor de PDF, el ancho de banda o el propio broker. Si cada worker abre 20 conexiones a PostgreSQL, pasar de 2 a 10 workers puede tumbar la base de datos y empeorar el throughput.</p>
+        <ul>
+          <li>Mide la latencia del trabajo y la tasa de <code>ack</code> antes de escalar.</li>
+          <li>Limita la concurrencia interna del worker (no proceses 50 mensajes en paralelo dentro de un proceso).</li>
+          <li>Separa trabajos lentos de rápidos en colas distintas; así escalas cada uno por separado.</li>
+          <li>Vigila <code>messages_ready</code> y <code>messages_unacknowledged</code>: el primero es backlog, el segundo es trabajo en vuelo.</li>
+        </ul>
+
+        <h3>Idempotencia: el precio de at-least-once</h3>
+        <p>Un worker puede procesar el mismo mensaje dos veces: porque murió antes del <code>ack</code>, porque el <code>ack</code> se perdió, o porque alguien hizo <code>nack(requeue)</code>. El broker no puede evitarlo sin renunciar a la garantía. La defensa está en el consumidor: una clave de negocio única y una operación que pueda repetirse sin efecto adicional.</p>
+        <pre><code class="language-text">CREATE TABLE facturas (
+  factura_id TEXT PRIMARY KEY,
+  pedido_id  TEXT NOT NULL,
+  total      NUMERIC NOT NULL,
+  emitida_en TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+</code></pre>
+        <p>Con esa restricción, un segundo <code>INSERT</code> del mismo <code>factura_id</code> falla o se ignora. El worker confirma igual: el trabajo ya está hecho. Lo importante es que la clave sea de negocio (<code>facturaId</code>), no un <code>messageId</code> que cambia en cada reintento.</p>
+
+        <h3>El worker lento y el worker que muere</h3>
+        <p>Un worker lento con prefetch alto es el peor enemigo del reparto: los mensajes están reservados, los demás workers ociosos y la cola parece vacía. Un worker que muere a mitad libera sus unacked, pero el trabajo parcial puede haberse ejecutado. Por eso:</p>
+        <ul>
+          <li>Pon timeouts al trabajo externo y decide <code>ack</code> o <code>nack</code>.</li>
+          <li>No reserves más mensajes de los que puedes procesar en un tiempo razonable.</li>
+          <li>Haz que el efecto sea idempotente y observable (registro por clave).</li>
+          <li>En el apagado, cancela el consumidor y espera los mensajes en vuelo.</li>
+        </ul>
+
+        <h3>Cómo medirlo</h3>
+        <table>
+          <thead><tr><th>Métrica</th><th>Qué cuenta</th><th>Qué mirar</th></tr></thead>
+          <tbody>
+            <tr><td><code>consumers</code></td><td>Consumidores activos en la cola.</td><td>Si baja a 0, nadie está procesando.</td></tr>
+            <tr><td><code>messages_ready</code></td><td>Mensajes esperando entrega.</td><td>Backlog: tendencia, no solo valor absoluto.</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>Entregados y sin confirmar.</td><td>Si crece, hay workers lentos o colgados.</td></tr>
+            <tr><td>Tasa de <code>ack</code> / <code>deliver</code></td><td>Velocidad de procesamiento.</td><td>Si <code>deliver</code> supera a <code>ack</code>, el sistema se atasca.</td></tr>
+            <tr><td>Latencia del trabajo</td><td>Tiempo por mensaje en tu worker.</td><td>Es el dato que decide el prefetch y el número de workers.</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un worker configurable por variables de entorno. Lanza tres procesos distintos contra la misma cola y observa el reparto.</p>
+        <pre><code class="language-javascript">// worker.mjs
+import amqp from "amqplib";
+
+const url = process.env.AMQP_URL ?? "amqp://guest:guest@localhost:5672";
+const nombre = process.env.WORKER_NAME ?? `worker-${process.pid}`;
+const prefetch = Number(process.env.PREFETCH ?? 1);
+const trabajoMs = Number(process.env.WORK_MS ?? 500);
+const cola = "facturas.pendientes";
+
+const connection = await amqp.connect(url);
+const channel = await connection.createChannel();
+await channel.assertQueue(cola, {
+  durable: true,
+  arguments: { "x-queue-type": "quorum" },
+});
+await channel.prefetch(prefetch);
+
+console.log(`[${nombre}] listo (prefetch=${prefetch}, trabajo=${trabajoMs}ms)`);
+
+const { consumerTag } = await channel.consume(cola, async (msg) =&gt; {
+  if (!msg) return;
+  const factura = JSON.parse(msg.content.toString());
+  console.log(`[${nombre}] toma ${factura.facturaId} tag=${msg.fields.deliveryTag}`);
+
+  await new Promise((resolve) =&gt; setTimeout(resolve, trabajoMs));
+
+  console.log(`[${nombre}] termina ${factura.facturaId}`);
+  channel.ack(msg);
+}, { noAck: false });
+
+const cerrar = async () =&gt; {
+  await channel.cancel(consumerTag);
+  await channel.close();
+  await connection.close();
+  process.exit(0);
+};
+process.on("SIGINT", cerrar);
+process.on("SIGTERM", cerrar);
+</code></pre>
+        <pre><code class="language-javascript">// productor-12.mjs
+import amqp from "amqplib";
+
+const connection = await amqp.connect("amqp://guest:guest@localhost:5672");
+const channel = await connection.createChannel();
+await channel.assertQueue("facturas.pendientes", {
+  durable: true,
+  arguments: { "x-queue-type": "quorum" },
+});
+
+for (let i = 1; i &lt;= 12; i++) {
+  const factura = { facturaId: `fac-${1000 + i}`, pedidoId: `ped-${8000 + i}`, total: 49.9 };
+  channel.sendToQueue("facturas.pendientes", Buffer.from(JSON.stringify(factura)), {
+    persistent: true,
+    contentType: "application/json",
+    messageId: factura.facturaId,
+  });
+}
+
+console.log("12 facturas encoladas");
+await channel.close();
+await connection.close();
+</code></pre>
+        <p>Arranca tres workers en tres terminales y publica:</p>
+        <pre><code class="language-bash"># terminal 1
+WORKER_NAME=worker-a WORK_MS=500 node worker.mjs
+# terminal 2
+WORKER_NAME=worker-b WORK_MS=500 node worker.mjs
+# terminal 3
+WORKER_NAME=worker-c WORK_MS=500 node worker.mjs
+# terminal 4
+node productor-12.mjs
+</code></pre>
+        <pre><code class="language-text">[worker-a] toma fac-1001 tag=1
+[worker-b] toma fac-1002 tag=1
+[worker-c] toma fac-1003 tag=1
+[worker-a] termina fac-1001
+[worker-a] toma fac-1004 tag=2
+[worker-b] termina fac-1002
+[worker-b] toma fac-1005 tag=2
+...
+</code></pre>
+        <p>Con <code>prefetch(1)</code>, cada worker toma uno, lo termina y toma el siguiente. El reparto es aproximadamente round-robin porque todos tardan lo mismo. Si uno tarda 3 segundos, los otros dos siguen avanzando y el lento solo retiene un mensaje.</p>
+        <p>En PowerShell, define las variables con <code>$env:WORKER_NAME="worker-a"</code> antes de <code>node worker.mjs</code>.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, tres workers generan facturas. El worker C tiene un problema de rendimiento (3 s por factura); A y B tardan 500 ms. Con prefetch 1, C solo bloquea una factura; con prefetch 10, acapara diez y deja a A y B mirando.</p>
+        <pre><code class="language-bash"># worker C lento
+WORKER_NAME=worker-c WORK_MS=3000 PREFETCH=10 node worker.mjs
+</code></pre>
+        <pre><code class="language-text">[worker-c] toma fac-1001 tag=1
+[worker-c] toma fac-1002 tag=2
+[worker-c] toma fac-1003 tag=3
+...
+[worker-c] toma fac-1010 tag=10
+
+# mientras, worker-a y worker-b no reciben nada
+</code></pre>
+        <p>La cola no está vacía: está <em>unacked</em> en C. Si C muere, los diez vuelven a la cola y se reparten; si C sigue lento, el backlog crece aunque A y B estén libres. La corrección es bajar el prefetch de C (o separar los trabajos lentos en otra cola), no añadir más workers a ciegas.</p>
+        <table>
+          <thead><tr><th>Configuración</th><th>Reparto</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td>Tres workers, prefetch 1</td><td>Justo; el lento bloquea uno.</td><td>Menos throughput por worker si la red domina.</td></tr>
+            <tr><td>Tres workers, prefetch 10</td><td>El primero que pide acapara.</td><td>Worker lento bloquea diez; otros ociosos.</td></tr>
+            <tr><td>Dos workers rápidos + cola aparte para lentos</td><td>Cada carga se escala por separado.</td><td>Más topología y más métricas que mirar.</td></tr>
+          </tbody>
+        </table>
+        <p>La idempotencia se implementa en la base de datos, no en la cabeza del worker:</p>
+        <pre><code class="language-javascript">await db.query(
+  `INSERT INTO facturas (factura_id, pedido_id, total)
+   VALUES ($1, $2, $3)
+   ON CONFLICT (factura_id) DO NOTHING`,
+  [factura.facturaId, factura.pedidoId, factura.total],
+);
+
+channel.ack(msg); // si ya existía, el trabajo también está hecho
+</code></pre>
+        <p>Si el worker muere después del <code>INSERT</code> y antes del <code>ack</code>, el siguiente intento choca con la clave primaria y no duplica la factura. Ese es el contrato: el efecto es idempotente, el <code>ack</code> confirma que el efecto ya está.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">El orden por pedido no sale gratis</p>
+          <p>Si los eventos de un mismo pedido deben procesarse en orden, no basta con una work queue. Enruta todos los eventos de ese pedido a la misma cola (por ejemplo, una cola por partición de cliente) y consúmela con un solo worker. Es la misma idea que las particiones de Kafka, aplicada a colas.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Empezar con <code>prefetch(1)</code> y subir con medidas.</td><td><code>prefetch(1000)</code> «para que vaya rápido».</td><td>Un worker lento acapara trabajo y bloquea a los demás.</td></tr>
+            <tr><td>Hacer el efecto idempotente por clave de negocio.</td><td>Confiar en que cada mensaje llega una vez.</td><td>La reentrega es normal en at-least-once.</td></tr>
+            <tr><td>Separar colas por tipo de trabajo y latencia.</td><td>Mezclar facturas de 3 s con emails de 50 ms.</td><td>Un trabajo lento no debe competir con uno rápido por los mismos workers.</td></tr>
+            <tr><td>Cancelar el consumidor y drenar en el apagado.</td><td>Matar el proceso con <code>SIGKILL</code>.</td><td>Los unacked se reencolan y el trabajo parcial se repite.</td></tr>
+            <tr><td>Monitorizar <code>messages_ready</code>, <code>unacked</code> y <code>consumers</code>.</td><td>Mirar solo el tamaño de la cola.</td><td>El atasco puede estar en mensajes reservados, no en la cola.</td></tr>
+            <tr><td>Escalar hasta el cuello real (DB, API externa, broker).</td><td>Añadir workers cuando la base de datos ya está saturada.</td><td>Más workers pueden empeorar la latencia y el throughput.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Esperar pub/sub de una work queue</h3>
+        <span class="code-label code-label--wrong">Mal — dos servicios comparten cola y compiten</span>
+        <pre><code class="language-text">facturacion y auditoria consumen "pedidos.nuevos"
+→ cada evento lo procesa solo uno de los dos
+</code></pre>
+        <span class="code-label code-label--right">Bien — una cola por servicio</span>
+        <pre><code class="language-javascript">await channel.assertQueue("facturacion.eventos", { durable: true });
+await channel.assertQueue("auditoria.eventos", { durable: true });
+await channel.bindQueue("facturacion.eventos", "pedidos", "pedido.creado");
+await channel.bindQueue("auditoria.eventos", "pedidos", "pedido.creado");
+</code></pre>
+        <p>Dos colas reciben una copia cada una; dos consumidores en la misma cola se reparten el trabajo. El patrón lo decide la topología, no el número de procesos.</p>
+
+        <h3>2. Prefetch alto con workers heterogéneos</h3>
+        <span class="code-label code-label--wrong">Mal — el lento acapara</span>
+        <pre><code class="language-javascript">await channel.prefetch(50);
+
+await channel.consume(cola, async (msg) =&gt; {
+  await generarPdfLento(msg); // 3 s por mensaje
+  channel.ack(msg);
+}, { noAck: false });
+</code></pre>
+        <span class="code-label code-label--right">Bien — prefetch bajo o cola separada</span>
+        <pre><code class="language-javascript">await channel.prefetch(1);
+// y, si el trabajo es muy lento, una cola dedicada con sus propios workers
+</code></pre>
+        <p>El prefetch alto no aumenta la capacidad del worker lento: solo reserva mensajes que otros podrían procesar.</p>
+
+        <h3>3. Un worker no idempotente</h3>
+        <span class="code-label code-label--wrong">Mal — duplicar la factura al reintentar</span>
+        <pre><code class="language-javascript">await db.insert("facturas", { pedidoId: factura.pedidoId, total: factura.total });
+channel.ack(msg);
+</code></pre>
+        <span class="code-label code-label--right">Bien — clave única y <code>ON CONFLICT</code></span>
+        <pre><code class="language-javascript">await db.query(
+  "INSERT INTO facturas (factura_id, pedido_id, total) VALUES ($1, $2, $3) ON CONFLICT (factura_id) DO NOTHING",
+  [factura.facturaId, factura.pedidoId, factura.total],
+);
+channel.ack(msg);
+</code></pre>
+        <p>El segundo intento debe ser un no-op. Si no lo es, cada caída del worker produce una factura duplicada y un cliente enfadado.</p>
+
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir el reparto con dos y tres workers, ver el efecto de un worker lento y comprobar la reentrega al matar uno.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Publica 12 facturas</strong> y confirma el backlog:
+            <pre><code class="language-bash">node productor-12.mjs
+docker exec rabbitmq rabbitmqctl list_queues name messages_ready consumers
+</code></pre>
+            <pre><code class="language-text">name                 messages_ready  consumers
+facturas.pendientes  12              0
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Arranca dos workers rápidos con prefetch 1:</strong>
+            <pre><code class="language-bash">WORKER_NAME=worker-a WORK_MS=500 node worker.mjs
+WORKER_NAME=worker-b WORK_MS=500 node worker.mjs
+</code></pre>
+            <p>Observa cuántas toma cada uno. Con 12 mensajes y tiempos iguales, el reparto ronda 6/6. Comprueba <code>messages_ready</code> y <code>unacked</code> mientras procesan.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Añade un worker lento con prefetch 10:</strong> para A y B, arranca <code>WORKER_NAME=worker-c WORK_MS=3000 PREFETCH=10</code> y publica otras 12. C acapara hasta 10 y A/B se quedan sin trabajo. Baja el prefetch de C a 1, vuelve a arrancar A y B y repite: el reparto se recupera.</li>
+          <li>
+            <strong>Paso 4 — Mata un worker a mitad:</strong> pulsa Ctrl+C en worker-a mientras tiene un mensaje. El broker reencola el unacked; worker-b lo recibe con <code>redelivered=true</code>. Añade el campo al log para verlo.
+          </li>
+          <li>
+            <strong>Paso 5 — Comprueba la idempotencia:</strong> publica dos veces la misma <code>facturaId</code> y procesa con <code>ON CONFLICT DO NOTHING</code>. La segunda inserción no duplica la fila y el worker confirma igual. Anota qué habría pasado sin la clave única.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Si <code>messages_ready</code> baja pero <code>messages_unacknowledged</code> sube y se queda, el trabajo está reservado por un worker que no termina. Bajar el prefetch ayuda, pero la causa suele ser un timeout ausente o un efecto de negocio bloqueado.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Orden por cliente con cuatro workers</h3>
+          <p>El taller necesita procesar eventos de pedidos en orden <strong>por cliente</strong>: los eventos del cliente A no pueden adelantarse entre sí, pero los de A y B pueden procesarse en paralelo. Tienes cuatro workers disponibles.</p>
+          <p>Diseña la topología y la estrategia de reparto: ¿cuántas colas, cómo eliges la cola para cada cliente y qué pasa si un cliente concentra el 90 % del tráfico? ¿Cómo mantienes el orden sin renunciar a la escala horizontal? ¿Qué métrica usarías para detectar que una partición está desequilibrada?</p>
+          <p><em>Pista: el orden se conserva dentro de una cola consumida por un solo consumidor. La escala viene de tener varias colas independientes, no de añadir consumidores a la misma cola.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Varios consumidores en la misma cola <strong>compiten</strong>: cada mensaje lo procesa uno solo. Es una work queue, no pub/sub.</li>
+          <li>El <strong>prefetch</strong> decide el reparto: bajo reparte justo; alto permite que un worker lento acapare.</li>
+          <li>El orden está garantizado por cola, no entre consumidores ni de forma global. Un <code>nack(requeue)</code> puede alterarlo.</li>
+          <li>Escalar workers no arregla un cuello de botella en la base de datos o en un servicio externo.</li>
+          <li>At-least-once implica duplicados posibles: la idempotencia por clave de negocio es obligatoria.</li>
+          <li>Mide <code>consumers</code>, <code>messages_ready</code> y <code>messages_unacknowledged</code>; el atasco no siempre está en la cola.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué decide</th></tr></thead>
+          <tbody>
+            <tr><td><code>prefetch(n)</code></td><td>Cuántos mensajes sin confirmar puede tener cada worker.</td></tr>
+            <tr><td><code>consumerTag</code></td><td>Identifica la suscripción para cancelarla.</td></tr>
+            <tr><td><code>deliveryTag</code></td><td>Identifica el mensaje dentro del canal para el <code>ack</code>.</td></tr>
+            <tr><td><code>redelivered</code></td><td>Indica que el mensaje ya se había entregado antes.</td></tr>
+            <tr><td><code>messages_ready</code></td><td>Backlog pendiente de entrega.</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>Trabajo en vuelo, posiblemente atascado.</td></tr>
+            <tr><td><code>ON CONFLICT DO NOTHING</code></td><td>Convierte un duplicado en un no-op idempotente.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos consumidores debo poner en una cola?</summary>
+            <div>
+              <p>Los que necesite el throughput sin saturar el recurso compartido. Empieza con dos o tres, mide la latencia y el backlog, y añade hasta que el cuello esté en otro sitio. Más workers no siempre es más rápido: si todos compiten por la misma base de datos, el rendimiento puede caer.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿RabbitMQ garantiza el orden de los mensajes?</summary>
+            <div>
+              <p>Garantiza el orden de entrega dentro de una cola, mientras un solo consumidor la procesa secuencialmente. Con varios consumidores, el orden de finalización no está garantizado; con <code>nack(requeue)</code>, la posición puede cambiar. Para orden por clave, usa una cola por clave o partición y un consumidor por cola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué dos workers no reciben el mismo mensaje?</summary>
+            <div>
+              <p>Porque están suscritos a la misma cola y el broker entrega cada mensaje a un solo consumidor. Eso es lo que permite repartir trabajo. Si quieres que ambos reciban una copia, necesitan colas distintas enlazadas al mismo exchange; entonces no compiten, cada uno tiene su propia copia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito procesar dos veces la misma factura?</summary>
+            <div>
+              <p>Con una clave de negocio única (<code>facturaId</code>) y una restricción en la base de datos. El segundo intento debe ser un no-op: <code>ON CONFLICT DO NOTHING</code>, un <code>upsert</code> idempotente o una tabla de deduplicación. El <code>messageId</code> puede ayudar, pero cambia si se republica; la clave de negocio es la que manda.</p>
+            </div>
+          </details>
+
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

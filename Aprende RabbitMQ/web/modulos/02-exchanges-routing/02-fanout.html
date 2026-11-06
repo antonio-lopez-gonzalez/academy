@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="02-fanout">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fanout: publicar a todos — Módulo 2 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Fanout: publicar a todos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · Exchanges y routing</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hay mensajes que no van dirigidos a nadie en concreto: «el catálogo cambió», «la configuración se recargó», «empieza la ronda». Todos los interesados deben enterarse <strong>ahora</strong>, y ninguno debe impedir que los demás se enteren. Ese es el trabajo de un exchange <strong>fanout</strong>: copia cada mensaje a todas las colas bindeadas e ignora por completo la routing key.</p>
+        <p>Es el exchange más simple de entender y el más fácil de usar mal. Su promesa es <em>broadcast</em>, no «entrega garantizada a quien no está mirando». Un fanout no almacena nada: si no hay ninguna cola bindeada en el momento de publicar, el mensaje se descarta. Y si la cola de un suscriptor es efímera, cuando ese suscriptor se desconecta deja de existir y los mensajes que lleguen mientras tanto no le esperan.</p>
+        <p>Aquí verás cuándo fanout es la respuesta correcta (invalidación de caché, eventos globales, abanico a servicios independientes), cómo construir suscriptores temporales sin filtrar colas huérfanas y por qué «fanout con routing key» no es una forma de filtrar. También la comparación incómoda: fanout y un topic bindeado con <code>#</code> se parecen mucho, pero no son lo mismo.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>El patrón pub/sub se suele explicar con fanout y se suele implementar con topic. Saber qué garantiza cada uno —y qué no— evita dos fallos clásicos: suscriptores que se pierden eventos por tener una cola temporal, y exchanges fanout usados para filtrar cuando el receptor solo quería una parte.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La regla: una copia por cola, routing key ignorada</h3>
+        <p>Fanout no compara nada. Por cada mensaje publicado, el broker enumera las colas bindeadas al exchange y deja una copia en cada una. La routing key puede ser <code>''</code>, <code>pedido.creado</code> o <code>lo-que-sea</code>: da igual. La binding key tampoco se evalúa, aunque la API exija pasar una cadena (usa <code>''</code>).</p>
+        <pre><code class="language-text">                 publish("taller.eventos", "cualquier.key")
+                                  |
+                                  v
+                        +-------------------+
+                        | taller.eventos    |
+                        | (fanout)          |
+                        +-------------------+
+                          |       |       |
+              +-----------+       |       +-------------+
+              v                   v                     v
+      +---------------+   +---------------+     +---------------+
+      | cache.productos|  | auditoria     |     | dashboard-7f3 |
+      | (durable)      |  | (durable)     |     | (exclusiva)   |
+      +---------------+   +---------------+     +---------------+
+        1 copia              1 copia              1 copia</code></pre>
+        <p>Dos matices que se confunden con frecuencia:</p>
+        <ul>
+          <li><strong>Una copia por cola, no por consumidor.</strong> Si dos procesos consumen la misma cola, se reparten los mensajes (competing consumers); no reciben ambos la misma copia. Para que dos instancias reciban <em>todo</em>, cada una necesita su propia cola.</li>
+          <li><strong>Sin colas bindeadas, no hay destino.</strong> El mensaje se descarta en silencio, igual que en direct. Un alternate exchange o <code>mandatory</code> pueden dar señal; lo verás en <a href="04-headers-y-alternate.html">headers y alternate exchange</a>.</li>
+        </ul>
+
+        <h3>El problema del suscriptor temporal</h3>
+        <p>Si declaras una cola con un nombre fijo para cada dashboard, en cuanto haya despliegues y réplicas tendrás colas huérfanas acumulando mensajes que nadie lee. La solución canónica son las <strong>colas exclusivas con nombre generado por el broker</strong>:</p>
+        <pre><code class="language-javascript">const { queue } = await ch.assertQueue('', { exclusive: true });
+// queue ≈ "amq.gen-JzTY20BRgKO-HjmUJj0wLg"
+await ch.bindQueue(queue, 'taller.eventos', '');
+await ch.consume(queue, onEvento, { noAck: false });
+</code></pre>
+        <p>La cadena vacía pide al broker un nombre único. <code>exclusive: true</code> ata la cola a la conexión que la declaró: solo esa conexión puede usarla y se borra al cerrarse. Es exactamente lo que quieres para una suscripción que vive mientras vive el proceso.</p>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Qué garantiza</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td><code>exclusive: true</code></td><td>Solo la conexión declarante puede consumir; se borra al cerrar la conexión.</td><td>Suscriptores efímeros, RPC replies, demos.</td></tr>
+            <tr><td><code>autoDelete: true</code></td><td>Se borra cuando el último consumidor se da de baja (si tuvo al menos uno).</td><td>Colas con nombre estable que no deben sobrevivir al consumidor.</td></tr>
+            <tr><td><code>x-expires: ms</code></td><td>Se borra tras un periodo sin consumidores, sin redeclaración y sin <code>basic.get</code>.</td><td>Colas temporales no exclusivas con nombre propio.</td></tr>
+            <tr><td>Durable, sin autoDelete</td><td>Sobrevive a reinicios y guarda mensajes mientras el consumidor está caído.</td><td>Suscriptores de negocio que no pueden perder eventos.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Exclusiva no significa «con buffer»</p>
+          <p>Una cola exclusiva se destruye con la conexión, y con ella sus mensajes listos. Si el suscriptor se cae, los eventos publicados durante la caída no se guardan «para cuando vuelva»: se pierden para él. Si eso no es aceptable, la cola debe ser durable y con nombre estable, y el consumidor debe reconectar y volver a consumir.</p>
+        </div>
+
+        <h3>Reconexión: la cola temporal se recrea</h3>
+        <p>Al reconectar, el nombre generado anterior no sirve. El suscriptor debe volver a declarar, bindear y consumir. Ese ciclo es parte del diseño, no un parche:</p>
+        <pre><code class="language-text">conectar → assertQueue('', { exclusive: true })
+        → bindQueue(queue, exchange, '')
+        → consume(queue)
+        → ... si cae la conexión, repetir desde el principio</code></pre>
+        <p>Si usas una librería de reconexión, comprueba que vuelve a ejecutar la topología. Una conexión recuperada con un canal nuevo pero sin <code>consume</code> es un suscriptor zombie: parece vivo y no recibe nada.</p>
+
+        <h3>Fanout frente a topic con <code>#</code></h3>
+        <p>Un binding <code>#</code> en un topic coincide con cualquier routing key, así que un topic con un único binding <code>#</code> se comporta como un fanout para esa cola. Pero no son intercambiables:</p>
+        <table>
+          <thead><tr><th>Criterio</th><th>Fanout</th><th>Topic con <code>#</code></th></tr></thead>
+          <tbody>
+            <tr><td>Intención</td><td>Broadcast explícito</td><td>Patrón que, en este caso, coincide con todo</td></tr>
+            <tr><td>Coste de routing</td><td>No evalúa nada</td><td>Evalúa el patrón en cada publicación</td></tr>
+            <tr><td>Mezclar selectivos</td><td>No: todos los bindings reciben todo</td><td>Sí: en el mismo exchange conviven <code>#</code> y <code>pedido.*</code></td></tr>
+            <tr><td>Riesgo</td><td>Ruido si alguien bindea una cola de más</td><td>Creer que <code>#</code> es gratis y multiplicar patrones</td></tr>
+            <tr><td>Lectura del diseño</td><td>«Esto es un evento global»</td><td>«Esto es una taxonomía con una suscripción total»</td></tr>
+          </tbody>
+        </table>
+        <p>Regla práctica: si <strong>todos</strong> los receptores deben recibir <strong>todo</strong>, fanout. Si conviven receptores totales y parciales, topic y un binding <code>#</code> para el total. No uses fanout y luego intentes filtrar en el consumidor: estarás moviendo el filtro al sitio equivocado y pagando tráfico por mensajes que se descartan.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-most-once y sin persistencia real. Las colas son exclusivas y efímeras, y los mensajes se publican sin confirms. Sirve para ver el fanout; no como plantilla de producción. En producción: colas durables para suscriptores de negocio, <code>ack</code> manual y confirms (ver <a href="../03-fiabilidad/01-publisher-confirms.html">publisher confirms</a>).</p>
+        <p>Dos suscriptores, dos colas, un exchange. Publica una vez y observa dos entregas:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertExchange('demo.fanout', 'fanout', { durable: true });
+
+// Dos colas exclusivas: una por suscriptor, con nombre generado.
+const a = await ch.assertQueue('', { exclusive: true });
+const b = await ch.assertQueue('', { exclusive: true });
+await ch.bindQueue(a.queue, 'demo.fanout', '');
+await ch.bindQueue(b.queue, 'demo.fanout', '');
+
+// noAck solo para la demo: en producción, ack manual tras procesar.
+await ch.consume(a.queue, (msg) =&gt; {
+  console.log('A recibió:', msg.content.toString());
+}, { noAck: true });
+await ch.consume(b.queue, (msg) =&gt; {
+  console.log('B recibió:', msg.content.toString());
+}, { noAck: true });
+
+// La routing key es irrelevante: fanout la ignora.
+ch.publish('demo.fanout', 'lo.que.sea', Buffer.from('pedido.creado'));
+
+await new Promise((resolve) =&gt; setTimeout(resolve, 200));
+await ch.close();
+await conn.close();
+</code></pre>
+        <p>Salida esperada (el orden entre A y B no está garantizado):</p>
+        <pre><code class="language-text">A recibió: pedido.creado
+B recibió: pedido.creado</code></pre>
+        <p>Qué hace cada pieza:</p>
+        <ul>
+          <li><code>assertExchange(..., 'fanout', { durable: true })</code>: el exchange sobrevive reinicios; las colas de este ejemplo no.</li>
+          <li><code>assertQueue('', { exclusive: true })</code>: nombre generado y cola ligada a la conexión. Al cerrar, ambas desaparecen.</li>
+          <li><code>bindQueue(cola, exchange, '')</code>: en fanout la clave no filtra; se pasa vacía por convención.</li>
+          <li><code>publish(exchange, routingKey, Buffer)</code>: una sola llamada; el broker copia a las dos colas.</li>
+        </ul>
+        <p>Cambia la routing key por <code>otra.cosa</code> y repite: verás las mismas dos entregas. Ese es el experimento que demuestra que fanout no enruta por clave.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El catálogo del taller cambia de precios varias veces al día. La API publica <code>catalogo.actualizado</code> y deben reaccionar: la caché de productos (no puede servir precios viejos), el buscador (reindexa), y los dashboards de la oficina (solo mientras están abiertos). Los dos primeros no pueden perder eventos; el tercero sí puede.</p>
+        <pre><code class="language-text">                   catalogo.eventos (fanout)
+                    /          |           \
+                   v           v            v
+        cache.productos   buscador.index   dashboard-&lt;uuid&gt;
+        (durable)         (durable)        (exclusiva, efímera)
+        siempre            siempre          solo mientras vive
+        ack manual         ack manual        la pestaña</code></pre>
+        <p>El publicador no conoce a ninguno de los tres. Solo declara el exchange y publica:</p>
+        <pre><code class="language-javascript">// publicador.js
+import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createConfirmChannel();
+await ch.assertExchange('catalogo.eventos', 'fanout', { durable: true });
+
+const evento = {
+  tipo: 'catalogo.actualizado',
+  sku: 'SKU-42',
+  precio: 19.9,
+  version: 7,
+};
+
+ch.publish('catalogo.eventos', '', Buffer.from(JSON.stringify(evento)), {
+  persistent: true,
+  contentType: 'application/json',
+  messageId: 'catalogo-SKU-42-v7',
+}, (err) =&gt; {
+  if (err) console.error('nack:', err.message);
+});
+</code></pre>
+        <p>La cola durable del buscador se declara una vez, con su binding, y su consumidor hace <code>ack</code> después de reindexar:</p>
+        <pre><code class="language-javascript">// buscador.js
+await ch.assertExchange('catalogo.eventos', 'fanout', { durable: true });
+await ch.assertQueue('buscador.index', { durable: true });
+await ch.bindQueue('buscador.index', 'catalogo.eventos', '');
+await ch.prefetch(20);
+
+await ch.consume('buscador.index', async (msg) =&gt; {
+  if (!msg) return;
+  try {
+    await indexar(JSON.parse(msg.content.toString()));
+    ch.ack(msg);
+  } catch (err) {
+    // Sin requeue infinito: a la DLQ o a una cola de reintentos.
+    ch.nack(msg, false, false);
+  }
+});
+</code></pre>
+        <p>El dashboard, en cambio, se suscribe con una cola exclusiva y la vuelve a crear si se cae la conexión:</p>
+        <pre><code class="language-javascript">// dashboard.js — llamado también desde el evento 'connect' tras reconectar
+async function suscribir(ch) {
+  await ch.assertExchange('catalogo.eventos', 'fanout', { durable: true });
+  const { queue } = await ch.assertQueue('', { exclusive: true });
+  await ch.bindQueue(queue, 'catalogo.eventos', '');
+  await ch.consume(queue, (msg) =&gt; {
+    enviarAlNavegador(JSON.parse(msg.content.toString()));
+    ch.ack(msg);
+  });
+}
+</code></pre>
+        <table>
+          <thead><tr><th>Suscriptor</th><th>Tipo de cola</th><th>Qué pasa si está caído 5 minutos</th></tr></thead>
+          <tbody>
+            <tr><td>Caché de productos</td><td>Durable + persistente</td><td>Los eventos se acumulan y se procesan al volver.</td></tr>
+            <tr><td>Buscador</td><td>Durable + persistente</td><td>Se acumulan; al arrancar reindexa el backlog.</td></tr>
+            <tr><td>Dashboard abierto</td><td>Exclusiva</td><td>Pierde esos eventos; al reconectar solo ve los nuevos.</td></tr>
+            <tr><td>Dashboard cerrado</td><td>No existe</td><td>No hay cola ni acumulación: no los necesita.</td></tr>
+          </tbody>
+        </table>
+        <p>Esa tabla es la decisión de diseño importante. Fanout no elige por ti: solo copia a quien tenga cola. La durabilidad y la persistencia son las que convierten una copia en una obligación.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar fanout solo cuando todos deben recibir todo</td><td>Filtrar dentro del consumidor un fanout</td><td>Estás pagando tráfico y complejidad por mensajes que se descartan; topic lo expresa mejor.</td></tr>
+            <tr><td>Colas exclusivas con nombre generado para suscriptores efímeros</td><td>Nombres fijos por instancia o por usuario</td><td>Los nombres fijos dejan colas huérfanas que acumulan mensajes para siempre.</td></tr>
+            <tr><td>Colas durables para suscriptores de negocio</td><td>Exclusivas para todo</td><td>Una cola efímera borra su backlog al desconectarse; el evento se pierde para ese servicio.</td></tr>
+            <tr><td>Declarar el exchange y las colas antes de publicar</td><td>Publicar y luego crear los bindings</td><td>El fanout no almacena: lo publicado sin colas se descarta.</td></tr>
+            <tr><td>Recrear la suscripción en cada reconexión</td><td>Asumir que la cola generada sobrevive</td><td>El nombre anterior ya no existe; el consumidor quedaría mudo.</td></tr>
+            <tr><td>Un exchange fanout por dominio de evento</td><td>Un fanout global para todo el sistema</td><td>Un solo exchange obliga a todas las colas a recibir todo y multiplica el ruido.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Usar fanout y filtrar en el consumidor</h3>
+        <span class="code-label code-label--wrong">Mal — todo el mundo recibe todo</span>
+        <pre><code class="language-javascript">// Un fanout para «eventos» y cada servicio descarta lo que no le interesa.
+if (evento.tipo !== 'pedido.creado') return ch.ack(msg); // ruido y CPU
+</code></pre>
+        <span class="code-label code-label--right">Bien — topic si hay selección</span>
+        <pre><code class="language-javascript">await ch.assertExchange('pedidos', 'topic', { durable: true });
+await ch.bindQueue('facturacion', 'pedidos', 'pedido.creado');
+// Solo llega lo que coincide; el filtro vive en el binding.
+</code></pre>
+        <p>Fanout no tiene semántica de filtro. Si un receptor descarta mensajes, el exchange equivocado está en el diseño.</p>
+
+        <h3>2. Cola temporal sin exclusividad ni autoDelete</h3>
+        <span class="code-label code-label--wrong">Mal — cola con nombre fijo que nadie limpia</span>
+        <pre><code class="language-javascript">await ch.assertQueue(`dashboard-${process.pid}`); // queda para siempre
+await ch.bindQueue(`dashboard-${process.pid}`, 'catalogo.eventos', '');
+</code></pre>
+        <span class="code-label code-label--right">Bien — nombre generado y vida ligada a la conexión</span>
+        <pre><code class="language-javascript">const { queue } = await ch.assertQueue('', { exclusive: true });
+await ch.bindQueue(queue, 'catalogo.eventos', '');
+</code></pre>
+        <p>El <code>pid</code> cambia en cada despliegue y la cola vieja se queda con su backlog. Con miles de réplicas, el broker se llena de colas muertas.</p>
+
+        <h3>3. Esperar que una cola exclusiva guarde el backlog</h3>
+        <span class="code-label code-label--wrong">Mal — «cuando vuelva, lo procesa»</span>
+        <pre><code class="language-text">servicio caído 10 min
+→ su cola exclusiva se borró al cerrar la conexión
+→ los eventos de esos 10 min no existen para él</code></pre>
+        <span class="code-label code-label--right">Bien — cola durable si el evento es obligatorio</span>
+        <pre><code class="language-javascript">await ch.assertQueue('facturacion.eventos', { durable: true });
+await ch.bindQueue('facturacion.eventos', 'catalogo.eventos', '');
+// Mensajes persistentes + ack manual = backlog recuperable.
+</code></pre>
+        <p>Fanout garantiza la copia a las colas que existen en ese instante, no la entrega futura a un suscriptor ausente.</p>
+
+        <h3>4. Publicar antes de que exista el binding</h3>
+        <span class="code-label code-label--wrong">Mal — carrera de arranque</span>
+        <pre><code class="language-javascript">ch.publish('catalogo.eventos', '', body); // aún no hay colas bindeadas
+await ch.assertQueue('buscador.index', { durable: true }); // tarde
+</code></pre>
+        <span class="code-label code-label--right">Bien — topología primero, publicación después</span>
+        <pre><code class="language-javascript">await declararTopologia(ch);   // exchange + colas + bindings
+ch.publish('catalogo.eventos', '', body, { persistent: true });
+</code></pre>
+        <p>Los exchanges no almacenan. Un mensaje publicado antes del binding se descarta aunque el consumidor arranque un segundo después.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver una copia por cola, comprobar que la routing key se ignora y entender el ciclo de vida de una cola exclusiva.</p>
+        <ol class="steps">
+          <li>
+            <strong>Declara el exchange y dos colas exclusivas</strong> con el ejemplo mínimo. Antes de publicar, imprime los nombres generados:
+            <pre><code class="language-javascript">console.log('cola A:', a.queue, '| cola B:', b.queue);
+</code></pre>
+            <p>Esperado: dos nombres distintos con prefijo <code>amq.gen-</code>.</p>
+          </li>
+          <li>
+            <strong>Publica tres mensajes</strong> con keys distintas (<code>a</code>, <code>pedido.creado</code>, <code>''</code>) y comprueba que A y B reciben los tres. La key no cambia el resultado.
+          </li>
+          <li>
+            <strong>Comprueba el reparto dentro de una cola</strong>: añade un segundo consumidor a la cola A y publica seis mensajes. Verás que se reparten entre los dos consumidores de A, mientras B sigue recibiendo los seis.
+            <pre><code class="language-text">A1: 3 mensajes   A2: 3 mensajes   B: 6 mensajes</code></pre>
+          </li>
+          <li>
+            <strong>Demuestra que la cola es efímera</strong>: cierra la conexión y ejecuta:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages consumers
+</code></pre>
+            <p>Las dos colas <code>amq.gen-*</code> ya no aparecen. Si el exchange era durable, sigue existiendo sin bindings.</p>
+          </li>
+          <li>
+            <strong>Sustituye una cola por una durable</strong>: declara <code>demo.permanente</code>, bíndala, publica con el consumidor desconectado y reconéctalo. Verás el backlog. Compara con lo que ocurrió con la exclusiva.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>En la management UI, la pestaña <em>Exchanges</em> muestra cuántos bindings tiene <code>demo.fanout</code>. Si borras una cola y el número no baja, revisa si estás mirando un exchange cacheado por la UI: recarga antes de concluir.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Broadcast sin perder el evento crítico</h3>
+          <p>El taller quiere que <code>catalogo.actualizado</code> llegue a (a) un servicio de caché que <strong>no puede perder</strong> ningún evento, (b) un índice de búsqueda que puede reconstruirse entero al arrancar, y (c) cualquier número de dashboards efímeros. Además, durante un despliegue convivirán dos versiones del servicio de caché y ninguna debe procesar el evento dos veces.</p>
+          <p>Diseña la topología con fanout, decide qué colas son durables y cuáles exclusivas, y explica qué ocurre si el publicador arranca antes que los consumidores. Después mide: publica 100 eventos con un dashboard desconectado y calcula cuántos procesa al volver.</p>
+          <p><em>Pista: «no perder» y «no duplicar» son problemas distintos. Para lo segundo necesitarás una clave estable y una tabla de idempotencia; el módulo 3 lo cubre.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Fanout copia cada mensaje a <strong>todas las colas bindeadas</strong> e ignora la routing key.</li>
+          <li>Una copia por <strong>cola</strong>: los consumidores de una misma cola se reparten los mensajes.</li>
+          <li>Sin colas bindeadas, el mensaje se descarta; fanout no almacena.</li>
+          <li>Las colas exclusivas con nombre generado son el patrón correcto para suscriptores efímeros; se borran al cerrar la conexión.</li>
+          <li>Si un suscriptor no puede perder eventos, su cola debe ser durable y el mensaje persistente.</li>
+          <li>Fanout y topic con <code>#</code> se parecen, pero topic permite mezclar suscripciones totales y parciales en el mismo exchange.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Llamada u opción</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>assertExchange(nombre, 'fanout', { durable: true })</code></td><td>Declara el exchange de broadcast</td></tr>
+            <tr><td><code>assertQueue('', { exclusive: true })</code></td><td>Crea una cola efímera con nombre generado</td></tr>
+            <tr><td><code>bindQueue(cola, exchange, '')</code></td><td>Suscribe la cola; la clave no se evalúa</td></tr>
+            <tr><td><code>autoDelete: true</code></td><td>Borra la cola al quedarse sin consumidores</td></tr>
+            <tr><td><code>x-expires</code></td><td>Borra una cola tras un tiempo sin uso</td></tr>
+            <tr><td><code>consume(..., { noAck: false })</code></td><td>Entrega con <code>ack</code> manual; obligatorio en producción</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar la routing key para filtrar en un fanout?</summary>
+            <div>
+              <p>No. Fanout la ignora por completo, tanto al publicar como al bindear. Si necesitas filtro, usa topic (patrones) o direct (igualdad). La única forma de «filtrar» con fanout es no bindear la cola, lo que equivale a no suscribirse.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre <code>exclusive</code> y <code>autoDelete</code>?</summary>
+            <div>
+              <p><code>exclusive</code> ata la cola a la conexión que la declaró: solo esa conexión puede consumirla y se borra al cerrarse. <code>autoDelete</code> la borra cuando se va el último consumidor, aunque la conexión siga viva. Para un suscriptor por proceso, <code>exclusive</code> es lo habitual; <code>autoDelete</code> encaja con colas de nombre estable compartidas por consumidores que van y vienen.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si tengo dos instancias del mismo servicio, ¿ambas reciben cada evento?</summary>
+            <div>
+              <p>Solo si cada instancia tiene su propia cola. Si ambas consumen la misma cola, compiten y cada mensaje va a una de las dos. Para un servicio con réplicas que deben repartirse el trabajo, una cola compartida es lo correcto; para un evento que cada instancia debe ver (por ejemplo, invalidar una caché local), una cola por instancia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Fanout es más rápido que topic?</summary>
+            <div>
+              <p>Su routing es más barato porque no evalúa patrones, pero el coste dominante suele ser el número de copias y la persistencia, no el matching. La razón para elegir fanout no es el rendimiento: es que el diseño quiere broadcast sin selección.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo evito que un dashboard que se reconecta pierda eventos?</summary>
+            <div>
+              <p>Con una cola durable y un mensaje persistente, el dashboard puede recuperar el backlog al volver. Si aceptas perder lo ocurrido mientras estaba cerrado, la cola exclusiva es más limpia. No hay una respuesta única: es una decisión de producto sobre qué significa «perderse un evento».</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

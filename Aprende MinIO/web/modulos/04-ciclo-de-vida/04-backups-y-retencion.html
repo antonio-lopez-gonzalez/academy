@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-backups-y-retencion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Backups y retención — Módulo 4 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Backups y retención</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Ciclo de vida</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Llegados a este punto el bucket tiene versionado, lifecycle y réplica. Parece que el dato está protegido. Y sin embargo, hay tres escenarios que ninguno de esos mecanismos cubre:</p>
+        <ul>
+          <li>Un script con credenciales de administrador borra <code>documentos/</code> y la réplica copia el borrado en segundos.</li>
+          <li>Un fallo lógico corrompe los PDFs durante tres semanas; la réplica copia fielmente los ficheros corruptos.</li>
+          <li>El proveedor del tier frío pierde el bucket y el contrato dice que la responsabilidad es tuya.</li>
+        </ul>
+        <p>La réplica protege de la <strong>pérdida de un sitio</strong>. El versionado protege de un <strong>borrado o sobrescritura concreta</strong>. El backup protege de <strong>que el dato bueno deje de existir en todos los sitios a la vez</strong>, incluido el caso en que el error lo comete la propia plataforma.</p>
+        <p>Esta lección cierra el módulo con lo que casi nadie quiere hacer hasta que lo necesita: una copia externa, una política de retención que la ley entienda y, sobre todo, una <strong>prueba de restauración</strong> que se ejecuta y se firma. Un backup que nunca se ha restaurado es una hipótesis, no un backup.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La definición que usaremos</p>
+          <p><strong>Backup</strong> es una copia de los datos en un medio y una ubicación independientes, con un procedimiento de restauración probado y un tiempo de recuperación medido. Todo lo que no cumpla esas tres condiciones es una copia, no un backup.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Tres mecanismos, tres preguntas distintas</h3>
+        <table>
+          <thead><tr><th></th><th>Versionado</th><th>Réplica</th><th>Backup</th></tr></thead>
+          <tbody>
+            <tr><td>Pregunta que responde</td><td>«¿Puedo recuperar la versión anterior de esta clave?»</td><td>«¿Puedo seguir leyendo si este sitio cae?»</td><td>«¿Puedo reconstruir el dato si todo lo demás falla?»</td></tr>
+            <tr><td>Dónde vive la copia</td><td>En el mismo bucket</td><td>En otro sitio, en línea</td><td>En otro medio y otra ubicación</td></tr>
+            <tr><td>Protege de un borrado propagado</td><td>Parcialmente: las versiones siguen</td><td>No: copia el borrado</td><td>Sí, si la copia es anterior e inmutable</td></tr>
+            <tr><td>Protege de un fallo del proveedor</td><td>No</td><td>Parcialmente</td><td>Sí, si el medio es independiente</td></tr>
+            <tr><td>RPO típico</td><td>0 (cada PUT)</td><td>Segundos o minutos</td><td>Horas o un día</td></tr>
+            <tr><td>Coste</td><td>Multiplica versiones</td><td>Duplica almacenamiento y red</td><td>Duplica o triplica, más operación</td></tr>
+          </tbody>
+        </table>
+        <h3>3-2-1 y su versión moderna</h3>
+        <p>La regla clásica sigue siendo una buena prueba de madurez:</p>
+        <pre><code class="language-text">3 copias de los datos
+2 medios o sistemas distintos
+1 copia fuera del sitio principal
+versión endurecida:
+3 copias  ·  2 medios  ·  1 offsite  ·  1 inmutable/offline  ·  0 errores en la restauración</code></pre>
+        <table>
+          <thead><tr><th>Copia</th><th>Dónde</th><th>Qué protege</th></tr></thead>
+          <tbody>
+            <tr><td>Producción</td><td>MinIO primario</td><td>Nada por sí sola: es el dato vivo.</td></tr>
+            <tr><td>Réplica</td><td>MinIO secundario en otra región</td><td>Caída del sitio primario.</td></tr>
+            <tr><td>Backup</td><td>Almacenamiento externo, idealmente con object lock</td><td>Borrado lógico, corrupción, ransomware, error humano.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p class="callout__title">La analogía del fotógrafo</p>
+          <p>El versionado es el historial de edición de una foto. La réplica es una segunda cámara disparando a la vez. El backup es el disco que guardas en casa de un familiar. Si alguien borra el proyecto entero y sincroniza la segunda cámara, solo el disco de casa te salva.</p>
+        </div>
+        <h3>Cómo se copia un bucket de objetos</h3>
+        <p>Hay tres formas y no son intercambiables:</p>
+        <table>
+          <thead><tr><th>Método</th><th>Qué copia</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc mirror</code> a otro alias S3</td><td>Objetos y, con <code>--versions</code>, todas las versiones</td><td>Backup lógico a otro MinIO o a S3. Es la opción principal.</td></tr>
+            <tr><td><code>mc mirror</code> a un sistema de archivos</td><td>Solo la versión actual, como ficheros</td><td>Copia simple, migración, entrega a un tercero. Pierde versiones y metadatos S3.</td></tr>
+            <tr><td>Snapshot del volumen</td><td>Todo el estado del disco, a nivel de bloque</td><td>Recuperación rápida de un nodo o de un volumen completo.</td></tr>
+          </tbody>
+        </table>
+        <p>El <strong>snapshot</strong> no sustituye al backup lógico: es rápido y consistente a nivel de bloque, pero depende del mismo tipo de almacenamiento y del mismo proveedor. Sirve para «volver atrás dos horas», no para reconstruir el negocio tras perder la plataforma.</p>
+        <h3>Backup completo, incremental o continuo</h3>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Cómo se implementa con <code>mc</code></th><th>RPO</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Completo diario</td><td><code>mc mirror</code> programado cada noche</td><td>24 h</td><td>Alto en tiempo y red, simple de razonar.</td></tr>
+            <tr><td>Incremental</td><td><code>mc mirror</code> solo copia lo que falta o cambió</td><td>24 h</td><td>Menor; el destino acumula estado.</td></tr>
+            <tr><td>Continuo</td><td><code>mc mirror --watch</code> o réplica + snapshots</td><td>Minutos</td><td>Requiere un proceso vivo y monitorización.</td></tr>
+          </tbody>
+        </table>
+        <p><code>mc mirror</code> compara por nombre, tamaño y fecha; no es un sistema de backup con catálogo, deduplicación ni históricos por sí mismo. Para tener «el estado de cada noche» necesitas versionado en el destino, snapshots o ejecutar la copia hacia una ruta con fecha.</p>
+        <h3>RPO y RTO: las dos cifras que hay que firmar</h3>
+        <table>
+          <thead><tr><th>Concepto</th><th>Definición</th><th>Ejemplo del almacén</th></tr></thead>
+          <tbody>
+            <tr><td><strong>RPO</strong></td><td>Cuántos datos puedes perder como máximo (ventana hacia atrás).</td><td>«Como mucho, los documentos de las últimas 4 horas».</td></tr>
+            <tr><td><strong>RTO</strong></td><td>Cuánto puedes tardar en volver a servir.</td><td>«El servicio debe estar operativo en 2 horas».</td></tr>
+          </tbody>
+        </table>
+        <p>Un RPO de 4 horas con backups diarios a las 02:00 es imposible: a las 09:00 puedes perder 7 horas. El RPO se deriva de la frecuencia de copia, no de la buena intención. Y el RTO se mide en un simulacro; si nunca has restaurado 2 TB, no sabes cuánto tardas.</p>
+        <h3>Retención: tres relojes distintos</h3>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Quién lo controla</th><th>Se puede acortar</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td>Lifecycle</td><td>Administrador del bucket</td><td>Sí, borrando la regla</td><td>Higiene y coste. No es una garantía legal.</td></tr>
+            <tr><td>Object lock — GOVERNANCE</td><td>Usuario con permiso de bypass</td><td>Sí, con permiso explícito</td><td>Protección contra borrados accidentales.</td></tr>
+            <tr><td>Object lock — COMPLIANCE</td><td>Nadie hasta que expira</td><td>No, ni con root</td><td>Retención regulatoria y WORM.</td></tr>
+            <tr><td>Legal hold</td><td>Usuario autorizado</td><td>Sí, retirando el hold</td><td>Litigios e investigaciones, sin fecha fija.</td></tr>
+          </tbody>
+        </table>
+        <p>El object lock solo se puede activar <strong>al crear el bucket</strong> (<code>mc mb --with-lock</code>) y activa versionado automáticamente. Intentar activarlo después es uno de esos errores que obligan a migrar el bucket entero.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Copiar el bucket <code>documentos</code> a un destino externo conservando versiones y metadatos:</p>
+        <pre><code class="language-bash">mc alias set backup https://backup.example.net:9000 \
+  "$BACKUP_ACCESS_KEY" "$BACKUP_SECRET_KEY"
+mc mb --ignore-existing backup/documentos
+mc mirror --overwrite --preserve --versions \
+  myminio/documentos \
+  backup/documentos
+</code></pre>
+        <p>Qué hace cada opción:</p>
+        <ul>
+          <li><code>mc mirror</code>: sincroniza origen y destino. Es idempotente: si lo ejecutas otra vez, solo mueve lo que falta o cambió.</li>
+          <li><code>--overwrite</code>: reemplaza en destino los objetos que difieren. Sin esto, algunos cambios se quedan atrás.</li>
+          <li><code>--preserve</code>: conserva timestamps y atributos del objeto.</li>
+          <li><code>--versions</code>: copia todas las versiones, no solo la actual. Es lo que convierte la copia en un backup útil frente a sobrescrituras.</li>
+          <li><code>backup/documentos</code>: destino. Debe existir y, si esperas versiones, tener versionado activo.</li>
+        </ul>
+        <p>Verifica que la copia es real, no que el comando terminó sin error:</p>
+        <pre><code class="language-bash">mc ls --versions backup/documentos/2026/
+mc du --recursive backup/documentos/
+mc diff myminio/documentos backup/documentos
+</code></pre>
+        <p><code>mc diff</code> compara la versión actual y debería devolver vacío. Para las versiones antiguas, la comprobación es <code>mc ls --versions</code> en ambos lados y el recuento de objetos.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos tiene un requisito doble: recuperar ante un desastre en menos de dos horas y conservar los contratos firmados durante siete años de forma inmutable. Se resuelve con dos destinos distintos.</p>
+        <h3>Topología de copias</h3>
+        <p>El primario sirve <code>documentos</code> y <code>contratos</code>. <code>documentos</code> se replica a otra DC y se copia a diario con versiones; <code>contratos</code> va a un destino externo con object lock, más un snapshot semanal y una copia offline trimestral.</p>
+        <h3>1. Preparar el destino inmutable de contratos</h3>
+        <pre><code class="language-bash">mc mb --with-lock backup/contratos
+mc retention set --default COMPLIANCE 2555d backup/contratos
+mc version info backup/contratos
+</code></pre>
+        <p><code>2555d</code> son siete años. La retención COMPLIANCE no se puede acortar ni con credenciales root: si te equivocas de plazo, el objeto queda bloqueado hasta que expire. Para contratos, eso es exactamente lo que se quiere; para un bucket de pruebas, es un problema.</p>
+        <h3>2. Copia diaria de documentos</h3>
+        <pre><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+FECHA="$(date +%Y-%m-%d)"
+mc mb --ignore-existing "backup/documentos-${FECHA}"   # bucket diario
+mc mirror --overwrite --preserve --versions \
+  myminio/documentos \
+  "backup/documentos-${FECHA}"
+# Metadatos del clúster: políticas, usuarios, configuración de buckets
+mc admin cluster bucket export myminio
+mc admin cluster iam export myminio
+</code></pre>
+        <p>Dos detalles que se olvidan siempre:</p>
+        <ul>
+          <li>Los <strong>objetos</strong> no son todo. Sin usuarios, políticas y configuración de buckets, restaurar el dato no devuelve el servicio.</li>
+          <li>La copia a una ruta fechada crece indefinidamente. Aplícale una política de retención en el destino (lifecycle sobre <code>documentos-*</code>) o usa snapshots del volumen.</li>
+        </ul>
+        <h3>3. Copia de contratos con retención legal</h3>
+        <pre><code class="language-bash">mc mirror --overwrite --preserve --versions \
+  myminio/contratos \
+  backup/contratos
+mc retention info backup/contratos/2026/acta-firmada.pdf
+mc legalhold set backup/contratos/2026/acta-firmada.pdf
+</code></pre>
+        <p>El <code>legalhold</code> se pone cuando hay un litigio o una auditoría: impide borrar el objeto hasta que se retire, independientemente de la retención. Es la forma de congelar un documento concreto sin bloquear el resto del bucket.</p>
+        <h3>4. Simulacro de restauración</h3>
+        <p>El simulacro se hace en un bucket nuevo, nunca encima del de producción. Así se mide el RTO real sin riesgo.</p>
+        <pre><code class="language-bash"># 1. Cronómetro
+INICIO=$(date +%s)
+# 2. Restaurar en un bucket aislado
+mc mb --ignore-existing myminio/restauracion-documentos
+mc mirror --overwrite --preserve --versions \
+  backup/documentos-2026-11-01 \
+  myminio/restauracion-documentos
+# 3. Verificar integridad y contenido
+mc diff backup/documentos-2026-11-01 myminio/restauracion-documentos
+mc ls --versions myminio/restauracion-documentos/2026/ | wc -l
+# 4. Medir
+FIN=$(date +%s)
+echo "RTO medido: $((FIN - INICIO)) segundos"
+</code></pre>
+        <p>El simulacro debe incluir una prueba funcional, no solo un <code>diff</code>: abrir un PDF, comprobar que el <code>content-type</code> es correcto y que la aplicación puede leerlo con sus credenciales. Un backup que se restaura pero no se puede consumir no ha pasado la prueba.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Restaurar no es copiar de vuelta sin pensar</p>
+          <p>Si restauras sobre el bucket de producción, <code>mc mirror</code> puede resucitar objetos que se borraron a propósito o duplicar versiones. Restaura siempre a un bucket nuevo, valida y luego decide qué devuelves y qué no. La restauración es una operación de datos, no un <code>rsync</code> valiente.</p>
+        </div>
+        <h3>Checklist de backup</h3>
+        <table>
+          <thead><tr><th>Punto</th><th>Criterio de aceptación</th></tr></thead>
+          <tbody>
+            <tr><td>Independencia</td><td>Otra cuenta, otro proveedor u otro medio; credenciales distintas de las de producción.</td></tr>
+            <tr><td>Inmutabilidad</td><td>Object lock o copia offline para el dato que no debe poder borrarse.</td></tr>
+            <tr><td>Monitorización</td><td>Alerta si la copia falla o si el tamaño baja de forma anómala.</td></tr>
+            <tr><td>Restauración</td><td>Simulacro trimestral con RTO medido y evidencia archivada.</td></tr>
+            <tr><td>Documentación</td><td>Runbook con comandos, credenciales en el gestor de secretos y contacto responsable.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Copiar versiones con <code>--versions</code></td>
+              <td>Copiar solo la versión actual</td>
+              <td>Una sobrescritura o un borrado lógico se propaga y la copia hereda el error.</td>
+            </tr>
+            <tr>
+              <td>Destino con credenciales y cuenta distintas</td>
+              <td>Backup en el mismo proveedor y con la misma clave</td>
+              <td>Un compromiso de credenciales borra origen y copia a la vez.</td>
+            </tr>
+            <tr>
+              <td>Object lock en el destino para el dato regulado</td>
+              <td>Confiar en que «nadie borrará el backup»</td>
+              <td>La inmutabilidad es un control técnico, no una promesa.</td>
+            </tr>
+            <tr>
+              <td>Restaurar a un bucket aislado y medir el tiempo</td>
+              <td>Probar la restauración en producción</td>
+              <td>El RTO se conoce solo si se ha ejecutado; el riesgo se elimina aislando.</td>
+            </tr>
+            <tr>
+              <td>Incluir metadatos del clúster en el backup</td>
+              <td>Guardar solo los objetos</td>
+              <td>Sin IAM y configuración, el dato está pero el servicio no arranca igual.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Usar <code>--remove</code> en la copia de seguridad</h3>
+        <span class="code-label code-label--wrong">Mal — el espejo obedece también a los borrados</span>
+        <pre><code class="language-bash">mc mirror --overwrite --remove myminio/documentos backup/documentos
+# ❌ Si alguien vacía documentos/ en producción, la copia también se vacía.
+</code></pre>
+        <span class="code-label code-label--right">Bien — copia acumulativa y versiones</span>
+        <pre><code class="language-bash">mc mirror --overwrite --preserve --versions \
+  myminio/documentos backup/documentos
+# La copia conserva lo que el origen ya no tiene.
+</code></pre>
+        <p><code>--remove</code> es útil para migrar un espejo exacto, no para un backup. En una copia de seguridad, la ausencia en origen no debe ser una orden de borrado.</p>
+        <h3>2. Copiar solo la versión actual</h3>
+        <span class="code-label code-label--wrong">Mal — perder el historial sin saberlo</span>
+        <pre><code class="language-bash">mc mirror myminio/documentos /mnt/backup/documentos
+# ❌ Copia ficheros: solo la versión actual, sin versiones ni metadatos S3.
+</code></pre>
+        <span class="code-label code-label--right">Bien — destino S3 con versiones</span>
+        <pre><code class="language-bash">mc version enable backup/documentos
+mc mirror --overwrite --preserve --versions \
+  myminio/documentos backup/documentos
+mc ls --versions backup/documentos/2026/
+</code></pre>
+        <p>El sistema de archivos no entiende de versiones ni de delete markers. Sirve para una copia simple, pero no para recuperar «el estado de antes de la sobrescritura».</p>
+        <h3>3. No probar nunca la restauración</h3>
+        <span class="code-label code-label--wrong">Mal — backup validado solo por el código de salida</span>
+        <pre><code class="language-bash">mc mirror myminio/documentos backup/documentos &amp;&amp; echo "backup OK"
+# ❌ "OK" significa que no hubo error de red, no que el dato se pueda recuperar.
+</code></pre>
+        <span class="code-label code-label--right">Bien — simulacro con evidencia</span>
+        <pre><code class="language-bash">mc mb --ignore-existing myminio/restauracion
+mc mirror --overwrite --versions backup/documentos myminio/restauracion
+mc diff backup/documentos myminio/restauracion
+# + prueba funcional con un objeto real y RTO medido
+</code></pre>
+        <h3>4. Crear el bucket sin object lock y querer activarlo después</h3>
+        <span class="code-label code-label--wrong">Mal — descubrirlo con el requisito legal encima</span>
+        <pre><code class="language-bash">mc mb myminio/contratos
+mc retention set --default COMPLIANCE 365d myminio/contratos
+# ❌ El object lock solo se habilita al crear el bucket. La operación falla.
+</code></pre>
+        <span class="code-label code-label--right">Bien — crear con lock desde el principio</span>
+        <pre><code class="language-bash">mc mb --with-lock myminio/contratos
+mc retention set --default COMPLIANCE 365d myminio/contratos
+mc retention info myminio/contratos/2026/acta.pdf
+</code></pre>
+        <p>Si el bucket ya existe sin lock, la vía es crear uno nuevo con lock y migrar los objetos; no hay una opción que lo active retroactivamente.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ejecutar un ciclo completo de copia, destrucción y restauración, midiendo el tiempo y comprobando que no se pierde ninguna versión.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara un bucket con historial:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing myminio/lab-backup
+mc version enable myminio/lab-backup
+printf 'v1\n' | mc pipe myminio/lab-backup/2026/acta.txt
+printf 'v2\n' | mc pipe myminio/lab-backup/2026/acta.txt
+printf 'v3\n' | mc pipe myminio/lab-backup/2026/acta.txt
+mc ls --versions myminio/lab-backup/2026/
+</code></pre>
+            <p>Salida esperada: tres versiones de <code>acta.txt</code>.</p>
+          </li>
+          <li>
+            <strong>Crea el destino y copia con versiones:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing myminio/lab-backup-copia
+mc version enable myminio/lab-backup-copia
+mc mirror --overwrite --preserve --versions \
+  myminio/lab-backup myminio/lab-backup-copia
+mc ls --versions myminio/lab-backup-copia/2026/
+</code></pre>
+            <p>Deben aparecer las mismas tres versiones. Si solo hay una, olvidaste <code>--versions</code>.</p>
+          </li>
+          <li>
+            <strong>Simula el desastre:</strong> borra el objeto y todas sus versiones del origen.
+            <pre><code class="language-bash">mc rm --recursive --force myminio/lab-backup/2026/
+mc ls myminio/lab-backup/2026/
+</code></pre>
+            <p>Salida esperada: el prefijo queda vacío. La copia, en cambio, conserva el historial.</p>
+          </li>
+          <li>
+            <strong>Restaura en un bucket aislado, cronometra y verifica:</strong>
+            <pre><code class="language-bash">INICIO=$(date +%s)
+mc mb --ignore-existing myminio/lab-restaurado
+mc mirror --overwrite --preserve --versions \
+  myminio/lab-backup-copia myminio/lab-restaurado
+FIN=$(date +%s)
+echo "RTO: $((FIN - INICIO)) s"
+mc cat myminio/lab-restaurado/2026/acta.txt
+mc ls --versions myminio/lab-restaurado/2026/
+mc diff myminio/lab-backup-copia myminio/lab-restaurado
+</code></pre>
+            <p>Salida esperada: <code>v3</code> como versión actual, tres versiones en total y <code>diff</code> vacío. Compara el RTO con el que habías supuesto. Anota en el runbook fecha, tamaño, RTO e incidencias, y borra los buckets de laboratorio con <code>mc rb --force</code>.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Repite el paso 3 borrando solo una versión intermedia. La restauración debe recuperar también esa versión: es la diferencia entre un backup de objetos y un backup de historial.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Diseñar el plan de continuidad del almacén</h3>
+          <p>Redacta un plan de backup y recuperación para el almacén de documentos que cumpla: RPO de 4 horas, RTO de 2 horas, retención legal de 7 años para <code>contratos/</code> y protección frente a un borrado con credenciales de administrador. Debe incluir destinos, frecuencia, cifrado, retención, quién puede borrar qué y el procedimiento exacto de restauración.</p>
+          <p>Después ejecuta un simulacro real con un subconjunto de datos y presenta la evidencia: comando ejecutado, tamaño restaurado, tiempo medido, diferencias encontradas y qué cambiarías del plan tras la prueba.</p>
+          <p><em>Pista: separa el dato regulado del resto. Lo que exige inmutabilidad no puede compartir destino ni credenciales con la copia operativa; y un RTO de 2 horas con 500 GB por red doméstica no se sostiene.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Versionado, réplica y backup responden a preguntas distintas; ninguno sustituye a los otros.</li>
+          <li>La regla <strong>3-2-1</strong> sigue siendo el mínimo: tres copias, dos medios, una fuera del sitio.</li>
+          <li><code>mc mirror --versions</code> conserva el historial; sin <code>--versions</code> solo copias la versión actual.</li>
+          <li><code>--remove</code> convierte la copia en un espejo y propaga los borrados: nunca en un backup.</li>
+          <li>El backup incluye <strong>objetos y metadatos del clúster</strong>: usuarios, políticas y configuración de buckets.</li>
+          <li>Object lock se activa al crear el bucket; COMPLIANCE no se puede acortar ni con root.</li>
+          <li>RPO y RTO se firman y se miden; un backup sin restauración probada es una hipótesis.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc mirror --versions</code></td><td>Copia objetos conservando todas las versiones</td></tr>
+            <tr><td><code>mc mirror --watch</code></td><td>Mantiene la copia al día mientras el proceso vive</td></tr>
+            <tr><td><code>mc diff</code></td><td>Compara la versión actual de origen y destino</td></tr>
+            <tr><td><code>mc ls --versions</code></td><td>Comprueba que el historial viajó</td></tr>
+            <tr><td><code>mc admin cluster bucket export</code></td><td>Exporta metadatos de buckets y su configuración</td></tr>
+            <tr><td><code>mc admin cluster iam export</code></td><td>Exporta usuarios, grupos y políticas</td></tr>
+            <tr><td><code>mc mb --with-lock</code></td><td>Crea un bucket con object lock y versionado</td></tr>
+            <tr><td><code>mc retention set --default</code></td><td>Fija la retención por defecto del bucket</td></tr>
+            <tr><td><code>mc legalhold set</code></td><td>Congela un objeto concreto</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si ya tengo réplica, ¿para qué quiero backup?</summary>
+            <div>
+              <p>Porque la réplica copia también los errores: un borrado, una corrupción o un cifrado malicioso llegan al secundario en segundos. El backup es una copia anterior, independiente y preferiblemente inmutable. La réplica te da continuidad; el backup te da vuelta atrás.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar <code>mc mirror --watch</code> como única estrategia?</summary>
+            <div>
+              <p>No. Es un proceso de cliente: si se cae, nadie lo nota hasta que falta un dato, y no crea históricos por sí mismo. Sirve como complemento para copias continuas, con supervisión y con snapshots o versionado en el destino que aporten puntos de retorno.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto espacio necesita el backup?</summary>
+            <div>
+              <p>Depende de versiones y retención. Un bucket con tres versiones por objeto puede triplicar el tamaño; con compresión y deduplicación del destino, menos. Mide con <code>mc du --recursive</code> en origen y en destino, y añade margen para los snapshots.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Con qué frecuencia hay que probar la restauración?</summary>
+            <div>
+              <p>Como mínimo una vez al trimestre, y siempre después de cambiar el destino, las credenciales o el procedimiento. La prueba debe restaurar datos reales, medir el tiempo y verificar que la aplicación los consume. Un simulacro anual es demasiado espaciado para un RTO de horas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

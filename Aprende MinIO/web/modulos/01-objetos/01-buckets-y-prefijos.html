@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="01-buckets-y-prefijos">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Buckets y prefijos — Módulo 1 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Buckets y prefijos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Objetos y buckets</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Crear un bucket es trivial. Diseñarlo bien no lo es. El nombre del bucket y la forma de las claves determinan qué listados puedes hacer, cuánto cuesta encontrar un documento y si podrás migrar de esquema sin copiar terabytes. Son decisiones baratas al principio y carísimas después, porque <strong>en object storage no existe renombrar una carpeta</strong>.</p>
+        <p>La confusión habitual es creer que <code>2026/informes/acme/</code> son tres directorios. No lo son: es una sola clave con barras. Los «directorios» que ves en la consola son prefijos agrupados al listar. Entenderlo cambia la forma de diseñar: dejas de pensar en árboles y empiezas a pensar en <em>cadenas ordenadas</em> y en las consultas que necesitas.</p>
+        <p>En esta lección veremos las reglas de nombre de bucket, qué es un prefijo exactamente, cómo funciona el listado con delimitador y paginación, y cómo elegir un esquema de claves para el almacén de documentos. También los límites que conviene conocer antes de que aparezcan en producción.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La clave es la API</p>
+          <p>No hay SQL sobre S3. El único filtro nativo de un listado es el prefijo. Si tus claves no empiezan por lo que consultas, acabarás recorriendo millones de objetos o manteniendo un índice en otra base de datos. Diseñar la clave es diseñar el índice.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Reglas del nombre de bucket</h3>
+        <p>MinIO sigue las reglas de S3 para que el mismo cliente funcione en ambos. No son sugerencias: un nombre inválido devuelve <code>InvalidBucketName</code>.</p>
+        <table>
+          <thead><tr><th>Regla</th><th>Válido</th><th>Inválido</th></tr></thead>
+          <tbody>
+            <tr><td>Entre 3 y 63 caracteres</td><td><code>documentos</code></td><td><code>doc</code> (2), 64 caracteres</td></tr>
+            <tr><td>Solo minúsculas, números, puntos y guiones</td><td><code>doc-2026</code></td><td><code>Documentos</code>, <code>doc_2026</code></td></tr>
+            <tr><td>Empieza y termina en letra o número</td><td><code>doc-2026</code></td><td><code>-documentos</code>, <code>documentos.</code></td></tr>
+            <tr><td>Sin puntos consecutivos</td><td><code>doc.prod</code></td><td><code>doc..prod</code></td></tr>
+            <tr><td>No parece una IP</td><td><code>doc-10-0-0-1</code></td><td><code>10.0.0.1</code></td></tr>
+            <tr><td>Sin prefijos reservados</td><td><code>documentos</code></td><td><code>xn--doc</code>, <code>sthree-doc</code></td></tr>
+          </tbody>
+        </table>
+        <p>En AWS el nombre es único globalmente entre todas las cuentas; en MinIO basta con que sea único en tu despliegue. Aun así, evita puntos si vas a usar TLS virtual-host: el certificado comodín <code>*.example.com</code> no cubre <code>doc.prod.example.com</code> con dos niveles. Un nombre simple y en minúsculas es el más portable.</p>
+        <h3>Cuántos buckets y de qué tamaño</h3>
+        <ul>
+          <li>MinIO no impone un límite duro de buckets; la guía operativa habla de no pasar de ~500 000 por despliegue.</li>
+          <li>Un bucket por <strong>dominio funcional</strong> (<code>documentos</code>, <code>media</code>, <code>backups</code>) suele ser mejor que uno por cliente o por año.</li>
+          <li>Las políticas, el versionado y el lifecycle se aplican por bucket. Si dos conjuntos de datos necesitan ciclos de vida distintos, probablemente necesiten buckets distintos.</li>
+          <li>Cada bucket añade superficie de configuración. Cien buckets por cliente son cien lugares donde equivocarse con una política.</li>
+        </ul>
+        <h3>Prefijo: una cadena, no un directorio</h3>
+        <p>Un prefijo es cualquier cadena inicial de una clave. <code>2026/</code> es un prefijo; <code>2026/informes/</code> también; <code>2026/inf</code> también. No hace falta que termine en barra, aunque por convención se use así para agrupar.</p>
+        <pre><code class="language-text">CLAVES EN EL BUCKET documentos
+2026/contratos/acme/CTR-2026-0142.pdf
+2026/contratos/globex/CTR-2026-0201.pdf
+2026/informes/acme/INF-2026-0007.pdf
+2026/informes/globex/INF-2026-0011.pdf
+2027/contratos/acme/CTR-2027-0003.pdf
+tmp/2026-02-11/borrador-8841.docx
+
+PREFIJO "2026/"          -> las cuatro primeras
+PREFIJO "2026/informes/" -> las dos de informes
+PREFIJO "2026/i"         -> también las dos de informes
+PREFIJO "acme/"          -> ninguna: el tenant no está al principio</code></pre>
+        <p>Ese último caso es la decisión de diseño más importante: si consultas por tenant, el tenant debe estar al principio o tendrás que listar todo y filtrar. No hay índice secundario gratuito.</p>
+        <h3>Listado con delimitador: cómo aparecen las «carpetas»</h3>
+        <p>La API <code>ListObjectsV2</code> acepta <code>prefix</code> y <code>delimiter</code>. Con <code>delimiter=/</code>, el servidor agrupa todas las claves que comparten el siguiente segmento y las devuelve como <code>CommonPrefixes</code>. Es una agregación calculada en la respuesta, no una estructura almacenada.</p>
+        <pre><code class="language-text">GET /documentos?list-type=2&amp;delimiter=/&amp;prefix=
+
+200 OK
+Contents:         (objetos sueltos en la raíz; normalmente ninguno)
+CommonPrefixes:   2026/
+                  2027/
+                  tmp/
+
+GET /documentos?list-type=2&amp;delimiter=/&amp;prefix=2026/
+
+Contents:         (ninguno)
+CommonPrefixes:   2026/contratos/
+                  2026/informes/</code></pre>
+        <p>Sin delimitador, el listado es plano y devuelve claves completas. Por eso <code>mc ls</code> sin <code>--recursive</code> simula carpetas y con <code>--recursive</code> las ignora. Ninguna de las dos vistas cambia lo que hay guardado.</p>
+        <h3>Paginación: mil claves por página</h3>
+        <p>Un listado devuelve como máximo 1 000 entradas. Si hay más, la respuesta trae <code>IsTruncated=true</code> y un <code>NextContinuationToken</code>. Para recorrer todo hay que repetir la petición con ese token hasta que <code>IsTruncated</code> sea falso.</p>
+        <pre><code class="language-text">Página 1  max-keys=1000  -> 1000 entradas + token "A"
+Página 2  continuation-token=A -> 1000 entradas + token "B"
+Página 3  continuation-token=B -> 137 entradas, IsTruncated=false
+FIN</code></pre>
+        <p>Los <code>CommonPrefixes</code> también cuentan para el límite. Un prefijo con 10 000 subcarpetas y ningún objeto necesitará varias páginas solo para listar los subprefijos. Y el orden es lexicográfico por clave, no por fecha: si necesitas «lo más reciente», o lo pones en la clave o lo consultas en tu base de datos.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">El error de la primera página</p>
+          <p>Un script que llama una vez a <code>ListObjectsV2</code> y asume que ha visto todo funciona en desarrollo con 20 objetos y pierde datos en producción con 20 000. Si escribes un recorrido, implementa el bucle de paginación desde el primer día.</p>
+        </div>
+        <h3>No hay rename, ni carpetas vacías</h3>
+        <p>Renombrar un prefijo exige copiar cada objeto a la clave nueva y borrar el original. No es atómico, cuesta tiempo y, con versionado, deja marcadores de borrado. Tampoco puedes crear una carpeta vacía: si la consola te deja, lo que hace es crear un objeto de 0 bytes cuya clave termina en <code>/</code>, un truco de compatibilidad, no un directorio.</p>
+        <p>Consecuencia: el esquema de claves debe prever los cambios. Añade versión de esquema si esperas evolución:</p>
+        <pre><code class="language-text">v1/2026/contratos/acme/CTR-2026-0142.pdf
+v2/2026/contratos/acme/CTR-2026-0142.pdf</code></pre>
+        <p>Así puedes migrar por prefijo sin mezclar dos interpretaciones de la misma ruta.</p>
+        <h3>Tres esquemas y sus consultas</h3>
+        <table>
+          <thead><tr><th>Esquema</th><th>Listar por tenant</th><th>Listar por año y tipo</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td><code>acme/2026/contratos/…</code></td><td>Barato: prefijo <code>acme/</code></td><td>Caro: recorrer todos los tenants</td><td>Un tenant con millones de objetos concentra el listado</td></tr>
+            <tr><td><code>2026/contratos/acme/…</code></td><td>Caro: recorrer años y tipos</td><td>Barato: prefijo <code>2026/contratos/</code></td><td>Las consultas por cliente requieren índice externo</td></tr>
+            <tr><td><code>contratos/2026/acme/…</code></td><td>Caro</td><td>Barato por tipo, no por año</td><td>Mezcla años dentro del mismo tipo</td></tr>
+          </tbody>
+        </table>
+        <p>En el almacén de documentos la consulta dominante es «documentos de un periodo y tipo» (informes mensuales, contratos del año). Por eso elegimos <code>2026/contratos/acme/…</code>. La consulta por tenant se resuelve con el índice de PostgreSQL, que ya existe para permisos y estado. Si el negocio cambiara y el 90 % de las consultas fueran por cliente, el esquema correcto sería el primero: no hay uno universal.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Crear el bucket y comprobar cómo se agrupan las claves con <code>minio-js</code>:</p>
+        <pre><code class="language-javascript">import * as Minio from 'minio'
+
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.MINIO_ROOT_USER,
+  secretKey: process.env.MINIO_ROOT_PASSWORD,
+})
+
+await client.makeBucket('documentos', 'us-east-1')
+
+await client.putObject(
+  'documentos',
+  '2026/informes/acme/INF-2026-0007.pdf',
+  Buffer.from('%PDF-1.7 demo'),
+  { 'Content-Type': 'application/pdf' },
+)
+
+const stream = client.listObjectsV2('documentos', '', false)
+for await (const item of stream) {
+  console.log(item.prefix ? `prefijo: ${item.prefix}` : `objeto:  ${item.name}`)
+}</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>makeBucket</code> crea el bucket en la región indicada. Si ya existe, lanza <code>BucketAlreadyOwnedByYou</code>; en un script, comprueba antes con <code>bucketExists</code>.</li>
+          <li><code>putObject</code> recibe bucket, clave, contenido y metadatos. La clave contiene barras y eso es todo: no se crea ningún directorio.</li>
+          <li><code>listObjectsV2(bucket, prefix, recursive)</code> con <code>recursive=false</code> usa <code>delimiter=/</code>. El flujo emite objetos y prefijos comunes.</li>
+          <li><code>item.prefix</code> distingue un prefijo de un objeto; su <code>size</code> es 0 y no tiene ETag.</li>
+        </ul>
+        <p>Salida:</p>
+        <pre><code class="language-text">prefijo: 2026/</code></pre>
+        <p>El PDF no aparece porque está un nivel más abajo. Si cambias a <code>recursive=true</code>, verás la clave completa y ningún prefijo. Es la misma información con otra agregación.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos centraliza la construcción de claves en un módulo. Así no hay dos servicios que inventen rutas distintas:</p>
+        <pre><code class="language-javascript">// lib/keys.mjs
+const SAFE = /^[a-z0-9][a-z0-9-]{1,62}$/
+
+export function documentKey({ year, type, tenant, docId, ext = 'pdf' }) {
+  if (!Number.isInteger(year) || year &lt; 2000 || year &gt; 2100) {
+    throw new Error('year inválido')
+  }
+  if (!SAFE.test(tenant)) throw new Error('tenant inválido')
+  if (!SAFE.test(docId.toLowerCase())) throw new Error('docId inválido')
+
+  return `${year}/${type}/${tenant}/${docId}.${ext}`
+}
+
+// documentKey({ year: 2026, type: 'contratos', tenant: 'acme',
+//               docId: 'CTR-2026-0142' })
+// -> "2026/contratos/acme/CTR-2026-0142.pdf"</code></pre>
+        <p>La validación no es burocracia: una clave con <code>..</code>, con barras inyectadas o con mayúsculas aleatorias rompe listados y políticas. El tenant y el <code>docId</code> vienen de la base de datos, pero se validan igual porque un error de datos no debe convertirse en una clave impredecible.</p>
+        <p>Con ese esquema, las operaciones del día a día quedan así:</p>
+        <table>
+          <thead><tr><th>Pregunta</th><th>Operación</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Contratos de 2026</td><td><code>mc ls --recursive local/documentos/2026/contratos/</code></td><td>Proporcional a los contratos de ese año</td></tr>
+            <tr><td>Todo lo de acme en 2026</td><td>Índice en PostgreSQL → claves exactas</td><td>Una consulta SQL + N <code>GET</code></td></tr>
+            <tr><td>Borradores de hoy</td><td><code>mc ls local/documentos/tmp/2026-02-11/</code></td><td>Prefijo pequeño y efímero</td></tr>
+            <tr><td>Objeto concreto</td><td><code>mc stat local/documentos/2026/…/CTR-2026-0142.pdf</code></td><td>Una petición <code>HEAD</code></td></tr>
+            <tr><td>Informe de capacidad</td><td><code>mc du local/documentos/2026/</code></td><td>Recorrido completo del prefijo</td></tr>
+          </tbody>
+        </table>
+        <p>Paginación explícita con <code>minio-js</code>, cuando necesitas controlar el tamaño de página o reanudar un recorrido:</p>
+        <pre><code class="language-javascript">let token = ''
+let page = 0
+
+do {
+  const result = await client.listObjectsV2Query(
+    'documentos', '2026/', token, '/', 100, '',
+  )
+  page += 1
+  console.log(`página ${page}: ${result.objects.length} entradas`)
+
+  for (const item of result.objects) {
+    console.log(item.name ?? item.prefix)
+  }
+
+  token = result.isTruncated ? result.nextContinuationToken : ''
+} while (token)</code></pre>
+        <p>Fíjate en los argumentos: bucket, prefijo, token, delimitador y tamaño máximo. La primera llamada usa token vacío. El bucle termina cuando el servidor dice que no hay más. Guardar el token permite reanudar un proceso largo sin empezar de cero, siempre que el conjunto no cambie demasiado.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">El prefijo temporal también se diseña</p>
+          <p><code>tmp/2026-02-11/</code> permite que una regla de lifecycle expire todo lo de un día con un prefijo. Si los temporales se mezclan con los definitivos, la limpieza pasa a ser un script que recorre y decide objeto a objeto.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Poner al principio el atributo que más consultas</td>
+              <td>Usar un UUID como única componente de la clave</td>
+              <td>El prefijo es el único filtro nativo del listado.</td>
+            </tr>
+            <tr>
+              <td>Centralizar la construcción de claves en una función</td>
+              <td>Concatenar rutas en cada servicio</td>
+              <td>Evita esquemas divergentes y claves con barras duplicadas.</td>
+            </tr>
+            <tr>
+              <td>Validar tenant, tipo y año antes de construir la clave</td>
+              <td>Confiar en que los datos de entrada son limpios</td>
+              <td>Una barra inyectada cambia el prefijo y rompe las políticas.</td>
+            </tr>
+            <tr>
+              <td>Paginar siempre los listados</td>
+              <td>Asumir que una respuesta contiene todo</td>
+              <td>El límite de 1 000 entradas es del protocolo, no del SDK.</td>
+            </tr>
+            <tr>
+              <td>Separar temporales en un prefijo propio</td>
+              <td>Mezclar borradores con documentos finales</td>
+              <td>Lifecycle puede expirar el prefijo entero sin lógica adicional.</td>
+            </tr>
+            <tr>
+              <td>Versionar el esquema en la clave si va a evolucionar</td>
+              <td>Cambiar el significado de las rutas existentes</td>
+              <td>Permite migrar por prefijo y convivir con dos formatos.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Nombre de bucket inválido</h3>
+        <span class="code-label code-label--wrong">Mal — mayúsculas y guiones bajos</span>
+        <pre><code class="language-bash"># ❌ InvalidBucketName
+mc mb local/Documentos_2026</code></pre>
+        <span class="code-label code-label--right">Bien — minúsculas, números y guiones</span>
+        <pre><code class="language-bash">mc mb local/documentos-2026</code></pre>
+        <p>El mismo nombre debe funcionar en MinIO y en AWS. Si empieza por mayúscula o contiene <code>_</code>, no es portable aunque algún servidor lo acepte.</p>
+        <h3>2. Creer que renombrar un prefijo es gratis</h3>
+        <span class="code-label code-label--wrong">Mal — esperar un <code>mv</code> atómico</span>
+        <pre><code class="language-bash"># ❌ Copia y borra objeto a objeto; no es atómico ni instantáneo.
+mc mv local/documentos/2026/ local/documentos/2025/</code></pre>
+        <span class="code-label code-label--right">Bien — copiar, verificar y borrar cuando cuadre</span>
+        <pre><code class="language-bash">mc cp --recursive local/documentos/2026/ local/documentos/2025/
+mc ls --recursive local/documentos/2025/ | wc -l
+mc rm --recursive --force local/documentos/2026/</code></pre>
+        <p>Con millones de objetos, el «rename» puede tardar horas y consumir ancho de banda. Diseña la clave para no necesitarlo.</p>
+        <h3>3. Claves que empiezan por barra</h3>
+        <span class="code-label code-label--wrong">Mal — segmento vacío al inicio</span>
+        <pre><code class="language-javascript">// ❌ La clave real es "/2026/informes/…" y el listado por "2026/" no la encuentra.
+const key = `/${year}/${type}/${tenant}/${docId}.pdf`</code></pre>
+        <span class="code-label code-label--right">Bien — sin barra inicial</span>
+        <pre><code class="language-javascript">const key = `${year}/${type}/${tenant}/${docId}.pdf`</code></pre>
+        <p>La barra inicial crea un primer segmento vacío. El objeto existe, pero aparece en un prefijo distinto del esperado y las políticas que conceden <code>documentos/2026/*</code> no lo cubren.</p>
+        <h3>4. Listar sin paginar</h3>
+        <span class="code-label code-label--wrong">Mal — una sola llamada y a confiar</span>
+        <pre><code class="language-javascript">// ❌ Solo procesa la primera página de 1 000.
+const { objects } = await client.listObjectsV2Query('documentos', '', '', '/', 1000)
+await processAll(objects)</code></pre>
+        <span class="code-label code-label--right">Bien — seguir el token hasta el final</span>
+        <pre><code class="language-javascript">let token = ''
+do {
+  const page = await client.listObjectsV2Query('documentos', '', token, '/', 1000)
+  await processAll(page.objects)
+  token = page.isTruncated ? page.nextContinuationToken : ''
+} while (token)</code></pre>
+        <p>El fallo es silencioso: no hay error, simplemente faltan objetos. En un backup o en una migración, eso significa pérdida de datos.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar con datos reales cómo se agrupan los prefijos, cómo funciona el delimitador y cómo se recorre un listado paginado.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el bucket y verifica las reglas.</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing local/documentos
+mc mb local/Documentos_2026 || echo "nombre inválido, como se esperaba"</code></pre>
+            <p>El segundo comando debe fallar. Anota el código de error que devuelve <code>mc</code>.</p>
+          </li>
+          <li>
+            <strong>Sube 25 objetos con tres prefijos distintos.</strong>
+            <pre><code class="language-bash">for i in $(seq -w 1 25); do
+  echo "documento $i" &gt; "/tmp/doc-$i.txt"
+  mc cp "/tmp/doc-$i.txt" \
+    "local/documentos/2026/informes/acme/INF-2026-00$i.txt"
+done</code></pre>
+            <p>Adapta el bucle en PowerShell con <code>1..25 | ForEach-Object { ... }</code>. Lo importante es que las claves compartan prefijo y tengan un orden lexicográfico claro.</p>
+          </li>
+          <li>
+            <strong>Compara listado plano y agrupado.</strong>
+            <pre><code class="language-bash">mc ls local/documentos/2026/
+mc ls --recursive local/documentos/2026/ | wc -l</code></pre>
+            <p>El primero muestra <code>informes/</code>; el segundo, las 25 claves. No hay directorios: solo dos formas de agregar.</p>
+          </li>
+          <li>
+            <strong>Lista con delimitador y página de 10 en 10.</strong> Ejecuta el ejemplo de <code>listObjectsV2Query</code> con <code>maxKeys=10</code> y muestra el número de página y el token. Deben salir tres páginas: 10, 10 y 5.
+          </li>
+          <li>
+            <strong>Comprueba el orden y el filtro por prefijo.</strong>
+            <pre><code class="language-bash">mc ls --recursive local/documentos/2026/informes/acme/ | head -5
+mc ls --recursive local/documentos/2026/contratos/</code></pre>
+            <p>El segundo prefijo no existe y devuelve vacío, no un error. Un prefijo sin objetos es un listado válido.</p>
+          </li>
+          <li>
+            <strong>Mide el coste de un listado grande.</strong> Sube 200 objetos pequeños con un bucle y cronometra <code>mc du</code> y <code>mc ls --recursive</code>. Compara con <code>mc stat</code> de una clave exacta. La diferencia es la razón por la que necesitas un índice para consultas por atributo.
+          </li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Migrar dos millones de claves sin parar el servicio</h3>
+          <p>El esquema antiguo es <code>acme/2026/contratos/CTR-2026-0142.pdf</code> y el nuevo debe ser <code>2026/contratos/acme/CTR-2026-0142.pdf</code>. Hay dos millones de objetos, el servicio no puede parar y los clientes antiguos seguirán escribiendo durante una semana.</p>
+          <p>Diseña el plan: orden de copia, cómo evitar que una escritura durante la migración se pierda, cómo saber qué objetos faltan, cómo convivir con ambos esquemas y cuándo se puede borrar el antiguo. Incluye un criterio de verificación distinto del recuento de objetos.</p>
+          <p><em>Pista: no hay rename. Piensa en copia por prefijo, doble escritura o lectura con fallback, y en comparar ETag además de número de claves. El borrado del esquema antiguo es el último paso, nunca el primero.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El bucket sigue reglas estrictas de nombre: 3–63 caracteres, minúsculas, sin guiones bajos.</li>
+          <li>Un <strong>prefijo</strong> es una cadena inicial de la clave; las «carpetas» son una agrupación calculada al listar.</li>
+          <li>Con <code>delimiter=/</code>, la API devuelve <code>CommonPrefixes</code>; sin delimitador, claves completas.</li>
+          <li>El listado pagina de 1 000 en 1 000 con <code>ContinuationToken</code>; ignorarlo pierde objetos en silencio.</li>
+          <li>No hay rename de prefijo ni carpetas vacías reales; cambiar de esquema es copiar y borrar.</li>
+          <li>La clave es el índice: pon al principio el atributo por el que más consultas.</li>
+          <li>Los temporales merecen su propio prefijo para que lifecycle los pueda expirar.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto / comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc mb --ignore-existing</code></td><td>Crea el bucket sin fallar si ya existe</td></tr>
+            <tr><td><code>mc ls</code></td><td>Listado agrupado por prefijos</td></tr>
+            <tr><td><code>mc ls --recursive</code></td><td>Listado plano de claves completas</td></tr>
+            <tr><td><code>prefix</code></td><td>Filtro nativo del listado</td></tr>
+            <tr><td><code>delimiter=/</code></td><td>Agrupa por el siguiente segmento</td></tr>
+            <tr><td><code>ContinuationToken</code></td><td>Reanuda un listado paginado</td></tr>
+            <tr><td><code>mc du</code></td><td>Suma tamaño y objetos de un prefijo</td></tr>
+            <tr><td><code>mc stat</code></td><td>Acceso directo a una clave concreta</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo crear buckets dentro de buckets?</summary>
+            <div>
+              <p>No. El modelo tiene dos niveles: bucket y clave. Lo que parece un sub-bucket es un prefijo. Si necesitas políticas o lifecycle independientes, crea otro bucket; si solo quieres organizar, usa prefijos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Se puede renombrar un bucket?</summary>
+            <div>
+              <p>No directamente. Hay que crear el bucket nuevo y copiar los objetos con <code>mc mirror</code> o <code>mc cp --recursive</code>, verificar y después borrar el antiguo. Si hay clientes en marcha, necesitas un periodo de doble lectura o una ventana de mantenimiento. El nombre del bucket aparece en las políticas y en las URLs, así que cambiarlo es un cambio de configuración, no solo de datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Hay un límite de objetos por bucket o por prefijo?</summary>
+            <div>
+              <p>No hay un límite práctico documentado de objetos totales; el límite real es la capacidad y el tiempo de listado. Un prefijo con decenas de millones de claves es legal, pero recorrerlo es caro. Si tu caso de uso requiere eso, diseña subprefijos por fecha o por rango y evita listados completos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un prefijo vacío lista todo el bucket?</summary>
+            <div>
+              <p>Sí. <code>prefix=""</code> no filtra nada y devuelve el primer nivel del bucket, con los prefijos comunes si usas delimitador. Es lo que hace <code>mc ls local/documentos</code>. No es un error, pero en buckets grandes conviene acotar siempre que se pueda.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El orden de listado es por fecha de subida?</summary>
+            <div>
+              <p>No: es lexicográfico por clave (orden de bytes UTF-8). <code>2026-02</code> va antes que <code>2026-10</code>, pero <code>10</code> va antes que <code>2</code> si no rellenas con ceros. Si necesitas orden temporal, usa fechas ISO 8601 en la clave (<code>2026-02-11T09-14-22Z</code>) o consulta el índice externo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

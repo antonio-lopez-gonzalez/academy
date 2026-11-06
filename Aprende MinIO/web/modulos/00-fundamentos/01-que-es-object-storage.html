@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="00" data-lesson="01-que-es-object-storage">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qué es el almacenamiento de objetos — Módulo 0 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Qué es el almacenamiento de objetos</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 0 · Fundamentos</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Tu aplicación guarda los PDF de los clientes en una carpeta del servidor. Funciona durante meses. Un día hay dos servidores, luego cuatro, y el balanceador envía cada petición a uno distinto: la mitad de las descargas devuelven 404. Copias la carpeta a mano, montas NFS y aparece el siguiente problema: dos procesos escriben el mismo archivo y uno pisa al otro. Después llega el backup de 8 TB y ya no sabes ni cuánto tarda en restaurarse.</p>
+        <p>El <strong>almacenamiento de objetos</strong> existe para ese momento. No es un sistema de ficheros más rápido ni un disco de red: es un modelo distinto, diseñado para guardar <em>blobs</em> completos, identificados por una clave, con metadatos y acceso por HTTP. Su unidad de trabajo no es «abrir un archivo y escribir en el byte 4 096», sino «guardar este objeto entero» o «dame este objeto entero».</p>
+        <p>Ese cambio parece una limitación y en realidad es la fuente de su escalabilidad. En esta lección veremos qué es exactamente un objeto, en qué se diferencia de un fichero y de un bloque, por qué es inmutable, cuándo conviene usarlo y cuándo es la herramienta equivocada. Es la base de todo el curso: si confundes objeto con carpeta, los prefijos, el versionado y el lifecycle se convertirán en comandos memorizados sin modelo detrás.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué empezar aquí</p>
+          <p>MinIO implementa la API S3, y S3 es un almacén de objetos, no un disco. Muchas decisiones que parecen rarezas —no hay <code>rename</code>, no puedes modificar un byte, borrar no siempre borra— se explican por este modelo. Entenderlo evita diseñar claves que luego no se pueden listar y evita usar object storage para cosas que pedían una base de datos.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>La definición que importa</h3>
+        <p>Un objeto es la terna <strong>datos + metadatos + clave</strong>. Nada más. Los datos son una secuencia de bytes opaca: a MinIO le da igual que sea un PDF, un vídeo o un Parquet. Los metadatos describen esos bytes: tipo de contenido, tamaño, fecha, checksum y pares clave-valor que tú aportas. La clave es el nombre único dentro de un bucket y, a diferencia de una ruta de fichero, es una cadena plana que <em>puede contener</em> barras.</p>
+        <pre><code class="language-text">+-------------------------------------------------------------+
+| OBJETO                                                      |
+|                                                             |
+|  clave     2026/informes/acme/informe-anual-2026.pdf        |
+|  datos     [ 2 411 233 bytes binarios, opacos para MinIO ]  |
+|  metadatos Content-Type: application/pdf                    |
+|            x-amz-meta-tenant: acme                          |
+|            x-amz-meta-sha256: 4f9c...                       |
+|            ETag: "9f2c1b..."                                |
++-------------------------------------------------------------+
+| bucket: documentos                                          |
++-------------------------------------------------------------+</code></pre>
+        <p>El bucket es el contenedor de primer nivel. Agrupa objetos, define políticas, versionado, lifecycle y cifrado. No hay buckets dentro de buckets. Un objeto pertenece a exactamente un bucket y se identifica por la pareja <code>bucket + clave</code>.</p>
+        <h3>Tres formas de guardar bytes</h3>
+        <table>
+          <thead><tr><th>Modelo</th><th>Unidad de acceso</th><th>Organización</th><th>Encaja en</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Fichero</strong> (NFS, SMB, ext4)</td>
+              <td>Abrir, leer y escribir rangos; bloquear; renombrar</td>
+              <td>Árbol de directorios con permisos POSIX</td>
+              <td>Compartir documentos entre humanos, código, configuraciones</td>
+            </tr>
+            <tr>
+              <td><strong>Bloque</strong> (EBS, iSCSI, SAN)</td>
+              <td>Bloques de tamaño fijo, sin semántica de archivo</td>
+              <td>Un dispositivo que el sistema operativo formatea</td>
+              <td>Bases de datos, sistemas transaccionales, baja latencia</td>
+            </tr>
+            <tr>
+              <td><strong>Objeto</strong> (S3, MinIO, GCS)</td>
+              <td>PUT y GET del objeto completo (o rangos de bytes)</td>
+              <td>Espacio plano: bucket + clave + metadatos</td>
+              <td>Documentos, backups, imágenes, logs, data lakes, artefactos</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>La diferencia clave no es el tamaño: es la <strong>unidad de mutación</strong>. En un fichero puedes cambiar el byte 100 sin tocar el resto. En un objeto, cualquier cambio produce una versión nueva del objeto completo. MinIO sí permite leer un rango con una petición <code>Range</code>, pero no escribir un rango: no existe un <code>PUT</code> parcial.</p>
+        <h3>Espacio plano, no árbol</h3>
+        <p>Cuando subes <code>2026/informes/acme/informe.pdf</code>, MinIO no crea tres directorios. Guarda un objeto cuya clave contiene barras. La consola y <code>mc ls</code> las muestran como carpetas porque es cómodo para humanos, pero esa jerarquía es una <em>vista</em> que se calcula al listar con un delimitador.</p>
+        <pre><code class="language-text">LO QUE VES                         LO QUE HAY
+documentos/                        bucket documentos
+├── 2026/                          ├── clave 2026/informes/acme/informe.pdf
+│   ├── informes/                  ├── clave 2026/informes/globex/q1.pdf
+│   │   ├── acme/                  ├── clave 2026/facturas/acme/f-001.pdf
+│   │   │   └── informe.pdf        └── clave 2027/informes/acme/informe.pdf
+│   │   └── globex/
+│   │       └── q1.pdf
+│   └── facturas/
+│       └── acme/
+│           └── f-001.pdf
+└── 2027/</code></pre>
+        <p>Consecuencia inmediata: <strong>no existe renombrar una carpeta</strong>. Renombrar <code>2026/</code> a <code>2025/</code> significaría copiar y borrar cada objeto, uno por uno. Lo veremos con detalle en <a href="../01-objetos/01-buckets-y-prefijos.html">Buckets y prefijos</a>.</p>
+        <h3>Inmutabilidad: reemplazar, no editar</h3>
+        <p>Un objeto publicado no se modifica. Un <code>PUT</code> sobre una clave existente crea una <strong>nueva versión lógica</strong> que sustituye a la anterior como «actual». Los lectores ven la versión antigua o la nueva, nunca una mezcla a medio escribir. Esa atomicidad es gratuita y es la razón por la que object storage encaja tan bien con réplicas, cachés y CDNs.</p>
+        <pre><code class="language-text">PUT informe.pdf (v1)        PUT informe.pdf (v2)
+        |                           |
+        v                           v
+   [ bytes v1 ]   &lt;----------  [ bytes v2 ]   &lt;- la clave apunta aquí
+        |                           |
+        +---- lectores ven v1       +---- lectores ven v2
+              o v1 completo              o v2 completo, nunca mitad y mitad</code></pre>
+        <p>Sin versionado, la versión anterior se vuelve inalcanzable en cuanto termina el <code>PUT</code>. Con versionado, MinIO conserva ambas y puedes recuperar la primera por su <em>version ID</em>. Lo veremos en <a href="../01-objetos/04-versionado-y-object-locking.html">Versionado y object locking</a>.</p>
+        <h3>Por qué escala</h3>
+        <ul>
+          <li><strong>Sin jerarquía que bloquear:</strong> no hay inodos, directorios ni locks distribuidos. Cada objeto es independiente.</li>
+          <li><strong>Metadatos separados de los datos:</strong> listar un prefijo no requiere abrir los objetos.</li>
+          <li><strong>Paralelismo natural:</strong> cien clientes pueden escribir cien claves distintas sin coordinarse.</li>
+          <li><strong>Durabilidad por software:</strong> MinIO usa erasure coding y réplica para sobrevivir a discos muertos, no un RAID del sistema operativo.</li>
+          <li><strong>HTTP de por medio:</strong> cualquier lenguaje, cualquier contenedor y cualquier CDN hablan el mismo protocolo.</li>
+        </ul>
+        <p>Los límites también existen y conviene saberlos desde el principio: la clave puede medir hasta 1 024 bytes y cada segmento entre barras hasta 255; un listado devuelve como máximo 1 000 claves por página; un <code>PUT</code> simple admite hasta 5 TiB en MinIO, y los objetos mayores requieren multipart. En AWS S3 el tamaño máximo de objeto es 5 TiB, así que si diseñas para la nube, ese es el techo portable.</p>
+        <h3>Cuándo usarlo y cuándo no</h3>
+        <table>
+          <thead><tr><th>Buen encaje</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Documentos y PDF de usuarios</td><td>Se escriben una vez, se leen muchas, crecen sin límite predecible.</td></tr>
+            <tr><td>Backups y archivos históricos</td><td>Objetos grandes, inmutables y con retención por política.</td></tr>
+            <tr><td>Imágenes, vídeo y audio</td><td>Se sirven por HTTP y se cachean en CDN.</td></tr>
+            <tr><td>Data lakes y Parquet</td><td>Motor analítico lee ficheros completos por rangos.</td></tr>
+            <tr><td>Artefactos de build y modelos</td><td>Versionado por clave y descarga paralela.</td></tr>
+            <tr><td>Logs y eventos crudos</td><td>Lifecycle los mueve o expira sin intervención.</td></tr>
+          </tbody>
+        </table>
+        <table>
+          <thead><tr><th>Mal encaje</th><th>Qué usar</th></tr></thead>
+          <tbody>
+            <tr><td>Transacciones, bloqueos, contadores</td><td>PostgreSQL, MySQL o Redis.</td></tr>
+            <tr><td>Editar un byte o añadir al final de un fichero</td><td>Sistema de ficheros o base de datos.</td></tr>
+            <tr><td>Montar como disco y ejecutar una base de datos</td><td>Volumen de bloque; S3 no da la latencia ni la semántica.</td></tr>
+            <tr><td>Miles de archivos de 1 KB con búsquedas por atributo</td><td>Base de datos documental o índice aparte.</td></tr>
+            <tr><td>Colaboración en tiempo real sobre un documento</td><td>CRDT, base de datos o servicio colaborativo.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">Objeto no significa «solo para cosas enormes»</p>
+          <p>Puedes guardar un objeto de 10 bytes. Lo que no puedes es consultarlo por su contenido ni actualizarlo parcialmente. La pregunta correcta no es «¿es grande?», sino «¿lo leo y escribo entero, y me sirve identificarlo por una clave?».</p>
+        </div>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Vamos a comprobar el modelo con un objeto real. Necesitas el MinIO de la lección <a href="03-instalacion-y-console.html">Instalación y consola web</a> y <code>mc</code> configurado como en <a href="04-mc-y-primer-bucket.html">mc y el primer bucket</a>; si aún no los tienes, lee el ejemplo y vuelve después.</p>
+        <pre><code class="language-bash">mc mb --ignore-existing local/documentos
+
+mc cp ./informe-anual-2026.pdf \
+  local/documentos/2026/informes/acme/
+
+mc stat local/documentos/2026/informes/acme/informe-anual-2026.pdf</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>mc mb</code> crea el bucket. <code>--ignore-existing</code> hace el comando idempotente: si ya existe, no falla.</li>
+          <li><code>mc cp</code> copia un fichero local a un bucket. Como el destino termina en <code>/</code>, conserva el nombre del fichero y lo añade a la clave. Las «carpetas» intermedias se crean implícitamente: no hay ninguna llamada para crearlas.</li>
+          <li><code>mc stat</code> pide los metadatos con un <code>HEAD</code>. No descarga los 2,4 MB.</li>
+        </ul>
+        <p>Salida típica:</p>
+        <pre><code class="language-text">Name      : 2026/informes/acme/informe-anual-2026.pdf
+Date      : 2026-02-11 09:14:22 CET
+Size      : 2.4 MiB
+ETag      : 9f2c1b7d4a0e5c63f8a1d2e3b4c5d6e7
+Type      : file
+Metadata  :
+  Content-Type: application/pdf</code></pre>
+        <p>Fíjate en tres cosas. La clave incluye toda la ruta, no solo el nombre. El <code>Content-Type</code> lo dedujo <code>mc</code> de la extensión, y es un metadato, no parte del fichero. Y el <code>ETag</code> identifica esa versión concreta: si vuelves a subir el mismo contenido, se repite; si cambias un byte, cambia.</p>
+        <p>Ahora sustituye el objeto por una versión corregida:</p>
+        <pre><code class="language-bash">mc cp ./informe-anual-2026-corregido.pdf \
+  local/documentos/2026/informes/acme/informe-anual-2026.pdf
+
+mc stat local/documentos/2026/informes/acme/informe-anual-2026.pdf</code></pre>
+        <p>El <code>ETag</code> es distinto y el tamaño puede serlo. No ha habido una «edición»: hay un objeto nuevo ocupando la misma clave. Si el bucket no tiene versionado, la versión anterior ya no se puede recuperar.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El hilo conductor del curso es un <strong>almacén de documentos</strong> para un copiloto interno. La empresa recibe contratos, informes y facturas en PDF; un millón doscientos mil documentos al año, unos 8 TB, con picos de 40 subidas por segundo. Los usuarios buscan por cliente y por fecha, y el sistema debe conservar los contratos siete años sin posibilidad de alterarlos.</p>
+        <p>El diseño inicial que muchos equipos escriben es este:</p>
+        <pre><code class="language-text">/var/documentos/
+├── acme/
+│   ├── contrato.pdf
+│   ├── contrato-final.pdf
+│   ├── contrato-final-bueno.pdf
+│   └── factura.pdf
+└── globex/</code></pre>
+        <p>Es un árbol de ficheros con nombres que mienten. No hay forma fiable de saber qué versión es la válida, la fecha no está en ningún sitio consultable y dos servidores no comparten el volumen. La traducción a objetos separa lo que identifica de lo que describe:</p>
+        <table>
+          <thead><tr><th>Elemento</th><th>Diseño</th></tr></thead>
+          <tbody>
+            <tr><td>Bucket</td><td><code>documentos</code></td></tr>
+            <tr><td>Clave</td><td><code>2026/contratos/acme/CTR-2026-0142.pdf</code></td></tr>
+            <tr><td>Metadatos de sistema</td><td><code>Content-Type: application/pdf</code></td></tr>
+            <tr><td>Metadatos de negocio</td><td><code>tenant=acme</code>, <code>sha256=…</code>, <code>doc-id=CTR-2026-0142</code></td></tr>
+            <tr><td>Versionado</td><td>Activado: cada corrección conserva la anterior</td></tr>
+            <tr><td>Object lock</td><td>Retención <code>COMPLIANCE</code> de 7 años para contratos</td></tr>
+            <tr><td>Lifecycle</td><td>Borradores a 90 días; versiones antiguas a 1 año</td></tr>
+          </tbody>
+        </table>
+        <p>Con esa estructura, las preguntas del negocio se convierten en listados:</p>
+        <ul>
+          <li>«¿Qué contratos de acme hay en 2026?» → listar el prefijo <code>2026/contratos/acme/</code>.</li>
+          <li>«Dame el informe anual» → <code>GET</code> de una clave exacta.</li>
+          <li>«¿Se modificó el contrato después de firmarse?» → versiones y <code>ETag</code>; con object lock, ni siquiera es posible.</li>
+          <li>«Borra los borradores de hace tres meses» → regla de lifecycle, no un script que alguien recuerda ejecutar.</li>
+        </ul>
+        <p>El almacén no sustituye a la base de datos. En PostgreSQL viven usuarios, permisos y el índice de documentos con su <code>doc-id</code>, su tenant y su estado. En MinIO viven los bytes y una copia de los metadatos imprescindibles. Esa separación es deliberada: la base de datos consulta, el object store guarda.</p>
+        <div class="callout callout--analogy">
+          <p class="callout__title">La analogía del guardarropa</p>
+          <p>Un sistema de ficheros es un armario con cajones: puedes abrir un cajón y cambiar una camiseta. Object storage es un guardarropa con ticket: entregas un paquete cerrado y recibes un número (la clave). Para cambiar algo, entregas un paquete nuevo con el mismo número. Nunca abres el paquete por la mitad, y por eso puedo tener mil empleados atendiendo a la vez sin que se pisen.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Diseñar la clave antes de subir el primer objeto</td>
+              <td>Improvisar prefijos y cambiarlos cuando hay datos</td>
+              <td>Cambiar de esquema obliga a copiar todos los objetos; no hay <code>rename</code>.</td>
+            </tr>
+            <tr>
+              <td>Guardar el checksum y el tenant en metadatos</td>
+              <td>Confiar solo en el nombre del fichero</td>
+              <td>Los metadatos viajan con el objeto y se consultan sin descargarlo.</td>
+            </tr>
+            <tr>
+              <td>Asumir que cada <code>PUT</code> sustituye el objeto completo</td>
+              <td>Intentar actualizaciones parciales o <em>append</em></td>
+              <td>No existe escritura por rangos; el objeto es la unidad atómica.</td>
+            </tr>
+            <tr>
+              <td>Activar versionado en buckets con datos irrecuperables</td>
+              <td>Confiar en que «borrar se puede deshacer» sin versionado</td>
+              <td>Sin versiones, un <code>DELETE</code> o un <code>PUT</code> erróneo es definitivo.</td>
+            </tr>
+            <tr>
+              <td>Usar lifecycle para expirar temporales</td>
+              <td>Scripts de limpieza que dependen de que alguien los ejecute</td>
+              <td>La política es declarativa, auditable y se aplica sola.</td>
+            </tr>
+            <tr>
+              <td>Mantener los metadatos pequeños y portables</td>
+              <td>Meter un JSON de 50 KB en <code>x-amz-meta-*</code></td>
+              <td>AWS limita los metadatos de usuario a 2 KB; un objeto auxiliar escala mejor.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. «Los prefijos son carpetas»</h3>
+        <span class="code-label code-label--wrong">Mal — renombrar una carpeta existente</span>
+        <pre><code class="language-bash"># ❌ No existe un rename de prefijo.
+# ❌ Esto copia y borra objeto a objeto, y puede tardar horas.
+mc mv local/documentos/2026/ local/documentos/2025/</code></pre>
+        <span class="code-label code-label--right">Bien — copiar a las claves nuevas y verificar</span>
+        <pre><code class="language-bash">mc cp --recursive \
+  local/documentos/2026/ \
+  local/documentos/2025/
+
+mc ls --recursive local/documentos/2025/ | wc -l
+# Solo cuando el recuento cuadra:
+mc rm --recursive --force local/documentos/2026/</code></pre>
+        <p>El «rename» de un prefijo es una copia completa seguida de un borrado. Si el bucket tiene versionado, el borrado deja <em>delete markers</em> y el espacio no se libera. Diseña las claves para no tener que renombrar.</p>
+        <h3>2. «Puedo editar el objeto en su sitio»</h3>
+        <span class="code-label code-label--wrong">Mal — abrir, parchear y esperar que sea atómico</span>
+        <pre><code class="language-javascript">// ❌ S3 no ofrece escritura por rangos ni append.
+await client.putObject('documentos', key, Buffer.from('nuevo pie de página'))</code></pre>
+        <span class="code-label code-label--right">Bien — descargar, transformar y volver a subir el objeto completo</span>
+        <pre><code class="language-javascript">const original = await client.getObject('documentos', key)
+const pdf = await renderWithFooter(original)
+
+await client.putObject('documentos', key, pdf, pdf.length, {
+  'Content-Type': 'application/pdf',
+})</code></pre>
+        <p>El segundo ejemplo sustituye el objeto entero y es atómico para los lectores. Aun así, dos procesos que hagan lo mismo se pisarán: para eso están el versionado y el bloqueo optimista, que veremos más adelante.</p>
+        <h3>3. «Sirve como base de datos»</h3>
+        <span class="code-label code-label--wrong">Mal — buscar por metadatos como si fuera SQL</span>
+        <pre><code class="language-bash"># ❌ Listar 1,2 millones de objetos para filtrar por tenant
+mc ls --recursive local/documentos/ | grep acme</code></pre>
+        <span class="code-label code-label--right">Bien — consultar en la base de datos y pedir la clave exacta</span>
+        <pre><code class="language-sql">SELECT object_key
+FROM documents
+WHERE tenant = 'acme' AND created_at &gt;= '2026-01-01';</code></pre>
+        <p>El listado de S3 no filtra por metadatos de usuario; solo por prefijo. Si necesitas consultas por atributos, mantén un índice en PostgreSQL y usa MinIO para los bytes.</p>
+        <h3>4. «Borrar es reversible»</h3>
+        <span class="code-label code-label--wrong">Mal — borrado recursivo sin versionado ni copia</span>
+        <pre><code class="language-bash"># ❌ Sin versionado, esto es definitivo.
+mc rm --recursive --force local/documentos/2026/</code></pre>
+        <span class="code-label code-label--right">Bien — versionado, object lock o réplica antes de borrar</span>
+        <pre><code class="language-bash">mc version enable local/documentos
+mc ls --versions local/documentos/2026/
+mc rm --recursive local/documentos/2026/   # deja delete markers</code></pre>
+        <p>Con versionado, el borrado crea marcadores y los datos siguen ahí; con object lock, ni siquiera se pueden borrar hasta que expire la retención. La reversibilidad se decide <em>antes</em> del incidente, no después.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> clasificar los datos de un proyecto real y traducirlos a buckets, claves y metadatos antes de escribir código.</p>
+        <ol class="steps">
+          <li>
+            <strong>Inventaria lo que guardas hoy.</strong> Crea una tabla con nombre, tamaño medio, frecuencia de escritura, frecuencia de lectura y si necesitas conservar versiones.
+            <pre><code class="language-text">documento          tamaño   escribe   lee      versiones
+contrato.pdf       1,8 MB   una vez   a veces  sí (7 años)
+factura.pdf        300 KB   una vez   a veces  sí (7 años)
+borrador.docx      2,1 MB   muchas    a veces  no
+miniatura.jpg      80 KB    una vez   siempre  no
+export.csv         40 MB    diaria    a veces  no</code></pre>
+          </li>
+          <li>
+            <strong>Decide el bucket.</strong> Un bucket por dominio funcional, no uno por cliente ni uno por año: <code>documentos</code> para lo jurídico, <code>media</code> para miniaturas. Los clientes y los años van en la clave, no en el bucket.
+          </li>
+          <li>
+            <strong>Diseña tres claves candidatas y elige una.</strong>
+            <pre><code class="language-text">A) acme/2026/contrato/CTR-2026-0142.pdf
+B) 2026/contratos/acme/CTR-2026-0142.pdf
+C) CTR-2026-0142.pdf</code></pre>
+            <p><strong>B</strong> permite listar «todos los contratos de 2026» y «los contratos de acme en 2026». <strong>A</strong> prioriza al cliente. <strong>C</strong> impide cualquier listado útil. La elección depende de la consulta dominante: en este curso usaremos B.</p>
+          </li>
+          <li>
+            <strong>Sube un objeto con metadatos de negocio y compruébalo.</strong>
+            <pre><code class="language-bash">mc cp --attr "tenant=acme;doc-id=CTR-2026-0142;sha256=4f9c" \
+  ./contrato.pdf \
+  local/documentos/2026/contratos/acme/CTR-2026-0142.pdf
+
+mc stat local/documentos/2026/contratos/acme/CTR-2026-0142.pdf</code></pre>
+            <pre><code class="language-text">Name      : 2026/contratos/acme/CTR-2026-0142.pdf
+Size      : 1.8 MiB
+ETag      : 2b7e...
+Metadata  :
+  Content-Type: application/pdf
+  X-Amz-Meta-Tenant: acme
+  X-Amz-Meta-Doc-Id: CTR-2026-0142</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba qué operación no puedes hacer.</strong> Intenta renombrar el prefijo <code>2026/</code> a <code>2025/</code> sin copiar, y explica por qué no existe el comando. Después mide cuánto tarda un listado de 1 000 objetos con <code>mc ls --recursive | Measure-Object</code> (PowerShell) o <code>| wc -l</code> (bash).
+          </li>
+          <li>
+            <strong>Escribe la política de borrado.</strong> Para cada fila del inventario, decide: versionado sí/no, retención, y si el borrado debe ser reversible. Los contratos van a <code>COMPLIANCE</code> siete años; los borradores expiran a 90 días; las miniaturas se pueden regenerar.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Si puedes responder «¿qué clave pido para el contrato de acme de 2026?» sin listar el bucket, el diseño es correcto. Si necesitas recorrer objetos para encontrar uno, la clave está mal pensada.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El informe que se reescribe cada noche</h3>
+          <p>Un proceso genera cada noche un PDF de 400 páginas (unos 60 MB) a partir de 400 plantillas HTML. Solo cambian dos o tres páginas al día, pero el PDF completo se regenera y se sube con la misma clave. El equipo se queja de que el almacenamiento crece sin control y de que descargar el informe tarda demasiado.</p>
+          <p>Diseña una estructura de objetos que permita: (a) servir el informe completo, (b) servir una página suelta sin descargar 60 MB, (c) conservar el histórico sin duplicar 60 MB por noche, y (d) saber qué páginas cambiaron entre dos versiones. No hace falta implementarlo: escribe las claves, los metadatos y qué operación usarías para cada caso.</p>
+          <p><em>Pista: un objeto no tiene que coincidir con un fichero. Piensa en granularidad: ¿qué unidad cambia de verdad? Y recuerda que el versionado guarda objetos completos, no diferencias.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un objeto es <strong>bytes + metadatos + clave</strong>, dentro de un bucket. No hay jerarquía real: las barras son parte de la clave.</li>
+          <li>La unidad de mutación es el objeto completo: <code>PUT</code> sustituye, no edita; los lectores ven una versión íntegra.</li>
+          <li>Object storage brilla con documentos, backups, media, data lakes y artefactos; no sirve para transacciones ni para escritura parcial.</li>
+          <li>Escala porque no hay locks ni inodos: cada clave es independiente y el acceso es HTTP.</li>
+          <li>Sin versionado, sobrescribir o borrar es definitivo. La reversibilidad se diseña antes del incidente.</li>
+          <li>La clave es una decisión de producto: determina qué listados puedes hacer y cuánto cuesta cambiar de idea.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Consecuencia práctica</th></tr></thead>
+          <tbody>
+            <tr><td>Bucket</td><td>Contenedor de primer nivel</td><td>Define políticas, versionado y lifecycle</td></tr>
+            <tr><td>Clave</td><td>Nombre único dentro del bucket</td><td>Incluye las barras; no hay rename de prefijo</td></tr>
+            <tr><td>Metadatos</td><td>Pares clave-valor y cabeceras</td><td>Se consultan con <code>HEAD</code> sin descargar</td></tr>
+            <tr><td>ETag</td><td>Identificador de la versión del objeto</td><td>Cambia al cambiar el contenido; no siempre es un MD5</td></tr>
+            <tr><td>Inmutabilidad</td><td>Cada escritura crea una versión nueva</td><td>Atomicidad para lectores; sin edición parcial</td></tr>
+            <tr><td>Prefijo</td><td>Cadena inicial de una clave</td><td>Es el único filtro nativo de un listado</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo montar MinIO como una unidad de red y trabajar con él?</summary>
+            <div>
+              <p>Existen herramientas como <code>s3fs</code> o <code>rclone mount</code>, pero no convierten S3 en un sistema de ficheros POSIX. No hay bloqueos, el rendimiento es irregular y una aplicación que espera <code>fsync</code> o escritura por rangos fallará. Úsalo para copiar ficheros, no para ejecutar una base de datos ni para editar documentos en sitio.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si es inmutable, ¿cómo corrijo un documento?</summary>
+            <div>
+              <p>Descargas el objeto, lo modificas en memoria o en disco y subes el resultado con la misma clave. Eso crea una versión nueva. Si el bucket tiene versionado, la anterior sigue accesible por su <em>version ID</em>; si no, se pierde. La inmutabilidad se refiere al objeto ya escrito, no a que no puedas publicar otra versión.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿MinIO es fuertemente consistente?</summary>
+            <div>
+              <p>Sí: las operaciones de lectura ven la última escritura confirmada, incluidas las de listado, sin el retardo que S3 tuvo históricamente. Eso simplifica mucho el código, pero no convierte dos escrituras concurrentes en una transacción: la última gana. Para evitar perder cambios necesitas versionado, claves únicas o bloqueo optimista.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Merece la pena para muchos archivos pequeños?</summary>
+            <div>
+              <p>Funciona, pero cada objeto tiene un coste fijo de metadatos y de petición. Miles de ficheros de 1 KB con muchas lecturas aleatorias suelen rendir mejor en una base de datos o empaquetados en un archivo mayor (un ZIP, un Parquet, un tar). Si los necesitas sueltos, al menos agrúpalos por prefijo para que los listados sean baratos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Sustituye a mi base de datos?</summary>
+            <div>
+              <p>No. Sustituye al disco donde guardabas los blobs. La base de datos sigue siendo el lugar para usuarios, permisos, estados y consultas por atributos. La arquitectura habitual es una fila en PostgreSQL con la clave del objeto y los metadatos consultables, y los bytes en MinIO.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

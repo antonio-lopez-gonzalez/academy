@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="01-publicar-y-consumir">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Publicar y consumir — Módulo 1 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Publicar y consumir</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Productores y consumidores</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El primer mensaje usó el exchange por defecto: una cola, un destino, cero reglas. Es útil para aprender, pero acopla el productor al nombre de la cola y no permite que dos consumidores reciban el mismo evento. Un sistema real publica <strong>hechos</strong> en un exchange con nombre y deja que las bindings decidan quién los recibe.</p>
+        <p>En esta lección damos el salto: <code>publish(exchange, routingKey, body, options)</code>, consumidores con <code>consumerTag</code>, mensajes con <code>deliveryTag</code>, cancelación ordenada y la diferencia entre «la cola está vacía» y «el mensaje no se enrutó». Son dos estados que se parecen en la UI y significan cosas opuestas.</p>
+        <p>También veremos el ciclo de vida de un consumidor. Un consumidor no es un bucle infinito sagrado: se puede cancelar, el broker puede cancelarlo si borras la cola, y un despliegue debe saber esperar a los mensajes en vuelo antes de cerrar.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Publicar y consumir son dos mundos</p>
+          <p>Publicar es un acto del productor contra un exchange; consumir es una suscripción del consumidor a una cola. Entre ambos hay una tabla de rutas y un almacén. Confundir los dos lados es la causa de la mayoría de los «no llega nada»: el mensaje se publicó bien, pero no había binding; o había binding, pero el consumidor estaba cancelado.</p>
+        </div>
+      </section>
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Exchange con nombre frente a exchange por defecto</h3>
+        <table>
+          <thead><tr><th></th><th>Exchange por defecto <code>""</code></th><th>Exchange con nombre</th></tr></thead>
+          <tbody>
+            <tr><td>Routing key</td><td>Debe ser el nombre exacto de una cola.</td><td>La decide el productor según el contrato de eventos.</td></tr>
+            <tr><td>Bindings</td><td>No existen: la relación es implícita.</td><td>Explícitas; puedes añadir o quitar destinos sin tocar al productor.</td></tr>
+            <tr><td>Varios consumidores</td><td>Requiere varias publicaciones o varias colas con el mismo nombre (imposible en un vhost).</td><td>Una publicación puede copiar a varias colas.</td></tr>
+            <tr><td>Acoplamiento</td><td>El productor conoce la cola.</td><td>El productor conoce un exchange y una routing key; no las colas.</td></tr>
+            <tr><td>Uso típico</td><td>Primer mensaje, RPC con cola de respuesta, tareas internas.</td><td>Eventos de dominio, pub/sub, routing por tipo.</td></tr>
+          </tbody>
+        </table>
+        <p>La API es simétrica: <code>sendToQueue(q, body, opts)</code> es <code>publish("", q, body, opts)</code>. En cuanto necesitas una segunda cola o quieres desacoplar, pasa a un exchange con nombre.</p>
+        <h3>La publicación</h3>
+        <pre><code class="language-text">publish(exchange, routingKey, content, options)
+   │           │            │         │
+   │           │            │         └─ persistent, contentType, messageId, headers…
+   │           │            └─────────── Buffer (cuerpo opaco)
+   │           └──────────────────────── cadena que compara el exchange
+   └──────────────────────────────────── nombre del exchange ("" = default)
+</code></pre>
+        <p><code>channel.publish</code> <strong>no devuelve una promesa</strong>. Devuelve un booleano que indica si el buffer del cliente aceptó el mensaje. Si es <code>false</code>, hay backpressure: el socket está saturado y conviene esperar al evento <code>drain</code> antes de seguir publicando.</p>
+        <pre><code class="language-javascript">const aceptado = channel.publish(exchange, key, body, options);
+if (!aceptado) {
+  await new Promise((resolve) =&gt; channel.once("drain", resolve));
+}
+</code></pre>
+        <p>Ese booleano no dice si el broker recibió el mensaje ni si acabó en una cola. Para lo primero hacen falta confirms; para lo segundo, <code>mandatory</code> o un alternate exchange.</p>
+        <h3>Propiedades que conviene poblar</h3>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Ejemplo</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>persistent</code></td><td><code>true</code></td><td>Pide persistencia en disco; solo efectiva con cola durable.</td></tr>
+            <tr><td><code>contentType</code></td><td><code>"application/json"</code></td><td>El consumidor sabe cómo interpretar el cuerpo.</td></tr>
+            <tr><td><code>messageId</code></td><td><code>"evt-7f3a"</code></td><td>Trazabilidad y deduplicación técnica; no sustituye la clave de negocio.</td></tr>
+            <tr><td><code>correlationId</code></td><td><code>"req-42"</code></td><td>Une petición y respuesta en RPC.</td></tr>
+            <tr><td><code>timestamp</code></td><td><code>Math.floor(Date.now() / 1000)</code></td><td>Saber cuándo se publicó, no cuándo se consumió.</td></tr>
+            <tr><td><code>headers</code></td><td><code>{ "x-origen": "api" }</code></td><td>Metadatos de trazabilidad o reintentos.</td></tr>
+          </tbody>
+        </table>
+        <h3>El consumidor y sus dos tags</h3>
+        <p><code>channel.consume(queue, callback, options)</code> registra un consumidor y devuelve un <code>consumerTag</code>. Ese tag identifica la suscripción y se usa para cancelarla. Cada mensaje entregado trae un <code>deliveryTag</code> distinto, que identifica el mensaje dentro del canal:</p>
+        <table>
+          <thead><tr><th>Campo</th><th>Dónde vive</th><th>Qué significa</th></tr></thead>
+          <tbody>
+            <tr><td><code>consumerTag</code></td><td>Resultado de <code>consume</code></td><td>Identifica la suscripción; lo usas en <code>cancel</code>.</td></tr>
+            <tr><td><code>deliveryTag</code></td><td><code>msg.fields.deliveryTag</code></td><td>Identifica el mensaje en el canal; lo usas en <code>ack</code>/<code>nack</code>.</td></tr>
+            <tr><td><code>redelivered</code></td><td><code>msg.fields.redelivered</code></td><td><code>true</code> si el broker ya lo entregó antes y no se confirmó.</td></tr>
+            <tr><td><code>exchange</code></td><td><code>msg.fields.exchange</code></td><td>Exchange por el que se publicó.</td></tr>
+            <tr><td><code>routingKey</code></td><td><code>msg.fields.routingKey</code></td><td>Clave con la que se publicó (no la binding key).</td></tr>
+            <tr><td><code>properties</code></td><td><code>msg.properties</code></td><td>Metadatos: <code>messageId</code>, <code>contentType</code>, <code>headers</code>…</td></tr>
+          </tbody>
+        </table>
+        <p>El <code>deliveryTag</code> es <strong>por canal</strong>, no global. Un <code>ack</code> hecho en otro canal no significa nada y el broker cierra el canal con un error de protocolo. Si abres un canal nuevo, los tags empiezan de cero.</p>
+        <h3>Cancelar un consumidor sin perder trabajo</h3>
+        <p><code>channel.cancel(consumerTag)</code> deja de enviar mensajes nuevos a ese consumidor. Los que ya están en vuelo siguen esperando su <code>ack</code>. La cola no se borra: si quedan mensajes, se acumulan hasta que otro consumidor se suscriba.</p>
+        <pre><code class="language-javascript">const { consumerTag } = await channel.consume(queue, onMessage, { noAck: false });
+
+// más tarde, en un despliegue ordenado:
+await channel.cancel(consumerTag); // deja de recibir
+// esperar los mensajes en vuelo (tu propio contador)
+await channel.close();
+await connection.close();
+</code></pre>
+        <p>El broker también puede cancelar: si borras la cola, emite un evento <code>cancel</code> en el canal. Escucharlo evita que un worker se quede creyendo que sigue suscrito:</p>
+        <pre><code class="language-javascript">channel.on("cancel", (fields) =&gt; {
+  console.warn("consumidor cancelado por el broker:", fields.consumerTag);
+});
+</code></pre>
+        <h3>Cola vacía no es mensaje sin enrutar</h3>
+        <table>
+          <thead><tr><th>Estado</th><th>Qué pasó</th><th>Cómo lo detectas</th></tr></thead>
+          <tbody>
+            <tr><td>Cola vacía</td><td>El mensaje se enrutó, se entregó y se confirmó (o no había mensajes).</td><td><code>messages = 0</code>, <code>consumers &gt; 0</code>; el consumidor registró el mensaje.</td></tr>
+            <tr><td>Mensaje sin enrutar</td><td>Ninguna binding casó; el exchange lo descartó.</td><td>No hay rastro en ninguna cola. Solo lo ves con <code>mandatory</code> + <code>return</code> o alternate exchange.</td></tr>
+            <tr><td>Mensaje en cola</td><td>Se enrutó, pero no hay consumidor o va lento.</td><td><code>messages_ready &gt; 0</code>, <code>consumers = 0</code> o prefetch saturado.</td></tr>
+            <tr><td>Mensaje unacked</td><td>Se entregó y el consumidor no confirmó.</td><td><code>messages_unacknowledged &gt; 0</code>.</td></tr>
+          </tbody>
+        </table>
+        <p>Para no perder lo no enrutado, publica con <code>mandatory: true</code> y escucha <code>return</code>:</p>
+        <pre><code class="language-javascript">channel.on("return", (msg) =&gt; {
+  console.warn(`no enrutado: ${msg.fields.routingKey}`, msg.content.toString());
+});
+
+channel.publish(exchange, "pedido.desconocido", body, { mandatory: true });
+</code></pre>
+        <p><code>basic.return</code> llega de forma asíncrona, después de la publicación. No es una excepción: si no escuchas el evento, el mensaje se pierde igual. En el módulo 2 veremos el alternate exchange como red de seguridad declarativa.</p>
+        <h3>Qué garantiza cada paso</h3>
+        <table>
+          <thead><tr><th>Paso</th><th>Garantía en este ejemplo</th><th>Quién</th></tr></thead>
+          <tbody>
+            <tr><td><code>publish</code></td><td>El cliente escribió el mensaje en el socket; no hay confirm.</td><td>Productor (parcial).</td></tr>
+            <tr><td>Enrutado</td><td>Si no hay binding, se descarta; con <code>mandatory</code>, vuelve.</td><td>Exchange + bindings.</td></tr>
+            <tr><td>Almacenado</td><td>Cola durable + mensaje persistente.</td><td>Broker.</td></tr>
+            <tr><td>Entregado</td><td>El broker lo envía según <code>prefetch</code>.</td><td>Broker.</td></tr>
+            <tr><td>Procesado</td><td><code>ack</code> manual; si el consumidor cae, se reentrega.</td><td>Consumidor + broker: at-least-once.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un exchange <code>direct</code>, una cola y una binding exacta. El productor publica; el consumidor imprime los metadatos y confirma.</p>
+        <pre><code class="language-javascript">// publicar.mjs
+import amqp from "amqplib";
+
+const connection = await amqp.connect("amqp://guest:guest@localhost:5672");
+const channel = await connection.createChannel();
+
+await channel.assertExchange("pedidos.direct", "direct", { durable: true });
+await channel.assertQueue("facturacion", { durable: true });
+await channel.bindQueue("facturacion", "pedidos.direct", "pedido.creado");
+
+channel.publish(
+  "pedidos.direct",
+  "pedido.creado",
+  Buffer.from(JSON.stringify({ id: "1042", total: 49.9 })),
+  { persistent: true, contentType: "application/json", messageId: "evt-1042" },
+);
+
+console.log("publicado pedido.creado");
+await channel.close();
+await connection.close();
+</code></pre>
+        <pre><code class="language-javascript">// consumir.mjs
+import amqp from "amqplib";
+
+const connection = await amqp.connect("amqp://guest:guest@localhost:5672");
+const channel = await connection.createChannel();
+
+await channel.assertExchange("pedidos.direct", "direct", { durable: true });
+await channel.assertQueue("facturacion", { durable: true });
+await channel.bindQueue("facturacion", "pedidos.direct", "pedido.creado");
+await channel.prefetch(1);
+
+const { consumerTag } = await channel.consume("facturacion", (msg) =&gt; {
+  if (!msg) return;
+  const pedido = JSON.parse(msg.content.toString());
+  console.log({
+    consumerTag,
+    deliveryTag: msg.fields.deliveryTag,
+    exchange: msg.fields.exchange,
+    routingKey: msg.fields.routingKey,
+    redelivered: msg.fields.redelivered,
+    messageId: msg.properties.messageId,
+    pedido,
+  });
+  channel.ack(msg);
+}, { noAck: false });
+
+console.log(`[facturacion] esperando con ${consumerTag}`);
+</code></pre>
+        <p>Salida esperada al ejecutar el consumidor y luego el productor dos veces:</p>
+        <pre><code class="language-text">[facturacion] esperando con amq.ctag-3f9a...
+{
+  consumerTag: 'amq.ctag-3f9a...',
+  deliveryTag: 1,
+  exchange: 'pedidos.direct',
+  routingKey: 'pedido.creado',
+  redelivered: false,
+  messageId: 'evt-1042',
+  pedido: { id: '1042', total: 49.9 }
+}
+</code></pre>
+        <p>Detalles que importan:</p>
+        <ul>
+          <li>El productor declara y enlaza antes de publicar. Si publicara antes, la cola no existiría y el mensaje se perdería.</li>
+          <li><code>routingKey</code> es <code>pedido.creado</code>, no <code>facturacion</code>: el exchange usa la binding para decidir.</li>
+          <li><code>deliveryTag=1</code> porque es el primer mensaje de ese canal. Si el consumidor se reconecta, vuelve a 1.</li>
+          <li><code>redelivered=false</code> indica primera entrega. Si matas el consumidor antes del <code>ack</code>, la siguiente será <code>true</code>.</li>
+          <li><code>consumerTag</code> lo genera el broker; puedes fijarlo tú con la opción <code>consumerTag</code> si necesitas identificarlo.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller publica eventos en un topic exchange. Facturación solo quiere pedidos creados; auditoría quiere todo lo que empiece por <code>pedido.</code>:</p>
+        <pre><code class="language-text">exchange "pedidos" (topic)
+   │
+   ├── binding "pedido.creado" ──▶ cola facturacion
+   └── binding "pedido.#"      ──▶ cola auditoria
+
+publish "pedido.creado"    → facturacion + auditoria
+publish "pedido.cancelado" → auditoria
+publish "pago.rechazado"   → nadie (sin binding)
+</code></pre>
+        <p>El productor no cambia según el destino: publica el hecho con su routing key. Si mañana se añade un servicio de fraude, se crea su cola y su binding; el productor sigue igual.</p>
+        <table>
+          <thead><tr><th>Evento</th><th>facturacion</th><th>auditoria</th><th>Cola de facturación</th></tr></thead>
+          <tbody>
+            <tr><td><code>pedido.creado</code></td><td>Recibe y confirma</td><td>Recibe y confirma</td><td>Se vacía si el consumidor está activo.</td></tr>
+            <tr><td><code>pedido.cancelado</code></td><td>No recibe</td><td>Recibe y confirma</td><td>Sin cambios.</td></tr>
+            <tr><td><code>pedido.creado</code> con facturación cancelada</td><td>Sin consumidor</td><td>Recibe y confirma</td><td><code>messages_ready</code> sube; el mensaje espera.</td></tr>
+          </tbody>
+        </table>
+        <p>Cancelar facturación no borra su cola ni sus mensajes. Si el consumidor se cae, la cola sigue acumulando:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+        <pre><code class="language-text">name          messages_ready  messages_unacknowledged  consumers
+auditoria     0               0                        1
+facturacion   1               0                        0
+</code></pre>
+        <p>Cuando facturación vuelve, recibe el pendiente. Ese es el buffer funcionando; el riesgo es que nadie mire la cifra y la cola crezca durante días.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Cancelar no es borrar</p>
+          <p><code>channel.cancel</code> desuscribe al consumidor. <code>deleteQueue</code> borra la cola y todos sus mensajes. En un despliegue normal quieres lo primero; lo segundo es una operación destructiva que exige confirmación y permisos.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar exchange, colas y bindings al arrancar, en ese orden.</td><td>Publicar y esperar que «alguien» haya creado la topología.</td><td>Un mensaje publicado sin binding se descarta sin avisar.</td></tr>
+            <tr><td>Publicar con <code>contentType</code>, <code>messageId</code> y <code>persistent</code>.</td><td>Mandar cuerpos anónimos sin metadatos.</td><td>Trazabilidad, validación y persistencia dependen de esas propiedades.</td></tr>
+            <tr><td>Usar <code>mandatory: true</code> y escuchar <code>return</code> en publicaciones críticas.</td><td>Asumir que toda publicación acaba en una cola.</td><td>Sin binding, el exchange descarta; el productor no se entera.</td></tr>
+            <tr><td>Cancelar el consumidor y esperar los mensajes en vuelo antes de cerrar.</td><td>Matar el proceso con <code>SIGKILL</code> en cada despliegue.</td><td>El broker reencola lo no confirmado, pero el trabajo a medias se repite.</td></tr>
+            <tr><td>Mantener la conexión y reutilizar canales por rol.</td><td>Abrir una conexión nueva por cada mensaje.</td><td>Abrir TCP + handshake AMQP es caro; los canales son baratos.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Publicar antes de crear la binding</h3>
+        <span class="code-label code-label--wrong">Mal — el exchange no tiene a dónde entregar</span>
+        <pre><code class="language-javascript">channel.publish("pedidos.direct", "pedido.creado", body);
+await channel.bindQueue("facturacion", "pedidos.direct", "pedido.creado");
+</code></pre>
+        <span class="code-label code-label--right">Bien — topología primero</span>
+        <pre><code class="language-javascript">await channel.bindQueue("facturacion", "pedidos.direct", "pedido.creado");
+channel.publish("pedidos.direct", "pedido.creado", body);
+</code></pre>
+        <p>La publicación no falla: se descarta. No hay evento de error si no usas <code>mandatory</code>. El orden de arranque es parte del contrato.</p>
+
+        <h3>2. Creer que <code>publish</code> devuelve una promesa</h3>
+        <span class="code-label code-label--wrong">Mal — <code>await</code> sobre un booleano</span>
+        <pre><code class="language-javascript">await channel.publish(exchange, key, body); // await true no espera nada
+</code></pre>
+        <span class="code-label code-label--right">Bien — tratar el booleano como backpressure</span>
+        <pre><code class="language-javascript">const ok = channel.publish(exchange, key, body);
+if (!ok) await new Promise((resolve) =&gt; channel.once("drain", resolve));
+</code></pre>
+        <p><code>publish</code> es síncrono y escribe en el buffer del cliente. Para saber si el broker lo tiene, necesitas un confirm channel; eso es otra garantía y otra API.</p>
+
+        <h3>3. Confirmar antes de procesar</h3>
+        <span class="code-label code-label--wrong">Mal — el mensaje desaparece si el efecto falla</span>
+        <pre><code class="language-javascript">channel.ack(msg);
+await generarFactura(pedido);
+</code></pre>
+        <span class="code-label code-label--right">Bien — efecto, luego <code>ack</code></span>
+        <pre><code class="language-javascript">await generarFactura(pedido);
+channel.ack(msg);
+</code></pre>
+        <p>Si el proceso muere entre el <code>ack</code> y el efecto, el broker no reentrega: convertiste at-least-once en at-most-once.</p>
+
+        <h3>4. Confundir cola vacía con mensaje perdido</h3>
+        <span class="code-label code-label--wrong">Mal — mirar solo <code>messages = 0</code></span>
+        <pre><code class="language-text">// ❌ "La cola está vacía, luego el mensaje nunca llegó"
+</code></pre>
+        <span class="code-label code-label--right">Bien — distinguir enrutado, listo y no confirmado</span>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+        <p>Una cola vacía puede significar «todo procesado» o «el exchange lo descartó». Para distinguirlo, registra la publicación y usa <code>mandatory</code>/<code>return</code>. Para ver trabajo atascado, mira <code>messages_unacknowledged</code>, no solo <code>messages</code>.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> observar dos consumidores independientes, cancelar uno y comprobar que sus mensajes esperan en la cola.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Arranca dos consumidores:</strong> guarda el consumidor del ejemplo mínimo como <code>consumidor-facturacion.mjs</code> y crea <code>consumidor-auditoria.mjs</code> cambiando la cola a <code>auditoria</code> y la binding a <code>pedido.#</code>.
+            <pre><code class="language-bash">node consumidor-facturacion.mjs
+node consumidor-auditoria.mjs
+</code></pre>
+          </li>
+          <li>
+            <strong>Paso 2 — Publica tres eventos:</strong> dos <code>pedido.creado</code> y uno <code>pedido.cancelado</code>.
+            <pre><code class="language-bash">node publicar.mjs
+node publicar.mjs
+node publicar.mjs   # cambia la routing key a pedido.cancelado
+</code></pre>
+            <p>Esperado: facturación recibe 2; auditoría recibe 3. Los <code>deliveryTag</code> de cada consumidor son independientes.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Cancela facturación con Ctrl+C</strong> (al cerrarse la conexión, el consumidor desaparece) y publica otro <code>pedido.creado</code>.
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+</code></pre>
+            <pre><code class="language-text">name          messages_ready  messages_unacknowledged  consumers
+auditoria     0               0                        1
+facturacion   1               0                        0
+</code></pre>
+            <p>Auditoría lo procesa; facturación lo retiene. No se ha perdido nada.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Vuelve a arrancar facturación:</strong> recibe el pendiente y la cola vuelve a 0. Fíjate en <code>redelivered</code>: será <code>false</code> si nunca se había entregado, no porque se haya reencolado.</li>
+          <li>
+            <strong>Paso 5 — Publica a una routing key sin binding:</strong> usa <code>pago.rechazado</code> con <code>mandatory: true</code> y escucha <code>return</code>. Debe aparecer un aviso <code>no enrutado: pago.rechazado</code> y ninguna cola debe cambiar.</li>
+          <li>
+            <strong>Paso 6 — Comprueba la diferencia:</strong> sin <code>mandatory</code>, repite el paso 5. No verás ningún aviso y el mensaje desaparecerá. Anota por qué la cola vacía no era prueba de entrega.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>En la UI, la cola <code>facturacion</code> con <code>consumers = 0</code> y <code>Ready = 1</code> es trabajo esperando. Si además <code>Unacked</code> crece, el consumidor está recibiendo pero no confirmando: el problema está en el código, no en el broker.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un evento de pago con red de seguridad</h3>
+          <p>Añade la cola <code>pagos</code> y enlázala al exchange <code>pedidos</code> para que reciba <code>pedido.pagado</code>. Publica un evento con esa clave y comprueba que llega. Después publica <code>pago.rechazado</code> con <code>mandatory: true</code> y captura el <code>return</code> para registrar la routing key y el cuerpo.</p>
+          <p>Responde: si el productor publica 1.000 eventos por segundo y el evento <code>return</code> llega después, ¿dónde guardarías los no enrutados para no perderlos? ¿Qué diferencia hay entre eso y un alternate exchange?</p>
+          <p><em>Pista: el evento <code>return</code> es asíncrono y trae el mensaje original. Un alternate exchange hace la captura en el broker, sin depender de que el productor escuche.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Publicar es <code>publish(exchange, routingKey, body, options)</code>; consumir es suscribirse a una cola.</li>
+          <li>El exchange copia a cada cola que casa; si no hay binding, descarta el mensaje.</li>
+          <li><code>consumerTag</code> identifica la suscripción; <code>deliveryTag</code> identifica el mensaje dentro del canal.</li>
+          <li><code>cancel</code> desuscribe sin borrar la cola: los mensajes pendientes esperan a otro consumidor.</li>
+          <li><code>publish</code> devuelve un booleano de backpressure, no una promesa ni un confirm.</li>
+          <li><code>mandatory</code> + <code>return</code> revela lo que no se pudo enrutar; sin ello, se pierde en silencio.</li>
+        </ul>
+        <table>
+          <thead><tr><th>API / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>assertExchange(nombre, tipo, opts)</code></td><td>Declara el exchange; el tipo y la durabilidad son parte del contrato.</td></tr>
+            <tr><td><code>bindQueue(cola, exchange, key)</code></td><td>Crea la regla de enrutado.</td></tr>
+            <tr><td><code>publish(exchange, key, body, opts)</code></td><td>Publica; devuelve <code>false</code> si hay backpressure.</td></tr>
+            <tr><td><code>consume(cola, cb, opts)</code></td><td>Registra el consumidor; devuelve <code>consumerTag</code>.</td></tr>
+            <tr><td><code>cancel(consumerTag)</code></td><td>Desuscribe; los mensajes pendientes quedan en la cola.</td></tr>
+            <tr><td><code>mandatory: true</code></td><td>Pide al broker que devuelva lo no enrutado.</td></tr>
+            <tr><td><code>channel.on("return", cb)</code></td><td>Recibe los mensajes no enrutados.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo hacer <code>ack</code> desde otro canal?</summary>
+            <div>
+              <p>No. El <code>deliveryTag</code> es un identificador dentro del canal que entregó el mensaje. Si haces <code>ack</code> en otro canal, el broker no sabe a qué mensaje te refieres y cierra el canal con un error de protocolo. Confirma siempre en el mismo canal del consumidor.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre la routing key y la binding key?</summary>
+            <div>
+              <p>La routing key la pone el productor en cada publicación. La binding key es la que se declaró al enlazar una cola con un exchange. El exchange compara ambas según su tipo; en <code>direct</code> deben ser iguales, en <code>topic</code> la routing key se compara con el patrón de la binding.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si cancelo un consumidor, ¿se borran sus mensajes?</summary>
+            <div>
+              <p>No. <code>cancel</code> solo desuscribe; la cola y sus mensajes siguen ahí. Se borran si usas <code>deleteQueue</code>, si la cola es auto-delete y se queda sin consumidores, o si el broker reinicia y la cola no era durable. La diferencia entre cancelar y borrar es la diferencia entre desplegar y destruir.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>publish</code> no es una promesa?</summary>
+            <div>
+              <p>Porque AMQP 0-9-1 trata la publicación como un envío asíncrono de un frame. <code>amqplib</code> expone un booleano para indicar backpressure, pero no espera al broker. La confirmación real llega con un <em>confirm channel</em>: publicas, el broker responde con <code>basic.ack</code> o <code>basic.nack</code>, y <code>waitForConfirms</code> resuelve cuando todas han llegado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un mensaje puede estar en dos colas a la vez?</summary>
+            <div>
+              <p>Sí: el exchange deposita una copia independiente en cada cola que casa. Cada copia tiene su propio <code>deliveryTag</code>, su <code>ack</code> y su redelivery. No es el mismo mensaje compartido: son copias con el mismo cuerpo y propiedades.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

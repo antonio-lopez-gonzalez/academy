@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="04-eventos-y-pruebas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eventos y pruebas — Módulo 7 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Eventos y pruebas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El document store ya guarda, versiona y limpia. Lo que falta es que reaccione: avisar a otro sistema cuando un documento queda almacenado, escanearlo, indexarlo o generar una miniatura. Y falta lo que separa un proyecto de una demo: pruebas que demuestren que el flujo funciona y un runbook para cuando no.</p>
+        <p>Los eventos de MinIO son notificaciones HTTP o mensajes a una cola. No son transacciones. Llegan al menos una vez, pueden duplicarse, pueden perderse si el destino está caído y no garantizan orden. El receptor debe ser rápido, idempotente y capaz de delegar el trabajo pesado. Esta lección cierra el módulo con el receptor, una batería de pruebas con <code>node --test</code> y un runbook para operar el sistema, sobre el estado que dejó <a href="./03-metadatos-versionado-y-lifecycle.html">Metadatos, versionado y lifecycle</a>.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque un evento duplicado que devuelve 500 genera reintentos infinitos, y porque un test que necesita un bucket compartido se vuelve flaky en la primera semana. La diferencia entre un sistema operable y uno frágil está en estas dos cosas.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Del bucket al receptor</h3>
+        <pre><code class="language-text">PUT en documentos/…            MinIO                         receptor
+        |                        |                               |
+        +-----------------------&gt;| evalúa reglas de notificación |
+                                 | POST /webhooks/minio          |
+                                 +------------------------------&gt;| valida token
+                                 |                              | deduplica
+                                 |                              | encola
+                                 |&lt;------------------------------+ 204
+                                 |                              |
+                                 |  si falla: reintenta         | worker procesa
+</code></pre>
+        <p>MinIO entrega el evento con formato compatible con S3: un objeto raíz con <code>EventName</code> y un array <code>Records</code>. Cada registro trae <code>eventName</code>, <code>eventTime</code>, <code>s3.bucket.name</code>, <code>s3.object.key</code>, <code>size</code>, <code>eTag</code> y <code>sequencer</code>.</p>
+        <pre><code class="language-json">{
+  "EventName": "s3:ObjectCreated:Put",
+  "Key": "documentos/acme/2026/11/7f2c-informe.pdf",
+  "Records": [
+    {
+      "eventName": "s3:ObjectCreated:Put",
+      "eventTime": "2026-11-05T10:00:00.000Z",
+      "s3": {
+        "bucket": { "name": "documentos" },
+        "object": {
+          "key": "acme/2026/11/7f2c-informe.pdf",
+          "size": 204800,
+          "eTag": "9f3c2ab1c4d5e6f708192a3b4c5d6e7f",
+          "contentType": "application/pdf",
+          "sequencer": "182178E8B3728CAC"
+        }
+      }
+    }
+  ]
+}</code></pre>
+        <p>La clave puede venir codificada si contiene espacios o caracteres especiales. Trátala como dato no confiable: decodifica, valida que empieza por el prefijo esperado y no la uses para construir rutas locales.</p>
+        <h3>Configurar el destino</h3>
+        <p>El proyecto usa variables de entorno porque el target se declara al arrancar MinIO. En Compose, con la API corriendo en el host, el bloque queda así:</p>
+        <pre><code class="language-yaml">services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+      MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY: "http://host.docker.internal:7072/webhooks/minio"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY: "dev-token"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"</code></pre>
+        <p>Después de reiniciar MinIO, se suscribe el bucket. La suscripción es independiente del target: si configuras el webhook pero no ejecutas <code>mc event add</code>, no llega nada.</p>
+        <pre><code class="language-bash">mc event add local/documentos \
+  arn:minio:sqs::primary:webhook \
+  --event put --suffix ".pdf"
+mc event list local/documentos
+</code></pre>
+        <p>El ARN identifica el target (<code>primary</code>) y el tipo (<code>webhook</code>). <code>--event put</code> filtra altas; <code>--suffix ".pdf"</code> reduce ruido. Para el pipeline completo, querrás también <code>s3:ObjectCreated:CompleteMultipartUpload</code>.</p>
+        <h3>Receptor: rápido, idempotente, con token</h3>
+        <p>El receptor del proyecto registra el evento y devuelve <code>204</code>. Es suficiente para observar el flujo, pero en producción debe además validar el token, deduplicar y encolar. El orden importa: responde antes de hacer trabajo pesado, porque MinIO tiene timeout y reintenta.</p>
+        <pre><code class="language-javascript">if (req.method === "POST" &amp;&amp; url.pathname === "/webhooks/minio") {
+  const auth = req.headers.authorization;
+  if (auth !== `Bearer ${process.env.MINIO_WEBHOOK_TOKEN}`) {
+    return send(res, 401, { error: "token inválido" });
+  }
+
+  const event = await readJson(req);
+  for (const record of event.Records ?? []) {
+    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+    const id = [record.s3.bucket.name, key, record.s3.object.eTag].join("/");
+    if (seen.has(id)) continue;   // en memoria: usa una tabla en producción
+    seen.add(id);
+    queue.push({ id, key, size: record.s3.object.size });
+  }
+  return send(res, 204);
+}
+</code></pre>
+        <p>La clave de idempotencia combina bucket, clave y ETag: el mismo objeto notificado dos veces se procesa una. Si el objeto cambia, el ETag cambia y es un trabajo nuevo. <code>sequencer</code> ayuda a ordenar eventos del mismo objeto, pero no es un identificador global ni garantiza orden entre objetos.</p>
+        <table>
+          <thead><tr><th>Regla</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td>Validar <code>Authorization</code></td><td>El endpoint está expuesto; sin token cualquiera puede inyectar eventos.</td></tr>
+            <tr><td>Responder 2xx rápido</td><td>Un timeout provoca reintentos y multiplica el trabajo.</td></tr>
+            <tr><td>Deduplicar antes de encolar</td><td>La entrega es al menos una vez.</td></tr>
+            <tr><td>No confiar en el orden</td><td>Dos objetos pueden llegar invertidos.</td></tr>
+            <tr><td>Encolar, no procesar en el handler</td><td>El trabajo pesado tiene su propio timeout y escala.</td></tr>
+          </tbody>
+        </table>
+        <h3>Eventos de aplicación y eventos de MinIO</h3>
+        <p>El proyecto emite además un webhook propio, <code>document.stored</code>, al completar una subida. No es lo mismo que la notificación de MinIO: el primero lo controla tu API y puede incluir el <code>id</code> del catálogo; el segundo lo emite el servidor y refleja el objeto, no tu estado de negocio. Para procesos de negocio, usa el de la API; para reaccionar a cualquier escritura, el de MinIO.</p>
+        <h3>Pruebas: pirámide y aislamiento</h3>
+        <table>
+          <thead><tr><th>Nivel</th><th>Qué prueba</th><th>Depende de</th><th>Velocidad</th></tr></thead>
+          <tbody>
+            <tr><td>Unidad</td><td>Claves, validaciones, reglas de lifecycle, parser de eventos</td><td>Nada</td><td>Milisegundos</td></tr>
+            <tr><td>Integración</td><td>Crear, firmar, subir, completar, descargar, borrar</td><td>MinIO + API</td><td>Segundos</td></tr>
+            <tr><td>Extremo a extremo</td><td>Navegador real subiendo un archivo</td><td>Todo el stack</td><td>Minutos</td></tr>
+          </tbody>
+        </table>
+        <p>La mayor parte de la confianza debe venir de la unidad: son rápidas, deterministas y cubren los errores que más duelen (traversal, tipos, tamaños). La integración demuestra que las piezas encajan; no debe ser la única red.</p>
+        <p>En Node.js 22, <code>node --test</code> descubre <code>*.test.mjs</code> y ejecuta cada archivo en un proceso. El proyecto ya trae pruebas de claves y catálogo. Añadir una prueba de lifecycle exige extraer las reglas a una función pura, para no necesitar MinIO:</p>
+        <pre><code class="language-javascript">// src/lifecycle.mjs
+export function lifecycleRules() {
+  return [
+    { ID: "expire-tmp", Status: "Enabled", Filter: { Prefix: "tmp/" }, Expiration: { Days: 1 } },
+    { ID: "expire-noncurrent", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: 30 } },
+  ];
+}
+</code></pre>
+        <pre><code class="language-javascript">import test from "node:test";
+import assert from "node:assert/strict";
+import { lifecycleRules } from "../src/lifecycle.mjs";
+
+test("el lifecycle solo expira tmp y versiones no actuales", () => {
+  const rules = lifecycleRules();
+  assert.deepEqual(rules.map((r) =&gt; r.ID), ["expire-tmp", "expire-noncurrent"]);
+  assert.equal(rules[0].Filter.Prefix, "tmp/");
+  assert.ok(!rules.some((r) =&gt; r.Filter.Prefix === "" &amp;&amp; r.Expiration));
+});
+</code></pre>
+        <h3>Prueba de integración con Compose</h3>
+        <p>La prueba de integración se salta si no hay API, para que <code>npm test</code> siga funcionando sin Docker. Con <code>BASE_URL</code> definida, recorre el flujo real:</p>
+        <pre><code class="language-javascript">import test from "node:test";
+import assert from "node:assert/strict";
+const BASE = process.env.BASE_URL;
+
+test("flujo completo de documento", { skip: !BASE }, async () =&gt; {
+  const created = await fetch(`${BASE}/documents`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tenant: "test-acme", filename: "prueba.pdf",
+      contentType: "application/pdf", size: 1024 }),
+  });
+  assert.equal(created.status, 201);
+  const doc = await created.json();
+  const put = await fetch(doc.uploadUrl, {
+    method: "PUT", headers: { "Content-Type": "application/pdf" },
+    body: "%PDF-1.4\nprueba\n",
+  });
+  assert.equal(put.status, 200);
+  const completed = await fetch(`${BASE}/documents/${doc.id}/complete`, { method: "POST" });
+  assert.equal(completed.status, 200);
+  assert.equal((await completed.json()).status, "stored");
+});
+</code></pre>
+        <p>Reglas para que no sea flaky: usa un tenant de prueba, limpia al final, no dependas del orden de listados y no compartas claves entre ejecuciones. Si la prueba falla, debe dejar el sistema en un estado inspeccionable, no borrar la evidencia.</p>
+        <h3>Runbook mínimo</h3>
+        <table>
+          <thead><tr><th>Síntoma</th><th>Comprobación</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>La API no arranca</td><td><code>curl /health</code>, logs de <code>npm run api</code></td><td>MinIO caído, credenciales mal o bucket inexistente.</td></tr>
+            <tr><td>Subida 403</td><td>Expiración y host de la URL</td><td>Pedir otra URL; no reutilizar la caducada.</td></tr>
+            <tr><td>No llegan eventos</td><td><code>mc event list</code>, logs del receptor</td><td>Target, suscripción o token mal configurados.</td></tr>
+            <tr><td>Disco lleno</td><td><code>mc admin info</code></td><td>Revisar lifecycle y versiones no actuales.</td></tr>
+            <tr><td>Borrado accidental</td><td><code>mc ls --versions</code></td><td>Quitar el delete marker y actualizar catálogo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La prueba más pequeña útil comprueba una regla de clave sin arrancar MinIO. El proyecto ya la tiene:</p>
+        <pre><code class="language-javascript">import test from "node:test";
+import assert from "node:assert/strict";
+import { documentKey } from "../src/keys.mjs";
+test("la clave no permite traversal", () =&gt; {
+  const key = documentKey({
+    tenant: "acme",
+    filename: "../../etc/passwd",
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    date: new Date("2026-11-05T00:00:00Z"),
+  });
+  assert.ok(!key.includes(".."));
+  assert.equal(key.split("/")[0], "acme");
+  assert.match(key, /^acme\/2026\/11\/123e4567-e89b-12d3-a456-426614174000-passwd$/);
+});
+</code></pre>
+        <p>Se ejecuta con:</p>
+        <pre><code class="language-bash">cd proyectos/document-store
+node --test test/keys.test.mjs
+</code></pre>
+        <pre><code class="language-text">✔ la clave no permite traversal (1.2ms)
+ℹ tests 1
+ℹ pass 1
+ℹ fail 0</code></pre>
+        <p>Sin servidor, sin red y sin estado compartido. Ese es el tipo de prueba que debe correr en cada commit.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El receptor real del proyecto es deliberadamente pequeño: registra el evento y responde. Así se observa el flujo sin introducir un worker en el curso:</p>
+        <pre><code class="language-javascript">if (req.method === "POST" &amp;&amp; url.pathname === "/webhooks/minio") {
+  const event = await readJson(req);
+  console.log("[minio-event]", event.EventName ?? "evento sin nombre");
+  for (const record of event.Records ?? []) {
+    console.log("  objeto:", record.s3.bucket.name, record.s3.object.key);
+  }
+  return send(res, 204);
+}
+</code></pre>
+        <p>Al subir un PDF completado, la consola muestra algo así:</p>
+        <pre><code class="language-text">[minio-event] s3:ObjectCreated:Put
+  objeto: documentos acme/2026/11/7f2c-informe.pdf
+</code></pre>
+        <p>Y si el destino no responde, MinIO reintenta. El receptor no debe tardar: si tarda más que el timeout, el evento se considera fallido aunque el trabajo se haya hecho, y llegará otra vez. Esa es la razón de separar recepción y procesamiento.</p>
+        <p>Comprobaciones de operación que acompañan al receptor:</p>
+        <pre><code class="language-bash">mc admin config get local notify_webhook:primary
+mc event list local/documentos
+curl -i -X POST http://localhost:7072/webhooks/minio \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"EventName":"s3:ObjectCreated:Put","Records":[]}'
+</code></pre>
+        <p>La última orden simula una entrega y debe devolver <code>204</code>. Si devuelve <code>401</code>, el token del entorno no coincide con el que envía MinIO. Si devuelve <code>500</code>, el receptor está lanzando antes de responder y MinIO lo reintentará.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Un evento no confirma el negocio</p>
+          <p>Que el receptor reciba un PUT no significa que el documento esté completo o aprobado. El evento de MinIO refleja el objeto; el estado de negocio vive en el catálogo. Procesa solo cuando la ficha esté en <code>stored</code>, o usa el webhook de aplicación <code>document.stored</code>.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Responder 204 y encolar</td><td>Escanear o generar derivados en el handler</td><td>El timeout de MinIO es corto y los reintentos multiplican el trabajo.</td></tr>
+            <tr><td>Deduplicar por bucket, clave y ETag</td><td>Confiar en que cada evento llega una vez</td><td>La entrega es al menos una vez.</td></tr>
+            <tr><td>Validar el token del webhook</td><td>Aceptar cualquier POST</td><td>El endpoint es público dentro de la red.</td></tr>
+            <tr><td>Probar claves y reglas sin MinIO</td><td>Depender de Docker para todo</td><td>Tests rápidos y deterministas en cada commit.</td></tr>
+            <tr><td>Tener runbook y checklist</td><td>Improvisar en el incidente</td><td>Reduce el tiempo de diagnóstico y las decisiones peligrosas.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Devolver 500 ante un duplicado</h3>
+        <span class="code-label code-label--wrong">Mal — el reintento se convierte en tormenta</span>
+        <pre><code class="language-javascript">if (await alreadyProcessed(id)) {
+  throw new Error("ya procesado"); // MinIO reintenta
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — idempotente y 2xx</span>
+        <pre><code class="language-javascript">if (await alreadyProcessed(id)) {
+  return send(res, 204); // nada que hacer, pero el evento se aceptó
+}
+</code></pre>
+        <p>Un duplicado no es un error: es una condición normal. Solo los fallos transitorios deben provocar reintento.</p>
+        <h3>2. Hacer el trabajo pesado antes de responder</h3>
+        <span class="code-label code-label--wrong">Mal — el webhook tarda minutos</span>
+        <pre><code class="language-javascript">app.post("/webhooks/minio", async (req, res) =&gt; {
+  await scanAndThumbnail(req.body); // 80 MB después...
+  res.status(204).end();
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — encolar y responder</span>
+        <pre><code class="language-javascript">app.post("/webhooks/minio", async (req, res) =&gt; {
+  await queue.add("scan", req.body);
+  res.status(204).end(); // el worker hará el trabajo
+});
+</code></pre>
+        <p>El receptor debe ser un portero, no un taller. Si el trabajo es largo, tiene su propio timeout, su propia escala y su propia cola de errores.</p>
+        <h3>3. Confiar en el orden o en la clave cruda</h3>
+        <span class="code-label code-label--wrong">Mal — asumir que el último evento es el estado actual</span>
+        <pre><code class="language-javascript">const key = record.s3.object.key; // puede venir codificada
+await process(key);              // sin comprobar el prefijo
+</code></pre>
+        <span class="code-label code-label--right">Bien — decodificar, validar y verificar el objeto</span>
+        <pre><code class="language-javascript">const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+if (!key.startsWith(`${tenant}/`)) return;
+const stat = await statObject(bucket, key); // el objeto manda
+</code></pre>
+        <p>El evento es una pista; el objeto y el catálogo son la verdad. Antes de actuar, comprueba que el objeto sigue existiendo y que su ETag coincide.</p>
+        <h3>4. Probar contra el bucket de todos</h3>
+        <span class="code-label code-label--wrong">Mal — tests que se pisan entre sí</span>
+        <pre><code class="language-javascript">await client.putObject("documentos", "informe.pdf", body);
+// otro test sobrescribe la misma clave y el resultado es aleatorio
+</code></pre>
+        <span class="code-label code-label--right">Bien — claves y tenants únicos, limpieza explícita</span>
+        <pre><code class="language-javascript">const tenant = `test-${crypto.randomUUID().slice(0, 8)}`;
+const key = `${tenant}/2026/11/${crypto.randomUUID()}-prueba.pdf`;
+t.after(() =&gt; client.removeObject("documentos", key).catch(() =&gt; {}));
+</code></pre>
+        <p>Un test que falla una de cada diez veces no es un test: es una fuente de desconfianza. Aísla los datos y limpia incluso cuando falla.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> conectar MinIO con el receptor, observar un evento real, comprobar la idempotencia y ejecutar la suite completa.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el proyecto y la API:</strong>
+            <pre><code class="language-bash">cd proyectos/document-store
+docker compose up -d
+npm install
+npm run api
+</code></pre>
+            <p>Añade al servicio de MinIO las tres variables <code>MINIO_NOTIFY_WEBHOOK_*</code> de la sección 2 y <code>extra_hosts</code>. Reinicia con <code>docker compose up -d</code>.</p>
+          </li>
+          <li>
+            <strong>Verifica el target y suscribe el bucket:</strong>
+            <pre><code class="language-bash">mc admin config get local notify_webhook:primary
+mc event add local/documentos \
+  arn:minio:sqs::primary:webhook \
+  --event put --suffix ".pdf"
+mc event list local/documentos
+</code></pre>
+            <p>Debe aparecer el ARN con el prefijo y el sufijo configurados. Si <code>event add</code> falla, el target no está habilitado.</p>
+          </li>
+          <li>
+            <strong>Sube un PDF por el flujo normal:</strong> crea el documento, haz el PUT a la URL firmada y llama a <code>/complete</code>. En la terminal de la API debe aparecer <code>[minio-event] s3:ObjectCreated:Put</code> con la clave del objeto.
+          </li>
+          <li>
+            <strong>Simula una entrega duplicada:</strong> reenvía el mismo JSON al receptor con <code>curl</code>. Si tu versión deduplica, el segundo envío no debe encolar trabajo; si solo registra, anota por qué el proyecto de referencia no deduplica todavía y qué añadirías.
+          </li>
+          <li>
+            <strong>Ejecuta la suite y hazla fallar:</strong>
+            <pre><code class="language-bash">npm test
+BASE_URL=http://localhost:7072 node --test test/integration.test.mjs
+</code></pre>
+            <p>La primera orden no necesita MinIO. La segunda recorre el flujo completo; si no existe el archivo de integración, créalo con el código de la sección 2. Después cambia el prefijo esperado de <code>tmp/</code> a <code>temp/</code> y ejecuta <code>npm test</code>: debe fallar. Restaura el valor y confirma que vuelve a pasar. Una prueba que nunca falla no demuestra nada.</p>
+          </li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Entrega fiable con reconciliación</h3>
+          <p>Diseña el procesamiento de eventos para que un documento se escanee e indexe exactamente una vez desde el punto de vista del negocio, aunque el evento llegue duplicado, el worker muera a mitad o el target esté caído una hora. Debes incluir: cola con ack, deduplicación persistente, reintentos con backoff, cola de descartes y un job de reconciliación que detecte objetos sin estado.</p>
+          <p>Define las métricas que demostrarían que funciona (edad del evento más antiguo, pendientes, duplicados descartados, fallos por tipo) y escribe el runbook para los tres incidentes más probables. Explica qué parte es exactamente una vez y qué parte sigue siendo al menos una vez.</p>
+          <p><em>Pista: la exactitud de negocio se consigue con una operación idempotente en el destino, no con una cola mágica. El estado final del objeto o del catálogo es lo que decide si el trabajo ya se hizo.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>MinIO notifica con formato S3 (<code>Records</code> con bucket, clave, tamaño, ETag y sequencer); el target se configura al arrancar y la suscripción con <code>mc event add</code>.</li>
+          <li>La entrega es al menos una vez, sin orden garantizado; el receptor valida token, deduplica, encola y responde 2xx rápido.</li>
+          <li>El evento de MinIO no confirma el estado de negocio: el catálogo sí; <code>node --test</code> cubre claves y reglas sin MinIO.</li>
+          <li>Un runbook y un checklist convierten el proyecto en algo operable.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Papel</th></tr></thead>
+          <tbody>
+            <tr><td><code>notify_webhook</code></td><td>Target HTTP de MinIO</td></tr>
+            <tr><td><code>mc event add</code></td><td>Suscribe un bucket a un target</td></tr>
+            <tr><td><code>s3:ObjectCreated:Put</code></td><td>Evento de objeto creado</td></tr>
+            <tr><td><code>document.stored</code></td><td>Evento de negocio de la API</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿MinIO garantiza que el evento llega una sola vez?</summary>
+            <div>
+              <p>No. La entrega es al menos una vez y puede repetirse por reintentos o reinicios. El orden entre objetos tampoco está garantizado. Diseña el consumidor para que procesar dos veces el mismo objeto no cambie el resultado.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo perder eventos?</summary>
+            <div>
+              <p>Sí. Si el destino está caído y la cola interna se llena, MinIO puede descartar notificaciones. Por eso el sistema necesita reconciliación: listar objetos y comparar con el catálogo para detectar los que nunca se procesaron.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué diferencia hay entre el webhook de MinIO y el de la API?</summary>
+            <div>
+              <p>El de MinIO lo emite el servidor cuando cambia un objeto y no conoce tu catálogo. El de la API lo emite tu código después de verificar y actualizar el estado. Para procesos de negocio, el segundo es más fiable; para reaccionar a cualquier escritura, el primero es más completo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué debe contener el checklist final del proyecto?</summary>
+            <div>
+              <p>Compose arranca con una orden; bucket versionado y lifecycle aplicados; política de mínimo privilegio; presigned uploads con expiración; validación de tipo y tamaño; <code>complete</code> idempotente; borrado recuperable; eventos configurados; suite en verde; runbook y backup probado. Si falta uno, el proyecto no está terminado: está en demo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="01-work-queues">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Work queues — Módulo 4 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Work queues</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Patrones</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El taller emite facturas. Cada pedido confirmado debe generar un PDF, guardarlo y avisar al cliente. Si la API hace ese trabajo dentro de la petición HTTP, el usuario espera varios segundos y, cuando el servicio de plantillas se cae, la venta se pierde. La solución no es «hacerlo más rápido»: es <strong>sacar el trabajo de la petición</strong> y ponerlo en una cola.</p>
+        <p>Una <strong>work queue</strong> (cola de trabajo, también <em>task queue</em>) es una cola con <strong>varios consumidores compitiendo por los mismos mensajes</strong>. El productor publica una tarea una vez; el broker la entrega a <em>un</em> worker disponible, no a todos. Añadir workers aumenta la capacidad de proceso sin tocar al productor; la cola absorbe los picos y permite que el sistema siga aceptando pedidos aunque la generación de facturas vaya con retraso.</p>
+        <p>Este patrón se llama <strong>competing consumers</strong> y tiene una consecuencia que conviene asumir desde el principio: el broker reparte, pero <strong>no garantiza el orden</strong> entre workers ni una ejecución única. La garantía que puedes construir es <em>at-least-once</em>: cada tarea se entrega al menos una vez, y el consumidor debe ser <strong>idempotente</strong> para que repetirla no duplique el efecto.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Ya sabes publicar, consumir y hacer <code>ack</code> (módulos 1 y 3). Aquí esas piezas se convierten en un patrón de arquitectura: cuántos workers, cuánto <code>prefetch</code>, qué hacer con las tareas lentas y cómo saber si el sistema va por detrás. Es la base de la job queue del proyecto final.</p>
+        </div>
+        <p>Los errores típicos no son de sintaxis: son de diseño. Activar <code>autoAck</code> «para ir más rápido», dejar el <code>prefetch</code> sin límite, confirmar antes de terminar el trabajo o ignorar que un mensaje puede llegar dos veces. Todos aparecen en esta lección con su versión correcta.</p>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El patrón: una cola, muchos workers</h3>
+        <p>El productor no conoce a los workers ni sabe cuántos hay. Solo publica en un exchange; el binding lleva la tarea a una cola; los consumidores se registran en esa cola. El broker decide a cuál entregar cada mensaje.</p>
+        <pre><code class="language-text">                       +---------------------------+
+  API  ---- publish --&gt;|  exchange taller.jobs     |
+                       |  (direct, durable)        |
+                       +-------------+-------------+
+                                     | routing key: facturas.generar
+                                     v
+                       +---------------------------+
+                       |  cola facturas.generar    |
+                       |  (quorum, durable)        |
+                       |  [t1][t2][t3][t4][t5]     |
+                       +---+---------+---------+---+
+                           |         |         |
+                           v         v         v
+                        worker1   worker2   worker3
+                        (prefetch 10 en cada uno)
+
+  Cada tarea va a UN worker. El trabajo se reparte; el mensaje no se copia.</code></pre>
+        <p>El exchange y la cola son infraestructura declarada una vez. Los workers escalan horizontalmente: arrancar otro proceso que consuma de la misma cola es toda la operación. El broker mantiene una <strong>ventana de mensajes no confirmados</strong> por consumidor: entrega hasta <code>prefetch</code> mensajes y espera <code>ack</code> antes de mandar más.</p>
+
+        <h3>Reparto, prefetch y mensajes en vuelo</h3>
+        <p>Sin <code>prefetch</code>, un worker rápido (o simplemente el primero en conectarse) puede acaparar cientos de mensajes y tenerlos en memoria sin procesar, mientras los demás están ociosos. El <code>prefetch</code> limita cuántos mensajes <em>sin confirmar</em> puede tener cada consumidor:</p>
+        <pre><code class="language-text">prefetch = 1                        prefetch = 10
+
+worker1: [t1] ................       worker1: [t1..t10] .......
+worker2: [t2] ................       worker2: [t11..t20] ......
+worker3: [t3] ................       worker3: [t21..t30] ......
+
+reparto fino, más viajes de red       más throughput, más memoria en vuelo
+y menos throughput por mensaje        y menos equidad si las tareas varían</code></pre>
+        <p>La regla práctica: <code>prefetch ≈ throughput por worker × latencia de la tarea</code>. Si un worker procesa 20 tareas/s y cada una tarda 2 s, necesita ~40 en vuelo para no quedarse esperando. Pero cada mensaje en vuelo ocupa memoria en el broker y en el cliente: si las tareas pesan 5 MB, 40 en vuelo son 200 MB por worker. El límite se elige con las dos cifras delante, no por costumbre.</p>
+
+        <h3>Tareas cortas y tareas largas</h3>
+        <table>
+          <thead><tr><th>Característica</th><th>Tareas cortas (ms)</th><th>Tareas largas (segundos/minutos)</th></tr></thead>
+          <tbody>
+            <tr><td><code>prefetch</code> razonable</td><td>10–100</td><td>1–5</td></tr>
+            <tr><td>Riesgo principal</td><td>Coste de red y de <code>ack</code> por mensaje</td><td>Un worker bloqueado retiene mucha cola</td></tr>
+            <tr><td>Heartbeat</td><td>El valor por defecto (60 s) sobra</td><td>Puede caducar si el proceso se bloquea; valora subirlo</td></tr>
+            <tr><td>Reintentos</td><td>Rápidos, con backoff corto</td><td>Necesitan DLQ y límite de intentos</td></tr>
+            <tr><td>Escalado</td><td>Más workers, mismo <code>prefetch</code></td><td>Más workers o partir la tarea en pasos</td></tr>
+          </tbody>
+        </table>
+        <p>Una tarea de 10 minutos dentro de un consumidor AMQP es frágil: si el worker muere en el minuto 9, el mensaje vuelve a la cola y otro empieza de cero. Para trabajos largos conviene <strong>dividirlos en etapas</strong> (cada una un mensaje) o usar <em>lease</em> y checkpoints en una base de datos, no confiar en que el canal sobreviva.</p>
+
+        <h3>Quién sostiene la garantía</h3>
+        <table>
+          <thead><tr><th>Garantía</th><th>Quién la sostiene</th><th>Qué implica</th></tr></thead>
+          <tbody>
+            <tr><td>El mensaje no se pierde al publicar</td><td>Productor + broker</td><td>Cola durable, mensaje persistente y <strong>publisher confirm</strong> antes de responder 202</td></tr>
+            <tr><td>El mensaje no se pierde al procesar</td><td>Consumidor</td><td><code>ack</code> manual <strong>después</strong> de completar el efecto</td></tr>
+            <tr><td>Se procesa al menos una vez</td><td>Broker (redelivery) + consumidor (ack)</td><td>Si el worker muere, el mensaje se reencola; puede haber duplicados</td></tr>
+            <tr><td>No se duplica el efecto</td><td>Consumidor</td><td>Idempotencia con clave de negocio y restricción única</td></tr>
+            <tr><td>El orden se respeta</td><td>Diseño de la cola</td><td>Un solo consumidor o <em>single active consumer</em>; con varios, no hay orden</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Medir el backlog</h3>
+        <p>Un work queue sano se mide por la diferencia entre lo que entra y lo que se procesa. En la management API y en <code>rabbitmqctl</code> tienes tres cifras que cuentan una historia distinta:</p>
+        <table>
+          <thead><tr><th>Cifra</th><th>Significado</th><th>Qué indica si crece</th></tr></thead>
+          <tbody>
+            <tr><td><code>messages_ready</code></td><td>En cola, sin entregar</td><td>Faltan workers o el broker no puede entregar</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>Entregados, sin <code>ack</code></td><td>Workers lentos, colgados o con <code>prefetch</code> enorme</td></tr>
+            <tr><td><code>consumers</code></td><td>Consumidores registrados</td><td>Si es 0 con mensajes listos, nadie está procesando</td></tr>
+          </tbody>
+        </table>
+        <p>Un backlog que sube con <code>consumers</code> estable y <code>unacked</code> bajo significa «faltan manos». Un <code>unacked</code> que sube sin bajar suele significar «un worker está atascado»: no es lo mismo escalar que reiniciar. Distinguirlo evita apagar incendios equivocados.</p>
+
+        <h3>Idempotencia: la clave es del negocio</h3>
+        <p>Un mensaje puede entregarse dos veces por redelivery, por un <code>ack</code> perdido o porque el worker murió después de guardar y antes de confirmar. El consumidor debe poder ejecutar la tarea dos veces con el mismo resultado. La clave no es el <code>messageId</code> del broker (puede repetirse si el productor reenvía el mismo evento): es el identificador de negocio, por ejemplo <code>facturaId</code>.</p>
+        <pre><code class="language-text">worker recibe factura 1042
+  ├── ¿existe ya una factura 1042 emitida?  --sí--&gt; ack y salir (no repetir)
+  └── no: INSERT ... ON CONFLICT (numero) DO NOTHING
+           └── si insertó, generar PDF y marcar emitida
+           └── ack</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">El orden no es gratis</p>
+          <p>Con varios consumidores, dos tareas de la misma factura pueden ejecutarse en paralelo y en cualquier orden. Si el orden importa, usa una <strong>routing key por entidad</strong> y <em>single active consumer</em>, o serializa por clave en la base de datos. Añadir workers no arregla un requisito de orden: lo rompe.</p>
+        </div>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una cola durable con dos workers y <code>prefetch</code> 1. El productor publica tres tareas; el broker las reparte. <strong>Garantía:</strong> at-least-once mientras el worker confirme después de procesar; el productor de este ejemplo no usa confirms todavía, así que la publicación es <em>at-most-once</em>.</p>
+        <p><strong>Productor</strong> (<code>publicar.mjs</code>):</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertQueue('tareas', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+
+for (let i = 1; i &lt;= 3; i++) {
+  ch.sendToQueue('tareas', Buffer.from(`tarea-${i}`), {
+    persistent: true,
+    messageId: `tarea-${i}`,
+  });
+}
+
+await ch.close();
+await conn.close();</code></pre>
+        <p><strong>Worker</strong> (<code>worker.mjs</code>), ejecútalo dos veces en terminales distintas:</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertQueue('tareas', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+await ch.prefetch(1);                       // un mensaje en vuelo por worker
+
+await ch.consume('tareas', async (msg) =&gt; {
+  if (!msg) return;                          // el servidor canceló el consumidor
+  console.log('recibido:', msg.content.toString());
+  await new Promise((r) =&gt; setTimeout(r, 1000)); // trabajo simulado
+  ch.ack(msg);                               // confirmar DESPUÉS
+}, { noAck: false });                        // ack manual, siempre</code></pre>
+        <p>Salida típica, repartida entre los dos procesos:</p>
+        <pre><code class="language-text">worker A: recibido: tarea-1
+worker B: recibido: tarea-2
+worker A: recibido: tarea-3</code></pre>
+        <p>Línea a línea: <code>assertQueue</code> es idempotente y debe coincidir en todos los clientes (tipo, durabilidad y argumentos); <code>prefetch(1)</code> evita que un worker acapare; <code>noAck: false</code> desactiva el acuse automático; <code>ack</code> se ejecuta al final, no al principio. Si matas un worker a mitad de la espera, su mensaje vuelve a la cola y el otro lo recibe: eso es la redelivery que hace posible at-least-once.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, la API responde <code>202 Accepted</code> en cuanto la factura queda encolada. El worker hace cuatro cosas: carga el pedido, renderiza el PDF, lo guarda y marca la factura como emitida. La clave de idempotencia es <code>facturaId</code>, y el <code>ack</code> va al final del último paso.</p>
+        <p><strong>API: publicación fiable con confirm</strong> (resumida):</p>
+        <pre><code class="language-javascript">const ch = await conn.createConfirmChannel();
+await ch.assertExchange('taller.jobs', 'direct', { durable: true });
+
+const payload = { facturaId: 'fac-1042', pedidoId: 'ped-8831' };
+ch.publish(
+  'taller.jobs',
+  'facturas.generar',
+  Buffer.from(JSON.stringify(payload)),
+  { persistent: true, contentType: 'application/json', messageId: payload.facturaId },
+);
+await ch.waitForConfirms();   // si falla, la API devuelve 503 y NO un 202</code></pre>
+        <p><strong>Worker: idempotente y con DLQ</strong>:</p>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas.generar', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-dead-letter-exchange': 'taller.dlx',
+    'x-delivery-limit': 5,
+  },
+});
+await ch.prefetch(10);
+
+await ch.consume('facturas.generar', async (msg) =&gt; {
+  if (!msg) return;
+  const { facturaId } = JSON.parse(msg.content.toString());
+
+  try {
+    const emitida = await db.oneOrNone(
+      'SELECT 1 FROM facturas WHERE id = $1 AND estado = $2',
+      [facturaId, 'emitida'],
+    );
+    if (emitida) return ch.ack(msg);       // ya se hizo: repetir es seguro
+
+    const pedido = await pedidos.cargar(facturaId);
+    const pdf = await plantillas.render('factura', pedido);
+    await almacen.guardar(`${facturaId}.pdf`, pdf);
+    await db.none(
+      `INSERT INTO facturas (id, estado) VALUES ($1, 'emitida')
+       ON CONFLICT (id) DO UPDATE SET estado = 'emitida'`,
+      [facturaId],
+    );
+    ch.ack(msg);
+  } catch (err) {
+    console.error('factura fallida', facturaId, err.message);
+    ch.nack(msg, false, !(err instanceof FacturaInvalida)); // transitorio: reencolar; el límite corta el bucle
+  }
+}, { noAck: false });</code></pre>
+        <p>El detalle que hace esto producción no es el <code>try/catch</code>: es que el <code>ack</code> ocurre después de persistir, que el <code>INSERT</code> es idempotente y que un fallo transitorio se reencola mientras el <code>x-delivery-limit</code> corta el bucle tras cinco intentos; un error permanente va directo a la DLQ. El mecanismo está en <a href="../03-fiabilidad/02-dead-letter-exchange.html">Dead-letter exchange</a> y el backoff en <a href="../03-fiabilidad/04-idempotencia-y-reintentos.html">Idempotencia y reintentos</a>.</p>
+        <p>Para observar el backlog mientras llegan pedidos:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+
+# name                 messages_ready  messages_unacknowledged  consumers
+# facturas.generar     184             10                       2</code></pre>
+        <p>184 listas y 10 en vuelo con dos workers significa que el sistema va por detrás: hay que escalar o investigar la latencia. 0 listas y 10 en vuelo significa que los workers están ocupados pero no hay atasco. La misma cifra, dos diagnósticos distintos.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Escalar es aburrido a propósito</p>
+          <p>Un worker más es otro proceso consumiendo de la misma cola. No hay que reconfigurar el broker ni avisar al productor. Esa es la ventaja del patrón: la capacidad es una variable operativa, no un cambio de arquitectura.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Fijar <code>prefetch</code> según latencia y memoria</td> <td>Dejarlo en 0 (sin límite) «para que vaya rápido»</td> <td>Sin ventana, un worker acapara la cola y los demás quedan ociosos.</td></tr>
+            <tr><td><code>ack</code> después de persistir el efecto</td> <td><code>ack</code> al recibir o antes de llamar a la base de datos</td> <td>Si el worker muere después del <code>ack</code>, el mensaje se perdió para siempre.</td></tr>
+            <tr><td>Idempotencia por clave de negocio</td> <td>Asumir que el broker entrega una sola vez</td> <td>La redelivery es normal; el duplicado es el caso esperado.</td></tr>
+            <tr><td>Cola durable tipo quorum y mensajes persistentes</td> <td>Cola temporal para trabajo que no se puede perder</td> <td>Sin durabilidad, un reinicio del broker borra el backlog.</td></tr>
+            <tr><td>Un <code>prefetch</code> por canal y consumidor</td> <td><code>prefetch</code> global como sustituto del diseño</td> <td>El límite global oculta qué consumidor está saturado y no existe en quorum queues.</td></tr>
+            <tr><td>Medir <code>ready</code>, <code>unacked</code> y <code>consumers</code></td> <td>Mirar solo el tamaño total de la cola</td> <td>Las tres cifras distinguen «faltan workers» de «hay un worker atascado».</td></tr>
+            <tr><td>Definir un límite de entregas y una DLQ</td> <td>Reintentar para siempre</td> <td>Un mensaje venenoso bloquea la cola y consume CPU sin avanzar.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. <code>autoAck</code> para «simplificar»</h3>
+        <span class="code-label code-label--wrong">Mal — confirmar al recibir</span>
+        <pre><code class="language-javascript">await ch.consume('facturas.generar', async (msg) =&gt; {
+  await generarFactura(msg.content.toString());   // si falla, ya está confirmado
+}, { noAck: true });</code></pre>
+        <span class="code-label code-label--right">Bien — confirmar al terminar</span>
+        <pre><code class="language-javascript">await ch.consume('facturas.generar', async (msg) =&gt; {
+  if (!msg) return;
+  try {
+    await generarFactura(msg.content.toString());
+    ch.ack(msg);
+  } catch (err) {
+    ch.nack(msg, false, false);
+  }
+}, { noAck: false });</code></pre>
+        <p>Con <code>autoAck</code>, el broker considera entregado el mensaje antes de que el trabajo exista. Un <em>crash</em> del worker justo después de recibirlo elimina la factura sin rastro.</p>
+
+        <h3>2. Un solo worker con <code>prefetch</code> enorme</h3>
+        <span class="code-label code-label--wrong">Mal — acaparar la cola</span>
+        <pre><code class="language-javascript">await ch.prefetch(5000);   // 5000 mensajes en memoria de un worker
+await ch.consume('facturas.generar', handler);</code></pre>
+        <span class="code-label code-label--right">Bien — ventana pequeña y medida</span>
+        <pre><code class="language-javascript">await ch.prefetch(10);     // 10 en vuelo por consumidor
+await ch.consume('facturas.generar', handler);</code></pre>
+        <p>Si el worker muere, los 5000 mensajes vuelven a la cola y se reentregan todos a la vez; además, los otros workers no reciben nada mientras tanto. La ventana debe salir de la latencia medida, no de un número redondo.</p>
+
+        <h3>3. Confirmar antes de escribir</h3>
+        <span class="code-label code-label--wrong">Mal — <code>ack</code> y luego trabajo</span>
+        <pre><code class="language-javascript">ch.ack(msg);
+await db.none('INSERT INTO facturas ...');   // si esto falla, no hay reintento</code></pre>
+        <span class="code-label code-label--right">Bien — trabajo y luego <code>ack</code></span>
+        <pre><code class="language-javascript">await db.none('INSERT INTO facturas ...');
+ch.ack(msg);                                  // redelivery si el proceso muere antes</code></pre>
+        <p>El orden importa. Confirmar antes convierte un fallo recuperable en una pérdida definitiva. La contrapartida —puede ejecutarse dos veces— se resuelve con idempotencia, no posponiendo el <code>ack</code> para siempre.</p>
+
+        <h3>4. Usar la cola como base de datos de estado</h3>
+        <span class="code-label code-label--wrong">Mal — consultar el backlog para saber qué falta</span>
+        <pre><code class="language-javascript">// ❌ "Si el mensaje está en la cola, la factura está pendiente"
+const pendientes = await api.get('/api/queues/%2F/facturas.generar');</code></pre>
+        <span class="code-label code-label--right">Bien — estado en la base de datos, cola para el trabajo</span>
+        <pre><code class="language-javascript">await db.none("UPDATE facturas SET estado = 'pendiente' WHERE id = $1", [id]);
+// la cola transporta la orden de trabajo; el estado vive en Postgres
+ch.publish('taller.jobs', 'facturas.generar', body, { persistent: true });</code></pre>
+        <p>Un mensaje consumido desaparece; uno purgado también. Si necesitas responder «¿qué facturas faltan?», la respuesta está en tu base de datos, no en <code>messages_ready</code>. La cola es un contrato de entrega, no un registro consultable.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver el reparto, la ventana de <code>prefetch</code> y la redelivery cuando un worker muere a mitad de una tarea.</p>
+        <ol class="steps">
+          <li>
+            <strong>Levanta el broker y crea la cola de trabajo:</strong>
+            <pre><code class="language-bash">docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:4-management
+docker exec rabbitmq rabbitmqctl await_startup</code></pre>
+            <p>La management UI queda en <code>http://localhost:15672</code> con <code>guest</code>/<code>guest</code>.</p>
+          </li>
+          <li>
+            <strong>Declara la cola y publica 10 tareas:</strong>
+            <pre><code class="language-bash">node publicar.mjs</code></pre>
+            <pre><code class="language-text">3 tareas publicadas en la cola tareas (repite hasta tener 10)</code></pre>
+            <p>Comprueba que están listas: <code>docker exec rabbitmq rabbitmqctl list_queues name messages_ready consumers</code>.</p>
+          </li>
+          <li>
+            <strong>Arranca dos workers en terminales separadas</strong> con <code>node worker.mjs</code>. Observa que cada tarea aparece en un solo worker y que, con <code>prefetch(1)</code> y 1 s de trabajo, cada uno procesa aproximadamente la mitad.
+            <pre><code class="language-text">worker A: tarea-1   worker A: tarea-3   worker A: tarea-5
+worker B: tarea-2   worker B: tarea-4   worker B: tarea-6</code></pre>
+          </li>
+          <li>
+            <strong>Mata un worker a mitad</strong> (Ctrl+C cuando queden tareas). Las tareas que tenía en vuelo vuelven a <code>ready</code> y el otro worker las recibe. Verifica el contador antes y después:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers</code></pre>
+            <p>Salida esperada tras la caída: <code>messages_unacknowledged = 0</code> y el resto en <code>ready</code> hasta que el worker superviviente las toma.</p>
+          </li>
+          <li>
+            <strong>Sube el prefetch a 5 y repite.</strong> Con tareas de 2 s, un worker tendrá hasta cinco en vuelo; si lo matas, las cinco se reencolan. Anota cuántas aparecen como <code>unacknowledged</code> con el worker vivo y explica la diferencia.</li>
+          <li>
+            <strong>Comprueba la durabilidad:</strong> publica 20 tareas sin workers, reinicia el contenedor (<code>docker restart rabbitmq</code>) y vuelve a listar. Las 20 deben seguir ahí, porque la cola es quorum y los mensajes persistentes.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Qué has demostrado</p>
+          <p>El reparto depende del <code>prefetch</code>, la redelivery depende de que el <code>ack</code> llegue tarde y la durabilidad depende de la cola y del mensaje, no del cliente. Tres garantías distintas que se configuran por separado.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Facturas exprés sin matar a las normales</h3>
+          <p>El taller quiere que las facturas de clientes premium se generen en menos de un minuto, aunque haya 500 facturas normales en backlog. Diseña el cambio usando <strong>dos colas</strong> (una exprés y una normal) y los mismos workers, de forma que un pico de facturas normales no retrase las exprés, pero que los workers no se queden ociosos cuando no hay exprés.</p>
+          <p>Define: nombres de cola, bindings, cuántos consumidores por cola, <code>prefetch</code> de cada uno y qué pasa si el worker exprés está ocupado. Escribe el trozo de código que declara y consume ambas colas en un solo proceso.</p>
+          <p><em>Pista: un consumidor puede consumir de dos colas a la vez desde el mismo canal, pero el <code>prefetch</code> es por consumidor. Piensa qué ventana necesita cada clase y cómo evitar que el consumidor exprés se convierta en el cuello de botella.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una work queue reparte <strong>cada mensaje a un solo worker</strong>; añadir workers escala la capacidad sin cambiar al productor.</li>
+          <li>El <code>prefetch</code> limita los mensajes en vuelo por consumidor y se calcula con throughput y latencia, no se deja en 0.</li>
+          <li>El <code>ack</code> va <strong>después</strong> del efecto; si el worker muere, el broker reentrega.</li>
+          <li>La garantía realista es <strong>at-least-once</strong>; la idempotencia es responsabilidad del consumidor y usa una clave de negocio.</li>
+          <li>Con varios consumidores <strong>no hay orden</strong> entre mensajes; si lo necesitas, cambia el diseño.</li>
+          <li><code>ready</code>, <code>unacked</code> y <code>consumers</code> diagnostican cosas distintas: faltan workers, hay un atasco o nadie escucha.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>prefetch(n)</code></td><td>Fija la ventana de mensajes sin confirmar por consumidor</td></tr>
+            <tr><td><code>ack(msg)</code></td><td>Confirma una entrega tras completar el trabajo</td></tr>
+            <tr><td><code>nack(msg, false, false)</code></td><td>Rechaza sin reencolar; con DLX configurado, va a la cola de fallos</td></tr>
+            <tr><td><code>x-queue-type: quorum</code></td><td>Declara una cola replicada y durable</td></tr>
+            <tr><td><code>x-delivery-limit</code></td><td>Limita las entregas antes de considerar el mensaje venenoso</td></tr>
+            <tr><td><code>messages_ready</code></td><td>Mensajes en cola pendientes de entregar</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>Mensajes entregados pendientes de <code>ack</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuántos workers debo poner?</summary>
+            <div>
+              <p>Los que hagan que <code>messages_ready</code> se mantenga estable con la latencia objetivo. Empieza con dos, mide el tiempo por tarea y el backlog, y añade hasta que el backlog deje de crecer. Más allá del número de núcleos disponibles, los workers compiten por CPU y el throughput se aplana.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>prefetch</code> 0 significa «sin límite»?</summary>
+            <div>
+              <p>Sí, en RabbitMQ <code>prefetch(0)</code> desactiva el límite y el broker entrega todo lo que pueda. Es útil para pruebas y peligroso en producción: un worker puede acumular miles de mensajes en memoria y, si muere, provocar una reentrega masiva.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si el mensaje se reentrega, ¿puedo tener dos facturas?</summary>
+            <div>
+              <p>Sí, si el consumidor no es idempotente. Por eso el ejemplo comprueba la clave de negocio y usa <code>ON CONFLICT</code>. El <code>messageId</code> del broker no basta: el mismo evento puede publicarse de nuevo con otro <code>messageId</code> y sigue siendo la misma factura.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no basta con una cola y un solo worker?</summary>
+            <div>
+              <p>Porque un worker es un punto único de fallo y un techo de capacidad. Con una cola y varios workers obtienes redundancia y escalado, a cambio de perder el orden global. Si el orden es imprescindible, un solo consumidor (o <em>single active consumer</em>) es una decisión válida, pero entonces el escalado se hace por partición de la clave, no añadiendo consumidores a la misma cola.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La cola puede crecer sin límite si los workers no dan abasto?</summary>
+            <div>
+              <p>Puede, hasta que el broker se queda sin memoria o disco. Configura <code>x-max-length</code> o una política de límite y decide qué hacer al desbordar: rechazar la publicación o descartar los más antiguos. Un backlog sin límite es una caída diferida; la lección <a href="../03-fiabilidad/03-ttl-y-limites.html">TTL y límites de cola</a> cubre las opciones.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

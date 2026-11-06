@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-dead-letter-exchange">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dead-letter exchange — Módulo 3 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Dead-letter exchange</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Fiabilidad</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo consumidor acaba encontrándose con un mensaje que no puede procesar: un JSON inválido, una referencia a un pedido que ya no existe, un proveedor externo que devuelve 400 para siempre. La reacción instintiva es <code>nack(msg, false, true)</code>: «que vuelva a la cola». Si el fallo es determinista, ese mensaje vuelve al instante, falla otra vez y consume la CPU del worker en un bucle que nunca termina. Es el famoso <strong>poison message</strong>.</p>
+        <p>El <strong>dead-letter exchange</strong> (DLX) es la salida ordenada. Cuando un mensaje «muere» en una cola —porque se rechazó sin reencolar, porque expiró, porque la cola superó su límite o porque agotó su número de entregas—, RabbitMQ lo republica en otro exchange. Ese exchange lo enruta a una <strong>dead-letter queue</strong> (DLQ), donde puedes inspeccionarlo, alertar y decidir qué hacer. No es un basurero: es la mesa de autopsias.</p>
+        <p>En esta lección verás exactamente cuándo se hace dead-lettering, cómo se configura, qué información viaja en la cabecera <code>x-death</code>, por qué el DLX no está cubierto por los publisher confirms y en qué se diferencia una DLQ de una cola de reintentos. También los dos errores que convierten una DLQ en un problema mayor: no consumirla nunca y usarla como mecanismo de reintento.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Sin DLQ, un mensaje venenoso bloquea una cola o se pierde sin rastro; con una DLQ mal operada, el problema se esconde. La diferencia entre «tenemos DLQ» y «podemos recuperarnos de un fallo» es que la DLQ tenga consumidor, alerta, retención y un procedimiento de replay.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué significa «morir» en una cola</h3>
+        <p>El broker no mueve el mensaje: lo <strong>republica</strong> en el exchange configurado y elimina el original. Ese matiz importa porque el nuevo mensaje es una publicación interna, con sus propias reglas de enrutado y sus propios riesgos. Los motivos que disparan el dead-lettering son cuatro:</p>
+        <table>
+          <thead><tr><th>Motivo (<code>reason</code>)</th><th>Cuándo ocurre</th><th>Quién lo provoca</th></tr></thead>
+          <tbody>
+            <tr><td><code>rejected</code></td><td><code>basic.reject</code> o <code>basic.nack</code> con <code>requeue: false</code></td><td>Consumidor</td></tr>
+            <tr><td><code>expired</code></td><td>El mensaje alcanza su TTL</td><td>Broker (tiempo)</td></tr>
+            <tr><td><code>maxlen</code></td><td>La cola supera <code>x-max-length</code> o <code>x-max-length-bytes</code></td><td>Broker (límite)</td></tr>
+            <tr><td><code>delivery_limit</code></td><td>Una quorum queue agota <code>delivery-limit</code></td><td>Broker (reintentos)</td></tr>
+          </tbody>
+        </table>
+        <p>Cerrar la conexión o matar el proceso <strong>no</strong> hace dead-lettering: el mensaje vuelve a estar listo y se reentrega. Tampoco lo hace un <code>nack</code> con <code>requeue: true</code>. El dead-lettering es una decisión explícita o el efecto de una política de la cola, no un efecto colateral de un fallo de red.</p>
+
+        <h3>Configuración: dos argumentos y una política</h3>
+        <pre><code class="language-javascript">await ch.assertExchange('pedidos.dlx', 'fanout', { durable: true });
+await ch.assertQueue('pedidos.dlq', { durable: true });
+await ch.bindQueue('pedidos.dlq', 'pedidos.dlx', '');
+
+await ch.assertQueue('trabajos.pedidos', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-dead-letter-exchange': 'pedidos.dlx',
+    'x-dead-letter-routing-key': 'trabajo.fallido',  // opcional
+    'x-delivery-limit': 5,
+  },
+});
+</code></pre>
+        <p><code>x-dead-letter-exchange</code> es obligatorio para activar la función. <code>x-dead-letter-routing-key</code> es opcional: si no lo pones, el mensaje conserva su routing key original; si lo pones, la sustituye. Ese segundo argumento es útil cuando la DLX es un exchange direct y quieres separar por tipo de fallo.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Los argumentos no se cambian en caliente</p>
+          <p>Si la cola ya existe con otros argumentos, redeclararla con DLX produce <code>406 PRECONDITION_FAILED</code>. La vía recomendada en producción es una <strong>policy</strong> (<code>dead-letter-exchange</code>, <code>dead-letter-routing-key</code>, <code>delivery-limit</code>) aplicada por patrón: se añade sin recrear la cola y queda auditada en un solo sitio.</p>
+        </div>
+
+        <h3>El viaje del mensaje</h3>
+        <pre><code class="language-text">consumidor rechaza (requeue=false)
+        |
+        v
+  +---------------------+     x-dead-letter-exchange      +--------------+
+  | trabajos.pedidos    |-------------------------------&gt;| pedidos.dlx  |
+  | (quorum, limit 5)   |                                 | (fanout)     |
+  +---------------------+                                 +--------------+
+                                                                |
+                                                                v
+                                                        +---------------+
+                                                        | pedidos.dlq   |
+                                                        | (durable)     |
+                                                        +---------------+
+                                                                |
+                                                     consumidor de DLQ
+                                                     (ack manual, alerta)</code></pre>
+        <p>El exchange de destino puede ser de cualquier tipo. Un patrón muy común es <code>fanout</code> para una DLQ única por servicio, o <code>direct</code> si quieres una DLQ por motivo. Lo que <strong>no</strong> debe hacer el DLX es apuntar de vuelta a la cola de trabajo sin un mecanismo de espera: eso es un bucle.</p>
+
+        <h3><code>x-death</code>: la autopsia del mensaje</h3>
+        <p>Cada dead-lettering deja constancia en la cabecera <code>x-death</code>, un array ordenado de lo más reciente a lo más antiguo. Cada entrada tiene:</p>
+        <table>
+          <thead><tr><th>Campo</th><th>Significado</th></tr></thead>
+          <tbody>
+            <tr><td><code>queue</code></td><td>Cola de la que salió el mensaje.</td></tr>
+            <tr><td><code>reason</code></td><td><code>rejected</code>, <code>expired</code>, <code>maxlen</code> o <code>delivery_limit</code>.</td></tr>
+            <tr><td><code>count</code></td><td>Cuántas veces murió desde esa cola por ese motivo (se comprime por pareja cola/motivo).</td></tr>
+            <tr><td><code>exchange</code></td><td>Exchange al que se publicó antes de morir por primera vez.</td></tr>
+            <tr><td><code>routing-keys</code></td><td>Routing keys originales (incluye <code>CC</code>, excluye <code>BCC</code>).</td></tr>
+            <tr><td><code>time</code></td><td>Momento del primer dead-lettering con esa pareja cola/motivo.</td></tr>
+            <tr><td><code>original-expiration</code></td><td>TTL original, si lo tenía; se elimina del mensaje para que no expire otra vez nada más llegar.</td></tr>
+          </tbody>
+        </table>
+        <p>Además, el primer dead-lettering añade <code>x-first-death-queue</code>, <code>x-first-death-reason</code>, <code>x-first-death-exchange</code> y <code>x-first-death-routing-key</code>. Esos campos son los que suelen usar las alertas: distinguen «murió aquí por primera vez» de «ya venía muerto de otra cola».</p>
+        <p>Al dead-letterear, el broker también sustituye el exchange y la routing key del mensaje por los del DLX, y elimina las cabeceras <code>CC</code> y <code>BCC</code>. Por eso un replay manual debe reconstruir el destino original a partir de <code>x-death</code>, no confiar en los campos actuales.</p>
+
+        <h3>Lo que el DLX no garantiza</h3>
+        <p>El dead-lettering es una publicación <strong>interna del broker</strong>. No pasa por tu canal, no obtiene un publisher confirm y no forma parte de la garantía del publish original. Si el DLX no existe, si la cola destino fue borrada o si el broker se queda sin disco en ese instante, el mensaje puede perderse. La respuesta operativa es doble: declarar el DLX antes que las colas que lo usan y monitorizar la profundidad de la DLQ y los logs del broker.</p>
+        <p>Tampoco hay garantía de orden: los mensajes dead-lettered se republican y compiten con el tráfico normal. Y si el mensaje muere varias veces, <code>x-death</code> crece (comprimido por cola/motivo), lo que puede ser útil para depurar y peligroso si lo usas como contador exacto de intentos.</p>
+
+        <h3>DLQ no es cola de reintentos</h3>
+        <table>
+          <thead><tr><th>Criterio</th><th>Cola de reintentos</th><th>Dead-letter queue</th></tr></thead>
+          <tbody>
+            <tr><td>Objetivo</td><td>Repetir automáticamente tras un fallo transitorio</td><td>Apartar lo que no se pudo procesar y estudiarlo</td></tr>
+            <tr><td>Retorno</td><td>Vuelve a la cola de trabajo tras un TTL</td><td>No vuelve sola; requiere decisión humana o un replay explícito</td></tr>
+            <tr><td>Intentos</td><td>Acotados por niveles y contador</td><td>No aplica: ya se agotaron</td></tr>
+            <tr><td>Consumidor</td><td>Ninguno: es una cola de espera</td><td>Sí, con <code>ack</code> manual para persistir y alertar</td></tr>
+            <tr><td>Señal de que algo va mal</td><td>Profundidad alta sostenida</td><td>Cualquier mensaje nuevo</td></tr>
+          </tbody>
+        </table>
+        <p>La confusión es carísima: si usas la DLQ como reintento, pierdes la distinción entre «fallo transitorio» y «mensaje irrecuperable», y la DLQ deja de ser una señal. El patrón correcto es <a href="04-idempotencia-y-reintentos.html">reintentos con TTL y DLX</a> y, solo después de agotarlos, DLQ.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-least-once dentro de la cola de trabajo. El mensaje se publica sin confirms (no nos importa aquí), pero el <code>reject</code> es explícito y la DLQ es durable. El dead-lettering en sí no está cubierto por ningún confirm: si la DLQ no existiera, el mensaje se perdería.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createChannel();
+
+// 1. El DLX y la DLQ se declaran primero.
+await ch.assertExchange('demo.dlx', 'fanout', { durable: true });
+await ch.assertQueue('demo.dlq', { durable: true });
+await ch.bindQueue('demo.dlq', 'demo.dlx', '');
+
+// 2. La cola de trabajo apunta al DLX.
+await ch.assertQueue('demo.trabajos', {
+  durable: true,
+  arguments: {
+    'x-dead-letter-exchange': 'demo.dlx',
+    'x-dead-letter-routing-key': 'trabajo.fallido',
+  },
+});
+
+ch.sendToQueue('demo.trabajos', Buffer.from('{"id":"J-1","payload":"roto"}'), {
+  persistent: true,
+  contentType: 'application/json',
+});
+
+// 3. Consumidor que rechaza sin reencolar.
+await ch.consume('demo.trabajos', (msg) =&gt; {
+  console.log('procesando', msg.content.toString());
+  ch.reject(msg, false);   // requeue = false → dead-letter
+}, { noAck: false });
+
+await new Promise((resolve) =&gt; setTimeout(resolve, 300));
+
+// 4. Leer la DLQ sin consumirla para siempre.
+const fallido = await ch.get('demo.dlq', { noAck: true });
+if (fallido) {
+  console.log('dead-letter:', fallido.fields.routingKey);
+  console.log('x-death:', fallido.properties.headers['x-death']);
+}
+
+await ch.close();
+await conn.close();
+</code></pre>
+        <p>Salida esperada (resumida):</p>
+        <pre><code class="language-text">procesando {"id":"J-1","payload":"roto"}
+dead-letter: trabajo.fallido
+x-death: [ { queue: 'demo.trabajos', reason: 'rejected', count: 1, ... } ]</code></pre>
+        <p>Fíjate en dos cosas. La routing key del mensaje en la DLQ es <code>trabajo.fallido</code>, no <code>demo.trabajos</code>: la sustituyó <code>x-dead-letter-routing-key</code>. Y el motivo es <code>rejected</code>, no <code>expired</code> ni <code>maxlen</code>. Si cambias <code>ch.reject(msg, false)</code> por <code>ch.nack(msg, false, true)</code>, el mensaje vuelve a la cola de trabajo y el consumidor lo recibe otra vez: eso es un bucle, no un dead-lettering.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La job queue del taller procesa pedidos con un worker que habla con un proveedor externo. Hay fallos transitorios (timeout, 503) y fallos definitivos (el pedido no existe, el importe es negativo). El worker no intenta distinguirlos con un <code>if</code> infinito: usa una cola de reintentos para los primeros y la DLQ para los segundos.</p>
+        <p>La topología de la cola de trabajo y su DLQ:</p>
+        <pre><code class="language-javascript">export async function declararFiabilidad(ch) {
+  await ch.assertExchange('pedidos.dlx', 'fanout', { durable: true });
+  await ch.assertQueue('pedidos.dlq', {
+    durable: true,
+    arguments: {
+      'x-queue-type': 'quorum',
+      'x-message-ttl': 7 * 24 * 60 * 60 * 1000,  // retención de 7 días
+      'x-max-length': 50_000,                    // techo para no crecer sin fin
+    },
+  });
+  await ch.bindQueue('pedidos.dlq', 'pedidos.dlx', '');
+
+  await ch.assertExchange('trabajos', 'direct', { durable: true });
+  await ch.assertQueue('trabajos.pedidos', {
+    durable: true,
+    arguments: {
+      'x-queue-type': 'quorum',
+      'x-dead-letter-exchange': 'pedidos.dlx',
+      'x-dead-letter-routing-key': 'trabajo.fallido',
+      'x-delivery-limit': 5,
+    },
+  });
+  await ch.bindQueue('trabajos.pedidos', 'trabajos', 'pedido.procesar');
+}
+</code></pre>
+        <p>El worker decide según el tipo de error. Un <code>400</code> del proveedor es definitivo; un <code>503</code> o un timeout se reintenta:</p>
+        <pre><code class="language-javascript">await ch.consume('trabajos.pedidos', async (msg) =&gt; {
+  if (!msg) return;
+  try {
+    await procesarPedido(JSON.parse(msg.content.toString()));
+    ch.ack(msg);
+  } catch (err) {
+    if (err.esDefinitivo) {
+      // Sin requeue: va a pedidos.dlx → pedidos.dlq con reason=rejected.
+      ch.nack(msg, false, false);
+      return;
+    }
+    // Transitorio: a la cola de espera, que lo devolverá tras el TTL.
+    ch.publish('trabajos.retry', 'pedido.procesar', msg.content, {
+      persistent: true,
+      headers: { ...msg.properties.headers, 'x-attempts': intentos(msg) + 1 },
+      messageId: msg.properties.messageId,
+    });
+    ch.ack(msg);   // el original ya está reencolado en la cola de espera
+  }
+});
+</code></pre>
+        <p>El consumidor de la DLQ no procesa negocio: persiste la evidencia, alerta y deja el mensaje disponible para un replay controlado.</p>
+        <pre><code class="language-javascript">await ch.prefetch(10);
+await ch.consume('pedidos.dlq', async (msg) =&gt; {
+  if (!msg) return;
+  const muerte = msg.properties.headers['x-death']?.[0] ?? {};
+  await db.insertarFallo({
+    messageId: msg.properties.messageId,
+    colaOrigen: muerte.queue,
+    motivo: muerte.reason,
+    routingKeys: muerte['routing-keys'],
+    cuerpo: msg.content.toString(),
+    ocurridoEn: new Date(),
+  });
+  await alertas.enviar('mensaje en DLQ', { cola: muerte.queue, motivo: muerte.reason });
+  ch.ack(msg);   // ack después de persistir, nunca antes
+}, { noAck: false });
+</code></pre>
+        <p>El replay se hace con una herramienta explícita, no con un botón que reenvía todo: se lee el fallo, se corrige la causa, se publica un mensaje <strong>nuevo</strong> con la misma clave de idempotencia y se marca el fallo como resuelto. Reenviar el mensaje original con su <code>x-death</code> puede volver a morir por la misma razón y contamina la autopsia.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar el DLX y la DLQ antes que las colas que los usan</td><td>Confiar en que «ya existirán»</td><td>Si el DLX no existe, el mensaje muerto se descarta y no hay traza.</td></tr>
+            <tr><td>Una DLQ por servicio o dominio, con consumidor y alerta</td><td>Una DLQ global para todo el sistema</td><td>Sin contexto no puedes priorizar ni hacer replay sin afectar a otros.</td></tr>
+            <tr><td><code>ack</code> manual después de persistir el fallo</td><td><code>autoAck</code> o ack antes de guardar</td><td>Si el proceso cae, el mensaje debe volver; con autoAck lo pierdes.</td></tr>
+            <tr><td>TTL y <code>max-length</code> en la DLQ</td><td>Dejarla crecer para siempre</td><td>Una DLQ sin techo llena el disco y tumba el broker.</td></tr>
+            <tr><td>Reintentos con TTL + DLX antes de la DLQ</td><td>Reencolar con <code>requeue: true</code> en bucle</td><td>El bucle calienta la CPU y no da tiempo a que el fallo se recupere.</td></tr>
+            <tr><td>Replay como herramienta auditada</td><td>Un script que reenvía toda la DLQ</td><td>Repetir un mensaje venenoso multiplica el incidente.</td></tr>
+            <tr><td>Alertar con cualquier mensaje nuevo en la DLQ</td><td>Mirar la DLQ solo cuando alguien se acuerda</td><td>La DLQ es la señal más directa de un contrato roto.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Reencolar para siempre un mensaje venenoso</h3>
+        <span class="code-label code-label--wrong">Mal — bucle caliente</span>
+        <pre><code class="language-javascript">ch.nack(msg, false, true);   // vuelve al instante, falla, vuelve...
+</code></pre>
+        <span class="code-label code-label--right">Bien — rechazo sin requeue y DLQ</span>
+        <pre><code class="language-javascript">ch.nack(msg, false, false);  // dead-letter si la cola tiene DLX
+</code></pre>
+        <p>Si el fallo es determinista, reintentar en el mismo instante no puede funcionar. La DLQ conserva el mensaje y libera al worker.</p>
+
+        <h3>2. Tener DLQ pero no consumirla</h3>
+        <span class="code-label code-label--wrong">Mal — el basurero silencioso</span>
+        <pre><code class="language-text">pedidos.dlq: 48.213 mensajes, 0 consumidores
+Nadie lo sabe. El equipo cree que «los mensajes se reintentan».</code></pre>
+        <span class="code-label code-label--right">Bien — consumidor, persistencia y alerta</span>
+        <pre><code class="language-javascript">await ch.consume('pedidos.dlq', async (msg) =&gt; {
+  await db.insertarFallo(msg);
+  await alertas.enviar('DLQ', { messageId: msg.properties.messageId });
+  ch.ack(msg);
+});
+</code></pre>
+        <p>La DLQ sin consumidor no es una red de seguridad: es un cementerio que nadie visita.</p>
+
+        <h3>3. Hacer que la DLQ vuelva a la cola de trabajo sin espera</h3>
+        <span class="code-label code-label--wrong">Mal — ciclo infinito</span>
+        <pre><code class="language-javascript">await ch.bindQueue('trabajos.pedidos', 'pedidos.dlx', 'trabajo.fallido');
+// El mensaje muerto vuelve inmediatamente a la misma cola.
+</code></pre>
+        <span class="code-label code-label--right">Bien — cola de espera con TTL y luego retorno</span>
+        <pre><code class="language-javascript">await ch.assertQueue('trabajos.retry.5s', {
+  durable: true,
+  arguments: {
+    'x-message-ttl': 5000,
+    'x-dead-letter-exchange': 'trabajos',
+    'x-dead-letter-routing-key': 'pedido.procesar',
+  },
+});
+</code></pre>
+        <p>El retorno automático necesita una espera y un límite. Sin ambas cosas, el broker se convierte en una centrifugadora.</p>
+
+        <h3>4. Usar el DLX como sustituto de la idempotencia</h3>
+        <span class="code-label code-label--wrong">Mal — «si se duplica, lo manda a la DLQ»</span>
+        <pre><code class="language-text">consumidor procesa y falla al hacer ack
+→ el broker reentrega
+→ el consumidor vuelve a procesar (efecto duplicado)
+→ no hay DLX que lo evite: el mensaje no murió, se reentregó</code></pre>
+        <span class="code-label code-label--right">Bien — clave de negocio y tabla de idempotencia</span>
+        <pre><code class="language-sql">INSERT INTO processed_messages (idempotency_key, consumer)
+VALUES ('pedido-P-1001-pagado-v1', 'facturacion')
+ON CONFLICT DO NOTHING;</code></pre>
+        <p>El DLX trata mensajes que fallan; la idempotencia trata mensajes que llegan dos veces. Son problemas distintos y necesitan mecanismos distintos.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> provocar un dead-lettering, leer la autopsia y comprobar que un <code>nack</code> con requeue no la produce.</p>
+        <ol class="steps">
+          <li>
+            <strong>Ejecuta el ejemplo mínimo</strong> y verifica que <code>demo.dlq</code> tiene un mensaje con <code>reason: rejected</code>.
+          </li>
+          <li>
+            <strong>Cambia el rechazo</strong> por <code>ch.nack(msg, false, true)</code>, borra las colas y repite. El mensaje no llega a la DLQ: vuelve a <code>demo.trabajos</code> y se reentrega. Detén el consumidor después de dos intentos para no dejarlo en bucle.
+          </li>
+          <li>
+            <strong>Provoca un <code>expired</code></strong>: declara una cola con <code>x-message-ttl: 1000</code> y DLX, publica un mensaje sin consumidor y espera dos segundos. Comprueba que aparece en la DLQ con <code>reason: expired</code> y que el payload conserva <code>original-expiration</code> si lo enviaste.
+          </li>
+          <li>
+            <strong>Provoca un <code>maxlen</code></strong>: declara una cola con <code>x-max-length: 2</code> y DLX, publica cinco mensajes sin consumidor y mira la DLQ. Deben aparecer los tres más antiguos (drop-head).
+          </li>
+          <li>
+            <strong>Inspecciona <code>x-death</code></strong> con <code>basic.get</code> y anota <code>queue</code>, <code>reason</code>, <code>count</code> y <code>routing-keys</code>. Después publica ese mismo mensaje otra vez en la cola de trabajo, recházalo y comprueba si <code>count</code> aumenta o si aparece una entrada nueva.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Una DLQ que cuente la historia</h3>
+          <p>Diseña una topología con tres motivos de muerte (<code>rejected</code>, <code>expired</code>, <code>maxlen</code>) que acaben en tres colas distintas, pero con una sola DLQ operativa para el equipo. Cada mensaje debe conservar la cola de origen y el motivo, y el consumidor de la DLQ debe poder reconstruir a qué exchange y con qué routing key se publicó originalmente.</p>
+          <p>Después implementa un replay que: (a) rechace mensajes con <code>count &gt; 3</code>, (b) republique los demás con una clave de idempotencia estable y (c) registre en una tabla qué se reenvió y qué se descartó. ¿Qué pasa si el replay se ejecuta dos veces? ¿Cómo lo demuestras?</p>
+          <p><em>Pista: <code>x-death</code> es un array con historial; la primera entrada no siempre es la historia completa. Y el exchange original ya no es el campo <code>exchange</code> del mensaje actual.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El dead-lettering <strong>republica</strong> el mensaje en un DLX y elimina el original; no es un movimiento ni una transacción.</li>
+          <li>Motivos: <code>rejected</code>, <code>expired</code>, <code>maxlen</code> y <code>delivery_limit</code>.</li>
+          <li><code>x-dead-letter-exchange</code> activa la función; <code>x-dead-letter-routing-key</code> decide la nueva key.</li>
+          <li><code>x-death</code> guarda cola, motivo, contador y routing keys originales; el primer evento añade <code>x-first-death-*</code>.</li>
+          <li>El dead-lettering no está cubierto por publisher confirms: si el destino no existe, el mensaje puede perderse.</li>
+          <li>Una DLQ necesita consumidor, persistencia, alerta, retención y replay; sin eso es un basurero.</li>
+          <li>DLQ y cola de reintentos son mecanismos distintos: reintento automático con TTL, DLQ para lo irrecuperable.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>x-dead-letter-exchange</code></td><td>Exchange al que se republica el mensaje muerto</td></tr>
+            <tr><td><code>x-dead-letter-routing-key</code></td><td>Routing key nueva (por defecto, la original)</td></tr>
+            <tr><td><code>x-delivery-limit</code></td><td>Entregas fallidas antes de dead-letter en quorum</td></tr>
+            <tr><td><code>x-death</code></td><td>Historial de muertes y motivo</td></tr>
+            <tr><td><code>basic.reject</code> / <code>basic.nack</code></td><td>Rechazo; con <code>requeue: false</code> dispara DLX</td></tr>
+            <tr><td><code>x-message-ttl</code></td><td>Expiración que puede alimentar la DLQ</td></tr>
+            <tr><td><code>rabbitmqctl list_queues</code></td><td>Vigila la profundidad de la DLQ y de la cola de trabajo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Dead-letter y dead-letter exchange son lo mismo que una DLQ?</summary>
+            <div>
+              <p>No exactamente. El <em>dead-lettering</em> es la acción; el <em>DLX</em> es el exchange que recibe el mensaje; la <em>DLQ</em> es la cola final. Puedes tener DLX sin DLQ (si el exchange no tiene bindings, el mensaje se pierde) y puedes tener una DLQ sin DLX (si alguien publica en ella a mano, pero entonces no es una DLQ funcional).</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi mensaje no va a la DLQ cuando mato el consumidor?</summary>
+            <div>
+              <p>Porque cerrar la conexión no es un rechazo: el mensaje vuelve a estar listo y se reentrega. Solo <code>reject</code>/<code>nack</code> con <code>requeue: false</code>, el TTL, el límite de cola o el delivery limit de una quorum queue disparan el dead-lettering. Si quieres que un crash cuente como intento, usa <code>delivery-limit</code> en quorum queues y lleva además tu propio contador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar el DLX de una cola que ya tiene mensajes?</summary>
+            <div>
+              <p>No redeclarando con otros argumentos: obtendrías <code>406</code>. Con una policy puedes cambiar el <code>dead-letter-exchange</code> de forma efectiva sin recrear la cola, y los mensajes que mueran a partir de ese momento usarán el nuevo destino. Los ya dead-lettered no se mueven.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La DLQ conserva el orden original?</summary>
+            <div>
+              <p>No de forma garantizada. El dead-lettering republica cada mensaje en el momento en que muere, y esos mensajes compiten con el resto. Si el orden es un requisito, necesitarás una clave de secuencia y lógica en el consumidor, no confiar en la cola.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

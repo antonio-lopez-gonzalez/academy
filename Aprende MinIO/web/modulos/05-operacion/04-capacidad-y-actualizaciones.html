@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-capacidad-y-actualizaciones">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Capacidad y actualizaciones — Módulo 5 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Capacidad y actualizaciones</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hay dos conversaciones que todo equipo de plataforma acaba teniendo con el almacenamiento, y las dos llegan tarde:</p>
+        <ul>
+          <li>«Se ha llenado el clúster y no podemos subir más documentos.»</li>
+          <li>«Hay que actualizar MinIO esta noche; ¿qué puede fallar y cómo volvemos atrás?»</li>
+        </ul>
+        <p>La primera es un problema de <strong>capacidad</strong>: planificar con TB brutos, olvidar las versiones y la réplica, o no dejar margen para el healing. La segunda es un problema de <strong>procedimiento</strong>: actualizar un clúster distribuido no es reiniciar un contenedor, y en MinIO no hay una tecla de deshacer.</p>
+        <p>Esta lección cierra el módulo con las dos rutinas que convierten la operación en algo aburrido, que es exactamente lo que se quiere: calcular antes de comprar, ampliar antes de llenar y actualizar con un plan que otra persona pueda ejecutar.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La regla del margen</p>
+          <p>Un clúster al 95 % no está «casi lleno»: está a una subida grande de bloquear escrituras, sin espacio para reconstruir shards y sin tiempo para comprar discos. El margen no es desperdicio; es la capacidad de seguir operando cuando algo va mal.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>De dato lógico a disco comprado</h3>
+        <p>El error más caro es confundir «tamaño de los archivos» con «discos necesarios». Entre uno y otro hay cuatro multiplicadores:</p>
+        <pre><code class="language-text">datos lógicos           lo que la aplicación cree que guarda
+      × versiones        cada PUT crea una versión (factor real medido, no 1)
+      × erasure coding    N/K (1,33× con EC:4 en 16 discos)
+      × réplica          2× si hay un segundo sitio con copia completa
+      + backup           otro destino, a menudo sin paridad
+      + margen           20–30 % para healing, rebalance y picos
+  resultado = discos que hay que comprar (y presupuestar)</code></pre>
+        <p>Ejemplo con números del almacén de documentos:</p>
+        <table>
+          <thead><tr><th>Concepto</th><th>Cálculo</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Datos lógicos</td><td>—</td><td>60 TB</td></tr>
+            <tr><td>Versionado</td><td>60 × 1,4</td><td>84 TB</td></tr>
+            <tr><td>Erasure coding EC:4 (16 discos)</td><td>84 × 1,33</td><td>112 TB brutos</td></tr>
+            <tr><td>Réplica en sitio B</td><td>112 × 1</td><td>112 TB brutos más</td></tr>
+            <tr><td>Backup externo</td><td>84 × 1</td><td>84 TB</td></tr>
+            <tr><td>Margen de operación</td><td>112 × 1,2</td><td>135 TB por sitio</td></tr>
+            <tr><td><strong>Compra total</strong></td><td>135 + 135 + 84</td><td><strong>354 TB</strong></td></tr>
+          </tbody>
+        </table>
+        <p>Si alguien presupuestó 60 TB, la diferencia no es un redondeo: es un factor de casi seis. Y el factor de versiones no se adivina: se mide con <code>mc du</code> y con el histórico de <code>mc ls --versions</code>.</p>
+        <h3>El coste oculto de los objetos pequeños</h3>
+        <p>Un objeto de 1 KB no ocupa 1 KB. Ocupa su dato, sus metadatos, una entrada por cada disco del erasure set y el coste de las operaciones que lo crearon. Millones de objetos pequeños pueden consumir más en metadatos e inodos que en contenido.</p>
+        <table>
+          <thead><tr><th>Patrón</th><th>Qué vigilar</th><th>Mitigación</th></tr></thead>
+          <tbody>
+            <tr><td>Millones de ficheros de &lt; 10 KB</td><td>Inodos y latencia de listado</td><td>Agrupar en archivos contenedores (tar, parquet, NDJSON) antes de subir.</td></tr>
+            <tr><td>Versiones de ficheros que cambian a diario</td><td>Factor de versionado real</td><td>Lifecycle de versiones no actuales; medir antes de fijar la retención.</td></tr>
+            <tr><td>Thumbnails y derivados</td><td>Ratio derivado/original</td><td>Storage class reducida y regeneración bajo demanda.</td></tr>
+            <tr><td>Subidas multipart abandonadas</td><td>Partes huérfanas</td><td>Regla de abortar multipart incompletos.</td></tr>
+          </tbody>
+        </table>
+        <h3>Umbrales: cuándo actuar</h3>
+        <table>
+          <thead><tr><th>Uso de capacidad usable</th><th>Estado</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>&lt; 60 %</td><td>Holgado</td><td>Revisar tendencia mensual; nada urgente.</td></tr>
+            <tr><td>60 – 70 %</td><td>Planificar</td><td>Iniciar compra y diseño del pool nuevo; la procurement tarda meses.</td></tr>
+            <tr><td>70 – 80 %</td><td>Ampliar</td><td>Ejecutar la expansión en la siguiente ventana.</td></tr>
+            <tr><td>80 – 90 %</td><td>Urgente</td><td>Expandir ya; revisar lifecycle y datos temporales; riesgo para healing.</td></tr>
+            <tr><td>&gt; 90 %</td><td>Crítico</td><td>Bloquear escrituras no esenciales, limpiar y ampliar; el margen ya no existe.</td></tr>
+          </tbody>
+        </table>
+        <p>Los porcentajes son una política, no un límite interno de MinIO. Ajusta los tuyos al tiempo de compra, al tamaño de los objetos y a la velocidad de crecimiento. Lo que no se puede negociar es tener <em>algún</em> umbral escrito y alertado.</p>
+        <h3>Por qué hace falta margen aunque «quepan» los datos</h3>
+        <ul>
+          <li><strong>Healing</strong>: reconstruir un disco escribe shards nuevos; necesita espacio temporal y ancho de banda.</li>
+          <li><strong>Rebalance</strong>: mover objetos entre pools duplica temporalmente el tránsito.</li>
+          <li><strong>Multipart</strong>: las partes en vuelo ocupan hasta que se completan o se abortan.</li>
+          <li><strong>Lifecycle</strong>: el scanner no borra al instante; entre «decidido» y «liberado» hay una ventana.</li>
+          <li><strong>Picos</strong>: una importación de 2 TB no debería dejar el clúster sin aire.</li>
+        </ul>
+        <h3>Cuotas: el cinturón de seguridad</h3>
+        <p>Una cuota por bucket evita que un solo equipo consuma todo el clúster:</p>
+        <pre><code class="language-bash">mc quota set myminio/documentos --size 40TiB
+mc quota info myminio/documentos
+</code></pre>
+        <p>Al alcanzar la cuota, las escrituras nuevas fallan con un error de cuota; lo existente se sigue leyendo. Es mejor un <code>403</code> controlado en un bucket que un clúster entero sin capacidad para todos.</p>
+        <h3>Actualizar: rolling, ordenado y sin downgrade</h3>
+        <p>MinIO se actualiza nodo a nodo. Mientras un nodo se reinicia, el resto mantiene el quórum si la topología tiene margen. El orden correcto:</p>
+        <ol>
+          <li><strong>Leer las notas de la versión</strong> y comprobar cambios de configuración o de comportamiento.</li>
+          <li><strong>Probar en staging</strong> con una copia representativa y las mismas políticas.</li>
+          <li><strong>Backup o snapshot</strong> y verificar que se puede restaurar (no basta con crearlo).</li>
+          <li><strong>Exportar configuración</strong>: buckets, IAM, lifecycle, réplica y notificaciones.</li>
+          <li><strong>Comprobar que el clúster está sano</strong>: sin discos offline ni healing en curso.</li>
+          <li><strong>Actualizar un nodo</strong>, esperar a que vuelva y a que el clúster lo reconozca.</li>
+          <li><strong>Repetir</strong> nodo a nodo, nunca dos a la vez.</li>
+          <li><strong>Verificar</strong> lectura, escritura, réplica, eventos y métricas.</li>
+          <li><strong>Observar</strong> 24–48 h antes de dar la ventana por cerrada.</li>
+        </ol>
+        <div class="callout callout--warning">
+          <p class="callout__title">No hay downgrade soportado</p>
+          <p>MinIO no documenta una vía de vuelta a una versión anterior. Si una actualización falla, el plan de recuperación es restaurar el backup o el snapshot y reconstruir, no cambiar el binario hacia atrás. Trata cada actualización como una operación de ida y guarda la evidencia de la prueba en staging.</p>
+        </div>
+        <h3>Baremetal y Kubernetes: el mismo orden, distinta herramienta</h3>
+        <table>
+          <thead><tr><th>Entorno</th><th>Cómo se actualiza</th><th>Qué vigilar</th></tr></thead>
+          <tbody>
+            <tr><td>Baremetal con systemd</td><td>Sustituir el binario o el paquete en un nodo y <code>systemctl restart minio</code>.</td><td><code>mc admin info</code> tras cada nodo; versión uniforme al final.</td></tr>
+            <tr><td>Kubernetes Operator</td><td>Actualizar la imagen del Tenant; el Operator hace el rolling de los pods.</td><td><code>kubectl rollout status</code>, salud del Tenant y quórum.</td></tr>
+            <tr><td>Laboratorio con Compose</td><td><code>docker compose pull &amp;&amp; docker compose up -d</code></td><td>Es un solo nodo: no hay quórum que preservar, pero tampoco HA.</td></tr>
+          </tbody>
+        </table>
+        <p>En Kubernetes no se actualiza el StatefulSet a mano: se cambia la versión en el recurso <code>Tenant</code> y se deja que el Operator respete el orden. Forzar un reinicio simultáneo de pods es la versión cloud-native de «reiniciar todos los nodos a la vez».</p>
+        <h3>Ventana de mantenimiento: qué congelar</h3>
+        <table>
+          <thead><tr><th>Elemento</th><th>Antes</th><th>Durante</th><th>Después</th></tr></thead>
+          <tbody>
+            <tr><td>Escrituras de aplicación</td><td>Avisar y reducir si es posible</td><td>Tolerar errores con reintentos</td><td>Verificar backlog y checksums</td></tr>
+            <tr><td>Lifecycle</td><td>Anotar reglas activas</td><td>No cambiar reglas</td><td>Comprobar que sigue aplicando</td></tr>
+            <tr><td>Réplica</td><td>Anotar <code>Pending</code></td><td>Puede aumentar</td><td>Esperar a cero o justificar el retraso</td></tr>
+            <tr><td>Eventos</td><td>Anotar suscripciones</td><td>Puede haber reintentos</td><td>Comprobar que no se perdió la cola</td></tr>
+            <tr><td>Backups</td><td>Ejecutar y verificar</td><td>Pausar si compiten por red</td><td>Reanudar y confirmar</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La comprobación más pequeña antes de actualizar: ¿el clúster está en condiciones de perder un nodo durante unos minutos?</p>
+        <pre><code class="language-bash">mc admin info cluster
+mc admin info cluster --offline
+</code></pre>
+        <pre><code class="language-text">●  minio.example.net:9000
+   Network: 4/4 OK
+   Drives: 16/16 OK
+   Pool: 1
+Pools:
+   1st, Erasure sets: 1, Drives per erasure set: 16
+16 drives online, 0 drives offline, EC:4</code></pre>
+        <p>Lectura:</p>
+        <ul>
+          <li><code>16/16</code> discos y <code>4/4</code> nodos: no hay degradación previa.</li>
+          <li><code>0 drives offline</code>: el healing no tiene trabajo pendiente conocido.</li>
+          <li><code>EC:4</code>: toleras 4 discos. Apagar un nodo de 4 discos te deja exactamente en el límite.</li>
+        </ul>
+        <p>Y la comprobación de que puedes apagar ese nodo sin perder quórum:</p>
+        <pre><code class="language-bash">curl -sS -o /dev/null -w "%{http_code}\n" \
+  "https://minio.example.net:9000/minio/health/cluster?maintenance=true"
+</code></pre>
+        <p><code>200</code> significa que el clúster mantiene lectura y escritura si ese nodo se va. <code>412</code> significa que perdería quórum: no es el momento de actualizar.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El clúster del almacén de documentos está al 74 % y hay una actualización pendiente. El equipo combina las dos operaciones en una sola ventana, con un orden que no compromete el margen.</p>
+        <h3>Estado de partida</h3>
+        <pre><code class="language-text">Pool 1: 4 nodos × 4 discos × 4 TB = 64 TB brutos
+EC:4 → 48 TB útiles
+uso: 35,5 TB (74 %)
+crecimiento: ~2,5 TB/mes
+días hasta el 85 %: (40,8 - 35,5) / (2,5/30) ≈ 64 días</code></pre>
+        <p>Con 64 días de margen, la compra del pool nuevo no llega a tiempo si se empieza hoy. La expansión se aprueba antes de la ventana de actualización.</p>
+        <h3>Plan de la ventana</h3>
+        <pre><code class="language-text">viernes 22:00  congelar despliegues y anotar estado
+22:10          backup lógico + export de configuración
+22:40          verificar backup (mc diff, mc ls --versions)
+23:00          actualizar minio-1 → esperar 16/16 y Network 4/4
+23:20          actualizar minio-2 → esperar
+23:40          actualizar minio-3 → esperar
+00:00          actualizar minio-4 → esperar
+00:20          smoke test: PUT, GET, DELETE, réplica, evento
+00:40          revisar logs y métricas 30 min
+01:10          descongelar y cerrar con evidencia</code></pre>
+        <h3>Comandos de la ventana</h3>
+        <pre><code class="language-bash"># 0. Estado y export antes de tocar nada
+mc admin info cluster &gt; ventana-2026-11-06-antes.txt
+mc admin cluster bucket export cluster
+mc admin cluster iam export cluster
+mc ilm rule export myminio/documentos &gt; lifecycle-documentos.json
+# 1. Backup y verificación
+mc mirror --overwrite --preserve --versions \
+  myminio/documentos backup/documentos-2026-11-06
+mc diff myminio/documentos backup/documentos-2026-11-06
+# 2. Un nodo a la vez (baremetal)
+ssh minio1 "sudo systemctl restart minio"
+until curl -fsS https://minio1.example.net:9000/minio/health/ready; do sleep 5; done
+mc admin info cluster | grep -E "Network|Drives"
+# 3. Repetir con minio2, minio3, minio4...
+# 4. Verificación funcional
+printf 'smoke test\n' | mc pipe myminio/documentos/tmp/smoke.txt
+mc cat myminio/documentos/tmp/smoke.txt
+mc rm myminio/documentos/tmp/smoke.txt
+mc replicate status myminio/documentos
+</code></pre>
+        <h3>Ampliación en la misma ventana (o la siguiente)</h3>
+        <pre><code class="language-bash"># Añadir el pool 2 al final de MINIO_VOLUMES en TODOS los nodos (una línea)
+MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4} https://minio{5...8}.example.net:9000/data/disk{1...4}"
+# Rolling restart de los 8 nodos, uno a uno
+mc admin info cluster
+mc admin rebalance start cluster
+mc admin rebalance status cluster
+</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">No mezcles prisa y capacidad</p>
+          <p>Actualizar y ampliar en la misma ventana es posible, pero multiplica los cambios. Si algo falla, no sabrás si es la versión o el pool nuevo. Con un clúster al 74 % hay margen para separar las operaciones en dos ventanas; con uno al 92 %, no lo hay.</p>
+        </div>
+        <h3>Checklist de la ventana</h3>
+        <table>
+          <thead><tr><th>Antes</th><th>Durante</th><th>Después</th></tr></thead>
+          <tbody>
+            <tr><td>Notas de versión leídas</td><td>Un nodo a la vez</td><td>Versión uniforme en todos los nodos</td></tr>
+            <tr><td>Staging probado</td><td>Esperar <code>ready</code> y <code>info</code> sano</td><td>Smoke test de lectura y escritura</td></tr>
+            <tr><td>Backup verificado</td><td>No cambiar configuración</td><td>Réplica y eventos comprobados</td></tr>
+            <tr><td>Config exportada</td><td>Registrar la hora de cada paso</td><td>Métricas y logs revisados 30 min</td></tr>
+            <tr><td>Clúster sin discos offline</td><td>Un dueño de la ventana</td><td>Evidencia archivada y runbook actualizado</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Planificar con capacidad usable, no bruta</td>
+              <td>Presupuestar los TB del cartel del disco</td>
+              <td>La paridad, las versiones y la réplica multiplican el consumo.</td>
+            </tr>
+            <tr>
+              <td>Alertar al 70 % y ampliar al 80 %</td>
+              <td>Esperar al 90 % para pedir discos</td>
+              <td>La compra y el montaje tardan más que el crecimiento.</td>
+            </tr>
+            <tr>
+              <td>Cuotas por bucket para los equipos</td>
+              <td>Un bucket sin límite que consume el clúster</td>
+              <td>Contiene el fallo a un inquilino, no a todos.</td>
+            </tr>
+            <tr>
+              <td>Actualizar nodo a nodo con verificación</td>
+              <td>Reiniciar el clúster para «tardar menos»</td>
+              <td>Sin quórum se pierden escrituras y el servicio se cae.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Presupuestar con TB brutos</h3>
+        <span class="code-label code-label--wrong">Mal — «tenemos 64 TB, caben 64 TB»</span>
+        <pre><code class="language-text">64 TB brutos, EC:4 → 48 TB útiles
+con versiones ×1,4 y margen del 20 % → ~28 TB lógicos
+❌ El equipo compró para 64 y solo puede guardar 28.
+</code></pre>
+        <span class="code-label code-label--right">Bien — calcular la cadena completa</span>
+        <pre><code class="language-text">lógicos × versiones × (N/K) × copias + margen
+60 × 1,4 × 1,33 = 112 TB brutos por sitio
++ réplica + backup + 20 % → decisión de compra
+</code></pre>
+        <h3>2. Ignorar las versiones y los derivados</h3>
+        <span class="code-label code-label--wrong">Mal — contar solo los archivos originales</span>
+        <pre><code class="language-bash">mc du --recursive myminio/documentos | tail -1
+# ❌ Solo la versión actual; el historial y los thumbnails no aparecen.
+</code></pre>
+        <span class="code-label code-label--right">Bien — medir el bucket real y su histórico</span>
+        <pre><code class="language-bash">mc du --recursive --versions myminio/documentos | tail -1
+mc ls --versions myminio/documentos/2026/ | wc -l
+</code></pre>
+        <h3>3. Reiniciar todos los nodos a la vez para ahorrar tiempo</h3>
+        <span class="code-label code-label--wrong">Mal — ventana corta, caída completa</span>
+        <pre><code class="language-bash">for n in 1 2 3 4; do ssh minio$n "systemctl restart minio" &amp; done
+wait
+# ❌ Sin quórum: los PUT fallan y el clúster puede tardar en reformarse.
+</code></pre>
+        <span class="code-label code-label--right">Bien — secuencial con comprobación</span>
+        <pre><code class="language-bash">for n in 1 2 3 4; do
+  ssh minio$n "systemctl restart minio"
+  until curl -fsS "https://minio$n.example.net:9000/minio/health/ready"; do sleep 5; done
+  mc admin info cluster | grep -E "Network|Drives"
+done
+</code></pre>
+        <h3>4. Suponer que se puede volver a la versión anterior</h3>
+        <span class="code-label code-label--wrong">Mal — rollback como si fuera una app stateless</span>
+        <pre><code class="language-bash"># ❌ "Si falla, volvemos a la imagen anterior y listo"
+docker pull quay.io/minio/minio:RELEASE.2026-09-01T00-00-00Z
+</code></pre>
+        <span class="code-label code-label--right">Bien — plan de recuperación con datos</span>
+        <pre><code class="language-bash"># Antes: backup verificado + snapshot del volumen
+mc mirror --overwrite --versions myminio/documentos backup/pre-upgrade
+# Después, si falla: restaurar en un entorno limpio y reconstruir
+</code></pre>
+        <p>MinIO no soporta downgrade. El «rollback» real es restaurar datos y configuración, y eso hay que probarlo antes, no improvisarlo durante el incidente.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> calcular la capacidad real de un despliegue, poner una cuota de seguridad y escribir el runbook de actualización.</p>
+        <ol class="steps">
+          <li>
+            <strong>Mide el estado actual:</strong>
+            <pre><code class="language-bash">mc admin info myminio
+mc du --recursive myminio/
+mc quota info myminio/documentos
+</code></pre>
+            <p>Anota capacidad usable, uso y número de objetos. Si el despliegue es de un solo disco, la capacidad usable coincide con el disco y <code>EC:0</code>: úsalo para practicar la fórmula, no como diseño de producción.</p>
+          </li>
+          <li>
+            <strong>Calcula un clúster de producción:</strong> 6 TB lógicos, factor de versionado 1,3, EC:4 en 16 discos, réplica a un segundo sitio, backup y 25 % de margen. Escribe la cadena completa y el resultado en TB brutos por sitio.</li>
+          <li>
+            <strong>Compara con la compra ingenua:</strong> ¿cuánto se habría comprado si solo se miraran los 6 TB lógicos? ¿Qué porcentaje del coste real se habría olvidado? Deja la respuesta escrita antes de seguir.</li>
+          <li>
+            <strong>Pon una cuota al bucket del laboratorio:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing myminio/lab-capacidad
+mc quota set myminio/lab-capacidad --size 1GiB
+mc quota info myminio/lab-capacidad
+</code></pre>
+            <p>Salida esperada: la cuota aparece como <code>1 GiB</code> y el uso actual. No hace falta llenarla; con la cuota puesta, el mecanismo queda demostrado.</p>
+          </li>
+          <li>
+            <strong>Escribe el runbook y su criterio de aborto:</strong> seis pasos (prechecks, backup verificado, export de configuración, actualización nodo a nodo, smoke test y criterio de aborto) con comandos y tiempos. Define el aborto como condición medible, por ejemplo «si <code>Drives</code> baja de 14/16 o <code>cluster?maintenance=true</code> devuelve 412, detener y no tocar el siguiente nodo».</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Limpia el bucket de laboratorio con <code>mc rb --force myminio/lab-capacidad</code>. Y revisa tu runbook: si otra persona no puede ejecutarlo sin preguntarte nada, todavía no está terminado.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un plan de capacidad a 18 meses con presupuesto limitado</h3>
+          <p>El almacén crece un 8 % mensual y el presupuesto solo permite una compra al año. Diseña un plan a 18 meses que no baje del 20 % de capacidad libre, incluyendo el efecto de las versiones, la réplica y el backup. Indica qué mes se compra, cuánto y con qué topología, y qué harías si el crecimiento real fuese el doble del previsto.</p>
+          <p>Después añade la restricción de la actualización: la compra y el upgrade no pueden coincidir en el mismo mes. ¿Cambia el plan? ¿Cuánto margen necesitas para absorber el retraso?</p>
+          <p><em>Pista: el crecimiento compuesto del 8 % mensual duplica el dato en unos nueve meses, no en un año. Y una compra que llega al 88 % de uso no da margen para el healing.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La capacidad se planifica de dato lógico a disco: versiones × paridad × copias + margen.</li>
+          <li>El sobrecoste de EC y el factor de versionado son los dos números que más se subestiman.</li>
+          <li>Los objetos pequeños consumen metadatos e inodos; agrupar es una decisión de capacidad.</li>
+          <li>Define umbrales: planificar al 60–70 %, ampliar al 70–80 %, actuar al 80 %.</li>
+          <li>El margen no es desperdicio: lo necesitan el healing, el rebalance y los picos.</li>
+          <li>Las cuotas por bucket contienen el consumo de un equipo.</li>
+          <li>Se actualiza nodo a nodo, con staging, backup verificado y configuración exportada.</li>
+          <li>MinIO no soporta downgrade: la vuelta atrás es restaurar datos, no cambiar el binario.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc admin info</code></td><td>Capacidad usable, discos y paridad</td></tr>
+            <tr><td><code>mc du --recursive --versions</code></td><td>Mide el consumo real, incluido el historial</td></tr>
+            <tr><td><code>mc quota set --size</code></td><td>Limita el tamaño de un bucket</td></tr>
+            <tr><td><code>mc admin cluster bucket export</code></td><td>Exporta la configuración de buckets</td></tr>
+            <tr><td><code>mc admin cluster iam export</code></td><td>Exporta usuarios y políticas</td></tr>
+            <tr><td><code>mc admin rebalance start</code></td><td>Redistribuye tras añadir un pool</td></tr>
+            <tr><td><code>mc admin info --offline</code></td><td>Precheck de la ventana</td></tr>
+            <tr><td><code>GET /minio/health/cluster?maintenance=true</code></td><td>Comprueba si puedes apagar un nodo</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Cuánto margen de capacidad debo dejar?</summary>
+            <div>
+              <p>Entre un 20 y un 30 % de la capacidad usable, según el tamaño del clúster y la velocidad de crecimiento. Ese margen cubre healing, rebalance, multipart y picos. Si el crecimiento es muy rápido, el margen debe ser mayor porque la compra tarda meses.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo actualizar MinIO sin downtime?</summary>
+            <div>
+              <p>Con una topología que mantenga quórum al perder un nodo, un rolling correcto permite seguir sirviendo. Habrá un breve periodo degradado y posibles reintentos de clientes. Con un solo nodo o con el clúster al límite de paridad, no hay actualización sin impacto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si actualizo y algo falla?</summary>
+            <div>
+              <p>No hay downgrade soportado. El plan es restaurar el backup o el snapshot en un entorno limpio y reconstruir la configuración exportada. Por eso la prueba en staging y la verificación del backup son pasos obligatorios, no burocracia.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Ampliar capacidad requiere parar el clúster?</summary>
+            <div>
+              <p>No. Se añade un pool al final de <code>MINIO_VOLUMES</code> y se reinicia nodo a nodo. Los objetos nuevos se reparten entre pools; los antiguos se quedan donde están hasta que ejecutes un rebalance. El servicio sigue, pero la distribución no será uniforme de inmediato.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

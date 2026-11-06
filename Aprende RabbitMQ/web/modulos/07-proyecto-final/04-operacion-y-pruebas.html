@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="04-operacion-y-pruebas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Operación y pruebas — Módulo 7 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Operación y pruebas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La job queue funciona en tu portátil. El último paso es que siga funcionando cuando el broker se reinicie, un worker se muera, la cola crezca y alguien tenga que diagnosticarlo a las tres de la mañana. Operar no es añadir un <code>console.log</code>: es hacer visible el estado, automatizar las pruebas y escribir qué hacer cuando algo falla. Los <a href="03-reintentos-y-dlq.html">reintentos y la DLQ</a> ya existen; ahora hay que demostrar que se pueden operar.</p>
+        <p>Este cierre del proyecto se apoya en cinco piezas:</p>
+        <table>
+          <thead><tr><th>Pieza</th><th>Pregunta que responde</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Healthchecks</strong></td><td>¿El proceso está vivo y puede aceptar trabajo ahora mismo?</td></tr>
+            <tr><td><strong>Métricas</strong></td><td>¿Cuánto entra, cuánto sale, cuánto se atasca y cuánto tarda?</td></tr>
+            <tr><td><strong>Logs</strong></td><td>¿Qué le pasó a este <code>jobId</code> concreto?</td></tr>
+            <tr><td><strong>Pruebas</strong></td><td>¿La política de reintentos y el contrato del mensaje siguen siendo correctos?</td></tr>
+            <tr><td><strong>Runbook</strong></td><td>¿Qué hace la persona de guardia cuando la cola crece o el broker cae?</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">Un sistema sin runbook no está terminado</p>
+          <p>Si la única persona que sabe qué hacer cuando la DLQ crece eres tú, el proyecto tiene un bus factor de uno. El runbook convierte conocimiento tácito en pasos reproducibles; las métricas y los logs le dan las señales para saber cuál aplicar.</p>
+        </div>
+        <p>Errores típicos: un liveness probe que comprueba el broker y reinicia la API en bucle cuando el broker cae, tests que comparten nombres de cola y fallan de forma intermitente, esperas de 30 segundos para probar un TTL y logs sin <code>jobId</code> que no permiten reconstruir un caso.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Liveness y readiness no son lo mismo</h3>
+        <p>El <strong>liveness</strong> responde «¿el proceso está vivo?». El <strong>readiness</strong> responde «¿puede atender tráfico ahora?». Si mezclas ambos y haces que el liveness dependa del broker, un reinicio de RabbitMQ reinicia en cascada todos los contenedores: el broker tarda en volver, los procesos entran en <code>CrashLoopBackOff</code> y el sistema tarda más en recuperarse de lo necesario.</p>
+        <table>
+          <thead><tr><th>Comprobación</th><th>Endpoint</th><th>Si falla</th></tr></thead>
+          <tbody>
+            <tr><td>Proceso HTTP responde</td><td><code>GET /health/live</code></td><td>Reiniciar el contenedor (liveness).</td></tr>
+            <tr><td>Canal AMQP y topología listos</td><td><code>GET /health/ready</code></td><td>Sacar la instancia del balanceador (readiness), sin reiniciar.</td></tr>
+            <tr><td>Consumidor activo</td><td><code>GET /health/ready</code> del worker</td><td>Reconectar o reiniciar el worker; un worker vivo pero sin consumidor no sirve.</td></tr>
+            <tr><td>Broker responde</td><td><code>rabbitmq-diagnostics -q ping</code></td><td>Alerta; no reinicies la API por ello.</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-javascript">// src/health.js — el readiness no lanza; informa
+export function readiness({ channel, consumerTag }) {
+  const broker = Boolean(channel &amp;&amp; channel.connection);
+  const consuming = Boolean(consumerTag);
+  return {
+    ok: broker &amp;&amp; consuming,
+    checks: { broker, consuming },
+    at: new Date().toISOString(),
+  };
+}</code></pre>
+        <p>En la API, el readiness debe comprobar que el canal de publicación existe y que un <code>publish</code> de sondeo fue confirmado. Un canal abierto puede estar roto por dentro; la única prueba fiable es intentar una operación barata y observar el resultado.</p>
+
+        <h3>Métricas: volumen, resultado, latencia y backlog</h3>
+        <table>
+          <thead><tr><th>Métrica</th><th>Tipo</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>jobs_submitted_total</code></td><td>Counter</td><td>Volumen de entrada; detecta picos y caídas.</td></tr>
+            <tr><td><code>jobs_completed_total{outcome}</code></td><td>Counter</td><td>Proporción de éxito, reintento y fallo.</td></tr>
+            <tr><td><code>job_duration_seconds</code></td><td>Histogram</td><td>Latencia p50/p95/p99 frente al SLA.</td></tr>
+            <tr><td><code>queue_depth{queue}</code></td><td>Gauge</td><td>Backlog actual; la señal más directa de que algo se atasca.</td></tr>
+          </tbody>
+        </table>
+        <p>El broker ya expone sus propias métricas con el plugin <code>rabbitmq_prometheus</code> en el puerto <code>15692</code>: profundidad, consumidores, mensajes sin confirmar, redeliveries y alarmas. No dupliques esas cifras en la aplicación; combínalas. La aplicación aporta el contexto de negocio (tipo de job, intento, resultado) que el broker no conoce.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">No pongas <code>jobId</code> como etiqueta</p>
+          <p>Cada valor distinto de una etiqueta crea una serie temporal. Un <code>jobId</code> por job genera millones de series y tumba Prometheus. Las etiquetas deben ser de cardinalidad baja: <code>type</code>, <code>outcome</code>, <code>queue</code>. El <code>jobId</code> va en los logs y en las trazas, no en las métricas.</p>
+        </div>
+        <pre><code class="language-text">jobs_completed_total{outcome="succeeded"} 1840
+jobs_completed_total{outcome="failed"} 12
+jobs_completed_total{outcome="retried"} 73
+job_duration_seconds_bucket{le="0.5"} 1200
+job_duration_seconds_bucket{le="2"} 1750
+job_duration_seconds_bucket{le="+Inf"} 1840</code></pre>
+
+        <h3>Logs: el hilo del <code>jobId</code></h3>
+        <p>Un log útil es estructurado, tiene un identificador de correlación y no contiene el payload. En el proyecto, cada línea del ciclo de un job comparte <code>jobId</code> y <code>traceId</code>:</p>
+        <pre><code class="language-json">{"level":"info","event":"job.received","jobId":"6f1c2a9e","type":"invoice.generate","attempt":0,"traceId":"b3f1c0d2"}
+{"level":"info","event":"job.succeeded","jobId":"6f1c2a9e","durationMs":842,"outcome":"succeeded","traceId":"b3f1c0d2"}
+{"level":"warn","event":"job.retry_scheduled","jobId":"6f1c2a9e","attempt":1,"delayMs":5000,"error":"ETIMEDOUT","traceId":"b3f1c0d2"}
+{"level":"error","event":"job.failed","jobId":"6f1c2a9e","attempt":3,"reason":"attempts_exhausted","traceId":"b3f1c0d2"}</code></pre>
+        <p>Reglas: un evento por transición importante, no uno por línea de código; el error como código corto y mensaje saneado, sin stack completo en producción; nada de cuerpos de mensajes con datos personales; <code>durationMs</code> para poder cruzar con el histograma. El <code>traceId</code> se propaga desde la cabecera HTTP y viaja en el mensaje.</p>
+
+        <h3>Docker Compose con healthchecks</h3>
+        <p>El arranque ordenado evita el error clásico: la API arranca antes que el broker, falla al conectar y el contenedor se reinicia hasta que el broker está listo. Con <code>depends_on: condition: service_healthy</code>, Compose espera a que el broker responda al ping.</p>
+        <pre><code class="language-yaml">services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    env_file: .env
+    ports:
+      - "5671:5671"
+      - "127.0.0.1:15671:15671"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # api: mismo patrón (build, command, env_file, depends_on: service_healthy)
+  worker:
+    build: .
+    command: ["node", "src/worker.js"]
+    env_file: .env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  rabbitmq-data:</code></pre>
+        <p><code>start_period</code> da margen al broker para arrancar sin contar los fallos iniciales. Sin él, los primeros pings fallidos pueden marcar el contenedor como <em>unhealthy</em> antes de que termine de iniciar. Para escalar workers: <code>docker compose up -d --scale worker=3</code>.</p>
+
+        <h3>Pruebas: unitarias para la política, integración para el contrato</h3>
+        <p>La función <code>planRetry</code> es pura: recibe intento y error, devuelve una acción. Se prueba sin broker, sin Docker y sin esperas. Es la prueba que más valor aporta por línea escrita porque cubre la lógica que decide si un job se pierde, se reintenta o se entierra.</p>
+        <table>
+          <thead><tr><th>Caso</th><th>Entrada</th><th>Esperado</th></tr></thead>
+          <tbody>
+            <tr><td>Primer fallo transitorio</td><td><code>attempt=0</code>, error normal</td><td><code>retry.5s</code>, <code>attempt=1</code></td></tr>
+            <tr><td>Intentos agotados</td><td><code>attempt=3</code>, error normal</td><td><code>dead</code>, <code>attempts_exhausted</code></td></tr>
+            <tr><td>Error permanente</td><td><code>attempt=0</code>, <code>err.permanent</code></td><td><code>dead</code>, <code>permanent</code></td></tr>
+          </tbody>
+        </table>
+        <p>La integración prueba lo que la unidad no puede: que el mensaje se publica, que la cola existe, que el <code>ack</code> lo borra y que un <code>nack</code> lo manda a la DLQ. Debe usar nombres únicos por ejecución y limpiar al terminar; si comparte nombres con el entorno de desarrollo, los tests se pisan entre sí.</p>
+        <p>Para no esperar los TTL reales, la topología de test se declara con TTL de 100–500 ms. Eso obliga a que los TTL sean configurables por entorno; es una decisión de diseño, no un truco de test.</p>
+
+        <h3>Runbook: síntomas, diagnóstico y acción</h3>
+        <table>
+          <thead><tr><th>Síntoma</th><th>Qué mirar</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>La cola de trabajo crece</td><td><code>messages</code>, <code>consumers</code>, <code>unacked</code>, CPU del worker</td><td>¿Hay consumers? Escalar workers; si hay 0, revisar crash y permisos. Si <code>unacked</code> no baja, buscar un handler colgado.</td></tr>
+            <tr><td>La DLQ crece</td><td><code>x-error</code>, tipo de job, <code>attempts</code></td><td>Clasificar: si es un bug, corregir y reprocesar filtrado; si es un proveedor, ajustar backoff.</td></tr>
+            <tr><td>El broker no responde</td><td>Alarma de memoria/disco, logs del nodo</td><td>La API devuelve 503; los workers reconectan. No borres la cola para «arreglarlo».</td></tr>
+            <tr><td>Mensajes sin confirmar altos</td><td><code>messages_unacknowledged</code>, duración del handler</td><td>Reducir prefetch, revisar timeouts del servicio externo, buscar <code>ack</code> olvidados.</td></tr>
+            <tr><td>Un job nunca termina</td><td>Estado <code>running</code>, <code>leaseUntil</code>, logs del worker</td><td>Esperar el lease y reintentar; si se repite, revisar la reclamación y el timeout.</td></tr>
+          </tbody>
+        </table>
+        <p>El runbook debe incluir comandos copiables y el criterio para escalar. «Mirar la cola» no es un paso; <code>rabbitmqctl list_queues -p taller-prod name messages consumers messages_unacknowledged</code> sí lo es, junto con el umbral que decide si se actúa.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una prueba unitaria de la política de reintentos, sin broker y sin dependencias externas:</p>
+        <pre><code class="language-javascript">// test/retry-policy.test.js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { planRetry } from '../src/retry-policy.js';
+
+test('el primer fallo transitorio reintenta a los 5 segundos', () =&gt; {
+  assert.deepEqual(planRetry(0, new Error('timeout')), {
+    action: 'retry',
+    attempt: 1,
+    routingKey: 'retry.5s',
+    delayMs: 5000,
+  });
+});
+
+test('el tercer fallo transitorio reintenta a los 10 minutos', () =&gt; {
+  assert.equal(planRetry(2, new Error('timeout')).routingKey, 'retry.10m');
+});
+
+test('los intentos agotados van a la DLQ', () =&gt; {
+  assert.deepEqual(planRetry(3, new Error('timeout')), {
+    action: 'dead',
+    reason: 'attempts_exhausted',
+  });
+});
+
+test('un error permanente no se reintenta', () =&gt; {
+  const err = Object.assign(new Error('pedido inexistente'), { permanent: true });
+  assert.deepEqual(planRetry(0, err), { action: 'dead', reason: 'permanent' });
+});</code></pre>
+        <p>Ejecuta <code>node --test</code>. La salida resume los cuatro casos y termina con código 0. Si cambias un TTL o el número de niveles, la prueba falla antes de que el cambio llegue al broker. Es la red de seguridad más barata del proyecto.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La prueba de integración usa un broker real, nombres únicos y limpieza garantizada. Se salta si no hay <code>RABBITMQ_URL</code>, para que <code>node --test</code> funcione en un portátil sin Docker.</p>
+        <pre><code class="language-javascript">// test/integration.test.js
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import amqp from 'amqplib';
+
+const URL = process.env.RABBITMQ_URL;
+
+test('publicar y consumir con ack borra el mensaje', { skip: !URL }, async (t) =&gt; {
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const queue = `test.jobs.${suffix}`;
+  const conn = await amqp.connect(URL);
+  const ch = await conn.createConfirmChannel();
+
+  t.after(async () =&gt; {
+    await ch.deleteQueue(queue).catch(() =&gt; {});
+    await ch.close();
+    await conn.close();
+  });
+
+  await ch.assertQueue(queue, { durable: false, autoDelete: true });
+  ch.sendToQueue(queue, Buffer.from('{"jobId":"j-1"}'), { persistent: true });
+  await ch.waitForConfirms();
+
+  const msg = await ch.get(queue, { noAck: false });
+  assert.ok(msg, 'el mensaje debe estar en la cola');
+  assert.equal(msg.content.toString(), '{"jobId":"j-1"}');
+  ch.ack(msg);
+
+  const after = await ch.checkQueue(queue);
+  assert.equal(after.messageCount, 0);
+});</code></pre>
+        <p>La cola es única por ejecución y <code>t.after</code> la borra aunque el test falle. Sin esa limpieza, la segunda ejecución encuentra mensajes de la primera y el fallo parece intermitente. Para probar la DLQ, declara una cola con <code>x-dead-letter-exchange</code>, haz <code>nack(requeue=false)</code> y comprueba que el mensaje aparece en la cola de muertos; para probar reintentos, usa TTL cortos configurables.</p>
+        <p>El healthcheck del compose se apoya en el comando del broker, no en un <code>curl</code> a la UI: la UI puede responder mientras AMQP no acepta conexiones. <code>rabbitmq-diagnostics -q ping</code> comprueba el nodo de verdad, y su código de salida es el que Compose entiende.</p>
+        <pre><code class="language-bash">docker compose up -d
+docker compose ps                     # rabbitmq debe estar "healthy"
+node --test                           # unitarias siempre; integración si hay URL
+RABBITMQ_URL=amqp://taller-api:...@localhost:5672/taller-prod node --test test/integration.test.js
+curl -s http://localhost:3000/health/ready | jq</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">Prueba el fallo, no solo el camino feliz</p>
+          <p>Un test que solo publica y consume no demuestra que el sistema sobreviva. Añade casos para: mensaje duplicado (mismo <code>jobId</code>), <code>nack</code> que va a la DLQ, worker que muere antes del <code>ack</code> y broker que se reinicia. Son los escenarios que rompen en producción.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Separar liveness de readiness</td><td>Reiniciar la API cuando el broker cae</td><td>Un broker caído no se arregla reiniciando a sus clientes.</td></tr>
+            <tr><td>Logs estructurados con <code>jobId</code> y <code>traceId</code></td><td>Logs sin contexto o con payload completo</td><td>Permiten reconstruir un caso sin exponer datos personales.</td></tr>
+            <tr><td>Tests con nombres únicos y limpieza</td><td>Colas compartidas entre ejecuciones</td><td>Evita fallos intermitentes y contaminación entre tests.</td></tr>
+            <tr><td>TTL configurables para pruebas rápidas</td><td>Esperar 10 minutos reales en cada test</td><td>La suite se ejecuta en segundos y se puede correr en cada commit.</td></tr>
+            <tr><td>Runbook con comandos y umbrales</td><td>«Revisar la cola» como único paso</td><td>La guardia necesita decisiones reproducibles, no intuición.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Liveness que depende del broker</h3>
+        <span class="code-label code-label--wrong">Mal — reinicio en cascada cuando el broker cae</span>
+        <pre><code class="language-yaml">healthcheck:
+  test: ["CMD", "node", "src/check-broker.js"]
+  # si RabbitMQ no responde, Docker reinicia la API</code></pre>
+        <span class="code-label code-label--right">Bien — liveness local, readiness con broker</span>
+        <pre><code class="language-text">/health/live   -> 200 si el proceso responde
+/health/ready  -> 200 si hay canal y consumidor
+                 503 si el broker no está</code></pre>
+        <p>El orquestador debe reiniciar el proceso cuando está colgado, no cuando su dependencia está caída. Si reinicias la API en bucle, multiplicas las reconexiones y retrasas la recuperación.</p>
+
+        <h3>2. Tests que comparten colas</h3>
+        <span class="code-label code-label--wrong">Mal — nombre fijo y estado compartido</span>
+        <pre><code class="language-javascript">await ch.assertQueue('test.jobs', { durable: true });
+// dos ejecuciones simultáneas se roban los mensajes</code></pre>
+        <span class="code-label code-label--right">Bien — nombre único y limpieza</span>
+        <pre><code class="language-javascript">const queue = `test.jobs.${crypto.randomUUID().slice(0, 8)}`;
+t.after(() =&gt; ch.deleteQueue(queue).catch(() =&gt; {}));</code></pre>
+        <p>El test pasa en local y falla en CI porque otra ejecución dejó mensajes o borró la cola. La limpieza en <code>t.after</code> garantiza que el entorno queda como estaba aunque el test falle.</p>
+
+        <h3>3. Esperar los TTL reales en los tests</h3>
+        <span class="code-label code-label--wrong">Mal — suite de 20 minutos</span>
+        <pre><code class="language-javascript">await new Promise((r) =&gt; setTimeout(r, 600_000));   // esperar 10 min</code></pre>
+        <span class="code-label code-label--right">Bien — TTL inyectado por entorno</span>
+        <pre><code class="language-javascript">const ttl = Number(process.env.RETRY_5S_MS ?? 5000);
+await ch.assertQueue(queue, {
+  arguments: { 'x-message-ttl': ttl, 'x-dead-letter-exchange': EXCHANGE },
+});</code></pre>
+        <p>Una suite lenta deja de ejecutarse en cada commit. Si los TTL son configurables, la prueba de integración usa 100 ms y sigue verificando el mismo mecanismo.</p>
+
+        <h3>4. Logs sin <code>jobId</code> o con payload</h3>
+        <span class="code-label code-label--wrong">Mal — imposible correlacionar y con PII</span>
+        <pre><code class="language-javascript">console.log('procesando', JSON.stringify(msg.content.toString()));</code></pre>
+        <span class="code-label code-label--right">Bien — evento, identificadores y resultado</span>
+        <pre><code class="language-javascript">console.log(JSON.stringify({
+  event: 'job.received', jobId, type, attempt, traceId,
+}));</code></pre>
+        <p>El payload puede contener direcciones, importes o datos personales; además, un log gigante cuesta dinero y esconde la señal. Con <code>jobId</code> y <code>traceId</code> puedes reconstruir el caso consultando el almacén, sin volcar el mensaje.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> levantar el proyecto, comprobar salud y métricas, ejecutar las pruebas y simular una caída del broker sin perder jobs.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el stack y comprueba la salud:</strong>
+            <pre><code class="language-bash">docker compose up -d
+docker compose ps
+curl -s http://localhost:3000/health/live
+curl -s http://localhost:3000/health/ready</code></pre>
+            <p>Esperado: <code>rabbitmq</code> en <code>healthy</code>, la API en <code>200</code> y el worker con un consumidor activo. Si el readiness falla, mira el log del worker antes de reiniciar nada.</p>
+          </li>
+          <li>
+            <strong>Genera carga y observa las métricas:</strong> publica 20 jobs con <code>curl</code> en un bucle y consulta <code>/metrics</code>. <code>jobs_submitted_total</code> debe subir a 20 y <code>jobs_completed_total</code> acercarse; <code>queue_depth</code> debe volver a 0 cuando el worker termina.</li>
+          <li>
+            <strong>Ejecuta las pruebas unitarias:</strong>
+            <pre><code class="language-bash">node --test test/retry-policy.test.js</code></pre>
+            <p>Esperado: 4 tests, 0 fallos, menos de un segundo. Cambia un TTL y comprueba que la prueba falla: has verificado que la red de seguridad funciona.</p>
+          </li>
+          <li>
+            <strong>Ejecuta la integración contra el broker:</strong> exporta <code>RABBITMQ_URL</code> con el usuario de test y ejecuta <code>node --test test/integration.test.js</code>. Debe crear una cola con sufijo único, consumir y borrarla. Repite dos veces seguidas: no debe quedar estado que haga fallar la segunda.</li>
+          <li>
+            <strong>Simula la caída del broker:</strong> <code>docker compose stop rabbitmq</code>. La API debe responder <code>503</code> en <code>POST /jobs</code> y el readiness debe pasar a <code>503</code>; el liveness debe seguir en <code>200</code>. Arranca de nuevo el broker y verifica que el worker reconecta, el readiness vuelve a <code>200</code> y los jobs pendientes se procesan.</li>
+          <li>
+            <strong>Ejecuta el runbook:</strong> con un job bloqueado artificialmente, comprueba <code>messages_unacknowledged</code>, mata el worker, observa la reentrega y documenta en el runbook el umbral y el comando que usaste. El ejercicio termina cuando otra persona podría repetir esos pasos sin ti.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un healthcheck que miente es peor que no tenerlo</p>
+          <p>Si el readiness devuelve 200 porque el proceso HTTP responde, pero el consumidor está muerto, el balanceador sigue enviando tráfico a una instancia que no procesa. Comprueba la pieza que realmente importa: canal, topología y consumidor activo.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Simulacro de caos y SLO</h3>
+          <p>Diseña un simulacro que demuestre, con evidencia, que la job queue cumple su garantía: ningún job aceptado con <code>202</code> se pierde, incluso si el broker se reinicia y un worker muere a mitad de proceso.</p>
+          <p>El simulacro debe incluir: inyección de fallos (matar el broker, matar un worker, llenar la cola), un verificador que compare los jobs aceptados con los terminados o en DLQ, y un criterio de éxito medible. Define además un SLO para la latencia de los jobs y las alertas que lo protegen, explicando qué señales son síntoma y cuáles son causa.</p>
+          <p><em>Pista: un contador de jobs aceptados en la API y otro de jobs en estado terminal en el almacén no cuadran si hay jobs en vuelo; el verificador debe esperar a que la cola se vacíe o usar una ventana temporal. Y matar el broker con mensajes en memoria no demuestra nada: usa mensajes persistidos en quorum y comprueba el disco.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><strong>Liveness</strong> comprueba el proceso; <strong>readiness</strong> comprueba canal, topología y consumidor.</li>
+          <li>Logs estructurados con <code>jobId</code> y <code>traceId</code>; nunca el payload con datos personales.</li>
+          <li>Pruebas unitarias para la política, integración con nombres únicos y TTL cortos para el contrato.</li>
+          <li>Runbook con síntomas, comandos y umbrales; sin él, el sistema no está operado.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Señal</th><th>Umbral de ejemplo</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td><code>queue_depth</code> creciendo</td><td>&gt; 1000 durante 10 min</td><td>Escalar workers o investigar consumidores</td></tr>
+            <tr><td><code>messages_unacknowledged</code></td><td>&gt; prefetch × workers</td><td>Handler colgado o timeout externo</td></tr>
+            <tr><td>DLQ</td><td>&gt; 0 durante 5 min</td><td>Inspeccionar motivo y alertar</td></tr>
+            <tr><td>p95 de duración</td><td>&gt; SLO durante 15 min</td><td>Revisar proveedor y tamaño de payload</td></tr>
+            <tr><td>Readiness</td><td>503 &gt; 1 min</td><td>Revisar conexión y consumidor, no reiniciar en bucle</td></tr>
+          </tbody>
+        </table>
+        <h3>Checklist de producción</h3>
+        <table>
+          <thead><tr><th>Área</th><th>Debe estar en…</th></tr></thead>
+          <tbody>
+            <tr><td>Broker</td><td>TLS, usuarios mínimos, quorum, alarmas de memoria y disco, disco persistente.</td></tr>
+            <tr><td>Publicación</td><td>Confirm, persistente, <code>mandatory</code>, topología declarada y versionada.</td></tr>
+            <tr><td>Consumo</td><td><code>ack</code> manual, prefetch ajustado, idempotencia y lease.</td></tr>
+            <tr><td>Fallos</td><td>Reintentos con backoff y límite, DLQ durable, alerta y reproceso probado.</td></tr>
+            <tr><td>Observabilidad</td><td>Healthchecks separados, métricas, logs con <code>jobId</code>, dashboards y alertas.</td></tr>
+            <tr><td>Pruebas</td><td>Unitarias de la política, integración con broker y simulacro de caos.</td></tr>
+            <tr><td>Operación</td><td>Runbook, guardia, backups de definiciones y despliegue rodado con drenaje.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Debo usar Prometheus o la management API?</summary>
+            <div>
+              <p>Prometheus para series temporales y alertas; la management API para diagnóstico puntual y para ver el estado actual de una cola concreta. La UI es excelente para investigar y mala como fuente de alertas: no tiene retención ni consultas históricas. Expón <code>rabbitmq_prometheus</code> en la red de métricas y deja la UI para las personas.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Los tests de integración deben correr en cada commit?</summary>
+            <div>
+              <p>Sí, si el entorno de CI puede levantar un broker efímero (Docker o Testcontainers). Si no, al menos en la pipeline que despliega a staging. Una integración que solo se ejecuta a mano se rompe sin que nadie lo note. Los tests unitarios, en cambio, deben correr siempre y en segundos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo pruebo la reentrega sin matar procesos a mano?</summary>
+            <div>
+              <p>Publica un mensaje, consúmelo con <code>noAck: false</code> y cierra el canal sin hacer <code>ack</code>. El broker lo marcará como no confirmado y lo reentregará al cerrarse el canal. En un test, puedes abrir una conexión, consumir, cerrarla y abrir otra para verificar que el mensaje vuelve. Es más determinista que un <code>kill</code> y prueba el mismo mecanismo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué alertas son imprescindibles y cuáles son ruido?</summary>
+            <div>
+              <p>Imprescindibles: DLQ con mensajes, cola de trabajo creciendo por encima del umbral, cero consumidores con mensajes pendientes, alarmas de memoria/disco y readiness caído. Ruido: cada mensaje fallido individual, cada reconexión o cada pico de CPU sin relación con el backlog. Alerta sobre síntomas que requieren acción, no sobre cada evento.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

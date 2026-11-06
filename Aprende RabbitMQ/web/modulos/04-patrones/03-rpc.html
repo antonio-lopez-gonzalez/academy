@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="03-rpc">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RPC sobre mensajería — Módulo 4 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>RPC sobre mensajería</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Patrones</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El worker de facturación necesita saber cuántas unidades de un SKU quedan antes de aplicar un descuento. Inventario ya existe como servicio, pero no expone HTTP: consume órdenes de una cola. La tentación es abrir un endpoint REST solo para esa llamada, con su autenticación, su cliente y su despliegue. La alternativa es <strong>RPC sobre mensajería</strong>: enviar una petición a una cola y esperar una respuesta en otra.</p>
+        <p>El patrón usa dos propiedades AMQP que ya conoces por separado: <code>reply_to</code> (dónde responder) y <code>correlation_id</code> (a qué petición corresponde la respuesta). Con ellas, un cliente puede tener varias peticiones en vuelo sobre una sola cola de respuesta y emparejar cada respuesta con su promesa. Parece sencillo, y lo es; lo difícil es <strong>el timeout, la respuesta tardía y el error</strong>.</p>
+        <p>Esta lección insiste en una idea incómoda: RPC sobre colas no es «HTTP con otro transporte». Es un patrón con garantías distintas, latencias distintas y modos de fallo distintos. Usarlo para todo produce sistemas más lentos y más frágiles que una llamada HTTP bien hecha. Usarlo donde encaja —procesos internos sin superficie HTTP, trabajos que necesitan la cola como buffer— resuelve problemas reales.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el tutorial clásico de RabbitMQ enseña un cliente RPC de 40 líneas y omite lo que pasa cuando el servidor tarda 30 segundos, cuando la respuesta llega después del timeout o cuando hay 200 peticiones concurrentes. Aquí construimos el cliente completo: correlación, timeout, limpieza y cancelación.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>El intercambio de mensajes</h3>
+        <p>El cliente publica una petición en una cola de trabajo. El servidor la consume, calcula la respuesta y la publica en la cola indicada por <code>reply_to</code>, copiando el <code>correlation_id</code>. El cliente tiene un consumidor sobre su cola de respuesta que despacha cada mensaje a la promesa correspondiente.</p>
+        <pre><code class="language-text">CLIENTE                                       SERVIDOR RPC
+   |                                               |
+   | 1. assertQueue('', exclusive, autoDelete)      |
+   |    -&gt; "amq.gen-Xyz"  (cola de respuesta)       |
+   |                                               |
+   | 2. publish a "stock.rpc"                       |
+   |    reply_to: amq.gen-Xyz                       |
+   |    correlation_id: 7f3a-...                    |
+   |    expiration: 2000                            |
+   |                        --------------------&gt;   |
+   |                                               | 3. consume
+   |                                               | 4. consultar stock
+   |    &lt;--------------------                       |
+   | 5. respuesta en amq.gen-Xyz                    |
+   |    correlation_id: 7f3a-...                    |
+   |    body: { ok: true, stock: 42 }               |
+   |                                               |
+   | 6. resolver promesa / descartar si expiró      |</code></pre>
+        <p>El servidor no necesita saber quién preguntó: solo copia <code>reply_to</code> y <code>correlation_id</code>. Eso permite escalar servidores RPC con una sola cola y consumidores en competencia, sin sesiones ni afinidad.</p>
+
+        <h3>Las cuatro piezas que hacen que funcione</h3>
+        <table>
+          <thead><tr><th>Pieza</th><th>Quién la pone</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>reply_to</code></td><td>Cliente, en cada petición</td><td>Nombre de la cola donde el servidor debe publicar la respuesta</td></tr>
+            <tr><td><code>correlation_id</code></td><td>Cliente, único por petición</td><td>Emparejar la respuesta con la petición correcta</td></tr>
+            <tr><td>Cola de respuesta exclusiva y auto-delete</td><td>Cliente, una por conexión</td><td>Recibir respuestas sin colisiones y borrarla al desconectar</td></tr>
+            <tr><td>Timeout</td><td>Cliente</td><td>No esperar para siempre; liberar la promesa y la entrada pendiente</td></tr>
+          </tbody>
+        </table>
+        <p>La cola de respuesta se declara <strong>una vez por conexión</strong>, no una por petición. Si creas una cola por petición, el broker acumula miles de colas efímeras y el coste de declararlas domina la latencia. El <code>correlation_id</code> permite multiplexar todas las peticiones de un cliente sobre esa única cola.</p>
+
+        <h3>Timeout: el corazón del cliente</h3>
+        <p>Un RPC sin timeout es una fuga de memoria con forma de promesa. Si el servidor está caído, la respuesta nunca llega y el proceso que espera queda colgado. El cliente debe:</p>
+        <ul>
+          <li>Registrar la petición en un mapa <code>correlationId -&gt; { resolve, reject, timer }</code> <strong>antes</strong> de publicar.</li>
+          <li>Arrancar un temporizador al publicar; al vencer, borrar la entrada y rechazar con un error de timeout.</li>
+          <li>Al recibir una respuesta, buscar la entrada; si no existe, es una <strong>respuesta tardía</strong> y se descarta sin romper nada.</li>
+          <li>Limpiar el temporizador al resolver para no dejar timers vivos.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title">La petición no se puede «desenviar»</p>
+          <p>Cuando el cliente hace timeout, el mensaje ya está en la cola o en el servidor. No hay forma de retirarlo. La cancelación es <em>cooperativa</em>: el cliente deja de esperar y el servidor puede mirar una cabecera de <em>deadline</em> antes de empezar trabajo caro. Si el servidor termina y responde, la respuesta se descarta porque ya no hay promesa. Ese trabajo perdido es el coste de no haber medido la latencia.</p>
+        </div>
+
+        <h3>Respuesta única y errores</h3>
+        <p>Un RPC devuelve <strong>una</strong> respuesta por petición. Si el servidor publica dos (por un reintento o un bug), la segunda se descarta: la entrada ya no está en el mapa. Para que eso sea seguro, el servidor debe ser idempotente y publicar la respuesta una sola vez por entrega.</p>
+        <p>Los errores de negocio viajan en el cuerpo, no en el canal:</p>
+        <pre><code class="language-json">{ "ok": false, "error": { "code": "SKU_DESCONOCIDO", "message": "El SKU no existe" } }</code></pre>
+        <p>El canal AMQP solo debe fallar por errores de transporte (cola inexistente, mensaje demasiado grande, permisos). Un <code>nack</code> por «no hay stock» confunde un resultado de negocio con un fallo de infraestructura y acaba en la DLQ equivocada.</p>
+
+        <h3><code>amq.rabbitmq.reply-to</code>: el atajo de RabbitMQ</h3>
+        <p>RabbitMQ ofrece una <em>pseudo-cola</em> llamada <code>amq.rabbitmq.reply-to</code>. El cliente la consume en modo <code>noAck</code> y el broker le entrega las respuestas dirigiéndolas a su canal, sin declarar una cola real. Ahorra una declaración y una conexión de retorno.</p>
+        <pre><code class="language-javascript">await ch.consume('amq.rabbitmq.reply-to', onReply, { noAck: true });
+ch.publish('', 'stock.rpc', body, {
+  replyTo: 'amq.rabbitmq.reply-to',
+  correlationId,
+});</code></pre>
+        <p>Es una extensión de RabbitMQ, no parte de AMQP 0-9-1: si mañana cambias de broker o de librería, no está. Además, al ser <code>noAck</code>, una respuesta perdida no se reentrega (el cliente ya tiene el timeout). Para el curso usamos la cola exclusiva explícita porque enseña el mecanismo; en producción, <code>reply-to</code> es una optimización válida si aceptas la dependencia.</p>
+
+        <h3>Cuándo NO usar RPC sobre colas</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>Mejor opción</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Petición de usuario que espera en HTTP</td><td>HTTP/gRPC directo</td><td>La cola añade un salto, un timeout y un modo de fallo sin aportar nada.</td></tr>
+            <tr><td>Latencia de milisegundos y servicio disponible</td><td>HTTP/gRPC</td><td>El RPC por colas pasa por disco y por dos operaciones de broker.</td></tr>
+            <tr><td>El cliente puede estar horas sin conexión</td><td>Cola de trabajo + evento de respuesta</td><td>Una promesa no sobrevive a un reinicio; un mensaje sí.</td></tr>
+            <tr><td>Necesitas broadcast a varios respondedores</td><td>Pub/sub o <em>scatter-gather</em></td><td>RPC es 1 a 1; para 1 a N el patrón es otro.</td></tr>
+            <tr><td>El llamador es un worker sin HTTP y el servidor ya consume colas</td><td>RPC sobre colas</td><td>Reutilizas la infraestructura y el enrutamiento existentes.</td></tr>
+            <tr><td>Quieres absorber picos y reintentar la petición</td><td>Cola de trabajo asíncrona</td><td>Si puedes responder «luego», no bloquees una conexión esperando.</td></tr>
+          </tbody>
+        </table>
+        <p>La pregunta decisiva no es «¿puedo?», sino «¿el llamador puede seguir sin la respuesta?». Si la respuesta es sí, no necesitas RPC: necesitas un evento o una tarea. Si es no, pregúntate si HTTP no es simplemente mejor.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un servidor que responde con el stock de un SKU y un cliente que pregunta una vez. <strong>Garantía:</strong> la petición es at-least-once si el servidor confirma tras calcular; la respuesta es at-most-once (si se pierde, el cliente hace timeout).</p>
+        <p><strong>Servidor</strong> (<code>servidor.mjs</code>):</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+await ch.assertQueue('stock.rpc', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+await ch.prefetch(4);
+
+await ch.consume('stock.rpc', async (msg) =&gt; {
+  if (!msg) return;
+  const { sku } = JSON.parse(msg.content.toString());
+  const stock = await inventario.consultar(sku);   // lectura idempotente
+  ch.sendToQueue(
+    msg.properties.replyTo,
+    Buffer.from(JSON.stringify({ ok: true, stock })),
+    {
+      correlationId: msg.properties.correlationId,
+      contentType: 'application/json',
+    },
+  );
+  ch.ack(msg);
+}, { noAck: false });</code></pre>
+        <p><strong>Cliente</strong> (<code>cliente.mjs</code>):</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+import { randomUUID } from 'node:crypto';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createChannel();
+
+const { queue } = await ch.assertQueue('', { exclusive: true, autoDelete: true });
+const pendientes = new Map();
+
+await ch.consume(queue, (msg) =&gt; {
+  if (!msg) return;
+  const entrada = pendientes.get(msg.properties.correlationId);
+  if (!entrada) return;                    // respuesta tardía: se descarta
+  clearTimeout(entrada.timer);
+  pendientes.delete(msg.properties.correlationId);
+  entrada.resolve(JSON.parse(msg.content.toString()));
+}, { noAck: true });
+
+function preguntar(sku, timeoutMs = 2000) {
+  const correlationId = randomUUID();
+  const respuesta = new Promise((resolve, reject) =&gt; {
+    const timer = setTimeout(() =&gt; {
+      pendientes.delete(correlationId);
+      reject(new Error('timeout de stock.rpc'));
+    }, timeoutMs);
+    pendientes.set(correlationId, { resolve, reject, timer });
+  });
+
+  ch.sendToQueue('stock.rpc', Buffer.from(JSON.stringify({ sku })), {
+    replyTo: queue,
+    correlationId,
+    expiration: String(timeoutMs),        // el broker la descarta si caduca
+    contentType: 'application/json',
+  });
+  return respuesta;
+}
+
+console.log(await preguntar('SKU-42'));</code></pre>
+        <p>Salida: <code>{ ok: true, stock: 42 }</code>. Detalles que importan: la cola de respuesta se declara antes de publicar; el consumidor se registra antes de la primera petición; el temporizador se cancela al resolver; y una respuesta con <code>correlationId</code> desconocido se ignora en silencio. Si mueves el <code>clearTimeout</code> fuera del consumidor, el proceso no termina nunca.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El worker de facturación pregunta el stock antes de aplicar un descuento por volumen. Si inventario tarda más de 2 segundos, la factura no se bloquea: se aplica la tarifa base y se marca la factura para revisión. El RPC es un <strong>enriquecimiento opcional</strong>, no una dependencia dura.</p>
+        <pre><code class="language-javascript">async function stockParaFactura(sku) {
+  try {
+    const r = await preguntar(sku, 2000);
+    if (!r.ok) throw new Error(`${r.error.code}: ${r.error.message}`);
+    return r.stock;
+  } catch (err) {
+    logger.warn('stock no disponible; sigo con tarifa base', { sku, err: err.message });
+    return null;                            // degradación explícita
+  }
+}</code></pre>
+        <p>El servidor RPC comprueba una cabecera de <em>deadline</em> antes de empezar trabajo caro, para no gastar CPU en una respuesta que el cliente ya no espera:</p>
+        <pre><code class="language-javascript">const deadline = Number(msg.properties.headers?.['x-deadline'] ?? 0);
+if (deadline &amp;&amp; Date.now() &gt; deadline) {
+  logger.info('petición caducada, se descarta', { sku });
+  ch.ack(msg);                              // no es un fallo: ya no interesa
+  return;
+}</code></pre>
+        <p>Y devuelve errores de negocio con un código estable, para que el cliente decida sin parsear mensajes:</p>
+        <pre><code class="language-javascript">try {
+  const stock = await inventario.consultar(sku);
+  responder(msg, { ok: true, stock });
+} catch (err) {
+  if (err instanceof SkuDesconocido) {
+    responder(msg, { ok: false, error: { code: 'SKU_DESCONOCIDO', message: err.message } });
+  } else {
+    ch.nack(msg, false, true);              // fallo transitorio: reintentar
+    return;
+  }
+}
+ch.ack(msg);
+
+function responder(msg, payload) {
+  ch.sendToQueue(msg.properties.replyTo, Buffer.from(JSON.stringify(payload)), {
+    correlationId: msg.properties.correlationId,
+    contentType: 'application/json',
+  });
+}</code></pre>
+        <p>El cliente registra cada timeout y cada respuesta tardía como métrica. Un <code>p99</code> de RPC que roza el timeout no se arregla subiendo el timeout: se arregla midiendo por qué el servidor tarda. Y si el servidor se satura, la cola de peticiones crece: es la señal de que el patrón está absorbiendo un pico, no de que haya que añadir más promesas.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Cuidado con el <code>expiration</code> en la petición</p>
+          <p><code>expiration</code> hace que el broker descarte la petición si nadie la consume a tiempo. Es útil para no procesar trabajo obsoleto, pero un valor igual al timeout del cliente puede descartar peticiones que iban a responderse justo a tiempo. Deja un margen (timeout del cliente 2500 ms, <code>expiration</code> 5000 ms) o no lo uses y confía en la comprobación de deadline del servidor.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una cola de respuesta exclusiva por conexión</td> <td>Una cola por petición o un nombre fijo compartido</td> <td>La primera acumula colas; la segunda hace que varios clientes compitan por respuestas ajenas.</td></tr>
+            <tr><td><code>correlation_id</code> único con <code>randomUUID()</code></td> <td>Reutilizar un contador o el <code>messageId</code> del broker</td> <td>Es la clave del mapa de promesas; dos peticiones con el mismo id se pisan.</td></tr>
+            <tr><td>Timeout explícito y limpieza del timer</td> <td>Esperar indefinidamente</td> <td>Una promesa sin timeout es una fuga de memoria y un hilo de event loop ocupado.</td></tr>
+            <tr><td>Descartar respuestas sin entrada pendiente</td> <td>Lanzar una excepción al recibir una respuesta tardía</td> <td>La respuesta tardía es normal; el cliente ya decidió seguir sin ella.</td></tr>
+            <tr><td>Errores de negocio en el cuerpo</td> <td><code>nack</code> o cerrar el canal por «sin stock»</td> <td>Un resultado esperado no es un fallo de infraestructura.</td></tr>
+            <tr><td>Servidores RPC idempotentes</td> <td>Confiar en que la petición llega una sola vez</td> <td>El broker puede reentregar si el servidor muere antes del <code>ack</code>.</td></tr>
+            <tr><td>Medir latencia, timeouts y cola de peticiones</td> <td>Subir el timeout para «arreglar» los fallos</td> <td>El timeout alto solo tapa la causa y multiplica el trabajo desperdiciado.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Cola de respuesta compartida con nombre fijo</h3>
+        <span class="code-label code-label--wrong">Mal — todos los clientes escuchan la misma cola</span>
+        <pre><code class="language-javascript">await ch.assertQueue('respuestas.rpc', { durable: true });
+await ch.consume('respuestas.rpc', onReply);</code></pre>
+        <span class="code-label code-label--right">Bien — cola exclusiva por conexión</span>
+        <pre><code class="language-javascript">const { queue } = await ch.assertQueue('', { exclusive: true, autoDelete: true });
+await ch.consume(queue, onReply, { noAck: true });</code></pre>
+        <p>Con una cola compartida, las respuestas se reparten entre clientes y cada uno recibe respuestas de peticiones ajenas. El <code>correlationId</code> no salva el diseño: el mensaje ya se consumió y el cliente legítimo nunca lo verá.</p>
+
+        <h3>2. Ignorar el <code>correlationId</code> al responder</h3>
+        <span class="code-label code-label--wrong">Mal — responder sin correlación</span>
+        <pre><code class="language-javascript">ch.sendToQueue(msg.properties.replyTo, Buffer.from(JSON.stringify(res)));</code></pre>
+        <span class="code-label code-label--right">Bien — copiar el identificador</span>
+        <pre><code class="language-javascript">ch.sendToQueue(msg.properties.replyTo, body, {
+  correlationId: msg.properties.correlationId,
+});</code></pre>
+        <p>Sin correlación, el cliente no puede saber a qué petición pertenece la respuesta. Con dos peticiones en vuelo, resolvería la promesa equivocada. El servidor debe tratar <code>replyTo</code> y <code>correlationId</code> como un contrato, no como un detalle opcional.</p>
+
+        <h3>3. RPC sin timeout</h3>
+        <span class="code-label code-label--wrong">Mal — esperar para siempre</span>
+        <pre><code class="language-javascript">const res = await new Promise((resolve) =&gt; {
+  pendientes.set(id, { resolve });
+  ch.sendToQueue('stock.rpc', body, { replyTo: queue, correlationId: id });
+});</code></pre>
+        <span class="code-label code-label--right">Bien — timeout, rechazo y limpieza</span>
+        <pre><code class="language-javascript">const timer = setTimeout(() =&gt; {
+  pendientes.delete(id);
+  reject(new Error('timeout'));
+}, 2000);
+pendientes.set(id, { resolve, timer });</code></pre>
+        <p>Si el servidor está caído, la promesa nunca se resuelve, la entrada del mapa queda para siempre y el proceso acumula trabajo muerto. El timeout no es una pesimización: es parte del contrato.</p>
+
+        <h3>4. Usar RPC para todo</h3>
+        <span class="code-label code-label--wrong">Mal — consultar el catálogo desde el frontend por colas</span>
+        <pre><code class="language-text">navegador -&gt; API -&gt; cola -&gt; servicio -&gt; cola de respuesta -&gt; API -&gt; navegador
+
+Dos saltos de broker, dos timeouts y una conexión AMQP por usuario.</code></pre>
+        <span class="code-label code-label--right">Bien — HTTP para lo síncrono, colas para el trabajo</span>
+        <pre><code class="language-text">navegador -&gt; API -&gt; servicio (HTTP/gRPC)          consulta interactiva
+API -&gt; cola de trabajos -&gt; worker                 factura, email, PDF</code></pre>
+        <p>RPC sobre colas brilla entre procesos internos que ya usan el broker. Para una petición de usuario con latencia ajustada, HTTP o gRPC es más simple, más rápido y más fácil de observar. Elegir colas «porque ya tenemos RabbitMQ» es acoplar la arquitectura a una herramienta.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> ver la correlación, el timeout, la respuesta tardía y la cola efímera desaparecer al cerrar el cliente.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el servidor</strong> y comprueba la cola de peticiones:
+            <pre><code class="language-bash">node servidor.mjs
+docker exec rabbitmq rabbitmqctl list_queues name messages_ready consumers</code></pre>
+            <p>Salida esperada: <code>stock.rpc 0 1</code>.</p>
+          </li>
+          <li>
+            <strong>Lanza el cliente</strong> y verifica la respuesta <code>{ ok: true, stock: 42 }</code>. En otra terminal, lista las colas mientras el cliente sigue vivo:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages consumers | grep amq.gen</code></pre>
+            <p>Verás una cola <code>amq.gen-...</code> con un consumidor: es la cola de respuesta exclusiva.</p>
+          </li>
+          <li>
+            <strong>Cierra el cliente</strong> (Ctrl+C) y vuelve a listar. La cola <code>amq.gen-...</code> ya no está: <code>exclusive</code> y <code>autoDelete</code> la borraron al cerrar la conexión.</li>
+          <li>
+            <strong>Simula un servidor caído:</strong> para el servidor, arranca el cliente y mide cuánto tarda en fallar. Debe rechazar con <code>timeout de stock.rpc</code> tras ~2 s, no quedarse colgado. Comprueba que el mensaje queda en <code>stock.rpc</code> si el <code>expiration</code> aún no venció.</li>
+          <li>
+            <strong>Prueba la respuesta tardía:</strong> añade 3 s de <code>sleep</code> en el servidor y deja el timeout del cliente en 2 s. El cliente falla por timeout; cuando el servidor responde, el mensaje llega a la cola de respuesta y el cliente lo descarta sin error. Repite con dos peticiones simultáneas y comprueba que cada una recibe su stock correcto.</li>
+          <li>
+            <strong>Escala servidores:</strong> arranca dos instancias de <code>servidor.mjs</code>. Las peticiones se reparten; cada respuesta vuelve al cliente correcto porque viaja a su cola efímera. Anota qué pasaría si ambos publicaran la respuesta sin <code>correlationId</code>.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Durante el ejercicio, la cola de peticiones debe volver a <code>messages_ready = 0</code> y <code>messages_unacknowledged = 0</code> después de cada respuesta. Si <code>unacked</code> se queda alto, el servidor está olvidando el <code>ack</code> en alguna rama del <code>try/catch</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Cancelación cooperativa de verdad</h3>
+          <p>El cliente hace timeout a los 2 segundos, pero el servidor sigue calculando durante 30. Implementa una cancelación cooperativa: el cliente debe enviar una señal de cancelación y el servidor debe abandonar el trabajo si aún no ha terminado. No vale con que el servidor termine y el cliente descarte la respuesta.</p>
+          <p>Diseña el protocolo: ¿una cola de cancelación por petición, un exchange de control, una cabecera con deadline? ¿Qué pasa si la cancelación llega después de que el servidor ya publicó la respuesta? ¿Cómo evitas que un cliente malicioso cancele peticiones ajenas?</p>
+          <p><em>Pista: el servidor puede comprobar el deadline entre pasos del cálculo, igual que un <code>AbortSignal</code>. Para la autorización, piensa en incluir el <code>correlationId</code> y el identificador del cliente en la señal, y valida ambos.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>RPC sobre colas = <strong>petición a una cola + respuesta a <code>reply_to</code></strong>, correlacionada por <code>correlation_id</code>.</li>
+          <li>La cola de respuesta es <strong>exclusiva y auto-delete, una por conexión</strong>, no una por petición.</li>
+          <li>El cliente necesita <strong>timeout, mapa de pendientes y descarte de respuestas tardías</strong>; sin eso, el patrón filtra memoria.</li>
+          <li>Una sola respuesta por petición; el servidor debe ser idempotente porque la petición puede reentregarse.</li>
+          <li>Los errores de negocio viajan en el cuerpo; el <code>nack</code> se reserva para fallos transitorios.</li>
+          <li>Si el llamador puede seguir sin la respuesta, no uses RPC; si la necesita ya y hay red, probablemente HTTP sea mejor.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>msg.properties.replyTo</code></td><td>Cola donde el servidor debe publicar la respuesta</td></tr>
+            <tr><td><code>correlationId</code></td><td>Empareja respuesta y petición en el cliente</td></tr>
+            <tr><td><code>assertQueue('', { exclusive: true, autoDelete: true })</code></td><td>Crea una cola de respuesta temporal y con nombre del servidor</td></tr>
+            <tr><td><code>expiration</code></td><td>Descarta la petición en el broker si nadie la consume a tiempo</td></tr>
+            <tr><td><code>amq.rabbitmq.reply-to</code></td><td>Pseudo-cola de respuesta directa, extensión de RabbitMQ</td></tr>
+            <tr><td><code>clearTimeout(timer)</code></td><td>Evita timers vivos y mantiene limpio el mapa de pendientes</td></tr>
+            <tr><td><code>nack(msg, false, true)</code></td><td>Reintenta la petición ante un fallo transitorio del servidor</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿RPC sobre colas es un antipatrón?</summary>
+            <div>
+              <p>No por sí mismo; lo es usarlo donde no encaja. Entre procesos internos que ya hablan AMQP, con cargas variables y necesidad de desacoplar el despliegue, es razonable. Para peticiones interactivas con latencia ajustada, añade saltos y modos de fallo sin beneficio. La decisión depende del llamador, no de la moda.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no crear una cola de respuesta por petición?</summary>
+            <div>
+              <p>Porque cada <code>assertQueue</code> y cada <code>deleteQueue</code> cuesta una ida y vuelta al broker, y con miles de peticiones por minuto el broker acumula colas efímeras. Una cola por conexión con <code>correlationId</code> multiplexa todas las peticiones y es más barata y más fácil de limpiar.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el servidor responde después del timeout?</summary>
+            <div>
+              <p>La respuesta llega a la cola exclusiva del cliente, el consumidor busca el <code>correlationId</code>, no lo encuentra y la descarta. No es un error: es el comportamiento esperado. Si esto ocurre a menudo, el problema es la latencia del servidor, no el cliente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar <code>amq.rabbitmq.reply-to</code> en producción?</summary>
+            <div>
+              <p>Sí, es una extensión estable de RabbitMQ y evita declarar la cola de respuesta. A cambio, acoplas el cliente a RabbitMQ y pierdes la reentrega de la respuesta (<code>noAck</code> obligatorio). Si el cliente ya tiene timeout, la pérdida de una respuesta no cambia el resultado: se traduce en un timeout igual.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo escalo servidores RPC sin que un cliente reciba la respuesta de otro?</summary>
+            <div>
+              <p>Con una sola cola de peticiones y varios consumidores en competencia. Cada petición lleva su <code>reply_to</code> y su <code>correlation_id</code>; el servidor que la tome responde a la cola exclusiva de ese cliente. No hay estado compartido entre servidores, así que escalar es añadir procesos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

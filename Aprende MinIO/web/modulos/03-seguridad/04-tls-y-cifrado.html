@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="04-tls-y-cifrado">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TLS y cifrado — Módulo 3 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>TLS y cifrado</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Seguridad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>«Está cifrado» es una de esas frases que tranquilizan y no dicen nada. ¿Cifrado mientras viaja por la red, o mientras está escrito en el disco? ¿Contra quién? Un TLS perfecto no impide que alguien con acceso físico al servidor lea los discos; un cifrado en reposo impecable no impide que un atacante en la misma red lea una subida por HTTP. Son dos capas distintas, con amenazas distintas, y se configuran por separado.</p>
+        <p>MinIO ofrece las dos. En tránsito, TLS con certificados propios o terminado en un proxy inverso. En reposo, cifrado del lado del servidor (SSE) en dos sabores: <strong>SSE-S3</strong>, donde MinIO gestiona las claves, y <strong>SSE-KMS</strong>, donde las gestiona un KMS externo a través de <strong>KES</strong>. Elegir bien depende de si quieres protegerte de un disco robado o también de un servidor comprometido.</p>
+        <p>Esta lección monta TLS con un certificado propio, conecta el SDK verificando la CA, activa cifrado por defecto en el bucket y explica qué rotación de claves es real y qué es un deseo. También derriba dos confusiones frecuentes: erasure coding no es cifrado, y RAID no es un backup.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La pregunta correcta no es «¿cifras?»</p>
+          <p>Es «¿contra qué modelo de amenaza?». TLS protege el cable y el trayecto. SSE protege el dato almacenado. La clave gestionada por el propio servidor protege el disco extraído, pero no un servidor en ejecución comprometido. La clave en un KMS externo separa el dato de la llave. Ninguna capa sustituye a las otras.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos capas, dos amenazas</h3>
+        <table>
+          <thead><tr><th>Amenaza</th><th>TLS en tránsito</th><th>Cifrado en reposo</th></tr></thead>
+          <tbody>
+            <tr><td>Sniffing en la red local</td><td>Sí, lo impide</td><td>No aplica</td></tr>
+            <tr><td>Man in the middle</td><td>Sí, si se verifica el certificado</td><td>No aplica</td></tr>
+            <tr><td>Disco o backup robado</td><td>No</td><td>Sí, si la clave no viaja con el disco</td></tr>
+            <tr><td>Servidor en ejecución comprometido</td><td>No</td><td>Depende: SSE-KMS separa la clave, SSE-S3 no</td></tr>
+            <tr><td>Operador con acceso al host</td><td>No</td><td>Parcial: sin la clave del KMS no lee</td></tr>
+            <tr><td>Borrado accidental</td><td>No</td><td>No: para eso hay versionado y backup</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-text">NAVEGADOR / SDK                RED                     MINIO                DISCO
+     |                          |                         |                     |
+     |---- TLS (capa 4-7) ----->|------------------------>|                     |
+     |   datos cifrados en tránsito                       |                     |
+     |                          |                         |--- SSE (capa app) ->|
+     |                          |                         |   datos cifrados    |
+     |                          |                         |   en reposo         |
+
+TLS termina en MinIO (o en el proxy). SSE empieza donde termina TLS.</code></pre>
+
+        <h3>TLS en MinIO: certificados y puertos</h3>
+        <p>MinIO busca los certificados en un directorio con esta estructura:</p>
+        <pre><code class="language-text">/certs
+├── public.crt          <- certificado del dominio (o cadena)
+├── private.key         <- clave privada
+├── CAs/
+│   └── full-chain-ca.crt
+└── s3.example.net/     <- certificados adicionales por SNI
+    ├── public.crt
+    └── private.key</code></pre>
+        <p>Al arrancar con <code>--certs-dir /certs</code>, MinIO sirve HTTPS en el puerto de la API (<code>9000</code>) y en el de la consola (<code>9001</code>). No hay un puerto TLS separado: si hay certificado, el mismo puerto cambia de esquema.</p>
+        <table>
+          <thead><tr><th>Camino</th><th>Cuándo</th><th>Ventaja</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td>Certificado en MinIO</td><td>Pocos servicios, red interna</td><td>Una sola pieza, sin proxy</td><td>Renovación y reinicio por tu cuenta</td></tr>
+            <tr><td>Reverse proxy (nginx, Caddy, Traefik)</td><td>Producción con dominio y renovación automática</td><td>HSTS, rate limit, logs, certificados automáticos</td><td>Hay que preservar Host y rutas para SigV4</td></tr>
+            <tr><td>Load balancer TLS</td><td>Nube o clúster</td><td>Gestión centralizada</td><td>El tramo LB a MinIO también debe protegerse</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Un proxy que reescribe rompe la firma</p>
+          <p>SigV4 firma el host y la ruta. Si el proxy cambia <code>Host</code>, añade un prefijo a la ruta o decodifica la URL, MinIO recalcula una firma distinta y devuelve <code>SignatureDoesNotMatch</code>. Configura <code>proxy_set_header Host $host</code> y no reescribas el path.</p>
+        </div>
+
+        <h3>Verificar, no desactivar</h3>
+        <p>Con un certificado autofirmado, el cliente falla con <code>UNABLE_TO_VERIFY_LEAF_SIGNATURE</code> o <code>self-signed certificate</code>. La tentación es desactivar la verificación. Eso convierte TLS en una decoración: cualquier intermediario puede presentar su propio certificado y leer el tráfico.</p>
+        <table>
+          <thead><tr><th>Cliente</th><th>Forma correcta de confiar</th><th>Forma incorrecta</th></tr></thead>
+          <tbody>
+            <tr><td>Node.js</td><td><code>NODE_EXTRA_CA_CERTS=/ruta/public.crt</code></td><td><code>rejectUnauthorized: false</code></td></tr>
+            <tr><td><code>curl</code></td><td><code>--cacert /ruta/public.crt</code></td><td><code>--insecure</code></td></tr>
+            <tr><td><code>mc</code></td><td>CA en <code>~/.mc/certs/CAs/</code></td><td><code>--insecure</code> permanente</td></tr>
+            <tr><td>Navegador</td><td>CA instalada en el sistema</td><td>Aceptar la excepción cada vez</td></tr>
+          </tbody>
+        </table>
+        <p>En producción, usa un certificado de una CA pública o interna confiable. Para desarrollo, genera uno con <code>certgen</code> o con <code>openssl</code> incluyendo los SAN correctos (<code>localhost</code>, la IP y el nombre del servicio).</p>
+
+        <h3>Cifrado del lado del servidor</h3>
+        <table>
+          <thead><tr><th>Modo</th><th>Quién tiene la clave</th><th>Protege de</th><th>Complejidad</th></tr></thead>
+          <tbody>
+            <tr><td><strong>SSE-S3</strong></td><td>MinIO, con una clave maestra del despliegue</td><td>Disco o backup robado; lectura directa de ficheros</td><td>Baja: un comando</td></tr>
+            <tr><td><strong>SSE-KMS</strong></td><td>Un KMS externo, a través de KES</td><td>Lo anterior, y además separa la llave del servidor</td><td>Media: KES, KMS, certificados, configuración</td></tr>
+            <tr><td><strong>SSE-C</strong></td><td>El cliente, en cada petición</td><td>El servidor nunca conoce la clave en reposo</td><td>Alta: gestionar y no perder la clave</td></tr>
+          </tbody>
+        </table>
+        <p>Con SSE-S3, MinIO cifra los objetos con una clave que gestiona el propio despliegue. Es la opción razonable para la mayoría de instalaciones: activas el cifrado por defecto del bucket y te olvidas. Su límite es claro: si alguien compromete el servidor y su configuración, tiene también la clave maestra. No está pensado para resistir a un administrador malicioso con root en la máquina.</p>
+        <p>Con SSE-KMS, MinIO pide una <em>data key</em> al KMS para cada objeto y guarda esa clave envuelta junto al objeto. El KMS externo mantiene la clave maestra, aplica políticas y registra cada uso. Si te llevas el disco, sin acceso al KMS no hay descifrado. <strong>KES</strong> es el puente sin estado entre MinIO y el KMS: no almacena claves, solo las pide y las devuelve.</p>
+        <pre><code class="language-text">SSE-S3:   objeto --cifrado con--> clave del despliegue (vive con MinIO)
+
+SSE-KMS:  objeto --cifrado con--> data key
+                                     |
+                                     +-- envuelta por --> KMS (clave maestra)
+                                                          ^
+                                                          |
+                                                    KES (sin estado)</code></pre>
+
+        <h3>Activar el cifrado por defecto</h3>
+        <pre><code class="language-bash"># SSE-S3 en todo el bucket
+mc encrypt set sse-s3 local/documentos
+mc encrypt info local/documentos
+
+# SSE-KMS con una clave concreta del KMS
+mc encrypt set sse-kms documentos-key local/documentos
+
+# Volver a escritura sin cifrado por defecto
+mc encrypt clear local/documentos</code></pre>
+        <p>La configuración es <strong>por bucket</strong> y afecta a las escrituras nuevas. Los objetos ya existentes conservan el cifrado con el que se escribieron: cambiar el default no los reescribe. Si necesitas re-cifrar lo antiguo, es una migración aparte, con copia y verificación.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">El cifrado por defecto no impide subir sin cifrar</p>
+          <p>Un cliente puede enviar sus propias cabeceras de cifrado o usar SSE-C. La política del bucket define el comportamiento cuando el cliente no dice nada, no una prohibición absoluta. Si necesitas exigir cifrado, compruébalo al validar el objeto o restringe las operaciones con una política.</p>
+        </div>
+
+        <h3>Rotación de claves y recuperación</h3>
+        <ul>
+          <li><strong>SSE-S3</strong>: la clave maestra la gestiona MinIO; su rotación va ligada a la configuración del despliegue. No hay un comando de «rotar» que re-cifre todos los objetos.</li>
+          <li><strong>SSE-KMS</strong>: el KMS rota la clave maestra según su política. Los objetos antiguos siguen legibles mientras el KMS conserve las versiones de clave; re-cifrarlos es una operación de datos, no un botón.</li>
+          <li><strong>Backup de claves</strong>: sin la clave, los objetos son ruido. El backup del bucket y el backup de la clave son dos copias distintas y ambas son obligatorias.</li>
+          <li><strong>Recuperación</strong>: prueba restaurar un objeto cifrado en otro entorno. Un backup que solo se puede leer en el servidor original no es un backup completo.</li>
+        </ul>
+
+        <h3>Lo que no es cifrado</h3>
+        <table>
+          <thead><tr><th>Confusión</th><th>Realidad</th></tr></thead>
+          <tbody>
+            <tr><td>«Erasure coding cifra los datos»</td><td>No. Trocea y añade paridad para tolerar fallos; los fragmentos siguen siendo legibles sin la clave.</td></tr>
+            <tr><td>«TLS cifra los datos en el disco»</td><td>No. TLS termina en el servidor; lo que se escribe después está en claro salvo SSE o cifrado de disco.</td></tr>
+            <tr><td>«El bucket privado está cifrado»</td><td>No. Privado controla el acceso; cifrado protege el soporte físico.</td></tr>
+            <tr><td>«RAID protege los datos»</td><td>RAID protege contra fallos de disco, no contra borrados, ransomware ni robo.</td></tr>
+            <tr><td>«Con HTTPS no hace falta SSE»</td><td>Son capas distintas: una protege el tránsito, la otra el reposo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Servir MinIO con un certificado propio y conectar el SDK verificándolo.</p>
+        <pre><code class="language-bash">mkdir -p certs
+certgen -host "localhost,127.0.0.1,minio.local"
+# genera public.crt y private.key en el directorio actual
+mv public.crt private.key certs/</code></pre>
+        <pre><code class="language-yaml">services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --certs-dir /certs --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_CONFIG_ENV_FILE: /run/secrets/minio_env
+    secrets: [minio_env]
+    volumes:
+      - minio-data:/data
+      - ./certs:/certs:ro
+
+secrets:
+  minio_env:
+    file: ./secrets/minio.env
+
+volumes:
+  minio-data:</code></pre>
+        <pre><code class="language-bash">docker compose up -d
+curl --cacert certs/public.crt https://localhost:9000/minio/health/live
+# 200 OK</code></pre>
+        <pre><code class="language-javascript">// app.mjs — el cliente cambia una sola línea
+const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: true,                 // ahora sí
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+})</code></pre>
+        <pre><code class="language-bash">NODE_EXTRA_CA_CERTS=certs/public.crt node --env-file=.env app.mjs</code></pre>
+        <ul>
+          <li><code>certgen</code> crea un certificado con los nombres que le pasas en <code>-host</code>; si falta el nombre por el que conectas, la verificación falla.</li>
+          <li><code>--certs-dir</code> le dice a MinIO dónde están <code>public.crt</code> y <code>private.key</code>.</li>
+          <li><code>curl --cacert</code> confía en esa CA concreta para esa petición.</li>
+          <li><code>NODE_EXTRA_CA_CERTS</code> añade la CA al almacén de Node sin tocar el sistema.</li>
+          <li><code>useSSL: true</code> es obligatorio; el puerto no cambia, cambia el esquema.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En producción, el certificado lo renueva el proxy y MinIO escucha solo en loopback. El proxy preserva el host porque la firma lo incluye.</p>
+        <pre><code class="language-text">server {
+  listen 443 ssl;
+  server_name minio.example.com;
+  ssl_certificate     /etc/letsencrypt/live/minio.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/minio.example.com/privkey.pem;
+  add_header Strict-Transport-Security "max-age=31536000" always;
+  client_max_body_size 0;          # no cortar subidas grandes
+  location / {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_request_buffering off;   # streaming, no buffering en disco
+  }
+}</code></pre>
+        <pre><code class="language-yaml">services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    # sin ports: solo accesible desde la red interna del proxy
+    expose:
+      - "9000"
+      - "9001"</code></pre>
+        <p>Dos decisiones importantes: <code>client_max_body_size 0</code> evita que nginx corte una subida de varios GB con un 413, y <code>proxy_request_buffering off</code> hace que el cuerpo fluya a MinIO en lugar de escribirse entero en un temporal del proxy.</p>
+        <p>Después, el cifrado por defecto del bucket:</p>
+        <pre><code class="language-bash">mc alias set prod https://minio.example.com app-admin "$APP_ADMIN_SECRET"
+mc encrypt set sse-s3 prod/documentos
+mc encrypt info prod/documentos</code></pre>
+        <pre><code class="language-text">Auto encryption 'sse-s3' is enabled for bucket 'documentos'</code></pre>
+        <pre><code class="language-bash">mc cp informe.pdf prod/documentos/acme/2026/11/informe.pdf
+mc stat prod/documentos/acme/2026/11/informe.pdf</code></pre>
+        <pre><code class="language-text">Name      : informe.pdf
+Size      : 20 KiB
+ETag      : 9c1e0b2a4d5f60718293a4b5c6d7e8f9
+Metadata  :
+  X-Amz-Server-Side-Encryption : AES256</code></pre>
+        <p>La cabecera <code>X-Amz-Server-Side-Encryption: AES256</code> confirma que el objeto se escribió cifrado. Si el bucket usa SSE-KMS, verás el nombre de la clave y el ETag dejará de ser el MD5 del contenido, como vimos en la <a href="../02-sdk/03-errores-reintentos-y-checksums.html">lección de checksums</a>.</p>
+        <pre><code class="language-bash"># Configuración de SSE-KMS con KES
+export MINIO_KMS_KES_ENDPOINT=https://kes.example.com:7373
+export MINIO_KMS_KES_KEY_NAME=documentos-key
+export MINIO_KMS_KES_CERT_FILE=/certs/minio.crt
+export MINIO_KMS_KES_KEY_FILE=/certs/minio.key
+mc encrypt set sse-kms documentos-key prod/documentos</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Prueba el borrado de la clave</p>
+          <p>En un entorno de laboratorio con SSE-KMS, revoca el acceso de MinIO al KMS y comprueba que un <code>getObject</code> falla. Es la única forma de verificar que el cifrado depende de verdad del KMS y no de una copia local de la clave.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>TLS en cualquier entorno que no sea local</td><td>HTTP «porque está en la red interna»</td><td>La red interna también se ve desde un contenedor comprometido o un portátil infectado.</td></tr>
+            <tr><td>Verificar la CA en el cliente</td><td><code>rejectUnauthorized: false</code> o <code>--insecure</code></td><td>Sin verificación, TLS no protege de un man in the middle.</td></tr>
+            <tr><td>Preservar <code>Host</code> y ruta en el proxy</td><td>Reescribir el path o el host</td><td>SigV4 firma ambos; cambiarlos produce 403.</td></tr>
+            <tr><td>Activar SSE por defecto en el bucket</td><td>Confiar solo en el cifrado del disco</td><td>El cifrado de disco protege el volumen, no un backup extraído ni un fichero copiado.</td></tr>
+            <tr><td>Usar SSE-KMS si la clave no debe vivir con el servidor</td><td>Creer que SSE-S3 resiste un root comprometido</td><td>SSE-S3 protege el soporte; SSE-KMS separa la llave del dato.</td></tr>
+            <tr><td>Guardar la clave y el backup por separado</td><td>Backup del bucket sin backup de la clave</td><td>Sin clave no hay restauración posible.</td></tr>
+            <tr><td>Probar la restauración cifrada</td><td>Asumir que el backup se podrá leer</td><td>Un backup no probado es una hipótesis, no una copia.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Desactivar la verificación del certificado</h3>
+        <span class="code-label code-label--wrong">Mal — TLS sin verificación es teatro</span>
+        <pre><code class="language-javascript">const client = new Minio.Client({
+  endPoint: 'minio.example.com',
+  useSSL: true,
+  transportAgent: new https.Agent({ rejectUnauthorized: false }), // ❌
+})</code></pre>
+        <span class="code-label code-label--right">Bien — confiar en la CA correcta</span>
+        <pre><code class="language-bash">NODE_EXTRA_CA_CERTS=/etc/ssl/certs/minio-ca.crt node app.mjs</code></pre>
+        <p>Desactivar la verificación permite que cualquier intermediario se presente como el servidor. Si el certificado es autofirmado, distribuye la CA; si es público, deja que el sistema la valide.</p>
+
+        <h3>2. Confundir TLS con cifrado en reposo</h3>
+        <span class="code-label code-label--wrong">Mal — «ya usamos HTTPS, el disco está protegido»</span>
+        <pre><code class="language-bash"># ❌ TLS activo, SSE desactivado, disco extraído -> datos legibles
+mc encrypt info local/documentos
+# Auto encryption is not enabled</code></pre>
+        <span class="code-label code-label--right">Bien — las dos capas, cada una con su propósito</span>
+        <pre><code class="language-bash">mc encrypt set sse-s3 local/documentos   # reposo
+# y TLS en el puerto 9000                 # tránsito</code></pre>
+        <p>El atacante que se lleva el disco no pasa por la red. El que escucha la red no necesita el disco. Son escenarios disjuntos y ninguno cubre al otro.</p>
+
+        <h3>3. Reescribir el host en el proxy</h3>
+        <span class="code-label code-label--wrong">Mal — la firma cubre el host original</span>
+        <pre><code class="language-text">proxy_set_header Host minio-internal:9000;  # ❌ SignatureDoesNotMatch</code></pre>
+        <span class="code-label code-label--right">Bien — preservar el host público</span>
+        <pre><code class="language-text">proxy_set_header Host $host;                # el que firmó el cliente</code></pre>
+        <p>El cliente firma <code>Host: minio.example.com</code>; si MinIO recibe otro, recalcula la firma con ese valor y no coincide. Lo mismo pasa si el proxy añade o quita un prefijo de la ruta.</p>
+
+        <h3>4. Hacer backup del bucket y no de la clave</h3>
+        <span class="code-label code-label--wrong">Mal — datos cifrados sin la llave</span>
+        <pre><code class="language-bash">mc mirror local/documentos backup/documentos
+# ❌ si el KMS se pierde, los objetos son indescifrables</code></pre>
+        <span class="code-label code-label--right">Bien — backup de datos y de claves, con restauración probada</span>
+        <pre><code class="language-text">1. Exportar/versionar la clave del KMS según su propio mecanismo
+2. Guardar el backup en otro medio y con otra credencial
+3. Restaurar en un entorno limpio y leer un objeto de prueba</code></pre>
+        <p>El cifrado convierte la clave en un dato crítico. Si la pierdes, el backup se convierte en bytes aleatorios perfectamente conservados.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> activar TLS con un certificado propio, conectar el SDK sin desactivar la verificación y comprobar el cifrado en reposo.</p>
+        <ol class="steps">
+          <li>
+            <strong>Genera el certificado con los SAN correctos:</strong>
+            <pre><code class="language-bash">mkdir -p certs
+certgen -host "localhost,127.0.0.1,minio.local"
+mv public.crt private.key certs/
+openssl x509 -in certs/public.crt -noout -text | grep -A1 'Subject Alternative Name'</code></pre>
+            <p>Deben aparecer <code>localhost</code> y <code>127.0.0.1</code>. Si falta el nombre por el que conectas, la verificación fallará.</p>
+          </li>
+          <li>
+            <strong>Arranca MinIO con <code>--certs-dir</code>:</strong> usa el compose de la sección 3 y comprueba los logs. Debe decir que escucha en HTTPS, no en HTTP.</li>
+          <li>
+            <strong>Verifica con <code>curl</code>:</strong>
+            <pre><code class="language-bash">curl -s -o /dev/null -w '%{http_code}\n' https://localhost:9000/minio/health/live
+curl --cacert certs/public.crt -s -o /dev/null -w '%{http_code}\n' https://localhost:9000/minio/health/live</code></pre>
+            <p>El primero debe fallar por certificado; el segundo debe devolver <code>200</code>. Esa diferencia es la prueba de que la verificación está activa.</p>
+          </li>
+          <li>
+            <strong>Conecta el SDK:</strong> pon <code>useSSL: true</code> y ejecuta con <code>NODE_EXTRA_CA_CERTS=certs/public.crt</code>. Si ves <code>UNABLE_TO_VERIFY_LEAF_SIGNATURE</code>, la variable no llegó al proceso o el fichero no es la CA correcta.</li>
+          <li>
+            <strong>Activa SSE-S3 y sube un objeto:</strong>
+            <pre><code class="language-bash">mkdir -p ~/.mc/certs/CAs
+cp certs/public.crt ~/.mc/certs/CAs/
+mc alias set tls https://localhost:9000 minio-root "$ROOT_PASSWORD"
+mc encrypt set sse-s3 tls/documentos
+mc cp informe.pdf tls/documentos/acme/2026/11/informe.pdf
+mc stat tls/documentos/acme/2026/11/informe.pdf</code></pre>
+            <p>Busca <code>X-Amz-Server-Side-Encryption: AES256</code>. Después ejecuta <code>mc encrypt info tls/documentos</code>.</p>
+          </li>
+          <li>
+            <strong>Comprueba el límite del default:</strong> sube un objeto antes y otro después de <code>mc encrypt clear</code>. El primero conserva su cifrado; el segundo se escribe sin cifrado por defecto. Conclusión: el cambio no reescribe el pasado.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Tu checklist debe responder tres preguntas: ¿el cliente verifica el certificado?, ¿el tránsito va por TLS?, ¿el bucket escribe cifrado por defecto? Si alguna respuesta es «no», sabes exactamente qué capa falta.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El disco robado</h3>
+          <p>Monta un entorno con SSE-KMS y KES, y demuestra con una prueba reproducible que un disco extraído del servidor no se puede leer sin acceso al KMS. Documenta el procedimiento: qué se copia, qué se intenta descifrar, qué error aparece y cómo se restaura el servicio cuando el KMS vuelve.</p>
+          <p>Después, simula la rotación de la clave maestra en el KMS y comprueba qué objetos siguen legibles, cuáles requieren una migración y qué pasa si el KMS conserva las versiones antiguas. Añade al runbook el backup y la restauración de la propia clave.</p>
+          <p><em>Pista: sin KMS, un <code>getObject</code> sobre un objeto SSE-KMS falla al pedir la data key. Para la rotación, distingue entre rotar la clave maestra y re-cifrar los objetos; no son la misma operación.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>TLS protege el tránsito; SSE protege el dato en reposo. Son capas independientes.</li>
+          <li>MinIO activa HTTPS en <code>9000</code> y <code>9001</code> cuando encuentra <code>public.crt</code> y <code>private.key</code>.</li>
+          <li>Verifica siempre el certificado: CA en el cliente, nunca <code>insecure</code> en producción.</li>
+          <li>Un proxy debe preservar <code>Host</code> y la ruta, porque SigV4 los firma.</li>
+          <li>SSE-S3 cifra con una clave del despliegue; SSE-KMS delega en un KMS externo mediante KES.</li>
+          <li>El cifrado por defecto afecta a escrituras nuevas, no re-cifra lo existente.</li>
+          <li>Sin backup de la clave no hay restauración; sin prueba de restauración no hay backup.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Dónde se configura</th><th>Qué protege</th></tr></thead>
+          <tbody>
+            <tr><td>TLS</td><td><code>--certs-dir</code> o proxy</td><td>Datos en tránsito</td></tr>
+            <tr><td>SSE-S3</td><td><code>mc encrypt set sse-s3</code></td><td>Disco y backup robados</td></tr>
+            <tr><td>SSE-KMS</td><td><code>mc encrypt set sse-kms</code> + KES</td><td>Lo anterior con la clave fuera del servidor</td></tr>
+            <tr><td>SSE-C</td><td>Cabeceras del cliente</td><td>El servidor no retiene la clave</td></tr>
+            <tr><td>Erasure coding</td><td>Configuración del servidor</td><td>Fallos de disco, no confidencialidad</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Hace falta TLS dentro de una red privada?</summary>
+            <div>
+              <p>Recomendado, sí. «Privada» no significa «de confianza»: un contenedor comprometido, un portátil infectado o un proveedor de red pueden ver el tráfico. Como mínimo, protege el tramo público y el que cruza zonas; si puedes, TLS de extremo a extremo con certificados internos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿SSE-S3 me protege si roban el servidor entero?</summary>
+            <div>
+              <p>Protege el disco o el backup extraído, pero si el atacante se lleva el servidor en marcha con su configuración, también puede tener la clave maestra. Para separar la llave del dato necesitas SSE-KMS con un KMS externo y control de acceso propio. Ninguna opción protege de un root que ya controla el proceso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿El cifrado cambia el ETag o el tamaño?</summary>
+            <div>
+              <p>Con SSE-KMS, el ETag deja de ser el MD5 del contenido, así que no lo compares con un hash local. El tamaño que ves es el del objeto lógico, no el de los fragmentos cifrados en disco. Con SSE-S3 el ETag puede seguir siendo el MD5; no bases la integridad en él, usa un checksum completo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo activar SSE-KMS sin KES?</summary>
+            <div>
+              <p>KES es el puente que MinIO usa para hablar con el KMS externo; necesitas un KMS compatible y configurar el endpoint y los certificados. Si no quieres esa complejidad, SSE-S3 cubre el caso de disco robado. Elegir SSE-KMS tiene sentido cuando la clave no puede vivir en el mismo servidor que los datos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

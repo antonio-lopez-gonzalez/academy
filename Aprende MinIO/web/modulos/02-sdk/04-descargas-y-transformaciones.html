@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="04-descargas-y-transformaciones">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Descargas y transformaciones — Módulo 2 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Descargas y transformaciones</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · SDK y aplicación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Subir es solo la mitad del problema, como vimos en <a href="../01-objetos/03-multipart-y-streaming.html">multipart y streaming</a>. Un almacén de documentos se usa para <em>leer</em>: abrir un PDF en el navegador, pedir las primeras páginas de una vista previa, mostrar una miniatura o servir un vídeo que el usuario quiere adelantar. Cada uno de esos casos tiene un patrón distinto, y el patrón ingenuo —traer el objeto entero a memoria y responder— es el que convierte un servidor sano en un montón de procesos muertos por falta de memoria.</p>
+        <p>Un objeto puede pesar 5 KB o 5 GB. El código que lo maneja no debería cambiar por ello: los streams permiten tratar ambos con el mismo consumo acotado. Pero los streams tienen reglas —hay que consumirlos, hay que cerrarlos, hay que propagar errores— y las transformaciones añaden una pregunta nueva: ¿se hacen al vuelo en cada descarga o una vez al subir?</p>
+        <p>Esta lección cubre las descargas por streaming, las peticiones por rango (la base de un visor de PDF o de vídeo), la escritura a ficheros temporales, las miniaturas con <code>sharp</code> y las cabeceras de caché que deciden si el navegador vuelve a pedir el objeto.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La memoria es el recurso escaso</p>
+          <p>La CPU se puede repartir y el disco se puede ampliar; la memoria de un proceso Node es un límite duro. Todo lo que hagas con objetos debe funcionar con un objeto de 1 GB sin reservar 1 GB de RAM. Si tu código llama a <code>readFile</code> o a <code>Buffer.concat</code>, ese límite ya está roto.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tres formas de leerlo</h3>
+        <p><code>getObject</code> pide el objeto completo; <code>getPartialObject(bucket, key, offset, length)</code> pide un rango; <code>statObject</code> hace un <code>HEAD</code> y devuelve metadatos sin descargar. Los dos primeros devuelven un <code>Readable</code>, y solo el segundo permite responder <code>206 Partial Content</code> sin traer el resto.</p>
+
+        <h3>Backpressure: el stream manda el ritmo</h3>
+        <pre><code class="language-text">MinIO  ----chunk---->  Readable  ----chunk---->  Writable (disco o socket)
+                          |                          |
+                          |  si el destino va lleno, |
+                          |  el stream pausa la      |
+                          |  lectura del origen      |
+                          +--------------------------+
+
+Sin backpressure: el origen lee a 500 MB/s y el destino escribe a 50 MB/s
+                 -> la diferencia se acumula en memoria -> OOM
+
+Con pipeline:    el destino marca el ritmo; la memoria se mantiene acotada</code></pre>
+        <p><code>pipeline</code> de <code>node:stream/promises</code> conecta los extremos, propaga el error de cualquiera de ellos y destruye los demás. Es la única forma razonable de encadenar MinIO con disco, con una respuesta HTTP o con <code>sharp</code>.</p>
+
+        <h3>Rangos: cómo se sirve un vídeo que se puede adelantar</h3>
+        <p>El navegador pide <code>Range: bytes=1048576-2097151</code> y espera un <code>206</code> con <code>Content-Range: bytes 1048576-2097151/10485760</code>. Si respondes <code>200</code> con el objeto completo, el reproductor descarga todo antes de saltar y la experiencia se rompe.</p>
+        <pre><code class="language-text">GET /video.mp4
+Range: bytes=1000-1999
+
+HTTP/1.1 206 Partial Content
+Accept-Ranges: bytes
+Content-Range: bytes 1000-1999/500000
+Content-Length: 1000
+
+[1000 bytes del objeto, desde el offset 1000]</code></pre>
+        <p>Tres detalles que se olvidan:</p>
+        <ul>
+          <li><code>Accept-Ranges: bytes</code> debe ir también en la respuesta completa, para que el cliente sepa que puede pedir rangos.</li>
+          <li>Un rango fuera del tamaño del objeto se responde <code>416</code> con <code>Content-Range: bytes */tamaño</code>.</li>
+          <li>El rango con sufijo (<code>bytes=-500</code>) significa «los últimos 500 bytes», no «desde el byte 500».</li>
+        </ul>
+
+        <h3>Ficheros temporales: el patrón que casi siempre funciona</h3>
+        <p>Cuando el consumidor necesita un fichero —<code>sharp</code>, <code>ffmpeg</code>, un antivirus— escribe el objeto en un directorio temporal y trabaja sobre él. Ventajas: el consumo de memoria no depende del tamaño, las herramientas externas funcionan igual y puedes medir el tamaño resultante con <code>stat</code> antes de subirlo.</p>
+        <pre><code class="language-text">getObject ──pipeline──> /tmp/minio-xxxx/in.bin
+                              |
+                              +── sharp / ffmpeg / antivirus
+                              |
+                        /tmp/minio-xxxx/out.jpg
+                              |
+                        stat + putObject(size conocido)
+                              |
+                        rm -rf /tmp/minio-xxxx  (finally)</code></pre>
+        <p>Un pico de descargas concurrentes puede llenar <code>/tmp</code> y tumbar el proceso: limita la concurrencia, comprueba el espacio libre y borra siempre en un <code>finally</code>.</p>
+
+        <h3>¿Transformar al vuelo o al escribir?</h3>
+        <table>
+          <thead><tr><th>Criterio</th><th>Al vuelo (on read)</th><th>Al escribir (on write)</th></tr></thead>
+          <tbody>
+            <tr><td>Coste</td><td>Se repite en cada descarga</td><td>Se paga una vez</td></tr>
+            <tr><td>Latencia</td><td>Alta la primera vez, cacheable después</td><td>Baja al leer</td></tr>
+            <tr><td>Flexibilidad</td><td>Parámetros infinitos (tamaño, formato, calidad)</td><td>Solo las variantes que generaste</td></tr>
+            <tr><td>Consistencia</td><td>Depende del original</td><td>Hay que invalidar si el original cambia</td></tr>
+            <tr><td>Uso típico</td><td>Redimensionar a un tamaño pedido por el usuario</td><td>Miniaturas fijas, PDF normalizado, antivirus</td></tr>
+          </tbody>
+        </table>
+        <p>La regla práctica: si la variante es <strong>finita y conocida</strong>, genérala al escribir y sirve el resultado como un objeto más. Si es <strong>arbitraria</strong>, genera al vuelo pero cachea por clave derivada.</p>
+
+        <h3>Content-Type y caché se deciden al escribir</h3>
+        <p>En S3, <code>Content-Type</code>, <code>Content-Disposition</code> y <code>Cache-Control</code> son metadatos del objeto. Se fijan en el <code>putObject</code> y se devuelven en cada <code>GET</code>. Cambiarlos después implica reescribir el objeto.</p>
+        <table>
+          <thead><tr><th>Clave</th><th>Cabecera recomendada</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td><code>acme/2026/11/&lt;uuid&gt;.pdf</code></td><td><code>private, max-age=60</code></td><td>Contenido privado; se sirve por la API, no por CDN</td></tr>
+            <tr><td><code>thumbs/&lt;uuid&gt;.jpg</code></td><td><code>public, max-age=31536000, immutable</code></td><td>La clave cambia cuando cambia el contenido</td></tr>
+            <tr><td><code>exports/informe-2026-11.pdf</code></td><td><code>private, max-age=300</code></td><td>Clave mutable: no se puede cachear para siempre</td></tr>
+          </tbody>
+        </table>
+        <p><code>immutable</code> solo es honesto si la clave nunca reutiliza contenido distinto. Si sobrescribes la misma clave, el navegador puede servir la versión vieja durante un año y ni siquiera preguntar.</p>
+
+        <h3>Cuándo delegar a un worker</h3>
+        <p>El proceso web debe responder rápido: si la transformación tarda o consume CPU que necesitan otras peticiones, publica <code>{ bucket, key, versionId }</code> en una cola y responde <code>202</code>. El worker descarga, transforma y sube el derivado con una clave idempotente, timeout y reintento acotado.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Descargar a disco sin cargar el objeto en memoria, y leer solo los primeros bytes.</p>
+        <pre><code class="language-javascript">// descargar.mjs
+import * as Minio from 'minio'
+import { pipeline } from 'node:stream/promises'
+import { createWriteStream } from 'node:fs'
+
+const client = new Minio.Client({ /* configuración de la lección 1 */ })
+const bucket = 'documentos'
+const key = 'acme/2026/11/informe.pdf'
+const stat = await client.statObject(bucket, key)
+const stream = await client.getObject(bucket, key)
+await pipeline(stream, createWriteStream('./informe.pdf'))
+console.log(`${stat.size} bytes, etag ${stat.etag}`)</code></pre>
+        <p>Para comprobar el tipo real, pide los primeros bytes con <code>getPartialObject(bucket, key, 0, 5)</code> y compara con <code>%PDF-</code>; el tamaño del rango es cinco, no el del objeto.</p>
+        <pre><code class="language-text">20480 bytes, etag 9c1e0b2a4d5f60718293a4b5c6d7e8f9
+%PDF-</code></pre>
+        <ul>
+          <li><code>statObject</code> primero: sabes el tamaño antes de abrir el stream y puedes rechazar objetos absurdos.</li>
+          <li><code>pipeline</code> cierra el stream de MinIO y el fichero aunque falle cualquiera de los dos.</li>
+          <li><code>getPartialObject</code> con <code>length = 5</code> pide un rango, no el objeto completo.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El endpoint de descarga del almacén responde con rangos, valida la caché del navegador y nunca bufferiza el documento.</p>
+        <pre><code class="language-javascript">// src/download.mjs
+import express from 'express'
+import * as Minio from 'minio'
+import { pipeline } from 'node:stream/promises'
+
+const BUCKET = 'documentos'
+const client = new Minio.Client({ /* configuración */ })
+const app = express()
+
+app.get('/api/documents/:id/content', async (req, res) =&gt; {
+  const key = await resolveKey(req.params.id) // consulta a tu base de datos
+  const stat = await client.statObject(BUCKET, key)
+  const type = stat.metaData['content-type'] ?? 'application/octet-stream'
+
+  const headers = {
+    'Content-Type': type,
+    'ETag': stat.etag,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=60',
+  }
+
+  const inm = req.headers['if-none-match']?.replaceAll('"', '')
+  if (inm === stat.etag) return res.status(304).end()
+  const range = req.headers.range
+  if (!range) {
+    res.writeHead(200, { ...headers, 'Content-Length': stat.size })
+    return sendObject(key, res)
+  }
+
+  const [, rawStart, rawEnd] = /^bytes=(\d*)-(\d*)$/.exec(range) ?? []
+  if (rawStart === undefined) return sendRangeError(res, stat.size)
+
+  let start = rawStart === '' ? Math.max(0, stat.size - Number(rawEnd)) : Number(rawStart)
+  let end = rawEnd === '' ? stat.size - 1 : Math.min(Number(rawEnd), stat.size - 1)
+  if (!Number.isFinite(start) || start &gt; end || start &gt;= stat.size) {
+    return sendRangeError(res, stat.size)
+  }
+
+  res.writeHead(206, {
+    ...headers,
+    'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+    'Content-Length': end - start + 1,
+  })
+  return sendObject(key, res, start, end - start + 1)
+})
+
+async function sendObject(key, res, offset, length) {
+  try {
+    const stream = offset === undefined
+      ? await client.getObject(BUCKET, key)
+      : await client.getPartialObject(BUCKET, key, offset, length)
+    await pipeline(stream, res)
+  } catch (err) {
+    if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') return // el cliente cortó
+    throw err
+  }
+}
+
+function sendRangeError(res, size) {
+  res.writeHead(416, { 'Content-Range': `bytes */${size}` })
+  res.end()
+}</code></pre>
+        <p>El orden importa: comprobar <code>If-None-Match</code> antes de abrir el stream evita trabajo y ancho de banda. El <code>304</code> no lleva cuerpo, pero sí debe llevar el <code>ETag</code> para que el cliente lo siga usando.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">El <code>Content-Length</code> de un rango no es el tamaño del objeto</p>
+          <p>Es <code>end - start + 1</code>. Si envías el tamaño completo con un cuerpo parcial, el cliente espera bytes que no llegan y la descarga se queda colgada hasta el timeout.</p>
+        </div>
+
+        <h3>Miniaturas con <code>sharp</code>, sin sorpresas de memoria</h3>
+        <p><code>sharp</code> usa <em>libvips</em>, que trabaja por franjas y no necesita cargar el bitmap completo. Aun así, el patrón más seguro es descargar a un temporal, transformar a otro fichero y subir con el tamaño ya conocido.</p>
+        <pre><code class="language-javascript">// src/thumbs.mjs
+import sharp from 'sharp'
+import { createReadStream, createWriteStream, statSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { pipeline } from 'node:stream/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+export async function makeThumbnail(client, key) {
+  const dir = await mkdtemp(join(tmpdir(), 'minio-thumb-'))
+  const input = join(dir, 'input')
+  const output = join(dir, 'output.jpg')
+  try {
+    const source = await client.statObject('documentos', key)
+    const stream = await client.getObject('documentos', key)
+    await pipeline(stream, createWriteStream(input))
+
+    await sharp(input)
+      .rotate()                                  // respeta la orientación EXIF
+      .resize({ width: 480, withoutEnlargement: true })
+      .jpeg({ quality: 82, mozjpeg: true })
+      .toFile(output)
+
+    const size = statSync(output).size
+    const thumbKey = `thumbs/${source.etag}-${key.split('/').pop()}.jpg`
+    await client.putObject(
+      'documentos', thumbKey, createReadStream(output), size,
+      {
+        'Content-Type': 'image/jpeg',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'X-Amz-Meta-Source-Key': key,
+        'X-Amz-Meta-Source-Etag': source.etag,
+      },
+    )
+    return { thumbKey, size }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}</code></pre>
+        <p>La clave de la miniatura incluye el ETag del original. Si el documento cambia, cambia la clave, y no hay que invalidar ninguna caché: la URL anterior simplemente deja de generarse. Ese es el mismo principio de <em>content-addressed</em> que usan los CDN.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar <code>pipeline</code> para conectar MinIO con disco o HTTP</td><td>Escuchar <code>data</code> y escribir a mano</td><td>El pipeline gestiona backpressure, errores y cierre de ambos extremos.</td></tr>
+            <tr><td>Servir rangos con <code>206</code> y <code>Content-Range</code></td><td>Responder <code>200</code> a un <code>Range</code></td><td>Sin rangos no hay búsqueda en vídeo ni reanudación de descargas.</td></tr>
+            <tr><td>Escribir a un temporal y borrarlo en <code>finally</code></td><td>Dejar ficheros en <code>/tmp</code> «por si acaso»</td><td>Los temporales huérfanos llenan el disco y tumban el proceso.</td></tr>
+            <tr><td>Cachear derivados con clave que incluye el ETag</td><td>Reutilizar la misma clave para contenido distinto</td><td>Permite <code>immutable</code> sin mentir y evita invalidaciones manuales.</td></tr>
+            <tr><td>Fijar <code>Content-Type</code> y <code>Cache-Control</code> al subir</td><td>Confiar en la detección del navegador</td><td>Una respuesta con tipo incorrecto se descarga en vez de mostrarse.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Cargar el objeto entero para responderlo</h3>
+        <span class="code-label code-label--wrong">Mal — el tamaño del objeto entra en RAM</span>
+        <pre><code class="language-javascript">const stream = await client.getObject(bucket, key)
+const chunks = []
+for await (const chunk of stream) chunks.push(chunk)
+res.send(Buffer.concat(chunks)) // ❌ 2 GB de RAM para un vídeo de 2 GB</code></pre>
+        <span class="code-label code-label--right">Bien — del objeto a la respuesta, sin buffer intermedio</span>
+        <pre><code class="language-javascript">res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': stat.size })
+await pipeline(await client.getObject(bucket, key), res)</code></pre>
+        <p>El buffer intermedio no aporta nada si no vas a modificar el contenido. Si necesitas transformar, encadena un <code>Transform</code> en el pipeline.</p>
+
+        <h3>2. Ignorar la cabecera <code>Range</code></h3>
+        <span class="code-label code-label--wrong">Mal — siempre 200 con el objeto completo</span>
+        <pre><code class="language-javascript">app.get('/video', async (req, res) =&gt; {
+  await pipeline(await client.getObject(bucket, key), res)
+}) // ❌ el reproductor no puede adelantar</code></pre>
+        <span class="code-label code-label--right">Bien — 206 con el tramo pedido</span>
+        <pre><code class="language-javascript">res.writeHead(206, {
+  'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+  'Content-Length': end - start + 1,
+  'Accept-Ranges': 'bytes',
+})
+await pipeline(await client.getPartialObject(bucket, key, start, end - start + 1), res)</code></pre>
+        <p>El reproductor del navegador pide rangos desde el primer segundo. Si respondes con todo el archivo, la reproducción funciona pero el salto de minutaje descarga de nuevo desde cero.</p>
+
+        <h3>3. Cachear para siempre una clave mutable</h3>
+        <span class="code-label code-label--wrong">Mal — mismo nombre, contenido nuevo</span>
+        <pre><code class="language-javascript">await client.putObject(bucket, 'avatars/ana.jpg', body, size, {
+  'Cache-Control': 'public, max-age=31536000, immutable', // ❌
+})</code></pre>
+        <span class="code-label code-label--right">Bien — clave nueva por versión</span>
+        <pre><code class="language-javascript">const key = `avatars/ana-${sha256.slice(0, 12)}.jpg`
+// nueva subida -> nueva clave -> caché inmutable honesta</code></pre>
+        <p>Con <code>immutable</code>, el navegador no revalida durante un año. Si cambias el contenido bajo la misma URL, el usuario verá la foto antigua y no hay forma remota de arreglarlo salvo cambiar la URL.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> descargar con streaming, servir rangos correctamente y generar una miniatura idempotente.</p>
+        <ol class="steps">
+          <li>
+            <strong>Genera una imagen de prueba y súbela:</strong>
+            <pre><code class="language-bash">npm install sharp@^0.35.5
+node -e "require('sharp')({ create: { width: 2000, height: 1500, channels: 3, background: '#C72C48' } }).jpeg().toFile('foto.jpg')"
+mc cp foto.jpg local/documentos/acme/2026/11/foto.jpg</code></pre>
+            <p>Salida esperada: <code>foto.jpg: 42.1 KiB</code> aproximadamente.</p>
+          </li>
+          <li>
+            <strong>Descarga con <code>pipeline</code> y compara el hash:</strong>
+            <pre><code class="language-bash">node --env-file=.env descargar.mjs
+sha256sum foto.jpg
+node -e "console.log(require('crypto').createHash('sha256').update(require('fs').readFileSync('informe.pdf')).digest('hex'))"</code></pre>
+            <p>Los dos hashes deben coincidir. Si no, el stream se cerró antes de tiempo.</p>
+          </li>
+          <li>
+            <strong>Pide un rango y comprueba el tamaño:</strong>
+            <pre><code class="language-javascript">const s = await client.getPartialObject('documentos', key, 0, 1024)
+let n = 0
+for await (const chunk of s) n += chunk.length
+console.log(n) // 1024</code></pre>
+          </li>
+          <li>
+            <strong>Levanta el endpoint de la sección 4 y pide rangos con <code>curl</code>:</strong>
+            <pre><code class="language-bash">curl -i -H 'Range: bytes=0-1023' http://localhost:3000/api/documents/abc/content</code></pre>
+            <pre><code class="language-text">HTTP/1.1 206 Partial Content
+Accept-Ranges: bytes
+Content-Range: bytes 0-1023/42123
+Content-Length: 1024</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba el 304:</strong> copia el <code>ETag</code> de la respuesta anterior y repite con <code>-H 'If-None-Match: "..."'</code>. Debe devolver <code>304 Not Modified</code> sin cuerpo. Prueba también <code>bytes=999999-</code> y espera <code>416</code>.</li>
+          <li>
+            <strong>Genera la miniatura dos veces:</strong> ejecuta <code>makeThumbnail</code> con la misma clave. La segunda ejecución debe reutilizar la misma clave de destino y no crear objetos nuevos. Comprueba con <code>mc ls local/documentos/thumbs/</code> y <code>mc stat</code> que el <code>Cache-Control</code> es el esperado.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Haz una descarga de un objeto de 100 MB mientras observas la memoria del proceso con <code>docker stats</code> o el monitor del sistema. Debe mantenerse plana. Si sube en escalera, hay un buffer escondido en algún punto del pipeline.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Variantes bajo demanda con caché</h3>
+          <p>Implementa un endpoint <code>/api/documents/:id/thumb?w=240</code> que genere la miniatura al vuelo la primera vez, la guarde en <code>thumbs/&lt;etag&gt;/&lt;ancho&gt;.jpg</code> y la sirva desde ahí en las siguientes peticiones. Debe admitir tres anchos permitidos, rechazar el resto y no regenerar si el objeto ya existe.</p>
+          <p>Cuando llegue una versión nueva del documento, las miniaturas antiguas deben dejar de servirse sin borrar nada de inmediato. Añade una métrica de <em>cache hit</em> y explica qué harías para limpiar las variantes huérfanas sin recorrer el bucket entero cada noche.</p>
+          <p><em>Pista: el ETag del original ya está en la ruta. Para la limpieza, piensa en lifecycle por prefijo y en un índice de variantes generadas, no en un listado completo.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>getObject</code> y <code>getPartialObject</code> devuelven streams; consúmelos con <code>pipeline</code> o <code>for await</code>.</li>
+          <li>Los rangos se responden con <code>206</code>, <code>Content-Range</code> y el <code>Content-Length</code> del tramo.</li>
+          <li>Un objeto que se reenvía no necesita buffer intermedio: del stream de MinIO al socket.</li>
+          <li>Los ficheros temporales acotan la memoria pero hay que borrarlos siempre y limitar la concurrencia.</li>
+          <li><code>sharp</code> transforma por franjas, pero el patrón seguro es temporal de entrada y temporal de salida.</li>
+          <li><code>Content-Type</code> y <code>Cache-Control</code> se fijan al escribir; las claves inmutables permiten caché agresiva.</li>
+          <li>Las transformaciones caras van a un worker idempotente, no al handler de la petición.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Necesidad</th><th>Método</th><th>Cabeceras clave</th></tr></thead>
+          <tbody>
+            <tr><td>Descargar un PDF</td><td><code>getObject</code></td><td><code>Content-Type</code>, <code>Content-Length</code></td></tr>
+            <tr><td>Vista previa de 1 página</td><td><code>getPartialObject</code></td><td><code>Content-Range</code></td></tr>
+            <tr><td>Reanudar una descarga</td><td><code>getPartialObject</code></td><td><code>Accept-Ranges</code>, <code>Content-Range</code></td></tr>
+            <tr><td>Evitar reenvíos</td><td><code>statObject</code></td><td><code>ETag</code>, <code>If-None-Match</code></td></tr>
+            <tr><td>Servir una miniatura</td><td><code>getObject</code> de la variante</td><td><code>Cache-Control: immutable</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo pedir varios rangos en una sola petición?</summary>
+            <div>
+              <p>S3 no soporta <code>multipart/byteranges</code>. <code>getPartialObject</code> pide un único intervalo. Si necesitas varias partes, haz varias peticiones o descarga el objeto completo; para vídeo adaptativo se usan segmentos separados, no múltiples rangos en una respuesta.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo pasar el stream de <code>getObject</code> directamente a <code>putObject</code>?</summary>
+            <div>
+              <p>Sí, si conoces el tamaño de antemano y lo pasas como argumento; si no, el SDK no puede planificar la subida. Para copias dentro del mismo servidor es más eficiente <code>copyObject</code>, que no baja los bytes al cliente. Y si el origen y el destino están en servidores distintos, un stream con tamaño conocido funciona bien.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi vídeo se ve pero no se puede adelantar?</summary>
+            <div>
+              <p>Casi siempre porque el endpoint ignora <code>Range</code> y devuelve <code>200</code> con el objeto completo. El reproductor puede reproducir desde el principio, pero al buscar reinicia la descarga. Comprueba que devuelves <code>206</code>, <code>Accept-Ranges: bytes</code> y un <code>Content-Range</code> correcto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Es seguro usar <code>sharp</code> con archivos subidos por usuarios?</summary>
+            <div>
+              <p><code>sharp</code> delega en libvips y ha tenido CVEs, como cualquier parser de formatos complejos. Mantén la dependencia actualizada, limita el tamaño y las dimensiones de entrada, ejecuta el procesado con menos privilegios y, si el riesgo es alto, en un contenedor aislado. No confíes en la extensión del fichero.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

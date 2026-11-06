@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-modo-distribuido">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Modo distribuido — Módulo 5 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Modo distribuido</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <code>docker compose up</code> del curso levanta un MinIO de un solo proceso y un solo disco. Es perfecto para aprender la API, pero es un punto único de fallo: si el contenedor muere, el bucket muere con él. Producción empieza cuando el almacenamiento sobrevive a la caída de una máquina.</p>
+        <p>El <strong>modo distribuido</strong> de MinIO reparte los datos entre varios servidores y discos. No hay un nodo coordinador ni un disco maestro: todos los nodos son iguales, hablan entre sí y participan en cada escritura. Es un sistema <em>server-side</em> de erasure coding a escala de clúster.</p>
+        <p>Aquí hay una frontera que el curso repite porque se ignora mucho: <strong>Docker Compose no está soportado para un clúster distribuido</strong>. Compose sirve para desarrollo local de un nodo. Un despliegue distribuido real se hace con el <strong>Kubernetes Operator</strong> o sobre <strong>baremetal</strong> con systemd. El motivo no es burocracia: es que un clúster necesita nombres estables, discos locales dedicados y una orquestación que no recicle contenedores con datos dentro.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Qué vas a poder decidir al terminar</p>
+          <p>Cuántos nodos y discos necesita tu carga, qué tolerancia a fallos compras con cada topología, cómo se amplía sin downtime y por qué añadir un pool no es lo mismo que ampliar un pool existente.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Pools: la unidad de crecimiento</h3>
+        <p>Un despliegue distribuido se compone de uno o más <strong>server pools</strong>. Cada pool es un grupo de nodos con sus discos, y dentro de cada pool MinIO crea uno o varios <strong>erasure sets</strong>.</p>
+        <pre><code class="language-text">MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4}"
+                          POOL 1
+        +-----------------------------------------------+
+        |  minio1   minio2   minio3   minio4           |
+        |  4 discos 4 discos 4 discos 4 discos          |
+        |                                               |
+        |  erasure set de 16 discos  →  EC:4            |
+        +-----------------------------------------------+
+  un pool puede tener más de un erasure set si supera los 16 discos</code></pre>
+        <p>Reglas que no se negocian:</p>
+        <ul>
+          <li>El tamaño de un pool se fija al crearlo. <strong>No se puede añadir un disco a un pool existente.</strong></li>
+          <li>Para crecer se añade un <strong>pool nuevo</strong>, con sus propios nodos y discos.</li>
+          <li>Los erasure sets <strong>no cruzan pools</strong>. Un objeto vive en un pool; si ese pool cae, sus objetos no se reconstruyen desde otro pool.</li>
+          <li>Un pool con más de 16 discos se divide en varios erasure sets del tamaño que MinIO calcule al inicializar.</li>
+        </ul>
+        <h3>Topología mínima con alta disponibilidad</h3>
+        <pre><code class="language-text">                        balanceador / DNS
+                     :9000 (S3)   :9001 (consola)
+                              |
+        +----------+----------+----------+----------+
+        |          |          |          |          |
+     minio1     minio2     minio3     minio4
+     d1 d2      d1 d2      d1 d2      d1 d2
+     d3 d4      d3 d4      d3 d4      d3 d4
+        |          |          |          |          |
+        +----------+----------+----------+----------+
+              16 discos, 1 erasure set, EC:4
+              tolera 4 discos = 1 nodo completo</code></pre>
+        <p>Esta es la topología de referencia del curso: <strong>4 nodos × 4 discos</strong>. Tolera la caída de un nodo entero sin perder escrituras, porque quedan 12 discos y K=12. No tolera dos nodos: quedarían 8 discos y muchos objetos perderían más de 4 shards.</p>
+        <h3>Requisitos reales de un clúster</h3>
+        <table>
+          <thead><tr><th>Requisito</th><th>Detalle</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Nodos y discos</td><td>Mínimo práctico 4 discos; recomendado 4+ nodos</td><td>El erasure set necesita al menos 4 discos para tener paridad útil.</td></tr>
+            <tr><td>Discos dedicados</td><td>Un disco por ruta, sin RAID ni LVM encima</td><td>MinIO necesita ver el fallo del disco y gestionar el healing.</td></tr>
+            <tr><td>Sistema de archivos</td><td>XFS o ext4, montado local</td><td>Rendimiento y comportamiento predecible con muchos ficheros.</td></tr>
+            <tr><td>Almacenamiento</td><td>Discos locales o volúmenes de bloque; nunca NFS/SMB</td><td>El erasure coding asume acceso directo y baja latencia.</td></tr>
+            <tr><td>Nombres</td><td>Hostnames/IP estables y resolubles</td><td>Los nodos se identifican entre sí; un nombre efímero rompe el clúster.</td></tr>
+            <tr><td>Versión</td><td>La misma versión y arquitectura en todos los nodos</td><td>Las actualizaciones son rolling; mezclar versiones no está soportado.</td></tr>
+            <tr><td>Reloj</td><td>NTP sincronizado</td><td>Firmas, expiración de presigned URLs y orden de eventos.</td></tr>
+            <tr><td>Red</td><td>1 GbE mínimo; 10 GbE recomendado</td><td>El healing y la reconstrucción mueven shards entre nodos.</td></tr>
+          </tbody>
+        </table>
+        <h3>Por qué Compose no vale para distribuido</h3>
+        <p>Compose es una herramienta de desarrollo: define contenedores en una sola máquina, con nombres y redes efímeras. Un clúster MinIO necesita exactamente lo contrario.</p>
+        <table>
+          <thead><tr><th>Lo que necesita el clúster</th><th>Lo que ofrece Compose</th></tr></thead>
+          <tbody>
+            <tr><td>Hostnames estables por nodo</td><td>Nombres de servicio que cambian al recrear el contenedor.</td></tr>
+            <tr><td>Discos locales dedicados por nodo</td><td>Volúmenes o bind mounts sobre el mismo host; un fallo de host se lleva todo.</td></tr>
+            <tr><td>Dominios de fallo independientes</td><td>Una sola máquina: no hay tolerancia real a fallos de nodo.</td></tr>
+            <tr><td>Orquestación con rolling updates</td><td>Recreación manual; sin control de quórum ni de orden.</td></tr>
+            <tr><td>Escalado y reemplazo de nodos</td><td>No hay scheduler ni reconciliación de estado.</td></tr>
+          </tbody>
+        </table>
+        <p>Puedes <em>simular</em> varios contenedores en Compose para aprender la sintaxis, pero no es un despliegue soportado ni prueba nada de alta disponibilidad: si el host cae, caen los cuatro «nodos». Para producción, Kubernetes Operator o baremetal.</p>
+        <h3>Kubernetes Operator: el camino gestionado</h3>
+        <p>El Operator declara un <strong>Tenant</strong> (un clúster MinIO) como recurso de Kubernetes. Él crea los StatefulSets, los volúmenes, los servicios y gestiona el ciclo de vida.</p>
+        <pre><code class="language-yaml">apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: minio-documentos
+  namespace: minio
+spec:
+  pools:
+    - name: pool-0
+      servers: 4
+      volumesPerServer: 4
+      size: 4Ti
+      storageClassName: local-nvme
+  mountPath: /export
+  requestAutoCert: true
+</code></pre>
+        <pre><code class="language-bash">kubectl apply -f tenant.yaml
+kubectl get tenants -n minio
+kubectl rollout status statefulset/minio-documentos-pool-0 -n minio
+</code></pre>
+        <p>La ventaja no es «Kubernetes porque sí»: el Operator aplica los cambios de forma ordenada, respeta el quórum y permite crecer añadiendo pools al <code>spec</code>. La contrapartida es que necesitas un clúster con volúmenes locales o de bloque y experiencia operando CRDs. Lo veremos en detalle en <a href="../06-integracion/02-kubernetes-operator.html">Kubernetes Operator</a>.</p>
+        <h3>Expansión: añadir un pool, no estirar el existente</h3>
+        <p>Cuando la capacidad se acerca al umbral, se añade un pool nuevo. El procedimiento conceptual:</p>
+        <ol>
+          <li>Preparar nodos y discos nuevos, con la misma versión y configuración.</li>
+          <li>Añadir el pool a <code>MINIO_VOLUMES</code> en <strong>todos</strong> los nodos, separado por un espacio.</li>
+          <li>Reiniciar de forma rolling: un nodo a la vez, esperando a que vuelva sano.</li>
+          <li>Verificar con <code>mc admin info</code> que aparecen los dos pools.</li>
+          <li>Opcional: rebalancear para mover datos antiguos al pool nuevo.</li>
+        </ol>
+        <pre><code class="language-bash"># Antes: un pool
+MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4}"
+# Después: dos pools en una sola línea (EnvironmentFile no admite continuación)
+MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4} https://minio{5...8}.example.net:9000/data/disk{1...4}"
+</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">El orden importa</p>
+          <p>Los pools deben aparecer en el mismo orden en todos los nodos. Un orden distinto hace que los nodos no se reconozcan como el mismo clúster. Y no se puede eliminar un pool del final sin decommission: quitar una línea de <code>MINIO_VOLUMES</code> no borra los datos, pero deja el clúster inconsistente.</p>
+        </div>
+        <h3>Rebalance y decommission</h3>
+        <table>
+          <thead><tr><th>Operación</th><th>Comando</th><th>Qué hace</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td>Rebalance</td><td><code>mc admin rebalance start ALIAS</code></td><td>Redistribuye objetos entre pools para equilibrar espacio.</td><td>Consume red y disco; es online pero lento.</td></tr>
+            <tr><td>Estado</td><td><code>mc admin rebalance status ALIAS</code></td><td>Progreso y velocidad.</td><td>—</td></tr>
+            <tr><td>Decommission</td><td><code>mc admin decommission start ALIAS/ POOL</code></td><td>Drena un pool y migra sus datos.</td><td>Irreversible una vez iniciado; no se puede cancelar.</td></tr>
+          </tbody>
+        </table>
+        <p>Ampliación no significa rebalanceo automático: los objetos nuevos se reparten, pero los antiguos se quedan donde estaban. Si el pool viejo está lleno y el nuevo vacío, el espacio no se equilibra solo. Planifica el rebalanceo o acepta que la distribución será desigual.</p>
+        <h3>Alta disponibilidad: qué cubre y qué no</h3>
+        <table>
+          <thead><tr><th>Fallo</th><th>Con 4 nodos × 4 discos, EC:4</th><th>Cobertura</th></tr></thead>
+          <tbody>
+            <tr><td>Un disco</td><td>Sigue todo; healing.</td><td>Sí</td></tr>
+            <tr><td>Un nodo</td><td>Sigue al límite (12 discos).</td><td>Sí, sin margen</td></tr>
+            <tr><td>Dos nodos</td><td>Pérdida parcial de objetos.</td><td>No</td></tr>
+            <tr><td>Un pool completo</td><td>Sus objetos inaccesibles.</td><td>No; requiere réplica</td></tr>
+            <tr><td>Pérdida del centro de datos</td><td>Todo el clúster.</td><td>No; requiere otro sitio</td></tr>
+          </tbody>
+        </table>
+        <p>El balanceador debe comprobar <code>/minio/health/ready</code> y repartir sin sesión pegajosa: S3 es stateless y cualquier nodo puede atender cualquier objeto. Si un nodo está caído, sacarlo del balanceador evita timeouts, pero no lo expulses del clúster: sigue siendo parte del erasure set y su healing importa.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El arranque de un clúster de cuatro nodos con cuatro discos cada uno, en baremetal con systemd. Cada nodo ejecuta exactamente el mismo comando:</p>
+        <pre><code class="language-bash">export MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4}"
+export MINIO_ROOT_USER="$MINIO_ROOT_USER"
+export MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
+minio server $MINIO_VOLUMES --console-address :9001
+</code></pre>
+        <p>Qué significa cada pieza:</p>
+        <ul>
+          <li><code>minio{1...4}.example.net</code>: notación de expansión. MinIO genera <code>minio1</code>, <code>minio2</code>, <code>minio3</code> y <code>minio4</code>.</li>
+          <li><code>/data/disk{1...4}</code>: cuatro rutas de disco por nodo. Deben ser discos físicos o volúmenes de bloque, no carpetas dentro del disco del sistema.</li>
+          <li><code>https://</code>: TLS entre nodos. En producción no se usa HTTP plano, ni siquiera en la red interna.</li>
+          <li><code>--console-address :9001</code>: la consola web; la API S3 escucha en <code>:9000</code>.</li>
+        </ul>
+        <p>En el <code>/etc/default/minio</code> de cada nodo queda lo mismo, sin <code>export</code>:</p>
+        <pre><code class="language-bash">MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4}"
+MINIO_OPTS="--console-address :9001"
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=CAMBIA-ESTO-Y-USALO-DE-UN-GESTOR-DE-SECRETOS
+</code></pre>
+        <p>Y se comprueba desde fuera:</p>
+        <pre><code class="language-bash">mc alias set cluster https://minio.example.net:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+mc admin info cluster
+</code></pre>
+        <pre><code class="language-text">●  minio.example.net:9000
+   Uptime: 12 minutes
+   Version: 2026-10-28T07:31:12Z
+   Network: 4/4 OK
+   Drives: 16/16 OK
+   Pool: 1
+Pools:
+   1st, Erasure sets: 1, Drives per erasure set: 16
+16 drives online, 0 drives offline, EC:4</code></pre>
+        <p>Si ves <code>Network: 4/4</code>, <code>Drives: 16/16</code> y un solo pool con 16 discos por set, el clúster está completo. Cualquier cifra menor indica un nodo o un disco que no se unió.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos empieza con 4 nodos × 4 discos de 4 TB (64 TB brutos, 48 TB útiles con EC:4). Al año, el uso llega al 70 % y el equipo planifica la expansión.</p>
+        <h3>Situación de partida</h3>
+        <pre><code class="language-text">Pool 1: 4 nodos × 4 discos × 4 TB = 64 TB brutos
+EC:4  →  48 TB útiles
+uso: 34 TB (70 % de 48 TB)
+proyección: +18 TB en 12 meses → no cabe</code></pre>
+        <h3>Expansión con un segundo pool</h3>
+        <pre><code class="language-text">Pool 1: minio1..4  × 4 discos × 4 TB  = 64 TB brutos
+Pool 2: minio5..8  × 4 discos × 8 TB  = 128 TB brutos
+                                       ---------------
+                                       192 TB brutos
+EC:4 en cada pool → 48 TB + 96 TB = 144 TB útiles
+  pool 2 tiene su propio erasure set de 16 discos
+  los objetos nuevos se reparten entre pools
+  los antiguos siguen en el pool 1 hasta rebalancear</code></pre>
+        <pre><code class="language-bash"># 1. Actualizar MINIO_VOLUMES en los 8 nodos (mismo orden, una sola línea)
+MINIO_VOLUMES="https://minio{1...4}.example.net:9000/data/disk{1...4} https://minio{5...8}.example.net:9000/data/disk{1...4}"
+# 2. Rolling restart: un nodo a la vez
+sudo systemctl restart minio
+# esperar a que mc admin info vuelva a mostrar el nodo sano antes del siguiente
+# 3. Verificar
+mc admin info cluster
+# 4. Opcional: equilibrar
+mc admin rebalance start cluster
+mc admin rebalance status cluster
+</code></pre>
+        <h3>Qué NO hacer al ampliar</h3>
+        <table>
+          <thead><tr><th>Error</th><th>Consecuencia</th></tr></thead>
+          <tbody>
+            <tr><td>Reiniciar los 8 nodos a la vez</td><td>Sin quórum: el clúster no arranca y las escrituras fallan en bloque.</td></tr>
+            <tr><td>Añadir un disco suelto a un pool existente</td><td>No está soportado; el pool es inmutable.</td></tr>
+            <tr><td>Usar un orden distinto de pools por nodo</td><td>Los nodos no forman el mismo clúster.</td></tr>
+            <tr><td>Montar el pool nuevo con NFS</td><td>Latencia y coherencia impredecibles; el healing se degrada.</td></tr>
+            <tr><td>Confiar en que el rebalance es automático</td><td>El pool viejo sigue lleno; el nuevo, vacío.</td></tr>
+          </tbody>
+        </table>
+        <h3>Alta disponibilidad en el día a día</h3>
+        <pre><code class="language-text">cliente → balanceador (health: /minio/health/ready)
+              |            |            |            |
+           minio1       minio2       minio3       minio4
+              \____________\____________/____________/
+                       erasure set 16, EC:4
+fallo de minio2:
+  - el balanceador deja de enviarle tráfico
+  - las escrituras siguen: 12 discos ≥ K=12
+  - el healing reconstruye los shards del nodo caído
+  - cuando vuelve, se reincorpora y termina de sincronizar</code></pre>
+        <p>El balanceador no debe enviar tráfico a un nodo que no responde, pero el nodo sigue perteneciendo al clúster. Expulsarlo o borrar sus datos «para limpiar» es la forma más rápida de convertir un fallo recuperable en una pérdida de datos.</p>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Diseñar pools con un dominio de fallo claro</td>
+              <td>Meter los 16 discos en un chasis</td>
+              <td>Un fallo de energía no debe contar como 16 fallos simultáneos.</td>
+            </tr>
+            <tr>
+              <td>Usar discos locales XFS/ext4 en JBOD</td>
+              <td>RAID, LVM o NFS debajo de MinIO</td>
+              <td>MinIO necesita ver el fallo y gestionar la reconstrucción.</td>
+            </tr>
+            <tr>
+              <td>Rolling restart de un nodo a la vez</td>
+              <td>Reiniciar el clúster completo</td>
+              <td>Sin quórum no hay escrituras; el orden mantiene el servicio.</td>
+            </tr>
+            <tr>
+              <td>Añadir pools al final y con el mismo orden</td>
+              <td>Reordenar o quitar pools de <code>MINIO_VOLUMES</code></td>
+              <td>El orden define la identidad del clúster.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Creer que Compose con varios contenedores es un clúster</h3>
+        <span class="code-label code-label--wrong">Mal — cuatro contenedores en un portátil</span>
+        <pre><code class="language-yaml">services:
+  minio1: { image: quay.io/minio/minio, volumes: ["./d1:/data"] }
+  minio2: { image: quay.io/minio/minio, volumes: ["./d2:/data"] }
+  minio3: { image: quay.io/minio/minio, volumes: ["./d3:/data"] }
+  minio4: { image: quay.io/minio/minio, volumes: ["./d4:/data"] }
+# ❌ Un solo host, volúmenes locales y nombres efímeros: no hay alta disponibilidad.
+</code></pre>
+        <span class="code-label code-label--right">Bien — Compose para desarrollo, Operator o baremetal para producción</span>
+        <pre><code class="language-bash"># Desarrollo: un nodo, sin pretensiones de HA
+docker compose up -d
+# Producción: Tenant con el Operator, o nodos baremetal con systemd
+kubectl apply -f tenant.yaml
+</code></pre>
+        <p>Compose no está soportado para distribuido. Puedes usarlo para entender la sintaxis, pero no para afirmar que tu servicio tolera fallos.</p>
+        <h3>2. Añadir un disco a un pool existente</h3>
+        <span class="code-label code-label--wrong">Mal — intentar estirar el pool</span>
+        <pre><code class="language-bash"># ❌ Añadir /data/disk5 a un pool ya creado no amplía su erasure set.
+MINIO_VOLUMES="https://minio{1...4}:9000/data/disk{1...5}"
+</code></pre>
+        <span class="code-label code-label--right">Bien — crear un pool nuevo</span>
+        <pre><code class="language-bash">MINIO_VOLUMES="https://minio{1...4}:9000/data/disk{1...4} https://minio{5...8}:9000/data/disk{1...4}"
+</code></pre>
+        <p>El tamaño de un pool es inmutable. La ampliación se hace por adición de pools, no por mutación del existente.</p>
+        <h3>3. Reiniciar todos los nodos a la vez</h3>
+        <span class="code-label code-label--wrong">Mal — «reinicio el clúster y ya»</span>
+        <pre><code class="language-bash">for n in 1 2 3 4; do ssh minio$n "systemctl restart minio" &amp; done
+wait
+# ❌ Sin quórum, las escrituras fallan y el clúster puede no volver a formar el set.
+</code></pre>
+        <span class="code-label code-label--right">Bien — uno a uno, comprobando salud</span>
+        <pre><code class="language-bash">for n in 1 2 3 4; do
+  ssh minio$n "systemctl restart minio"
+  until mc admin info cluster &gt;/dev/null 2&gt;&amp;1; do sleep 5; done
+  mc admin info cluster | grep -E "Drives|Network"
+done
+</code></pre>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> pasar de «funciona en mi portátil» a un diseño de clúster verificable, con números y con el comando de arranque correcto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Inspecciona el despliegue actual:</strong>
+            <pre><code class="language-bash">mc admin info myminio
+</code></pre>
+            <p>Anota pools, erasure sets, discos por set y <code>EC:N</code>. En el Compose del curso verás 1 pool, 1 set, 1 disco y <code>EC:0</code>. Escribe en una frase qué fallos tolera hoy: ninguno.</p>
+          </li>
+          <li>
+            <strong>Diseña una topología de 4 nodos × 4 discos de 2 TB:</strong> calcula TB brutos, TB útiles con EC:4 y fallos tolerados. Comprueba que 12 discos restantes tras perder un nodo siguen siendo ≥ K.</li>
+          <li>
+            <strong>Escribe el <code>MINIO_VOLUMES</code> exacto</strong> para esa topología con notación de expansión. Debe incluir TLS, el puerto 9000 y cuatro rutas de disco por nodo. Compáralo con el del ejemplo y explica cada símbolo.</li>
+          <li>
+            <strong>Simula la expansión:</strong> añade un segundo pool de 4 nodos × 4 discos de 4 TB al mismo <code>MINIO_VOLUMES</code>. Calcula la capacidad total y explica qué pasa con los objetos que ya existían.
+            <pre><code class="language-text">Pool 1: 4 × 4 × 2 TB = 32 TB brutos  → 24 TB útiles (EC:4)
+Pool 2: 4 × 4 × 4 TB = 64 TB brutos  → 48 TB útiles (EC:4)
+Total: 96 TB brutos → 72 TB útiles</code></pre>
+          </li>
+          <li>
+            <strong>Escribe el runbook de reinicio rolling y verifica el diseño:</strong> orden de nodos, comprobación entre nodos, comando de salud, criterio de parada y qué hacer si un nodo no vuelve. Después escribe qué salida esperarías de <code>mc admin info</code> con dos pools (líneas <code>Pools:</code>, <code>Erasure sets</code> y <code>Drives</code>).</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Si tu diseño tolera la caída de un nodo, dilo con precisión: «tolera 4 discos, que es un nodo de 4 discos, y solo mientras el healing no haya terminado». Si necesitas tolerar dos nodos, el número cambia y el coste también.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un plan de expansión sin downtime</h3>
+          <p>El clúster de 4 nodos × 4 discos está al 78 % y la previsión dice que en cinco meses no cabrá. Diseña un plan que añada capacidad sin perder escrituras, sin degradar la latencia de forma inaceptable y sin tocar los datos existentes más de lo necesario. Incluye el orden exacto de reinicios, la comprobación entre pasos y el criterio para abortar.</p>
+          <p>Después responde: si el pool nuevo tiene 8 discos por nodo y el viejo 4, ¿qué pasa con la distribución de objetos? ¿Qué harías para que el pool viejo dejase de llenarse? ¿Y si el presupuesto solo alcanza para tres nodos nuevos?</p>
+          <p><em>Pista: el pool nuevo no hereda los datos del viejo. El rebalanceo es una operación aparte, y tres nodos con cuatro discos pueden no alcanzar el tamaño de erasure set que necesita tu paridad.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El modo distribuido reparte datos entre nodos y discos; no hay coordinador ni disco maestro.</li>
+          <li>La unidad de crecimiento es el <strong>server pool</strong>; su tamaño se fija al crearlo y no se estira.</li>
+          <li>Los <strong>erasure sets no cruzan pools</strong>: un pool caído no se reconstruye desde otro.</li>
+          <li>Compose es solo para desarrollo de un nodo; producción se despliega con Kubernetes Operator o baremetal.</li>
+          <li>Expandir es añadir un pool al final de <code>MINIO_VOLUMES</code> y reiniciar en rolling, un nodo a la vez.</li>
+          <li>La alta disponibilidad del clúster no cubre la pérdida del centro de datos: para eso, réplica.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>minio server $MINIO_VOLUMES</code></td><td>Arranca un nodo del clúster</td></tr>
+            <tr><td><code>mc admin info</code></td><td>Muestra pools, sets, discos y paridad</td></tr>
+            <tr><td><code>mc admin rebalance start</code></td><td>Redistribuye objetos entre pools</td></tr>
+            <tr><td><code>mc admin rebalance status</code></td><td>Consulta el progreso del rebalanceo</td></tr>
+            <tr><td><code>mc admin decommission start</code></td><td>Drena un pool (irreversible)</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo montar un clúster distribuido con Docker Compose?</summary>
+            <div>
+              <p>Técnicamente puedes arrancar varios contenedores, pero no es un despliegue soportado ni proporciona alta disponibilidad: todos comparten host, red y destino de fallo. MinIO documenta Kubernetes y baremetal para distribuido. Usa Compose solo para el nodo de desarrollo del curso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos nodos necesito como mínimo?</summary>
+            <div>
+              <p>El mínimo práctico son cuatro discos para tener paridad real. Para alta disponibilidad se recomiendan al menos cuatro nodos con discos repartidos, de modo que la caída de un nodo no deje el clúster sin margen. Menos nodos pueden funcionar, pero la tolerancia y el rendimiento se resienten.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo añadir un disco a un nodo existente?</summary>
+            <div>
+              <p>No para ampliar el pool actual: el tamaño de un pool es inmutable. Puedes añadir un pool nuevo con esos discos y nodos. Añadir una ruta a <code>MINIO_VOLUMES</code> de un pool existente no aumenta su erasure set y puede dejar el clúster inconsistente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si cae un pool entero?</summary>
+            <div>
+              <p>Los objetos almacenados en ese pool dejan de estar accesibles; los de otros pools siguen. No hay reconstrucción entre pools, porque cada uno tiene sus propios erasure sets. La única protección para ese escenario es la réplica a otro sitio o un backup.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

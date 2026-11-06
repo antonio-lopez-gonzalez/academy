@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-quorum-queues">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quorum queues — Módulo 5 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Quorum queues</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Una cola clásica vive en <strong>un nodo</strong>. Si ese nodo se cae, la cola y su contenido dejan de estar disponibles hasta que vuelve; si el disco se pierde, se pierden los mensajes. Durante años la respuesta fue <em>mirrored queues</em>: copias de la cola en varios nodos. Eran frágiles ante particiones de red, propensas a duplicados y difíciles de razonar. RabbitMQ 4.0 las retiró.</p>
+        <p>La respuesta actual son las <strong>quorum queues</strong>: colas replicadas mediante <strong>Raft</strong>, con un líder y seguidores que mantienen un log consensuado. Cada mensaje persistente se replica antes de confirmarse; si el líder muere, un seguidor con el log actualizado toma el relevo. Es el tipo por defecto para trabajo durable en este curso, y la razón es simple: cambia lo que puedes prometer ante un fallo.</p>
+        <p>Pero no son gratis ni universales. Siempre son durables, no pueden ser exclusivas, no admiten <em>global QoS</em>, consumen disco en cada escritura y guardan un índice en memoria por mensaje. Esta lección explica cómo funcionan, qué garantizan, qué no soportan y cómo migrar sin perder mensajes.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque elegir el tipo de cola es elegir el modo de fallo. Una classic queue con <code>durable: true</code> sobrevive a un reinicio, pero no a la pérdida del nodo. Una quorum queue sobrevive a la pérdida de una minoría, a cambio de más disco, más latencia de escritura y límites funcionales que hay que conocer antes de declararla.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Raft en una frase</h3>
+        <p>Raft es un algoritmo de consenso: un conjunto de nodos mantiene un <strong>log replicado</strong> y elige un líder. El líder recibe las escrituras, las envía a los seguidores y considera un mensaje <em>confirmado</em> cuando la mayoría del clúster lo ha persistido. Con tres réplicas, la mayoría son dos: se tolera la caída de uno. Con cinco, se toleran dos.</p>
+        <pre><code class="language-text">                 clúster de 3 nodos, quorum queue "facturas.generar"
+
+        +------------------+      +------------------+      +------------------+
+        |     nodo A       |      |     nodo B       |      |     nodo C       |
+        |  LEADER (Raft)   | ---&gt; |  FOLLOWER        | ---&gt; |  FOLLOWER        |
+        |  log: [1][2][3]  |      |  log: [1][2][3]  |      |  log: [1][2]     |
+        +------------------+      +------------------+      +------------------+
+                 |                        |                        |
+                 +---------- mayoría (2 de 3) confirmada ----------+
+
+        Si A cae: B y C eligen líder (mayoría = 2) y la cola sigue.
+        Si B y C caen: A no tiene mayoría y deja de aceptar escrituras.</code></pre>
+        <p>El líder es <strong>por cola</strong>, no por nodo: un nodo puede liderar unas colas y seguir otras. Los mensajes se escriben primero en el líder, se replican y, cuando la mayoría confirma, el broker puede confirmar al productor si usas publisher confirms. Sin confirm, el productor no sabe cuándo ocurrió esa mayoría; la durabilidad real depende de la confirmación.</p>
+
+        <h3>Declaración y ciclo de vida</h3>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas.generar', {
+  durable: true,                             // obligatorio
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-delivery-limit': 5,
+    'x-dead-letter-exchange': 'taller.dlx',
+    'x-dead-letter-routing-key': 'facturas.fallidas',
+  },
+});</code></pre>
+        <p>El tipo forma parte de la identidad de la cola: si ya existe una classic con ese nombre, la redeclaración falla con <code>PRECONDITION_FAILED</code>. No hay conversión en caliente. La durabilidad también es obligatoria: una quorum queue no puede ser <code>durable: false</code>, ni exclusiva, ni auto-delete, ni tener nombre generado por el servidor.</p>
+        <p>Los mensajes se consideran persistentes siempre, independientemente de la propiedad <code>deliveryMode</code>: la cola los escribe en su log. Aun así, sigue publicando con <code>persistent: true</code> por claridad y porque el mismo código puede apuntar a una classic en otro entorno.</p>
+
+        <h3>Replicación, líder y recuperación</h3>
+        <p>Cuando un nodo que alojaba una réplica vuelve, se sincroniza con el líder antes de aceptar tráfico. Mientras está fuera, la cola sigue si queda mayoría. El estado se consulta con:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-queues quorum_status facturas.generar
+
+# Quorum queue "facturas.generar" in vhost "/"
+# Members:
+#   rabbit@rabbit1: leader
+#   rabbit@rabbit2: follower
+#   rabbit@rabbit3: follower</code></pre>
+        <p>Con tres nodos, el diseño tolera <strong>un fallo</strong>. No tolera una partición que deje al líder en minoría: esa minoría deja de aceptar escrituras y los consumidores conectados a ella se quedan sin servicio hasta que la red se recupere. Es el precio del consenso, y es la razón por la que un clúster de dos nodos es peor que uno de tres.</p>
+
+        <h3>Matriz de características</h3>
+        <table>
+          <thead><tr><th>Característica</th><th>Classic</th><th>Quorum</th></tr></thead>
+          <tbody>
+            <tr><td>No durable</td><td>Sí</td><td>No</td></tr>
+            <tr><td>Exclusiva / auto-delete</td><td>Sí</td><td>No</td></tr>
+            <tr><td>Nombre generado por el servidor</td><td>Sí</td><td>No</td></tr>
+            <tr><td>Replicación entre nodos</td><td>No</td><td>Sí (Raft)</td></tr>
+            <tr><td>TTL de mensaje y límite de longitud</td><td>Sí</td><td>Sí (excepto <code>x-overflow: reject-publish-dlx</code>)</td></tr>
+            <tr><td>Prioridad</td><td>Sí, con turnos</td><td>Sí desde 4.3, estricta (0–31)</td></tr>
+            <tr><td>QoS global por canal</td><td>Sí</td><td>No: error de canal</td></tr>
+            <tr><td>Retención en memoria</td><td>Según versión y carga</td><td>Nunca el cuerpo; índice en memoria</td></tr>
+            <tr><td>Dead-lettering fiable</td><td>At-most-once</td><td>At-least-once opcional</td></tr>
+            <tr><td>Reintento retardado nativo</td><td>No</td><td>Sí desde 4.3</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Límite de entregas y mensajes venenosos</h3>
+        <p>Una quorum queue cuenta las entregas de cada mensaje. Desde RabbitMQ 4.0, el límite por defecto es <strong>20</strong>: al superarlo, el mensaje se considera venenoso y se dead-letterea si hay DLX; si no, se descarta. Se ajusta con <code>x-delivery-limit</code> (o con la política <code>delivery-limit</code>).</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl set_policy qq-facturas "^facturas\." \
+  '{"delivery-limit":10,"dead-letter-exchange":"taller.dlx"}' \
+  --priority 10 --apply-to quorum_queues</code></pre>
+        <p>Un límite alto no es más seguro: significa que un mensaje que siempre falla se reintenta más veces antes de apartarse, consumiendo CPU y llenando los logs. El límite debe reflejar cuántos reintentos tiene sentido intentar, no cuántos caben en el disco.</p>
+
+        <h3>Dead-lettering con garantía</h3>
+        <p>En una classic queue, el dead-lettering es <em>at-most-once</em>: el mensaje se publica en la DLX y, si algo falla en el camino, se pierde. Las quorum queues admiten <code>x-dead-letter-strategy: at-least-once</code>, que usa un consumidor interno con publisher confirms: la cola origen retiene el mensaje hasta que la DLX lo confirma. Es más lento y consume más recursos, pero cierra el hueco entre «rechazado» y «en la DLQ».</p>
+        <pre><code class="language-javascript">arguments: {
+  'x-queue-type': 'quorum',
+  'x-dead-letter-exchange': 'taller.dlx',
+  'x-dead-letter-strategy': 'at-least-once',
+}</code></pre>
+        <p>Por defecto la estrategia es <code>at-most-once</code>, útil cuando la DLQ es informativa. Para mensajes de negocio que no pueden desaparecer, elige <code>at-least-once</code> y mide el coste.</p>
+
+        <h3>Cuándo NO usar quorum queues</h3>
+        <table>
+          <thead><tr><th>Caso</th><th>Tipo recomendado</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td>Cola de respuesta RPC exclusiva y temporal</td><td>Classic</td><td>Vive lo que la conexión; replicarla no aporta nada.</td></tr>
+            <tr><td>Telemetría efímera o una vista en vivo</td><td>Classic</td><td>Si se pierde, no importa; el coste de Raft no se justifica.</td></tr>
+            <tr><td>Cola gigante de un solo nodo para análisis</td><td>Classic</td><td>La quorum guarda un índice en memoria por mensaje y escribe todo a disco.</td></tr>
+            <tr><td>Trabajo durable que debe sobrevivir a un nodo</td><td>Quorum</td><td>Replicación real con mayoría; el fallo de un nodo no detiene el servicio.</td></tr>
+            <tr><td>Reintentos con límite y DLQ</td><td>Quorum</td><td>Delivery limit y dead-lettering fiable vienen de serie.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">Réplicas no son backups</p>
+          <p>Raft protege frente a la caída de un nodo, no frente a un <code>delete_queue</code>, un mensaje venenoso o un borrado accidental. Las réplicas están en el mismo clúster y obedecen la misma orden. Un backup real vive fuera y se prueba restaurando.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Declarar una quorum queue, publicar con confirm y comprobar su tipo y sus miembros. <strong>Garantía:</strong> el confirm llega cuando la mayoría de las réplicas persistió el mensaje; si el líder cae después, el mensaje sigue en el log.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://guest:guest@localhost:5672');
+const ch = await conn.createConfirmChannel();
+
+await ch.assertQueue('tareas.quorum', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});
+
+ch.sendToQueue('tareas.quorum', Buffer.from('tarea-1'), {
+  persistent: true,
+  messageId: 'tarea-1',
+});
+await ch.waitForConfirms();
+console.log('confirmada por la mayoría');
+
+await ch.close();
+await conn.close();</code></pre>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name type durable messages
+# tareas.quorum  quorum  true  1
+
+docker exec rabbitmq rabbitmq-queues quorum_status tareas.quorum</code></pre>
+        <p>En un nodo único, la «mayoría» es uno: la cola funciona, pero no tolera ningún fallo. La replicación real empieza con tres nodos. El tipo <code>quorum</code> no es una etiqueta cosmética: cambia el motor de almacenamiento, el protocolo de escritura y las operaciones permitidas.</p>
+        <p>Prueba lo que <strong>no</strong> se puede:</p>
+        <pre><code class="language-javascript">await ch.assertQueue('temporal', {
+  durable: true,
+  exclusive: true,                          // ❌ PRECONDITION_FAILED
+  arguments: { 'x-queue-type': 'quorum' },
+});</code></pre>
+        <p>El canal se cierra con un error de precondición. Una cola de respuesta RPC o una suscripción efímera no pueden ser quorum: para eso está la classic.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller lleva meses con <code>facturas.generar</code> como classic durable en un solo nodo. Al crecer, el equipo decide migrar a quorum para sobrevivir a la caída de un nodo. La migración no es un <code>ALTER</code>: es crear la cola nueva, mover los mensajes y cambiar a los consumidores.</p>
+        <p><strong>1. Declarar la nueva cola y su DLQ</strong> (sin tocar la antigua):</p>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas.generar.v2', {
+  durable: true,
+  arguments: {
+    'x-queue-type': 'quorum',
+    'x-delivery-limit': 5,
+    'x-dead-letter-exchange': 'taller.dlx',
+    'x-dead-letter-routing-key': 'facturas.fallidas',
+  },
+});
+await ch.bindQueue('facturas.generar.v2', 'taller.jobs', 'facturas.generar');</code></pre>
+        <p><strong>2. Mover los mensajes con Shovel</strong> (o con un consumidor temporal que reinyecte). El Shovel es un consumidor y un productor a la vez: confirma en origen solo cuando la publicación en destino se confirma.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management
+
+docker exec rabbitmq rabbitmqadmin declare shovel name=migra-facturas \
+  src-uri=amqp://guest:guest@localhost src-queue=facturas.generar \
+  dest-uri=amqp://guest:guest@localhost dest-queue=facturas.generar.v2 \
+  ack-mode=on-confirm</code></pre>
+        <p><strong>3. Cambiar consumidores y productores.</strong> Primero los consumidores a <code>.v2</code>, luego los productores. Durante la transición, el Shovel vacía la cola antigua; cuando <code>messages_ready</code> llega a 0 y no hay publicaciones nuevas, se borra la classic.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers
+docker exec rabbitmq rabbitmqadmin delete queue name=facturas.generar</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">El nombre de la cola es una API</p>
+          <p>Renombrar a <code>.v2</code> obliga a tocar consumidores y productores. Una alternativa es crear la quorum con el nombre definitivo en un vhost nuevo, migrar y cambiar la configuración de conexión. En cualquier caso, planifica una ventana y no confíes en que «el Shovel lo hará solo»: verifica el drenaje y el número de mensajes antes de borrar.</p>
+        </div>
+        <p><strong>4. Medir el coste.</strong> Una quorum queue escribe en el log y en el WAL antes de confirmar. En el mismo hardware, la latencia de publicación sube y el throughput baja respecto a classic. Antes de migrar, mide con tu tamaño de mensaje: la documentación avisa de que el rendimiento cae a medida que crece el mensaje, y el disco es el factor dominante.</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-diagnostics memory_breakdown --unit megabytes
+docker exec rabbitmq rabbitmqctl status | grep -A4 "file_descriptors"</code></pre>
+        <p>Con 30 000 mensajes en cola, el índice en memoria ronda 1 MB aunque los cuerpos estén en disco. Con un millón de mensajes, son decenas de MB por cola: el mejor ajuste de memoria sigue siendo <strong>mantener las colas cortas</strong>.</p>
+        <p>Distribuye líderes entre nodos para que un solo nodo no cargue con todas las escrituras:</p>
+        <pre><code class="language-bash">docker exec rabbitmq rabbitmq-queues rebalance quorum</code></pre>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Quorum para trabajo durable de negocio</td> <td>Classic para la cola principal de facturación</td> <td>La classic no sobrevive a la pérdida del nodo que la aloja.</td></tr>
+            <tr><td>Clúster de 3 o 5 nodos</td> <td>Clúster de 2 nodos «para tener réplica»</td> <td>Con dos nodos, la mayoría son dos: la caída de uno deja la cola sin quórum.</td></tr>
+            <tr><td><code>prefetch</code> por consumidor</td> <td><code>prefetch(n, true)</code> (global)</td> <td>Las quorum queues no soportan QoS global; el canal se cierra con error.</td></tr>
+            <tr><td>Límite de entregas y DLX explícitos</td> <td>Confiar en el límite por defecto sin revisarlo</td> <td>El valor por defecto (20) puede ser demasiado alto o bajo para tu operación.</td></tr>
+            <tr><td>Discos rápidos y con espacio libre monitorizado</td> <td>Ignorar el crecimiento del WAL y del log</td> <td>Cada mensaje se escribe antes de confirmarse; el disco es el recurso crítico.</td></tr>
+            <tr><td>Colas cortas y con límite de longitud</td> <td>Acumular millones de mensajes «por si acaso»</td> <td>El índice en memoria crece con el número de mensajes, no con su tamaño.</td></tr>
+            <tr><td>Migrar con Shovel y verificar el drenaje</td> <td>Borrar la classic y recrearla con otro tipo</td> <td>No se puede cambiar el tipo en sitio; borrar primero pierde el backlog.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Declarar la quorum como no durable o exclusiva</h3>
+        <span class="code-label code-label--wrong">Mal — propiedades incompatibles</span>
+        <pre><code class="language-javascript">await ch.assertQueue('tareas', {
+  durable: false,
+  exclusive: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});   // PRECONDITION_FAILED</code></pre>
+        <span class="code-label code-label--right">Bien — durable y sin exclusividad</span>
+        <pre><code class="language-javascript">await ch.assertQueue('tareas', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },
+});</code></pre>
+        <p>Una quorum queue es durable por diseño. Si necesitas una cola temporal, no uses quorum: usa classic con <code>exclusive</code> y <code>autoDelete</code>.</p>
+
+        <h3>2. Usar QoS global</h3>
+        <span class="code-label code-label--wrong">Mal — prefetch compartido por canal</span>
+        <pre><code class="language-javascript">await ch.prefetch(50, true);   // global: no soportado en quorum</code></pre>
+        <span class="code-label code-label--right">Bien — prefetch por consumidor</span>
+        <pre><code class="language-javascript">await ch.prefetch(10);         // por consumidor, el valor por defecto del cliente</code></pre>
+        <p>El broker devuelve un error de canal al intentar consumir de una quorum con QoS global activo. No es un detalle de estilo: es una operación no soportada.</p>
+
+        <h3>3. Creer que la réplica es un backup</h3>
+        <span class="code-label code-label--wrong">Mal — borrar la cola «porque hay réplicas»</span>
+        <pre><code class="language-bash">rabbitmqadmin delete queue name=facturas.generar
+# ❌ las tres réplicas obedecen: el backlog desaparece en todo el clúster</code></pre>
+        <span class="code-label code-label--right">Bien — exportar antes de operaciones destructivas</span>
+        <pre><code class="language-bash">rabbitmqadmin get queue=facturas.generar count=100000 ackmode=ack_requeue_false &gt; backup.jsonl
+# y probar la restauración en un entorno separado</code></pre>
+        <p>Raft replica operaciones, incluidas las destructivas. Un backup se hace fuera del clúster y se verifica; las réplicas solo protegen de la caída de un nodo.</p>
+
+        <h3>4. Migrar cambiando el tipo en sitio</h3>
+        <span class="code-label code-label--wrong">Mal — redeclarar con otro tipo</span>
+        <pre><code class="language-javascript">await ch.assertQueue('facturas.generar', {
+  durable: true,
+  arguments: { 'x-queue-type': 'quorum' },   // ya existe como classic
+});   // PRECONDITION_FAILED</code></pre>
+        <span class="code-label code-label--right">Bien — cola nueva, Shovel y cambio de consumidores</span>
+        <pre><code class="language-text">classic facturas.generar
+   -&gt; quorum facturas.generar.v2 (mismos bindings)
+   -&gt; Shovel con ack-mode=on-confirm
+   -&gt; consumidores a .v2, luego productores
+   -&gt; verificar messages_ready = 0 y borrar la antigua</code></pre>
+        <p>El tipo no es un argumento mutable: forma parte de la identidad. Cualquier intento de cambiarlo en caliente falla, y recrear la cola sin migrar pierde los mensajes que hubiera dentro.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar el tipo, los miembros, el límite de entregas y el comportamiento de una quorum queue en un clúster de tres nodos.</p>
+        <ol class="steps">
+          <li>
+            <strong>Levanta tres nodos</strong> con nombres de host estables y la misma cookie de Erlang. Con Docker Compose, cada servicio usa <code>hostname</code> y <code>RABBITMQ_ERLANG_COOKIE</code> compartida. Comprueba el clúster:
+            <pre><code class="language-bash">docker exec rabbit1 rabbitmqctl cluster_status</code></pre>
+            <p>Salida esperada: tres nodos en <code>running_nodes</code>.</p>
+          </li>
+          <li>
+            <strong>Declara la cola y publica 100 mensajes</strong> con confirm. Comprueba tipo, durabilidad y número de miembros:
+            <pre><code class="language-bash">docker exec rabbit1 rabbitmqctl list_queues name type durable messages
+docker exec rabbit1 rabbitmq-queues quorum_status facturas.generar</code></pre>
+            <p>Deben aparecer un líder y dos seguidores, repartidos entre los tres nodos.</p>
+          </li>
+          <li>
+            <strong>Mata el nodo líder</strong> (<code>docker stop rabbit1</code>) y observa:
+            <pre><code class="language-bash">docker exec rabbit2 rabbitmqctl list_queues name messages_ready
+docker exec rabbit2 rabbitmq-queues quorum_status facturas.generar</code></pre>
+            <p>La cola sigue disponible, hay un nuevo líder y no se pierden mensajes. Los consumidores conectados al nodo caído se reconectan cuando vuelve.</p>
+          </li>
+          <li>
+            <strong>Fuerza un mensaje venenoso:</strong> consume con <code>nack(msg, false, true)</code> en bucle sobre un mensaje concreto y un <code>x-delivery-limit</code> de 3. Tras tres entregas, debe aparecer en la DLQ. Verifica <code>x-death</code> y el motivo.
+          </li>
+          <li>
+            <strong>Comprueba las limitaciones:</strong> intenta declarar una quorum exclusiva y un <code>prefetch</code> global. Anota los errores exactos (<code>PRECONDITION_FAILED</code> y error de canal por QoS) y explica por qué ocurren.
+          </li>
+          <li>
+            <strong>Reinicia el nodo caído</strong> y espera a que se sincronice. Vuelve a mirar <code>quorum_status</code>: debe recuperar su réplica. Repite con dos nodos caídos y comprueba que el superviviente pierde el quórum y no acepta escrituras.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Qué observar</p>
+          <p>Con un nodo caído, el servicio continúa. Con dos caídos, no: no hay mayoría. Esa asimetría es la diferencia entre «alta disponibilidad» y «tener copias». Un clúster de tres tolera uno; uno de cinco tolera dos.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Migrar sin perder ni un mensaje</h3>
+          <p>El taller tiene tres colas classic durables (<code>facturas.generar</code>, <code>emails.enviar</code>, <code>informes.diarios</code>) y quiere pasar a quorum sin parar el servicio. Diseña la migración completa con tráfico en vivo: orden de pasos, cómo evitar mensajes huérfanos durante el cambio de consumidores, cómo verificar que no se perdió ninguno y cómo volver atrás si algo falla.</p>
+          <p>Elige qué colas migrar y cuáles dejar como classic, justificando el coste en disco y latencia. Define las alertas que confirmarán que la migración terminó bien.</p>
+          <p><em>Pista: un Shovel con <code>ack-mode=on-confirm</code> no pierde mensajes, pero puedes acabar con dos consumidores procesando la misma tarea. Piensa en el orden consumidores-productor y en una clave de idempotencia que cubra la transición.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Las quorum queues replican cada cola con <strong>Raft</strong>: líder, seguidores y confirmación por mayoría.</li>
+          <li>Con 3 nodos se tolera 1 fallo; con 5, 2. Un clúster de 2 no aporta alta disponibilidad.</li>
+          <li>Siempre son durables; no admiten exclusividad, auto-delete, nombre generado ni QoS global.</li>
+          <li>El <strong>delivery limit</strong> (20 por defecto desde 4.0) aparta mensajes venenosos; configúralo con DLX.</li>
+          <li>El dead-lettering puede ser <code>at-least-once</code>, a cambio de más recursos.</li>
+          <li>El coste es disco y latencia de escritura; el índice en memoria crece con el número de mensajes.</li>
+          <li>El tipo no se cambia en sitio: se migra con una cola nueva, Shovel y cambio ordenado de clientes.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>x-queue-type: quorum</code></td><td>Declara una cola replicada con Raft</td></tr>
+            <tr><td><code>rabbitmq-queues quorum_status</code></td><td>Muestra líder, seguidores y estado de la cola</td></tr>
+            <tr><td><code>x-delivery-limit</code></td><td>Número de entregas antes de considerar el mensaje venenoso</td></tr>
+            <tr><td><code>x-dead-letter-strategy</code></td><td><code>at-most-once</code> o <code>at-least-once</code> al dead-letterear</td></tr>
+            <tr><td><code>rabbitmq-queues rebalance quorum</code></td><td>Reparte los líderes entre los nodos</td></tr>
+            <tr><td><code>delivery-limit</code> (política)</td><td>Aplica el límite a un conjunto de colas sin redeclararlas</td></tr>
+            <tr><td><code>ack-mode=on-confirm</code></td><td>Shovel que confirma en origen solo tras confirmar en destino</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito tres nodos para usar quorum queues?</summary>
+            <div>
+              <p>Para alta disponibilidad, sí: con un solo nodo la cola funciona pero no tolera fallos; con dos, la caída de uno elimina la mayoría. Tres es el mínimo razonable y cinco el siguiente paso. Puedes empezar en local con un nodo para desarrollar, pero no lo llames producción.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa con los mensajes no confirmados si cae el líder?</summary>
+            <div>
+              <p>Los mensajes que ya estaban en el log replicado se conservan. Los que el líder había entregado pero no se habían confirmado vuelven a estar disponibles y se reentregan: de ahí los duplicados. El consumidor debe ser idempotente, igual que en una classic.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué mi publicación es más lenta que antes?</summary>
+            <div>
+              <p>Porque cada mensaje se escribe en el log del líder, se replica a la mayoría y se fuerza a disco antes de confirmar. Es el precio de la durabilidad real. Si la latencia no es aceptable, revisa el tamaño del mensaje, el disco y el uso de confirms en lote; no desactives la durabilidad sin entender qué pierdes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar prioridades en una quorum queue?</summary>
+            <div>
+              <p>Sí, desde RabbitMQ 4.3, con 32 niveles (0–31), <code>x-max-priority</code> ignorado y prioridad estricta. Ten en cuenta que un flujo alto de prioridad alta puede retrasar indefinidamente a las bajas; si necesitas cuotas, usa colas separadas. En versiones anteriores no había soporte y el argumento se ignoraba.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Las quorum queues sustituyen a los backups?</summary>
+            <div>
+              <p>No. Raft replica el estado y las operaciones, incluidas las destructivas. Un borrado accidental, un purge o un mensaje corrupto se replican también. Necesitas backups externos, con restauración probada, además de las réplicas.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-clustering-y-alta-disponibilidad">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clústeres y alta disponibilidad — Módulo 5 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Clústeres y alta disponibilidad</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un broker en un solo contenedor es perfecto para aprender y catastrófico para producción. Si el nodo se reinicia, el servicio entero deja de aceptar publicaciones; si el disco muere, el backlog desaparece. Un clúster de RabbitMQ reparte colas y conexiones entre varios nodos para que la caída de uno no detenga el negocio.</p>
+        <p>Pero «clúster» no significa «alta disponibilidad» por sí solo. Un clúster de dos nodos con una cola clásica en uno de ellos no sobrevive a la caída de ese nodo. La alta disponibilidad necesita tres cosas a la vez: <strong>réplicas de los datos</strong> (quorum queues), <strong>clientes que se reconectan</strong> a otro nodo y <strong>un punto de entrada</strong> que no sea una IP fija. Si falta una, el clúster es decorativo.</p>
+        <p>Esta lección monta un clúster de tres nodos, explica la cookie de Erlang, el reparto de colas, las particiones de red y el escenario concreto de «cae un nodo». También deja claro qué NO arregla un clúster: un diseño con una sola cola compartida, un consumidor no idempotente o un cliente que se conecta a un nodo concreto y se queda esperando.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque el fallo más común no es el disco: es el cliente. El broker sobrevive, el clúster elige un nuevo líder… y la aplicación sigue intentando conectar al nodo muerto sin reintentar. La alta disponibilidad termina en el código del consumidor, no en el diagrama.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué comparte un clúster y qué no</h3>
+        <p>Los nodos de un clúster comparten <strong>metadatos</strong> (exchanges, bindings, usuarios, políticas, definiciones de colas) y se comunican por Erlang. No comparten el contenido de una cola clásica: esa cola vive en el nodo donde se declaró. Las quorum queues sí replican su contenido en varios nodos.</p>
+        <pre><code class="language-text">                     clúster de 3 nodos
+
+   rabbit1                 rabbit2                 rabbit3
+   +-----------+           +-----------+           +-----------+
+   | exchanges |&lt;--------&gt; | exchanges |&lt;--------&gt; | exchanges |
+   | usuarios  |  Erlang   | usuarios  |  Erlang   | usuarios  |
+   | políticas |  25672    | políticas |  25672    | políticas |
+   +-----------+           +-----------+           +-----------+
+   | q.facturas| leader    | q.facturas| follower  | q.facturas| follower
+   | q.audit   | follower  | q.audit   | leader    | q.audit   | follower
+   | q.temporal| (solo en rabbit2, classic no replicada)
+
+   Definiciones: en todos. Contenido: solo las quorum lo replican.</code></pre>
+        <p>Esa distinción explica dos comportamientos que sorprenden: una cola clásica «desaparece» de la vista cuando su nodo cae, y una quorum sigue disponible mientras quede mayoría. También explica por qué crear una cola en un nodo y consumirla desde otro funciona sin configurar nada: el metadato es global.</p>
+
+        <h3>Nombres de nodo y cookie de Erlang</h3>
+        <p>Cada nodo se identifica como <code>rabbit@hostname</code>. Para formar clúster, los nodos deben poder resolver esos nombres y compartir la misma <strong>cookie de Erlang</strong>, un secreto que autentica la comunicación entre máquinas Erlang.</p>
+        <pre><code class="language-text">/var/lib/rabbitmq/.erlang.cookie     (permisos 600, mismo contenido en todos)
+
+rabbit@rabbit1  &lt;--- cookie ---&gt;  rabbit@rabbit2
+       ^                                  ^
+       +----------- cookie ---------------+</code></pre>
+        <p>En Docker se fija con <code>RABBITMQ_ERLANG_COOKIE</code> y un <code>hostname</code> estable. Sin cookie común, el <code>join_cluster</code> falla con <code>unable to connect to epmd</code> o un error de autenticación. Sin resolución de nombres, falla el descubrimiento. Ninguno de los dos errores tiene que ver con AMQP.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Nodo con nombre fijo, no IP</p>
+          <p>El nombre se guarda en los metadatos y en los datos de Raft. Si el contenedor cambia de IP o de hostname, el nodo no vuelve a reconocerse. Usa nombres estables (servicio DNS, <code>hostname</code> fijo o <code>RABBITMQ_NODENAME</code>) y no recrees nodos con el mismo nombre y datos de otro.</p>
+        </div>
+
+        <h3>Formar el clúster</h3>
+        <p>Desde RabbitMQ 4.1, <code>join_cluster</code> prepara el nodo por sí solo: ya no hace falta el baile de <code>stop_app</code>, <code>reset</code> y <code>start_app</code> de versiones anteriores.</p>
+        <pre><code class="language-bash"># en rabbit2 y rabbit3
+rabbitmqctl join_cluster rabbit@rabbit1
+
+# comprobar desde cualquiera
+rabbitmqctl cluster_status</code></pre>
+        <pre><code class="language-text">Cluster name: rabbit@rabbit1
+Disk Nodes
+rabbit@rabbit1
+rabbit@rabbit2
+rabbit@rabbit3
+Running Nodes
+rabbit@rabbit1
+rabbit@rabbit2
+rabbit@rabbit3</code></pre>
+        <p>Con Docker Compose, el orden importa: el nodo semilla debe estar sano antes de que los demás se unan. Un <code>depends_on</code> con <code>condition: service_healthy</code> y un <code>healthcheck</code> con <code>rabbitmq-diagnostics -q ping</code> evita condiciones de carrera en el arranque; el Compose completo está en el ejemplo mínimo.</p>
+        <p>En Kubernetes o en la nube, el descubrimiento se hace con el plugin de <em>peer discovery</em> correspondiente, no con IPs escritas a mano. El principio es el mismo: nombres estables y una semilla conocida.</p>
+
+        <h3>Clientes: el punto de entrada y la reconexión</h3>
+        <p>El cliente no debe conocer la lista de nodos ni elegir uno al azar para siempre. Dos patrones válidos:</p>
+        <table>
+          <thead><tr><th>Patrón</th><th>Cómo</th><th>Ventaja / límite</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Load balancer TCP</strong></td> <td>HAProxy, NLB o un Service de Kubernetes delante de los tres nodos</td> <td>Una sola dirección para la aplicación; el balanceador detecta nodos caídos. Es la opción habitual en producción.</td></tr>
+            <tr><td><strong>Lista en el cliente con reintento</strong></td> <td>La aplicación prueba <code>rabbit1</code>, <code>rabbit2</code>, <code>rabbit3</code> en bucle</td> <td>Sin componente extra; requiere código de reconexión y no reparte carga por sí solo.</td></tr>
+          </tbody>
+        </table>
+        <p><strong>amqplib no acepta varios hosts en una URL</strong>: <code>amqp://rabbit1,rabbit2</code> no es válido. O usas un balanceador, o implementas el bucle tú. Tampoco reconecta solo: cuando la conexión se cierra, emite <code>close</code> y el proceso debe volver a conectar, recrear el canal, redeclarar la topología y reanudar los consumidores.</p>
+        <pre><code class="language-javascript">const HOSTS = ['amqp://rabbit1:5672', 'amqp://rabbit2:5672', 'amqp://rabbit3:5672'];
+let siguiente = 0;
+let fallos = 0;
+
+async function conectar() {
+  for (let i = 0; i &lt; HOSTS.length; i++) {
+    const url = HOSTS[(siguiente + i) % HOSTS.length];
+    try {
+      const conn = await amqp.connect(url);
+      siguiente = (siguiente + i + 1) % HOSTS.length;
+      fallos = 0;
+      conn.on('close', reconectar);
+      conn.on('error', (err) =&gt; logger.error('amqp', err.message));
+      return conn;
+    } catch (err) {
+      logger.warn('nodo no disponible', { url, err: err.message });
+    }
+  }
+  throw new Error('ningún nodo respondió');
+}
+
+async function reconectar() {
+  try {
+    await montarConsumidores(await conectar());
+  } catch {
+    setTimeout(reconectar, Math.min(30_000, 1000 * 2 ** ++fallos));
+  }
+}</code></pre>
+        <p>La reconexión debe ser <strong>idempotente</strong>: redeclarar colas y exchanges con los mismos argumentos, volver a registrar consumidores y asumir que los mensajes en vuelo se reentregan. El broker no guarda el estado del canal del cliente.</p>
+        <p>El balanceador necesita <em>health checks</em> de AMQP, no solo de TCP. Un nodo puede aceptar el puerto y no estar listo para publicar. HAProxy con <code>option tcp-check</code> y un <code>send</code>/<code>expect</code> de AMQP, o el endpoint <code>/api/health/checks/alarms</code> para el management, detectan mejor el estado real.</p>
+
+        <h3>Particiones de red y <code>pause_minority</code></h3>
+        <p>Una partición divide el clúster en dos grupos que no se ven. Sin una política, ambos lados pueden creer que el otro está caído y aceptar escrituras: <em>split-brain</em>. RabbitMQ ofrece estrategias de manejo:</p>
+        <table>
+          <thead><tr><th><code>cluster_partition_handling</code></th><th>Comportamiento</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td><code>ignore</code> (por defecto)</td><td>Los dos lados siguen operando; la reconciliación puede perder mensajes de colas clásicas.</td><td>Clústeres donde las quorum queues y Raft ya protegen los datos; valorar con cuidado.</td></tr>
+            <tr><td><code>pause_minority</code></td><td>El lado con menos nodos deja de servir y se pausa; al curarse la red, se reincorpora.</td><td>Número impar de nodos; cuando prefieres perder disponibilidad antes que divergir.</td></tr>
+            <tr><td><code>autoheal</code></td><td>Estrategia heredada de Mnesia que reinicia la minoría y reconcilia. No se recomienda en instalaciones nuevas.</td><td>Evitarla salvo compatibilidad con instalaciones antiguas.</td></tr>
+          </tbody>
+        </table>
+        <p>Con quorum queues, Raft ya exige mayoría para escribir: el lado minoritario no puede confirmar mensajes, así que el split-brain de datos es mucho menos probable. Aun así, el <strong>metadata store</strong> (Mnesia o Khepri) también necesita mayoría para cambios de definiciones. En la práctica: elige una política explícita, usa un número impar de nodos y pruébala desconectando una interfaz, no leyendo la documentación el día del incidente.</p>
+        <pre><code class="language-bash"># rabbitmq.conf
+cluster_partition_handling = pause_minority</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">Dos nodos no son un clúster de alta disponibilidad</p>
+          <p>Con dos nodos, la mayoría son dos. Si uno cae, el superviviente no tiene quórum y las quorum queues dejan de aceptar escrituras. Un clúster de dos no tolera ningún fallo y añade complejidad. Usa tres o cinco.</p>
+        </div>
+
+        <h3>Qué pasa cuando cae un nodo</h3>
+        <pre><code class="language-text">T+0    rabbit1 (líder de facturas.generar) se cae
+T+1    los clientes de rabbit1 reciben close / error
+T+2    Raft elige líder entre rabbit2 y rabbit3 (mayoría = 2)
+T+3    los consumidores conectados a rabbit1 se reconectan al LB o al siguiente nodo
+T+4    los mensajes entregados y no confirmados se reentregan (posibles duplicados)
+T+5    el servicio sigue; la cola no perdió mensajes confirmados
+
+Al volver rabbit1:
+       se sincroniza con el líder, recupera su réplica y vuelve a aceptar conexiones
+       (no vuelve a ser líder automáticamente; Raft decide)</code></pre>
+        <p>La disponibilidad no es instantánea: hay una elección de líder, un tiempo de detección y una reconexión. Si tu SLA se mide en milisegundos, necesitas clientes con reintento rápido y un balanceador con health checks agresivos, no solo réplicas.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Formar un clúster de tres nodos con Compose y comprobar que una quorum queue ve tres miembros. <strong>Garantía:</strong> con los tres nodos sanos, la cola sobrevive a la caída de uno; los mensajes confirmados están en la mayoría.</p>
+        <pre><code class="language-yaml">services:
+  rabbit1:
+    image: rabbitmq:4-management
+    hostname: rabbit1
+    environment:
+      RABBITMQ_ERLANG_COOKIE: taller-cookie
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 20
+
+  rabbit2:
+    image: rabbitmq:4-management
+    hostname: rabbit2
+    environment:
+      RABBITMQ_ERLANG_COOKIE: taller-cookie
+    depends_on:
+      rabbit1: { condition: service_healthy }
+    command: &gt;
+      sh -c "rabbitmq-server -detached && rabbitmqctl await_startup &&
+             rabbitmqctl join_cluster rabbit@rabbit1 &&
+             rabbitmqctl await_startup && tail -f /dev/null"
+
+  rabbit3:
+    image: rabbitmq:4-management
+    hostname: rabbit3
+    environment:
+      RABBITMQ_ERLANG_COOKIE: taller-cookie
+    depends_on:
+      rabbit1: { condition: service_healthy }
+    command: &gt;
+      sh -c "rabbitmq-server -detached && rabbitmqctl await_startup &&
+             rabbitmqctl join_cluster rabbit@rabbit1 &&
+             rabbitmqctl await_startup && tail -f /dev/null"</code></pre>
+        <pre><code class="language-bash">docker compose up -d
+docker exec rabbit1 rabbitmqctl cluster_status
+docker exec rabbit1 rabbitmq-queues quorum_status facturas.generar</code></pre>
+        <p>Salida esperada: tres nodos en <code>Running Nodes</code> y tres miembros en la cola (un líder, dos seguidores). Si <code>cluster_status</code> muestra solo un nodo, revisa la cookie y la resolución de <code>rabbit1</code> antes de tocar nada más.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El taller monta tres nodos, un HAProxy delante y consumidores con reconexión. La API publica en el balanceador; los workers consumen del balanceador. Ningún proceso conoce el nombre de un nodo concreto.</p>
+        <pre><code class="language-text">API / workers
+     |
+     v
++-------------------+        +-----------+   +-----------+   +-----------+
+| HAProxy :5672     | ------&gt;| rabbit1   |   | rabbit2   |   | rabbit3   |
+| balance roundrobin|        | (nodo)    |   | (nodo)    |   | (nodo)    |
+| tcp-check         |        +-----------+   +-----------+   +-----------+
++-------------------+              \_____________ | _____________/
+                                              \|/
+                                    quorum queues replicadas
+
+Si rabbit2 cae, HAProxy deja de enviarle tráfico y Raft elige líder.</code></pre>
+        <pre><code class="language-text"># haproxy.cfg
+listen rabbitmq_amqp
+    bind *:5672
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    balance roundrobin
+    server rabbit1 rabbit1:5672 check inter 3s fall 3 rise 2
+    server rabbit2 rabbit2:5672 check inter 3s fall 3 rise 2
+    server rabbit3 rabbit3:5672 check inter 3s fall 3 rise 2</code></pre>
+        <p>La aplicación usa <code>amqp://taller:secreto@haproxy:5672</code> y no sabe cuántos nodos hay. Cuando el balanceador mueve la conexión, el cliente recibe un cierre y debe reconectar; el broker no conserva sus consumidores ni sus confirms pendientes.</p>
+        <p><strong>Escenario de caída</strong>: se apaga <code>rabbit2</code> con <code>docker stop rabbit2</code>. Los consumidores conectados a ese nodo ven <code>close</code>; los que están detrás del balanceador se redistribuyen. La quorum queue de facturas tenía su líder en <code>rabbit2</code>: Raft elige otro y sigue. Los mensajes que estaban en vuelo sin <code>ack</code> se reentregan al nuevo consumidor.</p>
+        <pre><code class="language-bash">docker stop rabbit2
+docker exec rabbit1 rabbitmqctl cluster_status
+docker exec rabbit1 rabbitmq-queues quorum_status facturas.generar
+docker exec rabbit1 rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers</code></pre>
+        <p>Recuperación: se vuelve a arrancar <code>rabbit2</code>; el nodo se une solo (los metadatos del clúster lo recuerdan) y sincroniza sus réplicas. No hace falta <code>join_cluster</code> de nuevo. Si el nodo se va para siempre, se retira con <code>rabbitmqctl forget_cluster_node rabbit@rabbit2</code> <strong>desde otro nodo</strong> y se reequilibran los líderes:</p>
+        <pre><code class="language-bash">docker start rabbit2
+docker exec rabbit1 rabbitmqctl await_startup
+docker exec rabbit1 rabbitmq-queues rebalance quorum</code></pre>
+        <p>El <code>rebalance</code> mueve liderazgos, no mensajes: es una operación segura pero no gratuita. Hazla en una ventana de baja carga y comprueba que las colas siguen disponibles.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Clúster de 3 o 5 nodos con quorum queues</td> <td>Dos nodos «para tener réplica»</td> <td>Con dos, la caída de uno elimina la mayoría y la cola deja de escribir.</td></tr>
+            <tr><td>Nombres de nodo estables y cookie común</td> <td>Confiar en IPs efímeras o en la cookie autogenerada</td> <td>El nodo no se reconoce tras recrearse y el clúster no se forma.</td></tr>
+            <tr><td>Balanceador TCP con health check real</td> <td>Hardcodear la IP de un nodo en la aplicación</td> <td>El nodo cae y el cliente sigue llamando a un muerto.</td></tr>
+            <tr><td>Reconexión con backoff y redeclaración de topología</td> <td>Asumir que amqplib reconecta solo</td> <td>El canal y los consumidores se pierden al cerrar la conexión.</td></tr>
+            <tr><td>Política de partición explícita y probada</td> <td>Dejar <code>ignore</code> sin saber qué implica</td> <td>Una partición mal gestionada puede dividir el clúster y perder datos clásicos.</td></tr>
+            <tr><td>Consumidores idempotentes</td> <td>Suponer que la reconexión no duplica entregas</td> <td>Los mensajes en vuelo se reentregan tras una caída o un cierre de canal.</td></tr>
+            <tr><td>Monitorizar nodos, alarmas y colas sin consumidores</td> <td>Mirar solo si el puerto 5672 responde</td> <td>Un nodo puede aceptar TCP y estar en alarma o sin quórum.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Clúster de dos nodos</h3>
+        <span class="code-label code-label--wrong">Mal — «tengo dos, tengo réplica»</span>
+        <pre><code class="language-text">rabbit1 + rabbit2  ->  quorum queue con 2 réplicas
+cae rabbit1        ->  queda 1 de 2: sin mayoría, sin escrituras</code></pre>
+        <span class="code-label code-label--right">Bien — tres nodos como mínimo</span>
+        <pre><code class="language-text">rabbit1 + rabbit2 + rabbit3  ->  mayoría = 2
+cae uno                      ->  la cola sigue disponible</code></pre>
+        <p>El consenso necesita mayoría. Dos nodos no toleran ningún fallo y, además, una partición deja a ambos lados sin quórum. Es el peor de los dos mundos.</p>
+
+        <h3>2. Cookie distinta o autogenerada</h3>
+        <span class="code-label code-label--wrong">Mal — cada contenedor genera la suya</span>
+        <pre><code class="language-yaml">services:
+  rabbit1:
+    image: rabbitmq:4-management
+  rabbit2:
+    image: rabbitmq:4-management
+# sin RABBITMQ_ERLANG_COOKIE: cada uno crea una cookie aleatoria</code></pre>
+        <span class="code-label code-label--right">Bien — secreto compartido y explícito</span>
+        <pre><code class="language-yaml">environment:
+  RABBITMQ_ERLANG_COOKIE: taller-cookie   # mismo valor en los tres</code></pre>
+        <p>La cookie autogenerada es cómoda en local y veneno en un clúster. El <code>join_cluster</code> falla con un error de autenticación que no menciona la cookie de forma obvia, y se pierden horas mirando puertos.</p>
+
+        <h3>3. Cliente sin reconexión</h3>
+        <span class="code-label code-label--wrong">Mal — conectar una vez y olvidar</span>
+        <pre><code class="language-javascript">const conn = await amqp.connect('amqp://rabbit1:5672');
+const ch = await conn.createChannel();
+await ch.consume('facturas.generar', handler);
+// si rabbit1 cae, el proceso queda vivo pero sin consumir</code></pre>
+        <span class="code-label code-label--right">Bien — reconectar, recrear y reanudar</span>
+        <pre><code class="language-javascript">conn.on('close', reconectar);
+conn.on('error', (err) =&gt; logger.error('amqp', err));
+
+async function reconectar() {
+  const conn = await conectar();
+  const ch = await conn.createChannel();
+  await declararTopologia(ch);
+  await ch.consume('facturas.generar', handler, { noAck: false });
+}</code></pre>
+        <p>El broker hace su parte; el cliente debe hacer la suya. Sin reconexión, el clúster sobrevive pero el servicio no procesa nada, y el backlog crece en silencio.</p>
+
+        <h3>4. Ignorar las particiones de red</h3>
+        <span class="code-label code-label--wrong">Mal — confiar en que «la red no se parte»</span>
+        <pre><code class="language-text"># sin cluster_partition_handling configurado
+# el lado minoritario sigue aceptando escrituras de colas clásicas</code></pre>
+        <span class="code-label code-label--right">Bien — política explícita y probada</span>
+        <pre><code class="language-ini"># rabbitmq.conf
+cluster_partition_handling = pause_minority</code></pre>
+        <p>Las particiones ocurren: un switch, un firewall, una actualización de red. Elige la política antes del incidente, con un número impar de nodos, y simula la partición desconectando un contenedor de la red. La configuración que no se ha probado no existe.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> formar el clúster, comprobar la réplica, matar un nodo y observar la reconexión y la reentrega.</p>
+        <ol class="steps">
+          <li>
+            <strong>Levanta los tres nodos</strong> con el Compose del ejemplo mínimo y verifica:
+            <pre><code class="language-bash">docker compose up -d
+docker exec rabbit1 rabbitmqctl cluster_status</code></pre>
+            <p>Salida esperada: tres nodos en <code>Running Nodes</code>. Si solo hay uno, revisa cookie y <code>hostname</code>.</p>
+          </li>
+          <li>
+            <strong>Declara una quorum queue y publica 200 mensajes</strong> con confirm. Comprueba los miembros:
+            <pre><code class="language-bash">docker exec rabbit1 rabbitmq-queues quorum_status facturas.generar</code></pre>
+            <p>Debe haber un líder y dos seguidores en nodos distintos.</p>
+          </li>
+          <li>
+            <strong>Arranca un consumidor con <code>prefetch(5)</code></strong> y deja que procese 20 mensajes. Después para el nodo donde está el líder (<code>docker stop rabbit1</code>). Observa el log del consumidor: <code>close</code>, reconexión y reentrega de los mensajes en vuelo.</li>
+          <li>
+            <strong>Comprueba desde otro nodo</strong> que la cola sigue y que hay un nuevo líder:
+            <pre><code class="language-bash">docker exec rabbit2 rabbitmqctl cluster_status
+docker exec rabbit2 rabbitmq-queues quorum_status facturas.generar</code></pre>
+          </li>
+          <li>
+            <strong>Simula una partición:</strong> desconecta <code>rabbit3</code> de la red de Compose (<code>docker network disconnect taller_default rabbit3</code>). Con <code>pause_minority</code>, el nodo aislado debe dejar de servir. Comprueba que no acepta publicaciones y vuelve a conectarlo.</li>
+          <li>
+            <strong>Recupera el nodo caído</strong> (<code>docker start rabbit1</code>), espera la sincronización y verifica que vuelve a aparecer como seguidor. Ejecuta <code>rabbitmq-queues rebalance quorum</code> y compara el reparto de líderes antes y después.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Durante todo el ejercicio, <code>messages_ready + messages_unacknowledged</code> debe cuadrar con lo publicado menos lo confirmado. Si el total baja tras una caída, algún mensaje se confirmó sin estar en la mayoría: revisa que el productor use confirms.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Sobrevivir a la pérdida de un centro de datos</h3>
+          <p>El taller quiere dos centros de datos separados 30 km. Diseña la topología con RabbitMQ 4.4: ¿un clúster estirado con nodos en ambos centros, dos clústeres con Federation/Shovel, o replicación de definiciones con <em>warm standby</em>? Considera la latencia de Raft entre centros, el comportamiento ante una partición total y el RPO/RTO que puede prometer cada opción.</p>
+          <p>Define qué colas deben estar activas en ambos lados, cómo se evita procesar la misma factura dos veces y qué se pierde si el centro principal desaparece en el peor momento.</p>
+          <p><em>Pista: Raft con nodos a 30 km añade latencia a cada confirmación y una partición deja un lado sin mayoría. Para recuperación entre centros suele ser mejor replicar el flujo (Federation/Shovel) que estirar el consenso, aceptando que no es una réplica exacta.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El clúster comparte <strong>definiciones</strong>; el contenido solo se replica en <strong>quorum queues</strong>.</li>
+          <li>Todos los nodos necesitan el mismo <strong>nombre estable</strong> y la misma <strong>cookie de Erlang</strong>.</li>
+          <li>Desde RabbitMQ 4.1, <code>join_cluster</code> no requiere parar y resetear el nodo.</li>
+          <li>Tres nodos toleran un fallo; dos no toleran ninguno. La mayoría manda.</li>
+          <li>El cliente necesita <strong>balanceador o lista con reintento</strong>, reconexión, redeclaración y consumidores idempotentes.</li>
+          <li>Una partición puede dividir el clúster; elige <code>cluster_partition_handling</code> de forma explícita y pruébala.</li>
+          <li>La recuperación incluye volver a arrancar el nodo, verificar la sincronización y, si procede, reequilibrar líderes.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto o comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>rabbitmqctl cluster_status</code></td><td>Muestra nodos, discos y estado del clúster</td></tr>
+            <tr><td><code>rabbitmqctl join_cluster rabbit@host</code></td><td>Une el nodo actual al clúster indicado</td></tr>
+            <tr><td><code>RABBITMQ_ERLANG_COOKIE</code></td><td>Fija la cookie compartida en un contenedor</td></tr>
+            <tr><td><code>rabbitmq-queues quorum_status</code></td><td>Lista líder y seguidores de una quorum queue</td></tr>
+            <tr><td><code>rabbitmq-queues rebalance quorum</code></td><td>Reparte liderazgos entre nodos</td></tr>
+            <tr><td><code>rabbitmqctl forget_cluster_node</code></td><td>Retira permanentemente un nodo del clúster</td></tr>
+            <tr><td><code>cluster_partition_handling</code></td><td>Estrategia ante particiones (<code>ignore</code>, <code>pause_minority</code>)</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo añadir un nodo a un clúster en producción sin parar?</summary>
+            <div>
+              <p>Sí. El nodo nuevo se une, sincroniza metadatos y las quorum queues reparten réplicas. No hay que reiniciar los existentes. Hazlo en una ventana de baja carga y vigila el disco y la latencia durante la sincronización, porque mueve datos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un consumidor conectado a un nodo sin la cola puede consumirla?</summary>
+            <div>
+              <p>Sí, si la cola es quorum: la réplica o el líder pueden estar en otro nodo y el broker redirige internamente. Con una cola clásica, el consumidor debe estar conectado al nodo que la aloja; si no, la cola no existe para él. Por eso las colas de trabajo van en quorum.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa con los mensajes en vuelo cuando cae un nodo?</summary>
+            <div>
+              <p>Los que no se confirmaron vuelven a estar disponibles y se reentregan a otro consumidor. Los confirmados y replicados se conservan. El resultado es <em>at-least-once</em>: puede haber duplicados, y el consumidor debe ser idempotente.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿<code>pause_minority</code> es la mejor opción siempre?</summary>
+            <div>
+              <p>No. Prioriza consistencia sobre disponibilidad: el lado minoritario deja de servir. Es buena con un número impar de nodos y cuando prefieres no divergir. Con quorum queues, Raft ya impide escribir sin mayoría, así que <code>ignore</code> puede ser suficiente, pero debes entender y probar la política que elijas. Lo que nunca es aceptable es no haber decidido.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

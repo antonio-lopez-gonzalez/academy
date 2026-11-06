@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-erasure-coding">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Erasure coding — Módulo 5 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Erasure coding</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora el curso ha tratado el bucket como una caja negra: <code>mc cp</code> entra, <code>mc cat</code> sale. Pero debajo hay discos, y los discos fallan. La pregunta que responde el <strong>erasure coding</strong> es muy concreta: si se rompen varios discos a la vez, ¿puedo seguir leyendo y escribiendo, o he perdido el bucket?</p>
+        <p>La respuesta de MinIO no es RAID ni una copia completa del dato. Es <strong>Reed-Solomon</strong>: cada objeto se parte en <em>shards</em>, se calculan shards de paridad y se reparten entre discos. Con eso, un objeto se reconstruye aunque falten varios fragmentos. La misma idea que usan los CD, los códigos QR y los enlaces espaciales, aplicada a object storage.</p>
+        <p>Entender el modelo importa por tres razones prácticas:</p>
+        <ul>
+          <li><strong>Capacidad</strong>: la paridad consume espacio. Un clúster de 100 TB no ofrece 100 TB.</li>
+          <li><strong>Tolerancia</strong>: el nivel de paridad decide cuántos discos puedes perder. No es un número mágico, es una decisión de diseño.</li>
+          <li><strong>Operación</strong>: tras un fallo, el clúster queda <em>degradado</em> hasta que el <strong>healing</strong> termina. Ese periodo es el más peligroso.</li>
+        </ul>
+        <div class="callout callout--why">
+          <p class="callout__title">Erasure coding no es backup</p>
+          <p>Protege de un fallo de hardware dentro del clúster. No protege de un borrado, de un error de aplicación ni de perder el centro de datos entero. Para eso están el versionado, la réplica y el backup de las lecciones anteriores. Son capas, no alternativas.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>N = K + M</h3>
+        <p>Tres letras que explican todo el mecanismo:</p>
+        <table>
+          <thead><tr><th>Símbolo</th><th>Nombre</th><th>Qué representa</th></tr></thead>
+          <tbody>
+            <tr><td><strong>N</strong></td><td>Erasure set size</td><td>Número de discos del conjunto sobre el que se reparte un objeto (4 a 16).</td></tr>
+            <tr><td><strong>K</strong></td><td>Data shards</td><td>Fragmentos con datos reales. Es el mínimo necesario para leer.</td></tr>
+            <tr><td><strong>M</strong></td><td>Parity shards</td><td>Fragmentos calculados. Permiten reconstruir hasta M fragmentos perdidos.</td></tr>
+          </tbody>
+        </table>
+        <p>La regla de oro: <code>M</code> nunca puede superar <code>N/2</code>. Como mínimo debe quedar tanta información útil como paridad; si no, el sistema sería más caro que una copia completa y no aportaría nada.</p>
+        <h3>Un objeto, dieciséis discos</h3>
+        <pre><code class="language-text">objeto: acta.pdf (48 MB)
+            +--------------------------------------------------+
+            |              divisor Reed-Solomon                |
+            +--------------------------------------------------+
+                    |       |       |       |       |
+                    v       v       v       v       v
+                 D1  D2  D3 ... D12 | P1  P2  P3  P4      N = 16, K = 12, M = 4
+                    |       |       |       |       |
+        +-----------+-------+-------+-------+-------+-----------+
+        |     |     |     |     |     |     |     |     |     |
+      disk1 disk2 disk3 ... disk12 disk13 disk14 disk15 disk16
+        D1    D2    D3      D12     P1     P2     P3     P4
+  se puede perder CUALQUIER combinación de 4 discos y el objeto sigue completo</code></pre>
+        <p>Dos matices que la analogía del RAID pierde:</p>
+        <ul>
+          <li>No hay un disco «de paridad» dedicado ni un disco «principal». Todos los discos contienen shards de todos los objetos.</li>
+          <li>La pérdida tolerable no es «un disco por cada grupo», sino <strong>M discos del erasure set</strong>, sean cuales sean. Con M=4, puedes perder cuatro discos a la vez.</li>
+        </ul>
+        <h3>Paridad por defecto según el tamaño del set</h3>
+        <table>
+          <thead><tr><th>Discos en el erasure set</th><th>Paridad por defecto</th><th>Sobrecoste</th><th>Fallos tolerados</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td><code>EC:0</code></td><td>1,00×</td><td>0 (desarrollo, sin protección)</td></tr>
+            <tr><td>2 – 3</td><td><code>EC:1</code></td><td>2,00× – 1,50×</td><td>1</td></tr>
+            <tr><td>4 – 5</td><td><code>EC:2</code></td><td>2,00× – 1,67×</td><td>2</td></tr>
+            <tr><td>6 – 7</td><td><code>EC:3</code></td><td>2,00× – 1,75×</td><td>3</td></tr>
+            <tr><td>8 – 16</td><td><code>EC:4</code></td><td>2,00× – 1,33×</td><td>4</td></tr>
+          </tbody>
+        </table>
+        <p>El sobrecoste se calcula como <code>N / K</code>. Con 16 discos y EC:4: <code>16 / 12 = 1,33×</code>. Es decir, para almacenar 1 TB de datos necesitas 1,33 TB de disco bruto. Con EC:8 en 16 discos, <code>16 / 8 = 2×</code>: la mitad del disco es paridad.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">La paridad se decide al crear el pool</p>
+          <p>El tamaño del erasure set se fija cuando MinIO inicializa un <strong>server pool</strong> y no se puede cambiar después. La paridad sí se puede ajustar en caliente, pero <strong>solo afecta a objetos nuevos</strong>: los existentes conservan la paridad con la que se escribieron. Cambiar EC:4 por EC:2 no reescribe el pasado.</p>
+        </div>
+        <h3>Quórum: leer y escribir necesitan K</h3>
+        <p>MinIO necesita al menos <strong>K shards</strong> para leer un objeto y <strong>K discos disponibles</strong> para escribir uno nuevo. Con N=16 y K=12:</p>
+        <table>
+          <thead><tr><th>Discos caídos</th><th>Lectura</th><th>Escritura</th><th>Estado</th></tr></thead>
+          <tbody>
+            <tr><td>0</td><td>Sí</td><td>Sí</td><td>Óptimo.</td></tr>
+            <tr><td>1 – 4</td><td>Sí, reconstruyendo</td><td>Sí</td><td>Degradado pero operativo: aún quedan ≥ 12.</td></tr>
+            <tr><td>5 – 11</td><td>Depende del objeto</td><td>No</td><td>Pérdida de quórum de escritura; algunos objetos con más de 4 shards perdidos son ilegibles.</td></tr>
+            <tr><td>12 – 16</td><td>No</td><td>No</td><td>Datos perdidos para los objetos afectados.</td></tr>
+          </tbody>
+        </table>
+        <p>«Depende del objeto» no es una evasiva: si un objeto tenía sus 16 shards en discos que siguen vivos, se lee; si perdió 5 o más, no. La tolerancia es por conjunto de shards, no una propiedad global mágica.</p>
+        <h3>Qué pasa cuando falla un disco, paso a paso</h3>
+        <pre><code class="language-text">t0  falla disk7
+    - MinIO detecta el fallo y marca el disco offline
+    - las lecturas siguen: se reconstruye desde los 15 shards restantes
+    - las escrituras siguen: hay 15 &gt;= K=12
+    - el clúster queda DEGRADADO: queda margen para 3 fallos más
+t1  healing automático
+    - el scanner detecta shards que faltan
+    - reconstruye los datos del disco perdido en los discos sanos
+    - consume CPU, disco y red; puede tardar horas en un bucket grande
+t2  healing completo
+    - vuelve la redundancia completa (4 fallos tolerables)
+    - hasta aquí, el riesgo era real: un segundo fallo reducía el margen</code></pre>
+        <p>El periodo entre <code>t0</code> y <code>t2</code> es el que hay que vigilar. Un clúster degradado no es un clúster sano con una luz amarilla: es un clúster con menos margen del que fue diseñado para tener.</p>
+        <h3>Healing: automático, pero no instantáneo</h3>
+        <p>MinIO repara en lectura cuando detecta un shard corrupto y, en segundo plano, con el scanner. Para forzarlo o comprobar el estado:</p>
+        <pre><code class="language-bash">mc admin heal myminio
+mc admin heal -r myminio/documentos
+mc admin heal -r myminio/documentos --dry-run
+mc admin heal -r myminio/documentos --scan deep
+</code></pre>
+        <table>
+          <thead><tr><th>Flag</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>-r</code></td><td>Recursivo: recorre el bucket o prefijo.</td></tr>
+            <tr><td><code>--dry-run</code></td><td>Informa de lo que repararía sin tocar nada. Útil para dimensionar.</td></tr>
+            <tr><td><code>--scan deep</code></td><td>Comprueba también la integridad de los shards, no solo su presencia. Más lento.</td></tr>
+            <tr><td><code>--remove</code></td><td>Elimina objetos corruptos irrecuperables. Es destructivo: úsalo con criterio.</td></tr>
+          </tbody>
+        </table>
+        <h3>Bit rot: el fallo silencioso</h3>
+        <p>Un disco puede devolver datos distintos de los que se escribieron sin avisar: un bit que se voltea por desgaste, temperatura o firmware. MinIO calcula un hash <strong>HighwayHash</strong> por shard y lo verifica en cada lectura. Si no cuadra, reconstruye el shard desde la paridad y marca el disco para healing. Esa es la diferencia entre «el archivo se lee» y «el archivo se lee bien».</p>
+        <h3>Storage class: pagar más o menos paridad</h3>
+        <p>MinIO permite dos clases por defecto:</p>
+        <table>
+          <thead><tr><th>Clase</th><th>Configuración</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>STANDARD</code></td><td>Paridad alta (por defecto, EC:4)</td><td>Datos importantes, lecturas frecuentes.</td></tr>
+            <tr><td><code>REDUCED_REDUNDANCY</code></td><td>Paridad menor (por ejemplo, EC:2)</td><td>Datos derivados, temporales, reproducible desde el original.</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-bash">mc admin config get myminio storage_class
+mc admin config set myminio storage_class \
+  standard=EC:4 \
+  reduced_redundancy=EC:2
+</code></pre>
+        <p>El cliente elige la clase al escribir:</p>
+        <pre><code class="language-bash">mc cp --storage-class REDUCED_REDUNDANCY \
+  ./thumbnails/acta.jpg myminio/documentos/derivados/
+</code></pre>
+        <p>La clase se guarda con el objeto; cambiarla en el servidor no reescribe lo ya almacenado. Y no es una forma de «ahorrar espacio» sin coste: reducir paridad reduce la tolerancia a fallos de esos objetos.</p>
+        <h3>Erasure coding frente a réplica</h3>
+        <table>
+          <thead><tr><th></th><th>Erasure coding</th><th>Réplica</th></tr></thead>
+          <tbody>
+            <tr><td>Alcance</td><td>Dentro del clúster</td><td>Entre sitios o buckets</td></tr>
+            <tr><td>Protege de</td><td>Fallo de discos y nodos</td><td>Caída de un centro de datos</td></tr>
+            <tr><td>Coste</td><td>1,33× – 2× según paridad</td><td>2× o más (copia completa)</td></tr>
+            <tr><td>Latencia</td><td>Reconstrucción en lectura si falta un shard</td><td>Lectura local en cada sitio</td></tr>
+            <tr><td>Se combinan</td><td>Sí: EC local + réplica remota es el patrón habitual</td><td>Sí</td></tr>
+          </tbody>
+        </table>
+        <h3>Límites que conviene saber</h3>
+        <ul>
+          <li><strong>Un solo disco no tiene paridad</strong>: en el Compose de desarrollo verás <code>EC:0</code>. No es un clúster tolerante a fallos.</li>
+          <li><strong>El erasure set no crece</strong>: si necesitas más capacidad o más discos por set, se añade un pool nuevo, no se estira el existente.</li>
+          <li><strong>Objetos pequeños</strong>: cada uno genera N shards y metadatos; con millones de ficheros de 1 KB, el coste dominante no es el dato.</li>
+          <li><strong>Healing compite con el tráfico</strong>: reconstruir un disco grande puede saturar la red; planifícalo.</li>
+          <li><strong>No sustituye a RAID de forma automática</strong>: MinIO recomienda JBOD y gestiona la redundancia él mismo; poner RAID debajo suele duplicar la protección y complicar la operación.</li>
+        </ul>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Lo más pequeño que puedes hacer para entender tu despliegue es preguntarle a MinIO cómo está organizado:</p>
+        <pre><code class="language-bash">mc admin info myminio
+</code></pre>
+        <pre><code class="language-text">●  minio.local:9000
+   Uptime: 3 hours
+   Version: 2026-10-28T07:31:12Z
+   Network: 1/1 OK
+   Drives: 4/4 OK
+   Pool: 1
+Pools:
+   1st, Erasure sets: 1, Drives per erasure set: 4
+120 GiB Used, 3 Buckets, 1842 Objects
+4 drives online, 0 drives offline, EC:2</code></pre>
+        <p>Cómo leerlo:</p>
+        <ul>
+          <li><strong>Drives 4/4 OK</strong>: no hay discos caídos en este momento.</li>
+          <li><strong>Erasure sets: 1</strong>: todos los discos forman un único conjunto. Con más de 16 discos verías varios sets.</li>
+          <li><strong>Drives per erasure set: 4</strong>: N=4. Es el tamaño con el que se calculó la paridad.</li>
+          <li><strong>EC:2</strong>: K=2, M=2. Con 4 discos, se toleran 2 fallos; el sobrecoste es <code>4/2 = 2×</code>.</li>
+        </ul>
+        <p>Y ahora la comprobación que casi nadie hace: ¿qué clase de almacenamiento está configurada?</p>
+        <pre><code class="language-bash">mc admin config get myminio storage_class
+</code></pre>
+        <pre><code class="language-text">storage_class standard=EC:4 reduced_redundancy=EC:2</code></pre>
+        <p>Si el set tiene 4 discos y la clase estándar pide EC:4, MinIO no puede cumplirla: la paridad máxima es <code>N/2 = 2</code>. La configuración se acepta, pero la paridad efectiva se limita al máximo posible. Por eso conviene que <code>standard</code> y el tamaño del set sean coherentes.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos crece hasta necesitar 40 TB útiles. El equipo diseña un clúster de cuatro nodos con cuatro discos de 4 TB cada uno: 16 discos, 64 TB brutos.</p>
+        <h3>Dimensionamiento</h3>
+        <pre><code class="language-text">4 nodos × 4 discos × 4 TB = 64 TB brutos
+erasure set: 16 discos (un solo set)
+paridad estándar: EC:4  →  K=12, M=4
+sobrecoste: 16/12 = 1,33×
+capacidad útil: 64 TB / 1,33 ≈ 48 TB
+tolerancia: 4 discos (o un nodo entero, si sus 4 discos fallan)</code></pre>
+        <table>
+          <thead><tr><th>Escenario</th><th>Discos disponibles</th><th>Qué ocurre</th></tr></thead>
+          <tbody>
+            <tr><td>Falla un disco</td><td>15/16</td><td>Lecturas y escrituras continúan; healing reconstruye.</td></tr>
+            <tr><td>Falla un nodo entero</td><td>12/16</td><td>Sigue operativo al límite: quedan exactamente K=12.</td></tr>
+            <tr><td>Falla un nodo y un disco de otro</td><td>11/16</td><td>Sin quórum de escritura; lecturas solo si el objeto conserva ≥12 shards.</td></tr>
+            <tr><td>Falla un segundo nodo</td><td>8/16</td><td>Muchos objetos ilegibles. Situación de pérdida parcial.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Un nodo no es un disco</p>
+          <p>Si los 4 discos de un nodo están en el mismo chasis y se cae la fuente, pierdes 4 discos de golpe. Con EC:4 estás en el límite exacto: cualquier fallo adicional te deja sin escrituras. Por eso los clústeres serios distribuyen discos entre nodos y añaden margen (EC:3 o EC:4 con más de 16 discos por pool).</p>
+        </div>
+        <h3>Configurar la clase estándar</h3>
+        <pre><code class="language-bash">mc admin config set myminio storage_class \
+  standard=EC:4 \
+  reduced_redundancy=EC:2
+mc admin service restart myminio
+mc admin info myminio
+</code></pre>
+        <p>Los objetos nuevos se escribirán con 12+4. Los antiguos, con la paridad que tuvieran. Si el equipo quiere cambiar la paridad de todo el bucket, necesita reescribirlo (copiar a un bucket nuevo), no basta con cambiar la configuración.</p>
+        <h3>Operar un fallo</h3>
+        <pre><code class="language-text">03:12  alerta: drive /data/disk3 offline en minio-2
+03:13  mc admin info myminio
+       → 15 drives online, 1 offline, EC:4
+03:14  el tráfico de lectura sigue; las escrituras siguen (15 ≥ 12)
+03:15  se sustituye el disco físicamente
+03:40  MinIO detecta el disco nuevo y comienza el healing
+05:10  healing completo: 16/16 online, redundancia restaurada
+durante 1h 58m el clúster tuvo 3 fallos de margen en vez de 4</code></pre>
+        <p>El error de operación típico no es el fallo del disco: es <strong>no reponerlo</strong> porque «el clúster sigue funcionando». Un clúster que lleva tres meses con un disco menos está a un fallo de quedarse sin margen, y nadie lo sabe porque los listados responden.</p>
+        <h3>Comprobar el estado del healing</h3>
+        <pre><code class="language-bash">mc admin heal -r myminio/documentos --dry-run
+mc admin heal -r myminio/documentos --scan deep
+</code></pre>
+        <p>El <code>--dry-run</code> es la forma segura de saber cuánto queda por reparar sin lanzar carga adicional. El <code>--scan deep</code> verifica integridad; úsalo en una ventana de mantenimiento, no en hora punta.</p>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Calcular capacidad útil con el sobrecoste de paridad</td>
+              <td>Planificar con los TB brutos</td>
+              <td>Con EC:4 pierdes un 25 %; con EC:8, la mitad.</td>
+            </tr>
+            <tr>
+              <td>Dejar margen tras un fallo y reponer el disco</td>
+              <td>Operar meses en modo degradado</td>
+              <td>La redundancia es el colchón; sin él, el siguiente fallo es fatal.</td>
+            </tr>
+            <tr>
+              <td>Usar <code>REDUCED_REDUNDANCY</code> solo en datos reproducibles</td>
+              <td>Bajar paridad para «ganar espacio» en datos críticos</td>
+              <td>La capacidad extra se paga con tolerancia a fallos.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Creer que un nodo con 4 discos tolera 4 fallos «de nodo»</h3>
+        <span class="code-label code-label--wrong">Mal — confundir shards con hosts</span>
+        <pre><code class="language-text">EC:4 sobre 4 nodos × 4 discos
+❌ "Puedo perder 4 nodos"
+   En realidad: 4 discos. Si caen 2 nodos, has perdido 8 discos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — razonar por discos y por dominio de fallo</span>
+        <pre><code class="language-text">4 discos tolerados = 1 nodo completo (4 discos) y nada más.
+Para tolerar 2 nodos con 4 discos cada uno: M ≥ 8
+→ N=16, EC:8, sobrecoste 2×. Es una decisión de coste, no gratis.
+</code></pre>
+        <h3>2. Cambiar la paridad y suponer que reescribe los objetos</h3>
+        <span class="code-label code-label--wrong">Mal — bajar EC para recuperar espacio</span>
+        <pre><code class="language-bash">mc admin config set myminio storage_class standard=EC:2
+# ❌ Los objetos existentes siguen con EC:4 y el espacio no cambia.
+</code></pre>
+        <span class="code-label code-label--right">Bien — cambiar la clase y reescribir si hace falta</span>
+        <pre><code class="language-bash">mc admin config set myminio storage_class standard=EC:2
+mc mirror --overwrite myminio/documentos myminio/documentos-nuevo
+# Solo los objetos nuevos usan la nueva paridad; migrar es una decisión aparte.
+</code></pre>
+        <h3>3. Ignorar el clúster degradado</h3>
+        <span class="code-label code-label--wrong">Mal — «sigue respondiendo, lo miro luego»</span>
+        <pre><code class="language-bash">mc admin info myminio
+# 15 drives online, 1 offline, EC:4
+# ❌ Se deja así durante semanas; el margen es de 3 fallos, no de 4.
+</code></pre>
+        <span class="code-label code-label--right">Bien — reponer y verificar el healing</span>
+        <pre><code class="language-bash">mc admin info myminio --offline
+mc admin heal -r myminio --dry-run
+# Reponer el disco y confirmar que vuelve a 16/16 y healing completo.
+</code></pre>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> leer la geometría real del clúster, calcular su capacidad útil y comprobar el estado del healing sin tocar datos.</p>
+        <ol class="steps">
+          <li>
+            <strong>Inspecciona el clúster:</strong>
+            <pre><code class="language-bash">mc admin info myminio
+mc admin info myminio --offline
+</code></pre>
+            <p>Anota: número de pools, erasure sets, discos por set, discos online/offline y el valor <code>EC:N</code>. En el Compose de desarrollo verás un solo disco y <code>EC:0</code>: es lo esperado.</p>
+          </li>
+          <li>
+            <strong>Lee la configuración de storage class:</strong>
+            <pre><code class="language-bash">mc admin config get myminio storage_class
+</code></pre>
+            <p>Si el set tiene 4 discos, la paridad máxima es EC:2. Comprueba si la configuración pide algo imposible y explica qué hará MinIO.</p>
+          </li>
+          <li>
+            <strong>Calcula a mano:</strong> para N=16 y EC:4, ¿cuál es K, cuántos fallos tolera y cuánto sobrecoste tiene? Para N=8 y EC:3, ¿cuánta capacidad útil queda de 32 TB brutos? Deja los números escritos antes de seguir.
+          </li>
+          <li>
+            <strong>Escribe un objeto con clase reducida en un bucket de laboratorio:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing myminio/lab-ec
+printf 'derivado reproducible\n' &gt; derivado.txt
+mc cp --storage-class REDUCED_REDUNDANCY \
+  derivado.txt myminio/lab-ec/derivados/prueba.txt
+mc ls --json myminio/lab-ec/derivados/
+</code></pre>
+            <p>Salida esperada: el objeto aparece con la clase <code>REDUCED_REDUNDANCY</code>. En un solo disco la paridad efectiva sigue siendo 0; lo que se demuestra es la etiqueta y el flujo.</p>
+          </li>
+          <li>
+            <strong>Comprueba el healing en seco y limpia:</strong>
+            <pre><code class="language-bash">mc admin heal -r myminio/lab-ec --dry-run
+mc rb --force myminio/lab-ec
+</code></pre>
+            <p>Salida esperada: ningún objeto pendiente. Si cambiaste la storage class del clúster, vuelve a dejarla como estaba y reinicia.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Vuelve a <code>mc admin info</code> y explica en una frase por qué la capacidad «usada» y la «disponible» no suman el tamaño bruto de los discos. Si no sabes responder, repasa la relación <code>N/K</code> antes de pasar al modo distribuido.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Diseñar la geometría de un clúster de 100 TB útiles</h3>
+          <p>Dimensiona un clúster MinIO que ofrezca 100 TB útiles, tolere la caída de un nodo completo y mantenga escrituras durante ese fallo. Decide número de nodos, discos por nodo, tamaño de disco y paridad. Calcula el coste bruto, el sobrecoste y el número de fallos que quedan disponibles tras perder un nodo.</p>
+          <p>Compara dos alternativas: una con 16 discos por pool y otra con varios pools de 8. ¿Cuál tolera mejor el fallo de un nodo? ¿Qué pasa con la capacidad si un pool queda inaccesible?</p>
+          <p><em>Pista: el erasure set nunca cruza pools. Un pool caído no se reconstruye desde otro pool; solo la réplica o el backup cubren ese escenario.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Erasure coding parte cada objeto en <strong>K datos + M paridad</strong>, repartidos por el erasure set.</li>
+          <li>Se toleran hasta <strong>M fallos de disco</strong>; <code>M</code> nunca supera <code>N/2</code>.</li>
+          <li>Leer requiere <strong>K shards</strong>; escribir requiere <strong>K discos</strong> disponibles.</li>
+          <li>El sobrecoste es <code>N/K</code>: EC:4 en 16 discos cuesta un 33 % de capacidad.</li>
+          <li>El tamaño del erasure set se fija al crear el pool; la paridad se puede cambiar, pero solo afecta a objetos nuevos.</li>
+          <li>Un fallo deja el clúster <strong>degradado</strong> hasta que el healing termina; ese es el periodo de riesgo.</li>
+          <li>Erasure coding protege del fallo de hardware, no de borrados ni de perder el sitio.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc admin info</code></td><td>Muestra pools, discos, sets y paridad efectiva</td></tr>
+            <tr><td><code>mc admin info --offline</code></td><td>Lista solo discos o nodos caídos</td></tr>
+            <tr><td><code>mc admin config set storage_class</code></td><td>Ajusta la paridad de objetos nuevos</td></tr>
+            <tr><td><code>mc cp --storage-class</code></td><td>Escribe un objeto con una clase concreta</td></tr>
+            <tr><td><code>mc admin heal -r</code></td><td>Repara un bucket o prefijo</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Erasure coding es lo mismo que RAID?</summary>
+            <div>
+              <p>Comparten la idea de paridad, pero el nivel de abstracción es distinto. RAID protege discos y es transparente al sistema de archivos; el erasure coding de MinIO protege objetos, reparte shards entre nodos y reconstruye en lectura. MinIO recomienda JBOD y gestionar la redundancia en el servidor, no debajo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo cambiar la paridad de un bucket existente?</summary>
+            <div>
+              <p>Puedes cambiar la configuración de storage class, pero solo se aplica a objetos nuevos. Los existentes conservan la paridad con la que se escribieron. Para cambiarlos hay que reescribirlos (copiar a un bucket nuevo y sustituir), lo que consume tiempo, red y espacio temporal.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si pierdo más shards de los que tolera un objeto?</summary>
+            <div>
+              <p>Ese objeto es ilegible. Otros objetos que no tenían shards en los discos perdidos pueden seguir leyéndose. No hay una recuperación mágica: la única vía es restaurar desde réplica o backup. Por eso el healing y la reposición de discos no son opcionales.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánta capacidad útil me queda realmente?</summary>
+            <div>
+              <p>Capacidad bruta × K/N, menos el margen de seguridad que quieras dejar. Con 16 discos y EC:4, el 75 %. A eso réstale versiones, réplica y backups: el número que ves en <code>mc admin info</code> es capacidad usable del clúster, no espacio libre para datos nuevos después de todo.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

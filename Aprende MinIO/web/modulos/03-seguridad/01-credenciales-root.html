@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-credenciales-root">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Credenciales root — Módulo 3 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Credenciales root</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Seguridad</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Todo MinIO arranca con un usuario <strong>root</strong>: la identidad que existe antes de que existan usuarios, políticas o buckets. Es la llave con la que se abre la puerta por primera vez. El problema empieza cuando esa llave se queda puesta en la cerradura: la aplicación la usa para todo, el equipo la comparte por chat y acaba en un <code>.env</code> que alguien sube a Git.</p>
+        <p>Root no es «un usuario con todos los permisos». Es una identidad <strong>fuera del sistema de políticas</strong>: no hay forma de limitarla por prefijo, por acción ni por bucket, y no se puede deshabilitar ni borrar. Si se filtra, el atacante puede leer todos los objetos, borrar buckets, crear usuarios y cambiar políticas. No hay recuperación parcial; hay que rotar y auditar.</p>
+        <p>La postura correcta es sencilla de enunciar y fácil de romper: root se usa para el arranque y para tareas de plataforma puntuales; las aplicaciones usan <a href="./02-usuarios-y-politicas.html">usuarios con permisos acotados</a>. Esta lección cubre cómo se define root, cómo se entrega el secreto, cómo se rota y qué señales indican que ya está comprometido.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">El default es peor de lo que crees</p>
+          <p>Si no defines <code>MINIO_ROOT_USER</code> y <code>MINIO_ROOT_PASSWORD</code>, MinIO arranca con <code>minioadmin:minioadmin</code>. No es un ejemplo de la documentación: es el valor real. Un servidor con el puerto 9000 expuesto y credenciales por defecto no está «sin configurar», está abierto.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué es exactamente el usuario root</h3>
+        <p>MinIO crea la identidad root al arrancar, leyendo estas dos variables:</p>
+        <pre><code class="language-bash">MINIO_ROOT_USER=minio-root
+MINIO_ROOT_PASSWORD=una-frase-larga-y-aleatoria-de-40-caracteres</code></pre>
+        <table>
+          <thead><tr><th>Propiedad</th><th>Root</th><th>Usuario IAM</th></tr></thead>
+          <tbody>
+            <tr><td>Quién lo crea</td><td>El servidor, al arrancar</td><td>Un administrador con <code>mc admin user add</code></td></tr>
+            <tr><td>Permisos</td><td>Todos, siempre</td><td>Los de sus políticas adjuntas</td></tr>
+            <tr><td>Se puede limitar</td><td>No</td><td>Sí, por acción y recurso</td></tr>
+            <tr><td>Se puede deshabilitar</td><td>No</td><td>Sí, con <code>mc admin user disable</code></td></tr>
+            <tr><td>Cómo se cambia</td><td>Variables de entorno y reinicio</td><td>Comandos de administración en caliente</td></tr>
+            <tr><td>Uso previsto</td><td>Arranque y operación de plataforma</td><td>Aplicaciones y personas</td></tr>
+          </tbody>
+        </table>
+        <p>La longitud mínima que exige MinIO es de <strong>3 caracteres</strong> para el usuario y <strong>8</strong> para la contraseña. Eso es un suelo técnico, no una recomendación: una contraseña de 8 caracteres se rompe con fuerza bruta offline en muy poco tiempo. Usa cadenas aleatorias de 32 caracteres o más, generadas con un gestor de secretos.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Se leen al arrancar, no en cada petición</p>
+          <p>Cambiar la variable de entorno de un contenedor en marcha no cambia la contraseña: el proceso ya leyó el valor. La rotación siempre implica reiniciar el servidor (o todos los nodos, en un clúster).</p>
+        </div>
+
+        <h3>Root frente a administrador delegado</h3>
+        <p>Hay dos formas de «tener permisos de administración». Root es la identidad irreducible. <code>consoleAdmin</code> es una política integrada que puedes adjuntar a un usuario normal y que permite gestionar el servidor sin ser root. La diferencia práctica: al usuario <code>consoleAdmin</code> puedes deshabilitarlo, rotarle el secreto o quitarle la política; a root, no.</p>
+        <pre><code class="language-text">root  ------------------------------------------->  todo, sin límites
+  |
+  +-- se usa UNA vez: crear el primer admin delegado
+        |
+        +-- ops-admin (consoleAdmin) ------------->  administración diaria
+              |
+              +-- app-documentos (política propia) ->  solo su prefijo
+                    |
+                    +-- svcacct (opcional) --------->  credencial de un job</code></pre>
+        <p>El objetivo es que, después del arranque, nadie necesite root para el día a día. Si tu aplicación tiene las credenciales root, cualquier error de código se convierte en un error con permisos totales.</p>
+
+        <h3>Cómo se entrega el secreto</h3>
+        <table>
+          <thead><tr><th>Método</th><th>Cuándo</th><th>Riesgo</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker compose</code> con <code>env_file</code></td><td>Desarrollo local</td><td>El valor queda en <code>docker inspect</code> y en el entorno del proceso.</td></tr>
+            <tr><td>Fichero de entorno montado y <code>MINIO_CONFIG_ENV_FILE</code></td><td>Servidor único, baremetal o contenedor</td><td>Hay que proteger permisos del fichero (<code>0600</code>) y no versionarlo.</td></tr>
+            <tr><td>Secret de Docker o Kubernetes</td><td>Producción</td><td>El secreto sigue existiendo en el plano de control; controla quién lo lee.</td></tr>
+            <tr><td>Vault, AWS Secrets Manager, SOPS</td><td>Producción con auditoría</td><td>Requiere integrar la inyección al arrancar; no lo metas en una imagen.</td></tr>
+          </tbody>
+        </table>
+        <p>MinIO permite apuntar a un fichero de entorno con <code>MINIO_CONFIG_ENV_FILE</code>. Es la vía más limpia en contenedores: el secreto no aparece en la línea de comandos ni en la definición del servicio.</p>
+
+        <h3>Rotación: qué cambia y qué deja de funcionar</h3>
+        <p>Rotar root significa arrancar el servidor con un valor nuevo. No hay un comando «cambiar contraseña de root» en caliente. El procedimiento seguro tiene un orden:</p>
+        <ol>
+          <li><strong>Antes</strong>: crea o verifica un usuario <code>consoleAdmin</code> con su propio secreto. Es tu red de seguridad si algo falla.</li>
+          <li>Genera el nuevo secreto y guárdalo en el gestor de secretos, no en un ticket.</li>
+          <li>Actualiza el fichero o el secret que lee el servidor.</li>
+          <li>Reinicia MinIO. En un clúster, todos los nodos deben acabar con las mismas credenciales root.</li>
+          <li>Verifica que el valor viejo falla y el nuevo funciona; comprueba también el admin delegado.</li>
+          <li>Actualiza cualquier automatización que aún usara root. Revisa los logs de acceso de las últimas horas.</li>
+        </ol>
+        <p>Consecuencias inmediatas de la rotación:</p>
+        <ul>
+          <li>Las <strong>presigned URLs</strong> firmadas con el secreto anterior dejan de ser válidas, aunque no hayan expirado.</li>
+          <li>Los procesos que tenían root en memoria empiezan a recibir <code>InvalidAccessKeyId</code> o <code>SignatureDoesNotMatch</code>.</li>
+          <li>Las sesiones de consola abiertas con root se invalidan.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p class="callout__title">En un clúster, la rotación no es instantánea</p>
+          <p>Todos los nodos deben compartir las mismas credenciales root. Durante un reinicio escalonado conviven nodos con secretos distintos, y una petición firmada con el nuevo valor puede caer en un nodo que aún tiene el viejo. Planifica una ventana o actualiza todos los nodos a la vez; no lo hagas en horario de pico.</p>
+        </div>
+
+        <h3>Qué puede hacer un root comprometido</h3>
+        <table>
+          <thead><tr><th>Acción</th><th>Impacto</th></tr></thead>
+          <tbody>
+            <tr><td>Leer cualquier objeto</td><td>Exfiltración completa de documentos, backups y secretos almacenados.</td></tr>
+            <tr><td>Borrar objetos y buckets</td><td>Pérdida de datos; sin versionado, irreversible.</td></tr>
+            <tr><td>Crear usuarios y políticas</td><td>Persistencia: el atacante se crea su propia puerta trasera.</td></tr>
+            <tr><td>Cambiar configuraciones del servidor</td><td>Desactivar cifrado, cambiar CORS, alterar lifecycle.</td></tr>
+            <tr><td>Leer configuraciones y metadatos</td><td>Descubrir otros servicios, endpoints y credenciales de terceros.</td></tr>
+          </tbody>
+        </table>
+        <p>Por eso una filtración de root no se trata como «cambio de contraseña»: se trata como incidente. Rota, revisa usuarios creados, revisa políticas modificadas, revisa accesos y, si hay datos sensibles, asume exfiltración hasta que los logs demuestren lo contrario.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un <code>compose.yml</code> que no pone el secreto en el YAML: lo lee de un fichero de entorno montado como secret.</p>
+        <pre><code class="language-yaml">services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_CONFIG_ENV_FILE: /run/secrets/minio_env
+    secrets:
+      - minio_env
+    volumes:
+      - minio-data:/data
+
+secrets:
+  minio_env:
+    file: ./secrets/minio.env
+
+volumes:
+  minio-data:</code></pre>
+        <pre><code class="language-bash"># secrets/minio.env — nunca se versiona
+MINIO_ROOT_USER=minio-root
+MINIO_ROOT_PASSWORD=K7f2pQ9xR4mT8vL3nB6cW1sH5jD0aZ2e</code></pre>
+        <pre><code class="language-bash">chmod 600 secrets/minio.env
+docker compose up -d</code></pre>
+        <p>Qué hace cada pieza:</p>
+        <ul>
+          <li><code>MINIO_CONFIG_ENV_FILE</code> le dice a MinIO que cargue variables desde ese fichero, con el mismo formato que un <code>.env</code>.</li>
+          <li>El secret de Compose monta el fichero en <code>/run/secrets/minio_env</code>, fuera del contexto de la imagen.</li>
+          <li>El YAML no contiene el valor: puede ir al repositorio sin filtrar nada.</li>
+          <li><code>chmod 600</code> limita la lectura al usuario que ejecuta Compose.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title">El secreto también está en el host</p>
+          <p>Un fichero montado sigue existiendo en el disco del servidor. Cifra el volumen, limita el acceso por SSH y rota si sospechas que alguien pudo leerlo. Un secret no es magia: es un secreto con mejor higiene.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El arranque del almacén crea un administrador delegado y un usuario de aplicación. Root solo se usa en este script, que se ejecuta desde el pipeline de plataforma con el secreto inyectado.</p>
+        <pre><code class="language-bash">#!/usr/bin/env bash
+# scripts/bootstrap.sh — se ejecuta una vez por entorno
+set -euo pipefail
+
+: "${MINIO_URL:?falta MINIO_URL}"
+: "${MINIO_ROOT_USER:?falta MINIO_ROOT_USER}"
+: "${MINIO_ROOT_PASSWORD:?falta MINIO_ROOT_PASSWORD}"
+: "${APP_USER:?falta APP_USER}"
+: "${APP_SECRET:?falta APP_SECRET}"
+: "${OPS_ADMIN_SECRET:?falta OPS_ADMIN_SECRET}"
+
+mc alias set bootstrap "$MINIO_URL" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+
+# 1. Administrador delegado para el equipo de plataforma
+if ! mc admin user info bootstrap ops-admin &gt;/dev/null 2&gt;&amp;1; then
+  mc admin user add bootstrap ops-admin "$OPS_ADMIN_SECRET"
+fi
+mc admin policy attach bootstrap consoleAdmin --user ops-admin
+
+# 2. Usuario de la aplicación, sin privilegios de administración
+if ! mc admin user info bootstrap app-documentos &gt;/dev/null 2&gt;&amp;1; then
+  mc admin user add bootstrap app-documentos "$APP_SECRET"
+fi
+mc admin policy attach bootstrap documentos-rw --user app-documentos
+
+echo "bootstrap completado: root ya no es necesario"</code></pre>
+        <p>El script es idempotente: si el usuario existe, no falla; si la política ya está adjunta, el comando lo indica y continúa. Eso permite ejecutarlo en cada despliegue sin miedo.</p>
+        <p>La aplicación recibe solo <code>APP_USER</code> y <code>APP_SECRET</code>. Nunca <code>MINIO_ROOT_*</code>:</p>
+        <pre><code class="language-bash"># .env.example de la aplicación — nombres, no valores
+MINIO_ENDPOINT=minio
+MINIO_PORT=9000
+MINIO_USE_SSL=false
+MINIO_ACCESS_KEY=app-documentos
+MINIO_SECRET_KEY=cambia-esto-en-tu-gestor-de-secretos
+MINIO_BUCKET=documentos</code></pre>
+        <pre><code class="language-bash"># .gitignore
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprueba que root no se usa</p>
+          <p>Busca en tus despliegues la cadena <code>MINIO_ROOT_</code>. Debe aparecer solo en el servicio de MinIO y en el script de bootstrap. Si aparece en la API, en un job o en una imagen, tienes una credencial root fuera de su sitio.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Definir root explícitamente, incluso en local</td><td>Dejar los valores por defecto</td><td>Sin variables, el servidor arranca con <code>minioadmin:minioadmin</code>.</td></tr>
+            <tr><td>Secreto aleatorio de 32+ caracteres</td><td>«MinIO2026!» o el nombre de la empresa</td><td>La longitud y la aleatoriedad son lo que resiste un ataque offline.</td></tr>
+            <tr><td>Entregar root por fichero o gestor de secretos</td><td>Pegarlo en el YAML, en la imagen o en el historial de shell</td><td>Todo lo que pasa por el YAML o la línea de comandos queda registrado.</td></tr>
+            <tr><td>Crear un <code>consoleAdmin</code> antes de rotar</td><td>Rotar root sin otra vía de administración</td><td>Si el nuevo valor no funciona, necesitas una puerta de emergencia.</td></tr>
+            <tr><td>Usar usuarios y políticas para la aplicación</td><td>Compartir root entre servicios</td><td>Root no se puede limitar y una filtración afecta a todo el servidor.</td></tr>
+            <tr><td>Rotar tras cualquier sospecha y revisar usuarios</td><td>Cambiar la contraseña y dar el incidente por cerrado</td><td>Un root comprometido pudo crear accesos persistentes.</td></tr>
+            <tr><td>Guardar <code>.env.example</code> sin valores reales</td><td>Versionar <code>.env</code> «solo en local»</td><td>El historial de Git conserva el secreto aunque borres el archivo después.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Arrancar sin variables y creer que está «sin configurar»</h3>
+        <span class="code-label code-label--wrong">Mal — credenciales por defecto en un puerto público</span>
+        <pre><code class="language-yaml">services:
+  minio:
+    image: quay.io/minio/minio
+    command: server /data
+    ports: ["9000:9000"]   # ❌ minioadmin:minioadmin</code></pre>
+        <span class="code-label code-label--right">Bien — root explícito desde el primer arranque</span>
+        <pre><code class="language-yaml">    environment:
+      MINIO_CONFIG_ENV_FILE: /run/secrets/minio_env
+    secrets: [minio_env]</code></pre>
+        <p>No hay ningún aviso visible: el servidor arranca correctamente. La única forma de detectarlo es saber que el default existe y comprobarlo en el checklist de despliegue.</p>
+
+        <h3>2. Dar root a la aplicación</h3>
+        <span class="code-label code-label--wrong">Mal — el servicio hereda todos los permisos</span>
+        <pre><code class="language-bash">MINIO_ACCESS_KEY=minio-root
+MINIO_SECRET_KEY=$MINIO_ROOT_PASSWORD   # ❌ en el contenedor de la API</code></pre>
+        <span class="code-label code-label--right">Bien — usuario con política acotada</span>
+        <pre><code class="language-bash">MINIO_ACCESS_KEY=app-documentos
+MINIO_SECRET_KEY=$APP_SECRET            # permisos solo sobre documentos/*</code></pre>
+        <p>Además de reducir el daño, el usuario acotado hace que los errores de código sean detectables: si la aplicación intenta borrar un bucket y recibe <code>AccessDenied</code>, es que estaba haciendo algo que no debía.</p>
+
+        <h3>3. Rotar el valor sin reiniciar</h3>
+        <span class="code-label code-label--wrong">Mal — el proceso sigue con el secreto viejo</span>
+        <pre><code class="language-bash">sed -i 's/^MINIO_ROOT_PASSWORD=.*/MINIO_ROOT_PASSWORD=nuevo/' secrets/minio.env
+# ❌ nadie reinició MinIO; la contraseña antigua sigue activa</code></pre>
+        <span class="code-label code-label--right">Bien — reiniciar y verificar ambos valores</span>
+        <pre><code class="language-bash">docker compose up -d --force-recreate minio
+mc alias set check http://localhost:9000 minio-root 'nuevo-secreto'
+mc admin info check</code></pre>
+        <p>Y verifica también que el valor viejo falla. Si sigue funcionando, el proceso no releyó el fichero o estás hablando con otro nodo.</p>
+
+        <h3>4. Confiar en <code>.gitignore</code> después de un commit</h3>
+        <span class="code-label code-label--wrong">Mal — borrar el archivo no borra la historia</span>
+        <pre><code class="language-bash">git rm --cached .env      # ❌ el secreto sigue en el commit anterior
+echo '.env' &gt;&gt; .gitignore</code></pre>
+        <span class="code-label code-label--right">Bien — rotar, purgar y avisar</span>
+        <pre><code class="language-bash">git log --all -- .env      # localizar el commit
+# rotar el secreto YA; después limpiar historia si el repo es público
+# y revisar accesos desde la fecha de exposición</code></pre>
+        <p>La rotación es lo urgente; la limpieza del historial es lo segundo. Un secreto publicado se considera comprometido aunque el repositorio sea privado.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> arrancar MinIO sin credenciales por defecto, crear un administrador delegado y rotar root comprobando que el valor anterior deja de funcionar.</p>
+        <ol class="steps">
+          <li>
+            <strong>Genera un secreto largo:</strong>
+            <pre><code class="language-bash">openssl rand -base64 36
+# en PowerShell:
+# [Convert]::ToBase64String((1..36 | ForEach-Object { Get-Random -Max 256 }))</code></pre>
+            <p>Guarda el resultado en <code>secrets/minio.env</code> con <code>MINIO_ROOT_USER=minio-root</code> y el secreto en <code>MINIO_ROOT_PASSWORD</code>. Permisos <code>600</code>.</p>
+          </li>
+          <li>
+            <strong>Levanta el servicio con el compose de la sección 3:</strong>
+            <pre><code class="language-bash">docker compose up -d
+mc alias set local http://localhost:9000 minio-root 'el-secreto-generado'
+mc admin info local</code></pre>
+            <pre><code class="language-text">●  localhost:9000
+   Uptime: 12 seconds
+   Version: 2025-xx-xxTxx-xx-xxZ
+   Network: 1/1 OK</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba que el default no funciona:</strong> intenta <code>mc alias set bad http://localhost:9000 minioadmin minioadmin</code>. Debe devolver <code>AccessDenied</code> o <code>InvalidAccessKeyId</code>. Si entra, el fichero de entorno no se cargó.</li>
+          <li>
+            <strong>Crea el administrador delegado:</strong>
+            <pre><code class="language-bash">mc admin user add local ops-admin 'otro-secreto-largo-y-distinto'
+mc admin policy attach local consoleAdmin --user ops-admin
+mc admin user info local ops-admin</code></pre>
+            <p>Comprueba que <code>ops-admin</code> puede ejecutar <code>mc admin info</code> sin usar root.</p>
+          </li>
+          <li>
+            <strong>Rota root:</strong> cambia <code>MINIO_ROOT_PASSWORD</code> en el fichero, ejecuta <code>docker compose up -d --force-recreate minio</code> y prueba:
+            <pre><code class="language-bash">mc alias set viejo http://localhost:9000 minio-root 'secreto-anterior'
+mc alias set nuevo http://localhost:9000 minio-root 'secreto-nuevo'</code></pre>
+            <p>El primero debe fallar con <code>InvalidAccessKeyId</code> o <code>SignatureDoesNotMatch</code>; el segundo debe funcionar. <code>ops-admin</code> debe seguir funcionando.</p>
+          </li>
+          <li>
+            <strong>Busca fugas:</strong> ejecuta <code>git log --all -p | grep -n 'MINIO_ROOT_PASSWORD'</code> (en PowerShell, <code>git log --all -p | Select-String MINIO_ROOT_PASSWORD</code>) y revisa que no haya valores en el repositorio. Documenta en el README del proyecto dónde vive el secreto y quién puede leerlo.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Después de la rotación, <code>mc admin info local</code> con el secreto viejo debe fallar y con el nuevo debe responder. Si el alias viejo sigue guardado en <code>~/.mc/config.json</code>, bórralo con <code>mc alias remove viejo</code>: no dejes credenciales muertas en disco.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Rotación sin caída y detección de uso de root</h3>
+          <p>Diseña el runbook para rotar root en un clúster de cuatro nodos sin que ninguna petición legítima falle. Debe incluir el orden de reinicio, cómo comprobar la consistencia entre nodos, qué hacer si un nodo no arranca con el valor nuevo y cómo revertir sin volver al secreto comprometido.</p>
+          <p>Además, construye una alerta que detecte uso de root en el día a día: a partir de los logs de auditoría o de los <code>request-id</code>, identifica peticiones firmadas por la identidad root y distingue las del bootstrap de las que vienen de una aplicación mal configurada.</p>
+          <p><em>Pista: en un clúster, la credencial root debe ser idéntica en todos los nodos; el problema no es el reinicio, es la ventana en la que conviven secretos distintos. Para la alerta, empieza por saber qué campo del log identifica al firmante.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Root se define con <code>MINIO_ROOT_USER</code> y <code>MINIO_ROOT_PASSWORD</code>; sin ellas, el default es <code>minioadmin:minioadmin</code>.</li>
+          <li>Root está fuera del sistema de políticas: no se puede limitar, deshabilitar ni borrar.</li>
+          <li>La contraseña mínima son 8 caracteres; usa 32 o más aleatorios.</li>
+          <li>Se lee al arrancar: rotar exige reiniciar y, en clúster, coordinar todos los nodos.</li>
+          <li>La rotación invalida presigned URLs y sesiones firmadas con el secreto anterior.</li>
+          <li>El secreto va por fichero o gestor de secretos, nunca en el YAML, la imagen o el historial de Git.</li>
+          <li>Un root comprometido puede leer, borrar y crear accesos persistentes: trátalo como incidente.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Variable o comando</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>MINIO_ROOT_USER</code></td><td>Nombre de la identidad root (mínimo 3 caracteres)</td></tr>
+            <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Secreto root (mínimo 8 caracteres)</td></tr>
+            <tr><td><code>MINIO_CONFIG_ENV_FILE</code></td><td>Cargar variables desde un fichero de entorno</td></tr>
+            <tr><td><code>mc admin user add</code></td><td>Crear un usuario IAM normal</td></tr>
+            <tr><td><code>mc admin policy attach</code></td><td>Adjuntar una política a un usuario o grupo</td></tr>
+            <tr><td><code>mc admin user disable</code></td><td>Deshabilitar un usuario (root no se puede)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo deshabilitar o borrar el usuario root?</summary>
+            <div>
+              <p>No. Root existe mientras exista el servidor y no pasa por el sistema de usuarios IAM. Lo que sí puedes hacer es no usarlo: crear un <code>consoleAdmin</code>, usarlo para la operación diaria y dejar root solo para el arranque y la rotación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa con las presigned URLs cuando roto root?</summary>
+            <div>
+              <p>Dejan de funcionar inmediatamente, aunque su <code>X-Amz-Expires</code> no haya llegado a cero. La firma se valida con el secreto actual; si el secreto cambia, la firma ya no cuadra. Es una razón más para no firmar con root: al rotarlo rompes enlaces de todos tus clientes.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo poner una política a root para limitarlo?</summary>
+            <div>
+              <p>No. Las políticas se evalúan para identidades IAM; root las ignora por diseño. Si necesitas un administrador acotado, crea un usuario con la política <code>consoleAdmin</code> o una política personalizada. Si necesitas un usuario de aplicación, dale solo las acciones S3 sobre su prefijo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Basta con cambiar la contraseña tras una filtración?</summary>
+            <div>
+              <p>No. Un atacante con root pudo crear usuarios, adjuntar políticas o modificar la configuración. Rota, enumera usuarios y políticas, compara con la configuración esperada y revisa los accesos. Si el servidor estuvo expuesto, asume que los datos pudieron copiarse.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Root y <code>consoleAdmin</code> son lo mismo en la práctica?</summary>
+            <div>
+              <p>Para muchas operaciones diarias, sí: ambos pueden administrar usuarios, políticas y buckets. La diferencia es el control: a <code>consoleAdmin</code> puedes quitarle la política, deshabilitarlo o rotarle el secreto sin reiniciar el servidor. Root no tiene ese interruptor.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

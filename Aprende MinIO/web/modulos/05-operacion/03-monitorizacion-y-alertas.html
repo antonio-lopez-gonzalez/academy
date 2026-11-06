@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-monitorizacion-y-alertas">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitorización y alertas — Módulo 5 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Monitorización y alertas</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Operación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un clúster MinIO puede estar fallando de tres formas distintas y las tres se parecen a «va lento»: un disco a punto de morir sube la latencia, un nodo sin quórum devuelve <code>503</code> a una de cada cuatro peticiones, y la capacidad baja hace que el siguiente <em>upload</em> grande bloquee las escrituras.</p>
+        <pre><code class="language-text">disco lento ────────┐
+nodo sin quórum ────┼──&gt; «va lento» ──&gt; latencia, 503, escrituras bloqueadas
+capacidad baja ─────┘</code></pre>
+        <p>Ninguna se detecta mirando la consola web de vez en cuando. La monitorización existe para convertir esas señales en <strong>números</strong>, y las alertas para convertir los números en <strong>una persona que actúa antes de que sea tarde</strong>. Y una alerta sin runbook es solo un mensaje que alguien silenciará.</p>
+        <p>En esta lección montamos las tres capas: <strong>salud</strong> (¿responde?), <strong>métricas</strong> (¿cómo está?) y <strong>alertas con procedimiento</strong> (¿qué hacemos?).</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La pregunta que ordena todo</p>
+          <p>No monitorices «todo lo que MinIO expone». Monitoriza lo que responde a: ¿puedo servir lecturas?, ¿puedo aceptar escrituras?, ¿voy a quedarme sin espacio?, ¿estoy perdiendo datos o redundancia? Todo lo demás es contexto para depurar.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Salud: tres endpoints con significados distintos</h3>
+        <table>
+          <thead><tr><th>Endpoint</th><th>200 significa</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td><code>/minio/health/live</code></td><td>El proceso está vivo y responde.</td><td>Liveness probe de Kubernetes; reiniciar si falla.</td></tr>
+            <tr><td><code>/minio/health/ready</code></td><td>El nodo está listo para atender tráfico.</td><td>Readiness probe; sacarlo del balanceador si falla.</td></tr>
+            <tr><td><code>/minio/health/cluster</code></td><td>El clúster tiene quórum de escritura.</td><td>Monitorización global; 503 indica falta de quórum.</td></tr>
+            <tr><td><code>/minio/health/cluster?maintenance=true</code></td><td>El clúster sobrevive si este nodo se apaga.</td><td>Ventanas de mantenimiento; 412 si se perdería quórum.</td></tr>
+          </tbody>
+        </table>
+        <pre><code class="language-bash">curl -sS -o /dev/null -w "live: %{http_code}\n" \
+  https://minio.example.net:9000/minio/health/live
+curl -sS -o /dev/null -w "ready: %{http_code}\n" \
+  https://minio.example.net:9000/minio/health/ready
+curl -sS -o /dev/null -w "cluster: %{http_code}\n" \
+  https://minio.example.net:9000/minio/health/cluster
+curl -sS -o /dev/null -w "maintenance: %{http_code}\n" \
+  "https://minio.example.net:9000/minio/health/cluster?maintenance=true"
+</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">Live no es «está sano»</p>
+          <p><code>/minio/health/live</code> solo dice que el proceso responde. Un nodo sin quórum, con un disco muerto o con el healing atascado puede devolver 200 en <code>live</code>. Para el estado real necesitas <code>cluster</code>, <code>mc admin info</code> y las métricas de discos.</p>
+        </div>
+        <h3><code>mc admin info</code>: la foto que hay que saber leer</h3>
+        <pre><code class="language-bash">mc admin info cluster
+mc admin info cluster --offline
+</code></pre>
+        <pre><code class="language-text">●  minio.example.net:9000
+   Network: 4/4 OK
+   Drives: 15/16 OK
+Pools:
+   1st, Erasure sets: 1, Drives per erasure set: 16
+38 TiB Used, 12 Buckets, 2.1M Objects
+15 drives online, 1 drives offline, EC:4</code></pre>
+        <table>
+          <thead><tr><th>Línea</th><th>Qué te dice</th><th>Cuándo es grave</th></tr></thead>
+          <tbody>
+            <tr><td><code>Network: 4/4</code></td><td>Nodos que se ven entre sí.</td><td>Menos de 4: hay un nodo aislado o caído.</td></tr>
+            <tr><td><code>Drives: 15/16</code></td><td>Discos online.</td><td>Cualquier disco offline reduce el margen de paridad.</td></tr>
+            <tr><td><code>EC:4</code></td><td>Paridad efectiva.</td><td>Si el set tiene menos de 2×EC discos, la tolerancia es marginal.</td></tr>
+            <tr><td><code>Used</code></td><td>Capacidad usada del clúster.</td><td>Supera el umbral que hayas definido (70–85 %).</td></tr>
+          </tbody>
+        </table>
+        <p><code>--offline</code> es la variante que deberías ejecutar en cada incidente: lista solo lo que falta, sin obligarte a interpretar el total.</p>
+        <h3>Métricas: Prometheus y el endpoint v3</h3>
+        <p>MinIO expone métricas en formato Prometheus. La versión 3 las organiza por dominio y es la recomendada para despliegues nuevos:</p>
+        <table>
+          <thead><tr><th>Endpoint v3</th><th>Contenido</th></tr></thead>
+          <tbody>
+            <tr><td><code>/minio/metrics/v3/cluster</code></td><td>Capacidad, uso, salud y erasure sets.</td></tr>
+            <tr><td><code>/minio/metrics/v3/system/drive</code></td><td>Discos: espacio, latencia, errores, inodos.</td></tr>
+            <tr><td><code>/minio/metrics/v3/api/requests</code></td><td>Peticiones S3, errores y latencia.</td></tr>
+            <tr><td><code>/minio/metrics/v3/replication</code></td><td>Estado de réplica y backlog.</td></tr>
+            <tr><td><code>/minio/metrics/v3/ilm</code></td><td>Transiciones y expiraciones.</td></tr>
+            <tr><td><code>/minio/metrics/v3/notification</code></td><td>Colas y entrega de eventos.</td></tr>
+          </tbody>
+        </table>
+        <p>El scrape se genera con <code>mc</code>, que incluye el <em>bearer token</em> necesario:</p>
+        <pre><code class="language-bash">mc admin prometheus generate cluster cluster --api-version v3
+</code></pre>
+        <pre><code class="language-yaml">scrape_configs:
+- job_name: minio-job-cluster
+  bearer_token: eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9...
+  metrics_path: /minio/metrics/v3/cluster
+  static_configs: [{ targets: ['minio.example.net:9000'] }]
+</code></pre>
+        <p>Para ver las métricas sin montar Prometheus:</p>
+        <pre><code class="language-bash">mc admin prometheus metrics cluster --api-version v3 | head -40
+</code></pre>
+        <p>El token caduca. Si el scrape empieza a devolver <code>401</code> de la noche a la mañana, casi siempre es eso: automatiza la rotación o usa credenciales de servicio con permisos de solo métricas.</p>
+        <h3>Las métricas que importan</h3>
+        <table>
+          <thead><tr><th>Señal</th><th>Métrica</th><th>Qué vigilar</th></tr></thead>
+          <tbody>
+            <tr><td>Capacidad total usable</td><td><code>minio_cluster_capacity_usable_total_bytes</code></td><td>Denominador del porcentaje de uso.</td></tr>
+            <tr><td>Capacidad libre usable</td><td><code>minio_cluster_capacity_usable_free_bytes</code></td><td>La que decide si puedes seguir escribiendo.</td></tr>
+            <tr><td>Nodos offline</td><td><code>minio_cluster_health_nodes_offline_count</code></td><td>Cualquier valor &gt; 0 es un incidente.</td></tr>
+            <tr><td>Disco libre</td><td><code>minio_node_drive_free_bytes</code></td><td>El disco más lleno, no la media.</td></tr>
+            <tr><td>Inodos libres</td><td><code>minio_node_drive_free_inodes</code></td><td>Muchos objetos pequeños agotan inodos antes que bytes.</td></tr>
+            <tr><td>Latencia de disco</td><td><code>minio_node_drive_latency_us</code></td><td>Percentil alto; un disco lento arrastra al clúster.</td></tr>
+            <tr><td>Errores S3</td><td><code>minio_s3_requests_errors_total</code></td><td>Ratio de errores 5xx/4xx.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">El healing no siempre tiene una métrica única</p>
+          <p>El estado del healing se lee mejor con <code>mc admin info</code> y <code>mc admin heal -r ALIAS --dry-run</code> que con un número aislado. Si quieres alertar, hazlo sobre la causa —disco offline, errores de disco, objetos pendientes— y no sobre un contador cuyo significado cambia entre versiones.</p>
+        </div>
+        <h3>Alertas: síntoma, no ruido</h3>
+        <p>Una alerta útil tiene cuatro partes: condición, umbral, ventana y acción. Sin la cuarta, no es una alerta; es una notificación.</p>
+        <pre><code class="language-yaml">groups:
+- name: minio
+  rules:
+  - alert: MinioNodeOffline
+    expr: minio_cluster_health_nodes_offline_count &gt; 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Hay un nodo de MinIO offline"
+      runbook: "https://runbooks.example.net/minio/node-offline"
+  - alert: MinioCapacityLow
+    expr: |
+      minio_cluster_capacity_usable_free_bytes
+        / minio_cluster_capacity_usable_total_bytes &lt; 0.20
+    for: 30m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Menos del 20 % de capacidad usable"
+      runbook: "https://runbooks.example.net/minio/capacity"
+</code></pre>
+        <p>Criterios que evitan la fatiga:</p>
+        <ul>
+          <li><strong>Ventanas</strong> (<code>for</code>) de 2 a 10 minutos: un pico de un scrape no es un incidente.</li>
+          <li><strong>Umbrales con margen</strong>: avisar al 70 % de capacidad deja tiempo para expandir; al 95 %, ya es tarde.</li>
+          <li><strong>Síntomas antes que causas</strong>: «errores 5xx altos» es accionable; «CPU al 60 %» normalmente no.</li>
+        </ul>
+        <h3>Logs: el contexto que las métricas no dan</h3>
+        <pre><code class="language-bash">mc admin logs cluster --last 100
+mc admin logs cluster --type application --last 50
+mc admin logs cluster --type minio --last 50
+mc support diag cluster
+</code></pre>
+        <p><code>mc admin logs</code> unifica los logs de los nodos; <code>mc support diag</code> genera un informe de diagnóstico para soporte. En Kubernetes, además, <code>kubectl logs</code> del pod concreto sigue siendo la vía para ver el arranque y los reinicios.</p>
+        <h3>Runbook: qué hacer cuando suena</h3>
+        <table>
+          <thead><tr><th>Alerta</th><th>Primera acción</th><th>Después</th></tr></thead>
+          <tbody>
+            <tr><td>Nodo offline</td><td><code>mc admin info --offline</code>; comprobar red y proceso.</td><td>Reincorporar; verificar healing; no borrar datos.</td></tr>
+            <tr><td>Disco offline</td><td>Identificar la ruta y el nodo; revisar <code>dmesg</code>/SMART.</td><td>Sustituir disco; confirmar healing completo.</td></tr>
+            <tr><td>Capacidad baja</td><td>Medir crecimiento con <code>mc du</code>; revisar lifecycle.</td><td>Añadir pool o expirar datos; nunca borrar a ciegas.</td></tr>
+            <tr><td>Errores S3</td><td>Separar 4xx (cliente) de 5xx (servidor).</td><td>Revisar quórum, discos y latencia; escalar.</td></tr>
+            <tr><td>Réplica retrasada</td><td><code>mc replicate status</code>; ver backlog.</td><td>Revisar red y destino; <code>resync</code> si hace falta.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La comprobación más pequeña que merece la pena automatizar: ¿el clúster puede aceptar escrituras ahora mismo?</p>
+        <pre><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+URL="${MINIO_URL:?falta MINIO_URL}"
+for probe in live ready cluster; do
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "$URL/minio/health/$probe")"
+  printf '%-10s %s\n' "$probe" "$code"
+  if [ "$code" != "200" ]; then
+    echo "FALLO: $probe devolvió $code" &gt;&amp;2
+    exit 1
+  fi
+done
+echo "MinIO responde y tiene quórum de escritura"
+</code></pre>
+        <p>Qué hace y por qué está ordenado así:</p>
+        <ul>
+          <li><code>live</code>: descarta que el proceso esté muerto. Si falla, no hay nada más que comprobar.</li>
+          <li><code>ready</code>: descarta que el nodo esté arrancando o fuera de servicio.</li>
+          <li><code>cluster</code>: comprueba el quórum. Es el que de verdad decide si un <code>PUT</code> va a funcionar.</li>
+          <li><code>set -euo pipefail</code>: el script falla ante cualquier error, no solo ante el último comando.</li>
+        </ul>
+        <p>Este script es un buen <em>smoke test</em> de despliegue, pero no sustituye a Prometheus: solo mira el instante en que se ejecuta. Las alertas necesitan series temporales.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos tiene un panel de control y cuatro alertas. El panel responde a «¿cómo estamos?»; las alertas, a «¿hay que actuar ya?».</p>
+        <h3>Panel mínimo</h3>
+        <p>Seis cifras bastan: capacidad usable (34,2 / 48 TiB, 71 %), nodos y discos (4/4 y 15/16), ratio de errores S3, latencia p95 del peor disco, peticiones por segundo y réplica pendiente. Debajo, healing, última ejecución de lifecycle y días hasta que caduque el certificado TLS.</p>
+        <h3>Qué se alerta y qué no</h3>
+        <table>
+          <thead><tr><th>Señal</th><th>Alerta</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td>Nodo offline</td><td>Sí, critical a los 2 min</td><td>Reduce quórum y redundancia de inmediato.</td></tr>
+            <tr><td>Disco offline</td><td>Sí, critical a los 5 min</td><td>El healing no empieza hasta que alguien repone.</td></tr>
+            <tr><td>Capacidad &lt; 20 %</td><td>Sí, warning a los 30 min</td><td>Queda tiempo para expandir sin urgencia.</td></tr>
+            <tr><td>Errores S3 &gt; 1 %</td><td>Sí, warning a los 10 min</td><td>Puede ser cliente o servidor; el runbook separa.</td></tr>
+            <tr><td>CPU al 60 %</td><td>No</td><td>No es accionable por sí solo; va en el panel.</td></tr>
+            <tr><td>Un pico de latencia de 10 s</td><td>No</td><td>Ruido; se investiga si persiste.</td></tr>
+            <tr><td>Certificado TLS &lt; 30 días</td><td>Sí, warning</td><td>Un fallo de TLS tumba el servicio igual que un disco.</td></tr>
+          </tbody>
+        </table>
+        <h3>Cómo se ve un incidente con estas piezas</h3>
+        <p>A las 09:02 salta <code>MinioDiskOffline</code> en <code>minio-3</code>. El runbook confirma 15/16 discos y escrituras OK, se sustituye el disco a las 09:20, el healing termina a las 11:10 y se cierra con el RTO real anotado. Sin la alerta, el disco habría seguido offline durante semanas.</p>
+        <h3>Consultas que se usan en el panel</h3>
+        <pre><code class="language-text">100 * minio_cluster_capacity_usable_free_bytes / minio_cluster_capacity_usable_total_bytes
+sum(rate(minio_s3_requests_errors_total[5m])) / sum(rate(minio_s3_requests_total[5m]))
+max by (server, drive) (1 - minio_node_drive_free_bytes / minio_node_drive_total_bytes)
+histogram_quantile(0.95, sum by (le) (rate(minio_node_drive_latency_us_bucket[5m])))</code></pre>
+        <p>La última consulta asume que la métrica de latencia es un histograma en tu versión. Si no lo es, usa el valor directo y ajusta el umbral: lo importante es vigilar el <strong>peor disco</strong>, no la media del clúster, que esconde el problema.</p>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Monitorizar <code>cluster</code>, no solo <code>live</code></td>
+              <td>Confundir «proceso vivo» con «clúster sano»</td>
+              <td>Un nodo sin quórum responde a <code>live</code> y falla los <code>PUT</code>.</td>
+            </tr>
+            <tr>
+              <td>Vigilar el peor disco y el peor nodo</td>
+              <td>Mirar solo la media del clúster</td>
+              <td>Un disco al 99 % basta para bloquear escrituras de su set.</td>
+            </tr>
+            <tr>
+              <td>Ventanas <code>for</code> y umbrales con margen</td>
+              <td>Alertar al primer scrape que cruza un límite</td>
+              <td>El ruido hace que se ignoren las alertas importantes.</td>
+            </tr>
+            <tr>
+              <td>Runbook con comandos y dueño</td>
+              <td>Alertas que solo dicen «algo va mal»</td>
+              <td>En un incidente, la claridad vale más que la telemetría.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Usar solo <code>/minio/health/live</code> como monitor</h3>
+        <span class="code-label code-label--wrong">Mal — «devuelve 200, está sano»</span>
+        <pre><code class="language-bash">curl -f https://minio.example.net:9000/minio/health/live
+# ❌ 200 aunque el clúster haya perdido quórum o tenga 3 discos caídos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — combinar live, ready y cluster</span>
+        <pre><code class="language-bash">curl -f https://minio.example.net:9000/minio/health/ready
+curl -f https://minio.example.net:9000/minio/health/cluster
+mc admin info cluster --offline
+</code></pre>
+        <h3>2. Alertar de capacidad con un número absoluto</h3>
+        <span class="code-label code-label--wrong">Mal — un umbral que no significa nada</span>
+        <pre><code class="language-yaml"># ❌ "Quedan menos de 5 TB": en un clúster de 400 TB es una emergencia;
+# en uno de 8 TB, es el estado normal desde el primer mes.
+expr: minio_cluster_capacity_usable_free_bytes &lt; 5e12
+</code></pre>
+        <span class="code-label code-label--right">Bien — porcentaje y tendencia</span>
+        <pre><code class="language-yaml">expr: |
+  minio_cluster_capacity_usable_free_bytes
+    / minio_cluster_capacity_usable_total_bytes &lt; 0.20
+for: 30m
+</code></pre>
+        <p>Añade al panel una proyección de días hasta llenarse con la pendiente de los últimos 30 días. Es la señal que permite planificar en vez de apagar fuegos.</p>
+        <h3>3. Scrapear cada 5 segundos y alertar al instante</h3>
+        <span class="code-label code-label--wrong">Mal — ruido garantizado</span>
+        <pre><code class="language-yaml"># ❌ Cualquier micro-pico de latencia dispara una página a las 3 de la mañana.
+expr: minio_node_drive_latency_us &gt; 100000
+for: 0m
+</code></pre>
+        <span class="code-label code-label--right">Bien — ventana y percentil</span>
+        <pre><code class="language-yaml">expr: |
+  histogram_quantile(0.95,
+    sum by (le) (rate(minio_node_drive_latency_us_bucket[5m]))
+  ) &gt; 500000
+for: 10m
+</code></pre>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar la cadena completa salud → métricas → alerta → runbook, y comprobar que cada eslabón funciona.</p>
+        <ol class="steps">
+          <li>
+            <strong>Comprueba los cuatro endpoints de salud:</strong>
+            <pre><code class="language-bash">for probe in live ready cluster; do
+  curl -sS -o /dev/null -w "$probe: %{http_code}\n" \
+    "http://localhost:9000/minio/health/$probe"
+done
+curl -sS -o /dev/null -w "maintenance: %{http_code}\n" \
+  "http://localhost:9000/minio/health/cluster?maintenance=true"
+</code></pre>
+            <p>Salida esperada en el Compose de desarrollo: <code>200</code> en los tres primeros. <code>maintenance</code> puede devolver <code>412</code>: con un solo nodo, apagarlo pierde el quórum.</p>
+          </li>
+          <li>
+            <strong>Lee el estado real:</strong>
+            <pre><code class="language-bash">mc admin info myminio
+mc admin info myminio --offline
+</code></pre>
+            <p>Anota discos online/offline, nodos y <code>EC:N</code>. Compara lo que dice <code>live</code> con lo que dice <code>info</code>: no son la misma pregunta.</p>
+          </li>
+          <li>
+            <strong>Genera la configuración de scrape:</strong>
+            <pre><code class="language-bash">mc admin prometheus generate myminio cluster --api-version v3
+</code></pre>
+            <p>Guarda la salida en <code>prometheus/minio-scrape.yml</code>. Identifica el <code>metrics_path</code>, el <code>bearer_token</code> y el target.</p>
+          </li>
+          <li>
+            <strong>Lee métricas sin Prometheus:</strong>
+            <pre><code class="language-bash">mc admin prometheus metrics myminio --api-version v3 | \
+  grep -E "minio_cluster_capacity_usable_(total|free)_bytes|minio_cluster_health_nodes_offline_count|minio_node_drive_offline_total"
+</code></pre>
+            <p>Calcula a mano el porcentaje libre: <code>free / total × 100</code>. Ese es el número que debe aparecer en el panel.</p>
+          </li>
+          <li>
+            <strong>Escribe las reglas de alerta y el runbook:</strong> una regla para nodo offline y otra para capacidad por debajo del 20 %, con <code>for</code>, <code>severity</code>, <code>summary</code> y <code>runbook</code>. Después escribe el runbook de «disco offline» en cinco pasos (confirmar, localizar, sustituir, verificar healing y cerrar con evidencia) e incluye el criterio de escalado.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Fuerza la alerta de disco en un entorno de laboratorio (por ejemplo, con una métrica de prueba o un disco desmontado) y comprueba que llega, que el runbook se entiende y que el cierre deja evidencia. Una alerta que nunca se ha disparado no está probada.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Detectar una degradación antes de que sea un incidente</h3>
+          <p>Diseña una alerta que avise cuando el clúster esté perdiendo redundancia de forma lenta: por ejemplo, un disco con errores de timeout crecientes pero aún online. Debe dispararse antes de que el disco caiga, no después, y no debe saltar por un único error aislado.</p>
+          <p>Escribe la consulta PromQL, el umbral, la ventana y el runbook. Después explica cómo la probarías sin romper un disco de producción y qué harías si la alerta se dispara un viernes a las 18:00.</p>
+          <p><em>Pista: mira la derivada de los errores, no el valor absoluto, y combínala con la latencia del mismo disco. Un contador que sube en escalera es más informativo que un total acumulado.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>live</code> dice que el proceso vive; <code>ready</code>, que puede atender; <code>cluster</code>, que hay quórum de escritura.</li>
+          <li><code>mc admin info</code> es la foto operativa; <code>--offline</code> aísla lo que falta.</li>
+          <li>Prometheus v3 organiza las métricas por dominio; <code>mc admin prometheus generate</code> produce el scrape con token.</li>
+          <li>Vigila capacidad usable, nodos y discos offline, latencia del peor disco y ratio de errores S3.</li>
+          <li>Alerta sobre síntomas accionables, con ventana y con runbook; evita el ruido de CPU y picos puntuales.</li>
+          <li>El healing se verifica con <code>mc admin info</code> y <code>heal --dry-run</code>, no solo con una métrica.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando / endpoint</th><th>Qué aporta</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /minio/health/live</code></td><td>Proceso vivo</td></tr>
+            <tr><td><code>GET /minio/health/ready</code></td><td>Nodo listo para tráfico</td></tr>
+            <tr><td><code>GET /minio/health/cluster</code></td><td>Quórum de escritura del clúster</td></tr>
+            <tr><td><code>mc admin info --offline</code></td><td>Nodos y discos caídos</td></tr>
+            <tr><td><code>mc admin prometheus generate</code></td><td>Configuración de scrape con token</td></tr>
+            <tr><td><code>mc admin prometheus metrics</code></td><td>Lectura puntual de métricas</td></tr>
+            <tr><td><code>mc admin logs</code></td><td>Logs unificados del clúster</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Necesito Prometheus o basta con la consola web?</summary>
+            <div>
+              <p>La consola sirve para mirar, no para avisar. Sin series temporales no puedes ver tendencias, ni distinguir un pico de una degradación, ni alertar a las 3 de la mañana. Para producción, Prometheus (o un sistema compatible) y alertas con runbook son el mínimo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cada cuánto debo scrapear?</summary>
+            <div>
+              <p>Cada 15 o 30 segundos es un buen equilibrio para MinIO: suficiente resolución y poco coste. Scrapear cada segundo multiplica el almacenamiento de series sin mejorar la detección, porque las alertas usan ventanas de minutos.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago si el token de Prometheus caduca?</summary>
+            <div>
+              <p>Regenerarlo con <code>mc admin prometheus generate</code> y actualizar el scrape. Mejor aún: automatiza la rotación o usa credenciales de servicio con permisos mínimos. Un panel congelado es peor que un panel vacío, porque parece sano.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo sé si el healing ha terminado?</summary>
+            <div>
+              <p>Con <code>mc admin info</code> (todos los discos online) y <code>mc admin heal -r ALIAS --dry-run</code> (sin objetos pendientes). Si además quieres integridad, <code>--scan deep</code> en una ventana de mantenimiento. No te fíes solo de que el bucket responda.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo alertar de cada error 4xx?</summary>
+            <div>
+              <p>No. Los 4xx suelen ser clientes con credenciales mal configuradas, claves inexistentes o firmas caducadas. Alerta sobre el ratio total de errores y separa 4xx de 5xx en el panel; los 5xx indican problemas del servidor y sí merecen atención inmediata.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-api-y-presigned-uploads">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API y presigned uploads — Módulo 7 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>API y presigned uploads</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>🕐 45 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La API del document store tiene una responsabilidad estrecha y crítica: decidir <em>qué</em> se puede subir, <em>dónde</em> se guarda y <em>cuándo</em> está disponible. Los bytes no pasan por ella. El navegador recibe una URL firmada, sube directo a MinIO y después pide a la API que verifique y registre el resultado.</p>
+        <p>Ese diseño elimina el cuello de botella de memoria y ancho de banda, pero introduce dos preguntas: ¿cómo impides que el cliente elija la clave? y ¿cómo sabes que lo que subió es lo que dijo? La respuesta es generar la clave en el servidor y verificar con <code>statObject</code> antes de dar el documento por bueno. Al terminar podrás subir un PDF con <code>curl</code>, completarlo, descargarlo y borrarlo de forma recuperable, igual que en <a href="../02-sdk/02-subidas-directas.html">Subidas directas</a>.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Porque una presigned URL mal emitida es una escritura arbitraria en tu bucket. El cliente no debe poder elegir la ruta, el tipo ni el tamaño efectivo. La firma limita el método y la clave; la verificación posterior limita la realidad.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Contrato HTTP</h3>
+        <table>
+          <thead><tr><th>Método y ruta</th><th>Qué hace</th><th>Éxito</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /health</code></td><td>Comprueba que el bucket existe</td><td>200 / 503</td></tr>
+            <tr><td><code>POST /documents</code></td><td>Valida, crea la ficha y firma la subida</td><td>201 con <code>id</code>, <code>key</code>, <code>uploadUrl</code></td></tr>
+            <tr><td><code>POST /documents/:id/complete</code></td><td>Verifica el objeto y pasa a <code>stored</code></td><td>200 con la ficha actualizada</td></tr>
+            <tr><td><code>GET /documents?tenant=</code></td><td>Lista el catálogo del tenant</td><td>200 con <code>documents</code></td></tr>
+            <tr><td><code>GET /documents/:id</code></td><td>Ficha + <code>downloadUrl</code> firmada</td><td>200 / 404</td></tr>
+            <tr><td><code>DELETE /documents/:id</code></td><td>Borra el objeto (delete marker) y marca <code>deleted</code></td><td>200</td></tr>
+            <tr><td><code>GET /objects?prefix=</code></td><td>Listado directo del bucket, sin catálogo</td><td>200</td></tr>
+            <tr><td><code>POST /webhooks/minio</code></td><td>Receptor de notificaciones reales de MinIO</td><td>204</td></tr>
+          </tbody>
+        </table>
+        <p>No hay autenticación de usuario en el proyecto: es una simplificación docente. En producción, cada petición debe llevar identidad (sesión, token o mTLS) y el tenant debe derivarse de ella, no del cuerpo. Aceptar <code>tenant</code> del cliente sin comprobar permisos es una escalada horizontal.</p>
+        <h3>Crear: la clave nace en el servidor</h3>
+        <pre><code class="language-text">POST /documents
+{ tenant, filename, contentType, size }
+        |
+        v
+assertTenant -> sanitizeFilename -> assertContentType -> assertSize
+        |
+        v
+id = randomUUID()          &lt;- el cliente no lo elige
+key = {tenant}/{año}/{mes}/{id}-{nombre}
+        |
+        v
+catálogo: status=pending
+uploadUrl = presignedPutObject(bucket, key, 900s)
+        |
+        v
+201 { id, key, uploadUrl, expiresIn }</code></pre>
+        <p>La URL firmada cubre el método <code>PUT</code>, el bucket, la clave y la expiración. No cubre un tamaño máximo: S3 no tiene una cabecera «no aceptes más de N bytes» en un PUT simple. Por eso el tamaño declarado se valida al crear y el tamaño real se valida al completar.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Content-Type no está garantizado por la firma</p>
+          <p><code>presignedPutObject</code> de minio-js firma la operación y la clave; la cabecera <code>Content-Type</code> que envíe el cliente no queda necesariamente vinculada. Al completar, lee <code>stat.metaData["content-type"]</code>, compara con el tipo declarado y rechaza si no coincide. Es un endurecimiento que el proyecto de referencia aún no aplica y que deberías añadir.</p>
+        </div>
+        <h3>Completar: verificar antes de confiar</h3>
+        <p>El paso <code>/complete</code> es el que convierte una subida en un documento. Debe ser idempotente: dos llamadas seguidas devuelven el mismo estado y no duplican efectos. La secuencia correcta es:</p>
+        <ol>
+          <li>Buscar la ficha; si no existe, <code>404</code>.</li>
+          <li><code>statObject</code>; si no hay objeto, <code>409</code> (la subida no ocurrió o caducó).</li>
+          <li>Comprobar tamaño real y tipo real; si no cuadra, <code>413</code> o <code>415</code>.</li>
+          <li>Actualizar el catálogo con <code>size</code>, <code>etag</code> y <code>completedAt</code>.</li>
+          <li>Emitir el evento de aplicación solo si el estado anterior era <code>pending</code>.</li>
+        </ol>
+        <p>El <code>ETag</code> se guarda como huella barata para detectar cambios y para reconciliar. No es una prueba criptográfica de integridad en objetos multipart o cifrados; para eso se usa un checksum propio.</p>
+        <h3>Validación: qué se rechaza y con qué código</h3>
+        <table>
+          <thead><tr><th>Regla</th><th>Error</th><th>HTTP</th></tr></thead>
+          <tbody>
+            <tr><td>JSON inválido o cuerpo &gt; 1 MB</td><td><code>JSON inválido</code> / <code>cuerpo demasiado grande</code></td><td>400 / 413</td></tr>
+            <tr><td>Tenant vacío, mayúsculas o barras</td><td><code>tenant inválido</code></td><td>400</td></tr>
+            <tr><td>Nombre vacío, <code>..</code> o sin caracteres útiles</td><td><code>filename inválido</code></td><td>400</td></tr>
+            <tr><td>Tipo fuera de la lista blanca</td><td><code>contentType no permitido</code></td><td>415</td></tr>
+            <tr><td>Tamaño cero, decimal, negativo o &gt; máximo</td><td><code>size inválido</code></td><td>413</td></tr>
+            <tr><td>Documento inexistente</td><td><code>documento no encontrado</code></td><td>404</td></tr>
+            <tr><td>Objeto aún no subido</td><td><code>el objeto todavía no se ha subido</code></td><td>409</td></tr>
+            <tr><td>Tamaño real &gt; máximo</td><td><code>el objeto supera el tamaño máximo</code></td><td>413</td></tr>
+          </tbody>
+        </table>
+        <p>Las funciones de <code>keys.mjs</code> lanzan <code>Error</code> genéricos para poder probarlas sin HTTP. En el borde de la API hay que traducirlos a errores de cliente: si el <code>catch</code> general los convierte en <code>500</code>, el cliente recibe un fallo de servidor por algo que envió mal. Envuelve la validación en un <code>HttpError(400/415/413)</code> o usa una clase de error de dominio con su código.</p>
+        <p>La descarga sigue el mismo principio: el bucket es privado y la API firma una URL de <code>GET</code> con expiración corta. El proyecto usa los mismos 900 s que la subida; para descargas de un usuario concreto, 300 s es más prudente. La URL no debe registrarse en logs ni guardarse en el catálogo: es una credencial temporal.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El núcleo son dos llamadas al SDK: firmar y verificar. Así las implementa el proyecto en <code>src/storage.mjs</code>:</p>
+        <pre><code class="language-javascript">import * as Minio from "minio";
+const client = new Minio.Client({
+  endPoint: "127.0.0.1",
+  port: 9000,
+  useSSL: false,
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+});
+export function presignedPut(client, config, key) {
+  return client.presignedPutObject(
+    config.bucket,
+    key,
+    config.presignExpirySeconds, // 900 s
+  );
+}
+export function statObject(client, config, key) {
+  return client.statObject(config.bucket, key);
+}
+</code></pre>
+        <p><code>presignedPutObject</code> devuelve una URL con <code>X-Amz-Signature</code>; no contacta con el servidor. <code>statObject</code> hace un <code>HEAD</code> y devuelve tamaño, ETag, fecha y metadatos. La primera crea capacidad de escritura; la segunda comprueba la realidad.</p>
+        <p>El cliente solo necesita hacer un PUT a esa URL:</p>
+        <pre><code class="language-bash">curl -i -X PUT "&lt;uploadUrl&gt;" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@informe.pdf"
+</code></pre>
+        <p>Si la URL caducó, MinIO responde <code>403</code> con <code>AccessDenied</code> o <code>ExpiredToken</code>. Si la clave no coincide, la firma falla. No hay forma de «arreglar» la URL: se pide otra.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Estas son las dos rutas que sostienen el flujo, extraídas de <code>src/api.mjs</code> y simplificadas para la lección:</p>
+        <pre><code class="language-javascript">if (req.method === "POST" &amp;&amp; url.pathname === "/documents") {
+  const body = await readJson(req);
+  const tenant = assertTenant(body.tenant);
+  const filename = body.filename;
+  const contentType = assertContentType(body.contentType);
+  const size = assertSize(body.size, config.maxUploadBytes);
+  const id = crypto.randomUUID();
+  const key = documentKey({ tenant, filename, id });
+  const doc = {
+    id, tenant, filename, key, contentType, size,
+    status: "pending", createdAt: new Date().toISOString(),
+  };
+  await catalog.create(doc);
+  const uploadUrl = await presignedPut(client, config, key);
+  return send(res, 201, {
+    id, key, uploadUrl,
+    expiresIn: config.presignExpirySeconds,
+    next: `PUT ${uploadUrl} y luego POST /documents/${id}/complete`,
+  });
+}
+</code></pre>
+        <p>Y la ruta de finalización:</p>
+        <pre><code class="language-javascript">if (req.method === "POST" &amp;&amp; action === "/complete") {
+  const doc = await catalog.get(id);
+  if (!doc) throw new HttpError(404, "documento no encontrado");
+  const stat = await statObject(client, config, doc.key).catch(() =&gt; null);
+  if (!stat) throw new HttpError(409, "el objeto todavía no se ha subido");
+  if (stat.size &gt; config.maxUploadBytes) {
+    throw new HttpError(413, "el objeto supera el tamaño máximo");
+  }
+  // Endurecimiento recomendado: el tipo real debe coincidir con el declarado.
+  const realType = stat.metaData?.["content-type"];
+  if (realType &amp;&amp; realType !== doc.contentType) {
+    throw new HttpError(415, "el tipo real no coincide con el declarado");
+  }
+  const updated = await catalog.update(id, {
+    status: "stored",
+    size: stat.size,
+    etag: stat.etag,
+    completedAt: new Date().toISOString(),
+  });
+  await notify({ event: "document.stored", id, key: doc.key, tenant: doc.tenant });
+  return send(res, 200, updated);
+}
+</code></pre>
+        <p>El flujo completo con <code>curl</code>, tal y como lo prueba el README:</p>
+        <pre><code class="language-bash"># 1. Crear
+curl -s -X POST http://localhost:7072/documents \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"acme","filename":"informe.pdf","contentType":"application/pdf","size":204800}'
+# 2. Subir a la URL devuelta
+curl -i -X PUT "$UPLOAD_URL" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@informe.pdf"
+# 3. Completar
+curl -s -X POST http://localhost:7072/documents/$ID/complete
+# 4. Descargar la ficha con URL firmada
+curl -s http://localhost:7072/documents/$ID
+</code></pre>
+        <pre><code class="language-json">{
+  "id": "7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e",
+  "tenant": "acme",
+  "filename": "informe.pdf",
+  "key": "acme/2026/11/7f2c9a1e-4b2d-4f7a-9c1e-3d5a6b7c8d9e-informe.pdf",
+  "contentType": "application/pdf",
+  "size": 204800,
+  "status": "stored",
+  "etag": "9f3c2ab1c4d5e6f708192a3b4c5d6e7f",
+  "completedAt": "2026-11-05T10:01:12.000Z"
+}
+</code></pre>
+        <table>
+          <thead><tr><th>Situación</th><th>Respuesta de la API</th><th>Qué debe hacer el cliente</th></tr></thead>
+          <tbody>
+            <tr><td>URL caducada</td><td>403 de MinIO al hacer PUT</td><td>Pedir otra URL; no reintentar la misma.</td></tr>
+            <tr><td>Complete antes del PUT</td><td>409</td><td>Subir primero y reintentar.</td></tr>
+            <tr><td>Dos completes seguidos</td><td>200 con el mismo estado</td><td>Nada; es idempotente.</td></tr>
+            <tr><td>Tipo no permitido</td><td>415</td><td>Corregir el tipo; no se firma la subida.</td></tr>
+            <tr><td>Tamaño real excesivo</td><td>413</td><td>El objeto queda en el bucket: hay que limpiarlo.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">El objeto rechazado no desaparece</p>
+          <p>Si la verificación falla después del PUT, el objeto ya está en MinIO. La API debe borrarlo o moverlo a un prefijo de rechazo, y el lifecycle debe expirar ese prefijo. Rechazar en el catálogo sin limpiar el bucket deja basura que nadie ve.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Generar id y clave en el servidor</td><td>Aceptar <code>key</code> del cliente</td><td>La firma quedaría apuntando a una ruta elegida por el atacante.</td></tr>
+            <tr><td>Firmar con expiración de minutos</td><td>URLs de horas o días</td><td>Menos ventana para reutilizar una URL filtrada.</td></tr>
+            <tr><td>Verificar con <code>statObject</code></td><td>Confiar en el <code>size</code> del JSON</td><td>El cliente controla lo que declara, no lo que sube.</td></tr>
+            <tr><td>Comparar el tipo real</td><td>Asumir que el PUT respetó el tipo</td><td>La firma de minio-js no lo garantiza.</td></tr>
+            <tr><td>Hacer <code>/complete</code> idempotente</td><td>Emitir un evento en cada llamada</td><td>Los reintentos del cliente son normales.</td></tr>
+            <tr><td>Limpiar objetos rechazados</td><td>Dejarlos en el prefijo del tenant</td><td>Ocupan espacio y pueden filtrarse en listados.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Aceptar la clave desde el cliente</h3>
+        <span class="code-label code-label--wrong">Mal — el cliente decide dónde escribe</span>
+        <pre><code class="language-javascript">const key = body.key; // "acme/../../otro-tenant/secreto.pdf"
+const url = await client.presignedPutObject("documentos", key, 900);
+</code></pre>
+        <span class="code-label code-label--right">Bien — clave derivada de datos validados</span>
+        <pre><code class="language-javascript">const id = crypto.randomUUID();
+const key = documentKey({ tenant, filename, id });
+const url = await client.presignedPutObject("documentos", key, 900);
+</code></pre>
+        <p>La URL firmada es capacidad de escritura. Si la clave la elige el cliente, también elige si sobrescribe un documento ajeno.</p>
+        <h3>2. Dar por bueno el tamaño declarado</h3>
+        <span class="code-label code-label--wrong">Mal — nunca se mira el objeto real</span>
+        <pre><code class="language-javascript">if (body.size &gt; MAX) throw new HttpError(413, "demasiado grande");
+await catalog.update(id, { status: "stored", size: body.size });
+</code></pre>
+        <span class="code-label code-label--right">Bien — el tamaño sale de <code>statObject</code></span>
+        <pre><code class="language-javascript">const stat = await statObject(client, config, doc.key);
+if (!stat) throw new HttpError(409, "objeto no subido");
+if (stat.size &gt; MAX) throw new HttpError(413, "demasiado grande");
+await catalog.update(id, { status: "stored", size: stat.size, etag: stat.etag });
+</code></pre>
+        <p>La primera validación ahorra una subida inútil; la segunda es la que impide almacenar un archivo de 2 GB declarando 2 KB.</p>
+        <h3>3. Devolver 500 ante un error del cliente</h3>
+        <span class="code-label code-label--wrong">Mal — la validación se convierte en fallo de servidor</span>
+        <pre><code class="language-javascript">try {
+  const tenant = assertTenant(body.tenant);
+} catch (error) {
+  throw error; // el catch global responde 500
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — traducir a un error HTTP concreto</span>
+        <pre><code class="language-javascript">try {
+  assertTenant(body.tenant);
+} catch (error) {
+  throw new HttpError(400, error.message);
+}
+</code></pre>
+        <p>Un <code>500</code> dice «el servidor falló». Un <code>400</code> dice «tu petición está mal». La diferencia importa para clientes, métricas y alertas.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> completar el ciclo de vida de un documento con la API real, comprobar la validación y recuperar un borrado.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca el proyecto:</strong>
+            <pre><code class="language-bash">cd proyectos/document-store
+docker compose up -d
+npm install
+npm run api
+</code></pre>
+            <p>Comprueba <code>curl http://localhost:7072/health</code>. Debe devolver 200 con el bucket <code>documentos</code>.</p>
+          </li>
+          <li>
+            <strong>Crea el documento y guarda la respuesta:</strong>
+            <pre><code class="language-bash">curl -s -X POST http://localhost:7072/documents \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"acme","filename":"informe.pdf","contentType":"application/pdf","size":204800}' \
+  | tee /tmp/doc.json
+</code></pre>
+            <p>Extrae <code>id</code> y <code>uploadUrl</code> con <code>jq</code> o a mano. La clave debe contener un UUID, no el nombre original.</p>
+          </li>
+          <li>
+            <strong>Sube un PDF pequeño a la URL firmada:</strong>
+            <pre><code class="language-bash">printf '%%PDF-1.4\n%% documento de prueba\n' &gt; /tmp/informe.pdf
+curl -i -X PUT "$UPLOAD_URL" \
+  -H "Content-Type: application/pdf" \
+  --data-binary "@/tmp/informe.pdf"
+</code></pre>
+            <p>Espera <code>200 OK</code> y un <code>ETag</code>. Si recibes <code>403</code>, la URL caducó: vuelve a crear el documento.</p>
+          </li>
+          <li>
+            <strong>Completa y verifica:</strong>
+            <pre><code class="language-bash">curl -s -X POST http://localhost:7072/documents/$ID/complete
+curl -s http://localhost:7072/documents/$ID
+</code></pre>
+            <p>El estado pasa a <code>stored</code> con <code>size</code> real y <code>etag</code>. Repite el <code>complete</code>: debe devolver 200 con el mismo resultado, no un error.</p>
+          </li>
+          <li>
+            <strong>Prueba los rechazos:</strong>
+            <pre><code class="language-bash"># tipo no permitido
+curl -s -X POST http://localhost:7072/documents \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"acme","filename":"x.exe","contentType":"application/x-msdownload","size":10}'
+# tenant con traversal
+curl -s -X POST http://localhost:7072/documents \
+  -H "Content-Type: application/json" \
+  -d '{"tenant":"../etc","filename":"x.pdf","contentType":"application/pdf","size":10}'
+</code></pre>
+            <p>Espera un 4xx con un mensaje claro. Si recibes 500, aplica la traducción de errores de la sección 6.</p>
+          </li>
+          <li>
+            <strong>Borra y recupera:</strong>
+            <pre><code class="language-bash">curl -s -X DELETE http://localhost:7072/documents/$ID
+mc ls --versions local/documentos/acme/2026/11/
+mc rm --version-id &lt;version-id-del-delete-marker&gt; local/documentos/$KEY
+curl -s http://localhost:7072/documents/$ID
+</code></pre>
+            <p>El <code>DELETE</code> crea un delete marker; al eliminarlo, la versión anterior vuelve a ser la actual. Actualiza el catálogo a <code>stored</code> si restauras manualmente: MinIO no avisa a tu base de datos.</p>
+          </li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Subidas grandes, reanudables y verificadas</h3>
+          <p>El límite de 25 MiB deja fuera vídeos y archivos comprimidos grandes. Diseña una extensión de la API para subidas multipart con presigned URLs por parte: iniciar, firmar cada parte, listar partes subidas, completar y abortar. Debe permitir reanudar tras una caída, verificar un checksum al final y caducar las subidas abandonadas.</p>
+          <p>Decide cuántas partes, de qué tamaño, cómo evitas que el cliente complete una subida con partes de otro documento y qué pasa si una parte se sube dos veces. Incluye los endpoints, el estado en el catálogo y una prueba de fallo a mitad de la subida.</p>
+          <p><em>Pista: cada parte tiene su propio <code>ETag</code>; la operación de completar recibe la lista ordenada. Un <code>ListParts</code> te dice qué falta, y el lifecycle de subidas multipart incompletas evita que los restos se acumulen.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La API valida, genera la clave y firma; los bytes van directos a MinIO.</li>
+          <li>La clave se deriva de datos validados; el cliente nunca la elige.</li>
+          <li>La presigned URL limita método, bucket, clave y tiempo, no el tamaño ni el tipo real.</li>
+          <li><code>statObject</code> es la verificación que convierte una subida en un documento.</li>
+          <li><code>/complete</code> debe ser idempotente y no repetir eventos en cada llamada.</li>
+          <li>Los errores de validación se traducen a 400, 413 o 415, no a 500.</li>
+          <li>Un objeto rechazado tras el PUT debe limpiarse o aislarse.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Función</th><th>Papel</th></tr></thead>
+          <tbody>
+            <tr><td><code>assertTenant</code></td><td>Valida el espacio del tenant</td></tr>
+            <tr><td><code>sanitizeFilename</code></td><td>Elimina rutas, acentos y caracteres peligrosos</td></tr>
+            <tr><td><code>assertContentType</code></td><td>Aplica la lista blanca de tipos</td></tr>
+            <tr><td><code>assertSize</code></td><td>Valida el tamaño declarado</td></tr>
+            <tr><td><code>documentKey</code></td><td>Construye la clave estable</td></tr>
+            <tr><td><code>presignedPut</code></td><td>Firma la subida directa</td></tr>
+            <tr><td><code>statObject</code></td><td>Verifica tamaño, ETag y tipo reales</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿La URL presignada se puede reutilizar?</summary>
+            <div>
+              <p>Sí, hasta que expira, y permite exactamente el método y la clave firmados. Si se filtra dentro de esa ventana, cualquiera puede subir a esa clave. Por eso la expiración es corta y la clave incluye un UUID no adivinable. Para subidas críticas, añade un token de un solo uso en la API que autorice el <code>complete</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo limitar el tamaño en la propia URL?</summary>
+            <div>
+              <p>Con un PUT simple no hay una cabecera estándar para imponer un máximo. La alternativa es un presigned POST con una política que incluya <code>content-length-range</code>, o verificar después con <code>statObject</code>. El proyecto usa PUT y verificación posterior; si el tamaño es crítico, añade la comprobación antes de publicar el documento.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si el cliente sube dos veces a la misma URL?</summary>
+            <div>
+              <p>La segunda escritura sobrescribe la primera. Con versionado, se crea una versión nueva y la anterior queda recuperable, pero el <code>ETag</code> y el tamaño del catálogo pueden quedar desfasados si el <code>complete</code> ya se ejecutó. Para evitarlo, el <code>complete</code> puede guardar el ETag esperado y rechazar si el objeto cambió, o usar claves únicas por intento.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito autenticación en la API si las URLs ya están firmadas?</summary>
+            <div>
+              <p>Sí. Las URLs firmadas protegen el acceso a MinIO, no a tu API. Sin autenticación, cualquiera puede crear documentos, listar tenants y pedir descargas. La identidad del usuario decide qué tenant puede usar; la firma solo decide qué operación de almacenamiento se permite.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

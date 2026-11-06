@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="01-publisher-confirms">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Publisher confirms — Módulo 3 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Publisher confirms</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Fiabilidad</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p><code>channel.publish()</code> no devuelve un recibo. Escribe el mensaje en el socket y sigue. Si el broker lo aceptó, si se persistió, si el disco estaba lleno o si la conexión se cortó a medio frame, el productor no se entera. Esa comodidad es la razón de que tantos sistemas «pierdan mensajes de vez en cuando» sin saber por qué.</p>
+        <p>Los <strong>publisher confirms</strong> son el mecanismo de AMQP 0-9-1 para cerrar ese agujero: el canal entra en modo confirm, el broker numera cada mensaje y responde con <code>basic.ack</code> o <code>basic.nack</code>. Cuando llega el ack, el broker ha <strong>tomado responsabilidad</strong> del mensaje. No significa que un consumidor lo haya procesado, ni siquiera que haya una cola detrás si no usas <code>mandatory</code>. Significa que puedes dejar de preocuparte por la parte que te toca.</p>
+        <p>La otra opción del protocolo son las transacciones AMQP: <code>tx.select</code>, publicar, <code>tx.commit</code>. Funcionan, pero son carísimas —la documentación de RabbitMQ habla de una caída de throughput del orden de 250×— y además son síncronas. Los confirms existen precisamente para sustituirlas en el caso normal. En esta lección verás qué garantiza un confirm, qué no, cómo esperar uno o mil, y cómo encajarlo con <code>mandatory</code> y con un patrón outbox.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Sin confirms, la garantía real de tu productor es <strong>at-most-once</strong> y no lo sabes. Con confirms pasa a ser <strong>at-least-once</strong> hacia el broker. Es el primer escalón de la fiabilidad; el segundo es el <code>ack</code> del consumidor, y el tercero, la idempotencia. Ninguno de los tres es opcional en un sistema que no puede perder mensajes.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Qué pasa exactamente al activar confirms</h3>
+        <p>El cliente envía <code>confirm.select</code> y el canal queda en modo confirm. Desde ese momento, broker y cliente numeran los mensajes publicados en ese canal empezando por 1. Cuando el broker acepta un mensaje, envía <code>basic.ack</code> con el <code>delivery-tag</code> de su número de secuencia; si no puede hacerse cargo, <code>basic.nack</code>. El campo <code>multiple</code> permite confirmar de golpe todo lo anterior a un número.</p>
+        <pre><code class="language-text">canal en modo confirm
+
+publish #1 ──┐
+publish #2 ──┼──&gt; broker acepta y responde:
+publish #3 ──┘
+                 basic.ack  deliveryTag=3, multiple=true
+                 (equivale a ack 1, 2 y 3)
+
+si el broker no puede: basic.nack deliveryTag=2
+</code></pre>
+        <p>En amqplib, <code>connection.createConfirmChannel()</code> hace el <code>confirm.select</code> por ti. El método <code>publish</code> de ese canal acepta un callback que se invoca con <code>(err, ok)</code>: <code>err</code> es no nulo si hubo nack o si el canal se cerró antes de confirmar.</p>
+        <table>
+          <thead><tr><th>Estrategia</th><th>Cómo</th><th>Throughput</th><th>Cuándo</th></tr></thead>
+          <tbody>
+            <tr><td>Una por una, esperando</td><td>Publicar y esperar el confirm antes de la siguiente</td><td>El más bajo (cientos/s)</td><td>Casi nunca; solo pruebas o ritmos muy bajos</td></tr>
+            <tr><td>Lote</td><td>Publicar N y <code>await waitForConfirms()</code></td><td>Medio (miles/s)</td><td>Jobs por lotes, importaciones, ETL</td></tr>
+            <tr><td>Asíncrona</td><td>Callback por mensaje; seguir publicando</td><td>El más alto (decenas de miles/s)</td><td>API y servicios con tráfico continuo</td></tr>
+          </tbody>
+        </table>
+        <p>Las cifras son órdenes de magnitud, no benchmarks: dependen de persistencia, tamaño, red y colas. Lo importante es la forma de la curva: esperar cada confirm convierte una operación asíncrona en una llamada de red bloqueante.</p>
+        <h3>Qué garantiza y qué no</h3>
+        <p>Un <code>basic.ack</code> significa que el broker ha aceptado el mensaje y se hace responsable según la configuración de la cola. En una cola durable con mensaje persistente, eso implica que se ha escrito en disco (classic queue) o replicado según la política de quorum. Pero:</p>
+        <ul>
+          <li><strong>No garantiza consumo.</strong> El mensaje puede estar en la cola y el consumidor caerse antes de procesarlo. Eso lo cubre el <code>ack</code> del consumidor.</li>
+          <li><strong>No garantiza que se haya enrutado.</strong> Un exchange sin bindings acepta el mensaje y lo confirma; se descarta. Para detectarlo necesitas <code>mandatory</code> o un alternate exchange.</li>
+          <li><strong>No es una transacción de negocio.</strong> Si actualizas tu base de datos y publicas, el confirm no hace atómico el conjunto. Eso lo resuelve el patrón outbox.</li>
+          <li><strong>No sobrevive a todo.</strong> Si el broker confirma y luego pierde el disco antes de replicar, ninguna garantía lógica te salva; para eso están las réplicas y los backups.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title">Un confirm por canal, no por conexión</p>
+          <p>El modo confirm es una propiedad del canal. Si publicas desde varios canales, cada uno tiene su propia secuencia y sus propios confirms. No compartas un canal entre hilos o procesos: además de mezclar secuencias, AMQP no está pensado para escrituras concurrentes en el mismo canal.</p>
+        </div>
+        <h3><code>mandatory</code> y <code>basic.return</code>: el caso «no enrutado»</h3>
+        <p>Si publicas con <code>mandatory: true</code> y ningún binding coincide, el broker te devuelve el mensaje con <code>basic.return</code> <strong>antes</strong> del confirm. El confirm llega igual: el broker hizo su trabajo, pero el mensaje no fue a ninguna cola. Por eso hay que escuchar el evento <code>return</code> del canal y correlacionarlo (por <code>messageId</code> o por la routing key) para no marcar como enviado algo que se descartó.</p>
+        <pre><code class="language-text">publish(mandatory=true, key sin binding)
+        |
+        +--&gt; basic.return  (mensaje devuelto, con fields/properties)
+        |
+        +--&gt; basic.ack     (el broker lo procesó; no está en ninguna cola)</code></pre>
+        <p>Si el exchange tiene un alternate exchange y este enruta el mensaje, <strong>no habrá return</strong>: para el broker, el mensaje se enrutó. AE y <code>mandatory</code> son dos formas de tratar el mismo caso; elegir una (o combinarlas con cuidado) evita señales contradictorias. Lo viste en <a href="../02-exchanges-routing/04-headers-y-alternate.html">headers y alternate exchange</a>.</p>
+        <h3>Nack, canal cerrado y el estado «no sé»</h3>
+        <p>Un nack puede venir por un rechazo del broker (por ejemplo, una cola con <code>x-overflow: reject-publish</code> llena) o por un fallo interno. La respuesta correcta no es reintentar en bucle: es registrar, aplicar backoff y republicar con una clave de idempotencia. Si el canal se cierra con confirms pendientes, esos mensajes quedan en estado <strong>desconocido</strong>: pueden haberse persistido o no. La única salida segura es republicar asumiendo duplicados y deduplicar en el consumidor (<a href="04-idempotencia-y-reintentos.html">idempotencia y reintentos</a>).</p>
+        <p>Y si <code>publish</code> devuelve <code>false</code>, el buffer de escritura está lleno: espera al evento <code>drain</code> antes de seguir. Ignorarlo no pierde mensajes por sí mismo, pero dispara la memoria del proceso y puede acabar en un cierre de conexión.</p>
+        <h3>Outbox: la atomicidad que los confirms no dan</h3>
+        <p>El patrón outbox escribe el cambio de negocio y el mensaje pendiente en la <strong>misma transacción de base de datos</strong>. Un proceso aparte lee la tabla, publica con confirms y marca la fila como enviada. Si el proceso cae entre el commit y la publicación, la fila sigue ahí y se reintenta. La garantía es at-least-once; la idempotencia del consumidor cierra el círculo.</p>
+        <pre><code class="language-sql">BEGIN;
+  UPDATE pedidos SET estado = 'pagado' WHERE id = 'P-1001';
+  INSERT INTO outbox (id, exchange, routing_key, payload)
+  VALUES (gen_random_uuid(), 'taller.eventos', 'pedido.pagado', '{"id":"P-1001"}');
+COMMIT;
+-- después: SELECT ... FOR UPDATE SKIP LOCKED, publish con confirm, marcar enviado</code></pre>
+        <p>No es gratis: añade una tabla, un relay y limpieza. Pero es la única forma seria de que «cobrar y avisar» no se desincronicen cuando el broker tiene un mal día.</p>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p><strong>Garantía de este ejemplo:</strong> at-least-once desde el productor hasta el broker. El mensaje es persistente y la cola durable, así que el confirm implica persistencia. No hay consumidor: la garantía de procesamiento no está en juego.</p>
+        <pre><code class="language-javascript">import amqp from 'amqplib';
+
+const conn = await amqp.connect('amqp://taller:taller@localhost:5672');
+const ch = await conn.createConfirmChannel();   // confirm.select incluido
+
+await ch.assertQueue('pedidos.creados', { durable: true });
+
+// Confirm asíncrono: el callback se invoca con el ack o el nack.
+ch.publish('', 'pedidos.creados', Buffer.from('{"id":"P-1001"}'), {
+  persistent: true,
+  contentType: 'application/json',
+}, (err, ok) =&gt; {
+  if (err) console.error('nack o canal cerrado:', err.message);
+  else console.log('confirmado:', ok);
+});
+
+// Confirm de lote: espera a todos los pendientes de este canal.
+for (let i = 0; i &lt; 5; i++) {
+  ch.publish('', 'pedidos.creados', Buffer.from(`{"id":"P-200${i}"}`), {
+    persistent: true,
+  });
+}
+await ch.waitForConfirms();
+console.log('lote confirmado');
+
+await ch.close();
+await conn.close();
+</code></pre>
+        <p>Salida esperada (el orden exacto puede variar):</p>
+        <pre><code class="language-text">confirmado: {}
+lote confirmado</code></pre>
+        <p>Lo esencial, línea a línea:</p>
+        <ul>
+          <li><code>createConfirmChannel()</code>: sin esto, el callback de <code>publish</code> nunca se invoca y <code>waitForConfirms</code> no existe.</li>
+          <li>El callback recibe <code>(err, ok)</code>. En amqplib, un nack llega como <code>Error('message nacked')</code>; un cierre de canal, como error de canal.</li>
+          <li><code>waitForConfirms()</code> espera a los mensajes publicados <strong>hasta ese momento</strong>; si publicas más después, no entran en esa espera.</li>
+          <li><code>persistent: true</code> + cola durable: el confirm se emite cuando el broker se hace responsable en disco. Si la cola fuera transitoria, el confirm no prometería supervivencia al reinicio.</li>
+        </ul>
+        <p>Prueba a publicar en un exchange que no existe: el canal se cerrará y el callback recibirá error. Prueba a publicar en un exchange existente sin bindings: el confirm llegará, aunque el mensaje se haya descartado. Esa diferencia es la que justifica <code>mandatory</code>.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API del taller publica eventos de pedido. No puede bloquear la respuesta HTTP esperando un confirm por mensaje, pero tampoco puede decir «pedido creado» si el broker no se hizo cargo. La solución: un <strong>publicador con confirms asíncronos</strong>, <code>mandatory</code> y un registro de pendientes.</p>
+        <pre><code class="language-javascript">// publicador.js
+import amqp from 'amqplib';
+
+const conn = await amqp.connect(process.env.AMQP_URL);
+const ch = await conn.createConfirmChannel();
+const pendientes = new Map();   // messageId → { resolve, reject }
+
+ch.on('return', (msg) =&gt; {
+  const id = msg.properties.messageId;
+  const p = pendientes.get(id);
+  if (p) p.reject(new Error(`no enrutado: ${msg.fields.routingKey}`));
+  console.error('basic.return', {
+    exchange: msg.fields.exchange,
+    key: msg.fields.routingKey,
+    replyText: msg.fields.replyText,
+  });
+});
+
+export function publicar(exchange, routingKey, evento, messageId) {
+  return new Promise((resolve, reject) =&gt; {
+    pendientes.set(messageId, { resolve, reject });
+    ch.publish(exchange, routingKey, Buffer.from(JSON.stringify(evento)), {
+      persistent: true,
+      mandatory: true,
+      contentType: 'application/json',
+      messageId,
+    }, (err) =&gt; {
+      const p = pendientes.get(messageId);
+      if (!p) return;
+      pendientes.delete(messageId);
+      if (err) p.reject(err);
+      else p.resolve();
+    });
+  });
+}
+</code></pre>
+        <p>El caso de uso en la API: el evento se publica después de guardar el pedido, y el <code>messageId</code> es estable (no un UUID nuevo en cada reintento), para que el consumidor pueda deduplicar:</p>
+        <pre><code class="language-javascript">app.post('/pedidos', async (req, res) =&gt; {
+  const pedido = await db.crearPedido(req.body);
+  const messageId = `pedido-${pedido.id}-creado-v1`;
+
+  try {
+    await publicar('taller.eventos', 'pedido.creado', {
+      pedidoId: pedido.id,
+      total: pedido.total,
+    }, messageId);
+    res.status(201).json(pedido);
+  } catch (err) {
+    // El pedido existe, pero el evento no se confirmó: no lo ocultes.
+    req.log.error({ err, pedidoId: pedido.id }, 'evento no confirmado');
+    res.status(202).json({ ...pedido, aviso: 'evento en reintento' });
+  }
+});
+</code></pre>
+        <p>Ese <code>202</code> es una decisión de negocio, no un tecnicismo: el pedido está guardado, el evento se reintentará desde el outbox. Si en lugar de eso devolvieras <code>500</code>, el cliente reintentaría la creación y tendrías dos pedidos. Si devolvieras <code>201</code> sin más, estarías mintiendo sobre la notificación.</p>
+        <h3>Relay del outbox</h3>
+        <p>El caso completo añade una tabla y un proceso que publica lo pendiente. Cada ciclo toma un lote, publica, espera los confirms y marca:</p>
+        <pre><code class="language-javascript">async function relayOutbox() {
+  const filas = await db.query(`
+    SELECT id, exchange, routing_key, payload
+    FROM outbox
+    WHERE enviado_en IS NULL
+    ORDER BY creado_en
+    LIMIT 100
+    FOR UPDATE SKIP LOCKED
+  `);
+
+  if (filas.length === 0) return;
+
+  for (const fila of filas) {
+    ch.publish(fila.exchange, fila.routing_key, Buffer.from(fila.payload), {
+      persistent: true,
+      messageId: fila.id,
+    });
+  }
+
+  try {
+    await ch.waitForConfirms();
+    await db.query('UPDATE outbox SET enviado_en = now() WHERE id = ANY($1)', [
+      filas.map((f) =&gt; f.id),
+    ]);
+  } catch (err) {
+    // No marques nada: el siguiente ciclo reintenta y el consumidor deduplica.
+    console.error('lote no confirmado, se reintentará', err.message);
+  }
+}
+</code></pre>
+        <p>Dos detalles que separan esto de una demo: <code>FOR UPDATE SKIP LOCKED</code> permite varios relays sin pisarse, y el <code>messageId</code> es el id de la fila del outbox, estable entre reintentos. La garantía es at-least-once; el consumidor debe ser idempotente.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar un canal confirm dedicado al productor</td><td>Compartir canal entre publicadores concurrentes</td><td>Las secuencias y los callbacks se mezclan; AMQP no es thread-safe por canal.</td></tr>
+            <tr><td>Confirm asíncrono con callback y un mapa de pendientes</td><td><code>await waitForConfirms()</code> después de cada mensaje</td><td>Esperar por mensaje convierte el throughput en latencia de red.</td></tr>
+            <tr><td>Marcar los mensajes persistentes y las colas durables</td><td>Confirmar mensajes transitorios y creer que sobreviven</td><td>El confirm solo promete lo que la cola puede prometer.</td></tr>
+            <tr><td>Escuchar <code>return</code> y usar <code>mandatory</code> en eventos críticos</td><td>Asumir que un confirm implica que había cola</td><td>Un exchange sin bindings confirma y descarta.</td></tr>
+            <tr><td>Reintentar nacks con backoff y clave estable</td><td>Republicar en bucle inmediato</td><td>Un nack por saturación se convierte en una tormenta si no esperas.</td></tr>
+            <tr><td>Outbox cuando hay una escritura de negocio implicada</td><td>Publicar dentro de la transacción de base de datos</td><td>Si el commit falla después de publicar, el evento miente; si publicas después y falla, el evento falta.</td></tr>
+            <tr><td>Medir confirm latency y nacks</td><td>Mirar solo el throughput</td><td>Un aumento de latencia de confirms suele preceder a una alarma de disco o de memoria.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Publicar y cerrar la conexión inmediatamente</h3>
+        <span class="code-label code-label--wrong">Mal — el mensaje puede no haber salido</span>
+        <pre><code class="language-javascript">ch.publish(exchange, key, body, { persistent: true });
+await conn.close();   // el frame puede estar aún en el buffer
+</code></pre>
+        <span class="code-label code-label--right">Bien — esperar el confirm antes de cerrar</span>
+        <pre><code class="language-javascript">ch.publish(exchange, key, body, { persistent: true });
+await ch.waitForConfirms();
+await ch.close();
+await conn.close();
+</code></pre>
+        <p>En un proceso por lotes, este error explica los mensajes que «a veces» no llegan al terminar el script.</p>
+
+        <h3>2. Esperar un confirm por mensaje en un bucle</h3>
+        <span class="code-label code-label--wrong">Mal — una ida y vuelta por mensaje</span>
+        <pre><code class="language-javascript">for (const evento of eventos) {
+  ch.publish(exchange, key, body(evento));
+  await ch.waitForConfirms();   // throughput de cientos por segundo
+}
+</code></pre>
+        <span class="code-label code-label--right">Bien — lote o callbacks</span>
+        <pre><code class="language-javascript">for (const evento of eventos) ch.publish(exchange, key, body(evento));
+await ch.waitForConfirms();     // una espera para todo el lote
+
+// o mejor, sin bloquear el bucle:
+const pendientes = eventos.map((e) =&gt; publicarConConfirm(e));
+await Promise.all(pendientes);
+</code></pre>
+        <p>El confirm es asíncrono por diseño. Serializarlo es como hacer una petición HTTP por cada fila de una importación.</p>
+
+        <h3>3. Creer que un confirm significa «enrutado»</h3>
+        <span class="code-label code-label--wrong">Mal — marcar como enviado sin comprobar la cola</span>
+        <pre><code class="language-javascript">ch.publish('taller.eventos', 'pedido.creado', body, {}, (err) =&gt; {
+  if (!err) outbox.marcarEnviado(id);   // ¿había binding?
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — <code>mandatory</code> + <code>return</code></span>
+        <pre><code class="language-javascript">ch.on('return', (msg) =&gt; outbox.marcarNoEnrutado(msg.properties.messageId));
+ch.publish('taller.eventos', 'pedido.creado', body, { mandatory: true }, cb);
+</code></pre>
+        <p>Sin cola, el broker confirma y descarta. El confirm dice «lo tuve», no «lo guardé en algún sitio».</p>
+
+        <h3>4. Confundir confirm con <code>ack</code> del consumidor</h3>
+        <span class="code-label code-label--wrong">Mal — «ya está procesado»</span>
+        <pre><code class="language-text">productor recibe basic.ack
+→ el mensaje está en la cola, no procesado
+→ el worker puede caer antes de hacer su ack
+→ el broker lo reentrega (at-least-once)</code></pre>
+        <span class="code-label code-label--right">Bien — dos garantías separadas</span>
+        <pre><code class="language-text">confirm del productor  → el broker se responsabiliza
+ack del consumidor     → el procesamiento terminó
+idempotencia           → el reintento no duplica efectos</code></pre>
+        <p>Son eslabones distintos. Ninguno de los dos, por separado, te da «exactamente una vez».</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir la diferencia entre esperar por mensaje, por lote y de forma asíncrona; y comprobar qué hace un confirm cuando no hay binding.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara un publicador de 1.000 mensajes</strong> con <code>createConfirmChannel</code>, cola durable y mensajes persistentes. Mide con <code>performance.now()</code>.
+          </li>
+          <li>
+            <strong>Variante síncrona</strong>: espera <code>waitForConfirms()</code> después de cada <code>publish</code>. Anota milisegundos y mensajes por segundo.
+          </li>
+          <li>
+            <strong>Variante por lotes</strong>: publica 100, espera, repite 10 veces. Compara. Esperado: una mejora de un orden de magnitud, no un 10 %.
+          </li>
+          <li>
+            <strong>Variante asíncrona</strong>: registra un callback por mensaje y espera <code>Promise.all</code>. Compara con las dos anteriores y explica por qué el bucle no se bloquea.
+          </li>
+          <li>
+            <strong>Prueba el no enrutado</strong>: publica en el exchange <code>taller.eventos</code> con una key imposible y <code>mandatory: true</code>. Debes recibir <code>basic.return</code> y, después, el confirm. Repite sin <code>mandatory</code>: solo confirm.
+          </li>
+          <li>
+            <strong>Comprueba la persistencia</strong>:
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues name messages messages_persistent
+</code></pre>
+            <p>Si <code>messages_persistent</code> no cuadra con lo publicado, revisa <code>persistent: true</code> y que la cola sea durable.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Repite la variante asíncrona con el broker bajo carga (por ejemplo, publicando 50.000 mensajes de 10 KB). Si el proceso empieza a crecer en memoria, estás ignorando el valor <code>false</code> de <code>publish</code>: añade la espera a <code>drain</code>.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El relay que sobrevive a un crash</h3>
+          <p>Implementa un relay de outbox que publique con confirms y sea correcto ante un <code>kill -9</code> en cualquier punto: entre el commit y la publicación, entre la publicación y el confirm, y entre el confirm y el <code>UPDATE</code> que marca la fila. Debe haber un solo relay activo o varios sin pisarse, y ningún evento puede perderse.</p>
+          <p>Después mide cuántos duplicados produce una caída forzada y explica cómo los absorbe el consumidor. ¿Cambiaría algo usar un <code>messageId</code> nuevo en cada intento? ¿Y si el <code>UPDATE</code> se hiciera antes del confirm?</p>
+          <p><em>Pista: el estado «publicado pero no marcado» es inevitable; la pregunta es si el consumidor puede reconocerlo. <code>FOR UPDATE SKIP LOCKED</code> ayuda con la concurrencia, no con la atomicidad.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Sin confirms, el productor no sabe si el broker recibió el mensaje: at-most-once por defecto.</li>
+          <li><code>createConfirmChannel()</code> activa el modo confirm; el broker responde <code>ack</code> o <code>nack</code> por número de secuencia.</li>
+          <li>Un confirm significa que el broker <strong>se hace responsable</strong>, no que el consumidor haya procesado.</li>
+          <li>Sin <code>mandatory</code>, un mensaje sin binding se confirma y se descarta; con <code>mandatory</code>, llega <code>basic.return</code> antes del confirm.</li>
+          <li>Esperar por mensaje destruye el throughput; usa callbacks o lotes con <code>waitForConfirms()</code>.</li>
+          <li>Si el canal muere con confirms pendientes, el estado es desconocido: republica con clave estable e idempotencia.</li>
+          <li>Para atomicidad negocio-mensaje, outbox; los confirms no son una transacción distribuida.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Llamada o concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>createConfirmChannel()</code></td><td>Crea un canal en modo confirm</td></tr>
+            <tr><td><code>publish(..., cb)</code></td><td>Publica y notifica ack/nack por callback</td></tr>
+            <tr><td><code>waitForConfirms()</code></td><td>Espera a todos los pendientes del canal; rechaza en nack</td></tr>
+            <tr><td><code>mandatory: true</code></td><td>Pide <code>basic.return</code> si no se enruta</td></tr>
+            <tr><td><code>channel.on('return', …)</code></td><td>Recibe los mensajes devueltos</td></tr>
+            <tr><td><code>persistent: true</code></td><td>Marca el mensaje para disco (la cola debe ser durable)</td></tr>
+            <tr><td><code>outbox</code></td><td>Atomicidad entre la base de datos y la publicación</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Los confirms sustituyen a las transacciones AMQP?</summary>
+            <div>
+              <p>Para publicar, sí en la práctica: los confirms son mucho más baratos y permiten el mismo tipo de comprobación. Las transacciones AMQP (<code>tx.select</code>/<code>tx.commit</code>) siguen existiendo, pero su coste es enorme y no resuelven la atomicidad con tu base de datos. No mezcles ambos modos en el mismo canal: son incompatibles.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Un confirm garantiza que el mensaje está en disco?</summary>
+            <div>
+              <p>Solo si el mensaje es persistente y la cola es durable. En classic queues, el broker confirma tras persistir; en quorum queues, tras replicar según la política. Si publicas mensajes transitorios en una cola transitoria, el confirm solo dice que el broker los aceptó en memoria.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago con un <code>basic.nack</code>?</summary>
+            <div>
+              <p>Tratarlo como un fallo recuperable: registrar el motivo, esperar con backoff y republicar el mismo mensaje con la misma clave de idempotencia. Si el nack viene de una cola llena con <code>reject-publish</code>, insistir sin esperar solo empeora la saturación. Si es un fallo interno persistente, alerta y detén el publicador.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuántos mensajes puedo tener pendientes de confirmar?</summary>
+            <div>
+              <p>No hay un número mágico: cada mensaje pendiente consume memoria en el cliente. Usa una ventana acotada (por ejemplo, 1.000–10.000) y no publiques más allá hasta que bajen los pendientes. Si el productor crece sin control, acabarás en un problema de memoria antes que en un problema del broker.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si confirmo y el consumidor falla, ¿se pierde el mensaje?</summary>
+            <div>
+              <p>No si el consumidor usa <code>ack</code> manual: el broker reentrega los no confirmados. Se pierde si usas <code>autoAck: true</code> o si el mensaje era transitorio y el broker se reinicia. El confirm del productor y el <code>ack</code> del consumidor son eslabones distintos; la durabilidad de la cola es el puente entre ambos.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

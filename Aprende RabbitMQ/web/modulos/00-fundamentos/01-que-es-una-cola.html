@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="00" data-lesson="01-que-es-una-cola">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qué es una cola de mensajes — Módulo 0 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Qué es una cola de mensajes</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 0 · Fundamentos</span>
+          <span>🕐 30 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Imagina el endpoint que crea un pedido. Hace tres cosas seguidas: guarda el pedido, genera la factura y envía el correo de confirmación. Funciona en desarrollo, con un pedido cada diez segundos. En producción, un viernes por la tarde, el proveedor de correo tarda ocho segundos y la base de datos de facturación está en mantenimiento. El cliente pulsa «Comprar», la petición se queda colgada y, cuando por fin responde con un error, el pedido ya está guardado pero la factura no. El usuario reintenta. Ahora hay dos pedidos.</p>
+        <p>El problema no es el código: es el <strong>acoplamiento temporal</strong>. La API no puede terminar hasta que terminen tres sistemas que no controla y que no necesitan participar en la respuesta. Una cola de mensajes rompe esa cadena: la API guarda el pedido, deja un mensaje y responde. El resto ocurre después, a su ritmo, con reintentos y sin arrastrar al usuario.</p>
+        <p>Una cola no es magia ni una base de datos. Es un <strong>contrato de entrega</strong>: alguien publica un mensaje, un broker lo almacena y lo enruta, y un consumidor lo procesa y confirma. Cada una de esas palabras tiene garantías distintas, y elegirlas mal es la diferencia entre «el sistema aguanta» y «hemos perdido pedidos sin saberlo».</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué existe esta lección</p>
+          <p>Antes de instalar RabbitMQ conviene saber qué problema estás comprando. La mensajería añade un broker que operar, latencia eventual, duplicados posibles y un modelo mental nuevo. Si no tienes claro qué acoplamiento rompe y qué garantía necesitas, acabarás usando una cola como base de datos o creyendo que resuelve problemas que no son suyos.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El problema: una cadena síncrona</h3>
+        <p>En una llamada HTTP síncrona, el cliente espera a que el servidor termine todo el trabajo. Si el servidor llama a tres servicios, la latencia es la suma y la disponibilidad es el producto:</p>
+        <pre><code class="language-text">cliente ──POST /pedidos──▶ API ──▶ PostgreSQL      (20 ms)
+                              ├──▶ facturación     (300 ms)
+                              ├──▶ email           (800 ms, a veces 8 s)
+                              └──▶ inventario      (150 ms)
+                              │
+                              └── respuesta al cliente: cuando todo termina
+
+Si facturación está al 99 % y email al 99 %, la cadena completa
+no está al 99 %: está al 0,99 × 0,99 = 98,01 % como máximo.</code></pre>
+        <p>Y hay un problema peor que la latencia: el <strong>fallo en cascada</strong>. Si el proveedor de correo se cae, la API devuelve error aunque el pedido se haya guardado. El cliente reintenta, se duplica el pedido y alguien pasa la tarde cuadrando datos.</p>
+        <h3>Qué añade una cola</h3>
+        <p>Con mensajería, la API hace solo lo que necesita para responder: validar, persistir el pedido y publicar un evento. El resto son consumidores independientes:</p>
+        <pre><code class="language-text">cliente ──POST /pedidos──▶ API ──INSERT──▶ PostgreSQL
+                              │
+                              └──publish──▶ [ exchange ] ──▶ [ cola ] ──▶ worker
+                                                                   │
+                                                              ack / nack
+
+La API responde 202 Accepted en cuanto el mensaje está publicado.
+El worker puede estar caído: el mensaje espera en la cola.</code></pre>
+        <p>La cola actúa como <strong>buffer</strong> y como <strong>frontera de fallo</strong>. Un pico de cien pedidos por segundo no requiere cien workers en ese instante: se encolan y se procesan a la capacidad disponible. Un worker caído no tumba la API: sus mensajes quedan pendientes hasta que vuelva otro.</p>
+        <h3>Tres desacoplamientos</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Qué significa</th><th>Ejemplo en el taller</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Temporal</strong></td>
+              <td>Productor y consumidor no tienen que estar vivos a la vez.</td>
+              <td>La API publica a las 23:00; el worker de facturación arranca a las 06:00 y encuentra los mensajes.</td>
+            </tr>
+            <tr>
+              <td><strong>Espacial</strong></td>
+              <td>El productor no conoce la identidad ni la ubicación del consumidor.</td>
+              <td>La API publica <code>pedido.creado</code> sin saber si lo lee facturación, inventario o un servicio nuevo que aún no existe.</td>
+            </tr>
+            <tr>
+              <td><strong>De fallos</strong></td>
+              <td>Un consumidor lento o caído no propaga el error al productor.</td>
+              <td>El correo de confirmación falla; el pedido sigue creado y el mensaje se reintenta.</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>Un buffer, no una base de datos</h3>
+        <p>Es tentador pensar en la cola como una tabla donde «se guardan» los pedidos. No lo es: el dato de una base de datos permanece hasta que alguien lo borra y se puede consultar, filtrar y actualizar; el mensaje de una cola desaparece cuando el consumidor confirma, no se consulta y el broker no entiende su contenido. La cola transporta el «qué ha pasado»; el estado del negocio vive en la base de datos.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">La cola no sustituye la persistencia del negocio</p>
+          <p>El pedido debe estar en PostgreSQL antes de publicar el evento. Si solo vive en la cola y el consumidor falla de forma definitiva, lo pierdes. El patrón habitual es <strong>guardar estado + publicar evento</strong>, y resolver la atomicidad entre ambos con un <em>outbox</em> o con reintentos idempotentes.</p>
+        </div>
+        <h3>Garantías: elige una y sabe quién la sostiene</h3>
+        <p>«Entrega garantizada» no significa nada si no dices cuántas veces y ante qué fallo. Las tres opciones clásicas:</p>
+        <table>
+          <thead><tr><th>Garantía</th><th>Qué promete</th><th>Quién la sostiene</th><th>Cómo se implementa</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>At-most-once</strong></td>
+              <td>Como máximo una entrega. Si el consumidor cae después de recibir, el mensaje se pierde.</td>
+              <td>El broker, que considera entregado en cuanto envía.</td>
+              <td><code>autoAck: true</code> o <code>noAck: true</code>. Rápido y frágil.</td>
+            </tr>
+            <tr>
+              <td><strong>At-least-once</strong></td>
+              <td>Al menos una entrega. Si el consumidor no confirma, el mensaje vuelve a la cola.</td>
+              <td>El consumidor, con <code>ack</code> manual, y el broker, con redelivery.</td>
+              <td><code>ack</code> después de procesar. Puede duplicar: exige idempotencia.</td>
+            </tr>
+            <tr>
+              <td><strong>Exactly-once</strong></td>
+              <td>Exactamente una entrega, sin pérdidas ni duplicados.</td>
+              <td>Nadie la regala de extremo a extremo.</td>
+              <td>Se aproxima con at-least-once + clave de negocio única + deduplicación.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>En este curso partimos de una regla: <strong>no existe entrega exactamente una vez gratis</strong>. Si alguien te la promete, pregunta qué pasa si el proceso muere entre el efecto y el <code>ack</code>, o si el broker confirma y la red se corta antes de que el productor se entere.</p>
+        <h3>Cuándo NO usar mensajería</h3>
+        <p>Una cola añade piezas y estados intermedios. No es la respuesta a todo:</p>
+        <ul>
+          <li><strong>Necesitas la respuesta ya y con consistencia fuerte.</strong> Un <code>GET /saldo</code> no debe pasar por una cola: el cliente espera un dato actual, no un «procesando».</li>
+          <li><strong>La operación es única, barata y de bajo volumen.</strong> Un cron diario que genera un CSV no necesita un broker; un script y un log pueden bastar.</li>
+          <li><strong>Necesitas consultar el histórico.</strong> Eso es una base de datos o un event store, no una cola.</li>
+        </ul>
+        <h3>Ejemplos donde sí encaja</h3>
+        <p>Pedidos y facturación (la API responde rápido y la factura se genera después), emails y notificaciones (el proveedor externo es lento y conviene reintentar con backoff), procesamiento de imágenes (trabajo pesado y workers que escalan) y eventos de dominio (varios servicios reaccionan al mismo hecho sin acoplarse). En todos, la garantía razonable es <strong>at-least-once</strong> con consumidores idempotentes.</p>
+        <h3>El hilo conductor: el taller de pedidos</h3>
+        <p>Durante el curso construimos un sistema que crece contigo:</p>
+        <ol>
+          <li>El taller publica <code>pedido.creado</code> y un consumidor lo imprime.</li>
+          <li>Facturación e inventario reciben el mismo evento con un fanout.</li>
+          <li>Las rutas se afinan con un topic exchange: <code>pedido.*</code>, <code>pedido.creado</code>, <code>pedido.cancelado</code>.</li>
+          <li>Añadimos confirms, <code>ack</code> manual, reintentos, DLQ y la job queue completa.</li>
+        </ol>
+        <p>Todo lo que veas a partir de aquí responderá a una pregunta concreta del taller: <em>¿qué pasa si este paso falla?</em></p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Antes de instalar nada, reproduce el concepto con una cola en memoria. No es RabbitMQ, pero te obliga a ver las tres piezas: alguien publica, algo almacena y alguien consume sin bloquear al productor.</p>
+        <pre><code class="language-javascript">// cola.mjs — una cola en memoria para observar el desacoplamiento
+const cola = [];
+let procesados = 0;
+
+function publicar(pedido) {
+  cola.push(pedido);
+  console.log(`[api] pedido ${pedido.id} aceptado; pendientes: ${cola.length}`);
+}
+
+async function worker() {
+  while (true) {
+    const pedido = cola.shift();
+    if (!pedido) {
+      await new Promise((resolve) =&gt; setTimeout(resolve, 100));
+      continue;
+    }
+    await new Promise((resolve) =&gt; setTimeout(resolve, 300)); // simula facturación
+    procesados += 1;
+    console.log(`[worker] pedido ${pedido.id} procesado (${procesados})`);
+  }
+}
+
+worker(); // no se espera: el worker corre en paralelo
+publicar({ id: "1042", total: 49.9 });
+publicar({ id: "1043", total: 12.0 });
+publicar({ id: "1044", total: 87.5 });
+</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>cola</code> es el broker: un array que guarda mensajes pendientes.</li>
+          <li><code>publicar</code> hace <code>push</code> y vuelve inmediatamente. La API no espera a que se procese nada.</li>
+          <li><code>worker</code> hace <code>shift</code>: saca el mensaje más antiguo (FIFO) y lo procesa.</li>
+          <li><code>await new Promise(...)</code> simula el trabajo lento de facturación.</li>
+          <li><code>worker()</code> no lleva <code>await</code> delante: se lanza y el hilo principal sigue publicando.</li>
+        </ul>
+        <p>Salida esperada (el orden exacto de las tres primeras líneas puede variar):</p>
+        <pre><code class="language-text">[api] pedido 1042 aceptado; pendientes: 1
+[api] pedido 1043 aceptado; pendientes: 2
+[api] pedido 1044 aceptado; pendientes: 3
+[worker] pedido 1042 procesado (1)
+[worker] pedido 1043 procesado (2)
+[worker] pedido 1044 procesado (3)
+</code></pre>
+        <p>Fíjate en lo importante: los tres pedidos se aceptaron en milisegundos y el worker tardó casi un segundo. Ese hueco es el buffer. Ahora mata el proceso con <kbd>Ctrl</kbd>+<kbd>C</kbd> antes de que termine: los mensajes desaparecen con la memoria. Esa es la primera lección de fiabilidad: <strong>una cola en el proceso no sobrevive al proceso</strong>. RabbitMQ existe, entre otras cosas, para que la cola viva fuera de tu aplicación.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el taller, la API crea el pedido y publica un evento. No genera la factura ni envía el correo: solo deja constancia de que algo ocurrió.</p>
+        <pre><code class="language-javascript">async function crearPedido(datos) {
+  const pedido = await db.insert("pedidos", {
+    ...datos,
+    estado: "pendiente",
+    creadoEn: new Date().toISOString(),
+  });
+
+  await broker.publicar("pedido.creado", {
+    id: pedido.id,
+    cliente: pedido.cliente,
+    total: pedido.total,
+  });
+
+  return { id: pedido.id, estado: "pendiente" };
+}
+</code></pre>
+        <p>La topología inicial tiene un exchange y tres colas independientes:</p>
+        <pre><code class="language-text">                         ┌──────────────────────────────┐
+   API ──publish────────▶│  exchange pedidos (topic)    │
+   routing key:          └──────────────┬───────────────┘
+   pedido.creado                        │
+                         ┌──────────────┼──────────────┐
+                         │              │              │
+                    pedido.creado  pedido.creado   pedido.#
+                         ▼              ▼              ▼
+                   ┌───────────┐  ┌────────────┐  ┌───────────┐
+                   │facturacion│  │ inventario │  │ auditoria │
+                   └─────┬─────┘  └─────┬──────┘  └─────┬─────┘
+                         ▼              ▼               ▼
+                    genera PDF     reserva stock    registra todo
+</code></pre>
+        <p>Cada cola tiene su propio consumidor y su propio ritmo. Si facturación va lenta, inventario sigue reservando stock y auditoría sigue registrando. No hay una cadena: hay tres reacciones al mismo hecho.</p>
+        <table>
+          <thead><tr><th>Si falla…</th><th>Qué ocurre</th><th>Qué debe hacer el sistema</th></tr></thead>
+          <tbody>
+            <tr><td>El worker de facturación está caído</td><td>Los mensajes se acumulan en <code>facturacion</code>.</td><td>Alarma por backlog; escalar workers o revisar el fallo.</td></tr>
+            <tr><td>El proveedor de email tarda 30 s</td><td>La API no se entera; el consumidor espera.</td><td>Timeout, <code>nack</code> y reintento con backoff; nunca bloquear la cola.</td></tr>
+            <tr><td>El broker no está disponible</td><td>La publicación falla.</td><td>La API decide: error 503, outbox o reintento; no fingir que el evento salió.</td></tr>
+            <tr><td>El consumidor procesa dos veces</td><td>Se duplica una factura o un email.</td><td>Idempotencia por clave de negocio (<code>pedidoId</code>).</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--analogy">
+          <p class="callout__title">La analogía del mostrador</p>
+          <p>Sin cola, el cliente espera mientras el dependiente va al almacén, llama al proveedor y prepara la factura. Con cola, le da un resguardo («aceptado»), deja la comanda en una bandeja y el cliente se va. La bandeja es la cola; el resguardo es el <code>202 Accepted</code>.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Publicar <strong>eventos de negocio</strong> con un nombre estable: <code>pedido.creado</code>.</td>
+              <td>Nombres atados a la implementación: <code>insert_pedido_en_bd</code>.</td>
+              <td>El evento describe un hecho, no una función interna. Varios consumidores pueden reaccionar sin acoplarse a tu código.</td>
+            </tr>
+            <tr>
+              <td>Hacer el consumidor <strong>idempotente</strong> por clave de negocio.</td>
+              <td>Confiar en que el mensaje llegará una sola vez.</td>
+              <td>At-least-once puede duplicar. Una clave única en base de datos convierte el duplicado en un no-op.</td>
+            </tr>
+            <tr>
+              <td>Separar colas por tipo de trabajo y definir un límite con alarma de backlog.</td>
+              <td>Una sola cola gigante para facturas, emails e imágenes, creciendo sin control.</td>
+              <td>Un trabajo lento bloquea a los demás y una cola que crece es un incidente silencioso.</td>
+            </tr>
+            <tr><td>Versionar el esquema del mensaje (<code>schemaVersion</code>).</td><td>Cambiar campos sin avisar a los consumidores.</td><td>Productor y consumidores se despliegan por separado; el contrato debe evolucionar sin romper.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Encadenar todo en la petición HTTP</h3>
+        <span class="code-label code-label--wrong">Mal — el cliente espera a tres sistemas</span>
+        <pre><code class="language-javascript">app.post("/pedidos", async (req, res) =&gt; {
+  const pedido = await db.insert("pedidos", req.body);
+  await facturar(pedido);        // 300 ms
+  await enviarEmail(pedido);     // 800 ms, a veces falla
+  await reservarStock(pedido);   // 150 ms
+  res.status(201).json(pedido);
+});
+</code></pre>
+        <span class="code-label code-label--right">Bien — persistir, publicar y responder</span>
+        <pre><code class="language-javascript">app.post("/pedidos", async (req, res) =&gt; {
+  const pedido = await db.insert("pedidos", req.body);
+  await broker.publicar("pedido.creado", pedido);
+  res.status(202).json({ id: pedido.id, estado: "pendiente" });
+});
+</code></pre>
+        <p>La API sigue siendo responsable de que el pedido esté guardado; lo que delega es el trabajo posterior. Si la publicación falla, debe devolver error o dejar el evento en un outbox: lo que no puede es responder «aceptado» y perderlo.</p>
+        <h3>2. Creer que la cola garantiza una sola entrega</h3>
+        <span class="code-label code-label--wrong">Mal — asumir exactly-once</span>
+        <pre><code class="language-javascript">// ❌ "Si el mensaje llega, llega una sola vez"
+await crearFactura(pedido);
+channel.ack(msg);
+</code></pre>
+        <span class="code-label code-label--right">Bien — asumir duplicados y deduplicar</span>
+        <pre><code class="language-javascript">await db.query(
+  "INSERT INTO facturas (pedido_id, total) VALUES ($1, $2) ON CONFLICT (pedido_id) DO NOTHING",
+  [pedido.id, pedido.total],
+);
+channel.ack(msg);
+</code></pre>
+        <p>El <code>ack</code> puede perderse después de crear la factura; el broker reentrega y el consumidor vuelve a ejecutar. La restricción única convierte el segundo intento en un no-op.</p>
+        <h3>3. No poner límites ni alarmas</h3>
+        <span class="code-label code-label--wrong">Mal — una cola sin dueño</span>
+        <pre><code class="language-text">// ❌ crece durante días; nadie lo mira hasta que el disco se llena</code></pre>
+        <span class="code-label code-label--right">Bien — límite, DLQ y alerta</span>
+        <pre><code class="language-text">x-max-length + dead-letter-exchange
+alerta si messages_ready &gt; 10 000 durante 5 min</code></pre>
+        <p>Sin consumidores no hay alta disponibilidad: hay trabajo acumulándose.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar con tus manos que el productor no espera, que la cola absorbe un pico y que una cola en memoria muere con el proceso.</p>
+        <ol class="steps">
+          <li>
+            <strong>Paso 1 — Crea el archivo y deja el worker comentado:</strong>
+            <pre><code class="language-bash">mkdir laboratorio-cola
+cd laboratorio-cola
+node --version   # debe ser v22 o superior
+</code></pre>
+            <p>Copia el ejemplo mínimo en <code>cola.mjs</code>, pero sustituye la última línea <code>worker();</code> por <code>// worker();</code>.</p>
+          </li>
+          <li>
+            <strong>Paso 2 — Publica tres pedidos sin consumidor:</strong>
+            <pre><code class="language-bash">node cola.mjs
+</code></pre>
+            <pre><code class="language-text">[api] pedido 1042 aceptado; pendientes: 1
+[api] pedido 1043 aceptado; pendientes: 2
+[api] pedido 1044 aceptado; pendientes: 3
+</code></pre>
+            <p>El proceso termina de inmediato. Los mensajes se quedaron en el array y, al salir, se perdieron. Eso es una cola sin broker: <strong>at-most-once</strong> y sin persistencia.</p>
+          </li>
+          <li>
+            <strong>Paso 3 — Activa el worker y vuelve a ejecutar:</strong>
+            <pre><code class="language-bash"># descomenta worker();
+node cola.mjs
+</code></pre>
+            <pre><code class="language-text">[api] pedido 1042 aceptado; pendientes: 1
+[api] pedido 1043 aceptado; pendientes: 2
+[api] pedido 1044 aceptado; pendientes: 3
+[worker] pedido 1042 procesado (1)
+[worker] pedido 1043 procesado (2)
+[worker] pedido 1044 procesado (3)
+</code></pre>
+            <p>Los pedidos se aceptan antes de que el worker termine el primero. Ese desfase es el desacoplamiento temporal.</p>
+          </li>
+          <li>
+            <strong>Paso 4 — Genera un pico:</strong> añade antes de la llamada a <code>worker()</code> un bucle que publique 500 pedidos:
+            <pre><code class="language-javascript">for (let i = 0; i &lt; 500; i++) {
+  publicar({ id: String(2000 + i), total: 10 });
+}
+</code></pre>
+            <p>Ejecuta y observa: la API acepta los 500 en unos milisegundos; el worker tarda unos 150 segundos. La cola es el amortiguador entre ambas velocidades.</p>
+          </li>
+          <li>
+            <strong>Paso 5 — Interrumpe a mitad:</strong> pulsa <kbd>Ctrl</kbd>+<kbd>C</kbd> cuando el worker lleve unos cuantos pedidos. Vuelve a ejecutar el script. Los pedidos que quedaban en el array ya no existen: no hay nada que reanudar.</li>
+          <li>
+            <strong>Paso 6 — Anota la conclusión:</strong> escribe en un comentario qué garantía ofrece esta implementación y qué falta para que sea at-least-once. La respuesta corta: falta un broker externo que guarde los mensajes y un <code>ack</code> que confirme el procesamiento.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Si el worker procesa más rápido de lo que publicas, la cola casi nunca crece y el ejercicio parece innecesario. Baja la velocidad del worker o sube el número de publicaciones: el buffer solo se ve cuando la entrada supera la capacidad.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Dos reacciones, una decisión</h3>
+          <p>El taller necesita que, al crear un pedido, <strong>facturación</strong> genere una factura y <strong>marketing</strong> envíe un email de bienvenida. Facturación no puede perder ni una factura; marketing puede tolerar un email duplicado, pero no quiere bloquearse si el proveedor de correo está lento.</p>
+          <p>Diseña la topología: ¿una cola con dos tipos de consumidores compitiendo, dos colas separadas o un exchange con dos bindings? Decide para cada una la garantía de entrega y quién la sostiene. Después responde: si marketing se cae durante una hora, ¿qué pasa con las facturas? ¿Y si facturación se cae?</p>
+          <p><em>Pista: una cola con dos consumidores reparte cada mensaje a uno solo; dos colas con dos consumidores independientes reciben ambas una copia. Piensa primero en el efecto de negocio, no en el código.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una cola de mensajes rompe el acoplamiento <strong>temporal</strong>, <strong>espacial</strong> y <strong>de fallos</strong> entre productor y consumidor.</li>
+          <li>El broker actúa como <strong>buffer</strong>: absorbe picos y permite que el consumidor procese a su ritmo.</li>
+          <li>Una cola <strong>no es una base de datos</strong>: no se consulta, no se actualiza y el mensaje desaparece al confirmarse.</li>
+          <li>Toda garantía debe nombrarse: <strong>at-most-once</strong> (puede perder), <strong>at-least-once</strong> (puede duplicar) o <strong>exactly-once</strong> aproximado con idempotencia.</li>
+          <li>La mensajería no es para todo: respuestas inmediatas, payloads enormes y orden global estricto suelen pedir otras herramientas.</li>
+          <li>El taller de pedidos usará eventos de negocio, colas independientes por consumidor y un diseño explícito de fallos.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Concepto</th><th>Qué es</th><th>Quién lo sostiene</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Productor</strong></td><td>Publica un mensaje en un exchange.</td><td>Debe decidir si espera confirmación del broker.</td></tr>
+            <tr><td><strong>Cola</strong></td><td>Buffer ordenado de mensajes pendientes de consumo.</td><td>Retención hasta el <code>ack</code>.</td></tr>
+            <tr><td><strong>Consumidor</strong></td><td>Procesa mensajes y confirma con <code>ack</code>.</td><td>At-least-once e idempotencia.</td></tr>
+            <tr><td><strong>At-least-once</strong></td><td>Al menos una entrega; se puede duplicar.</td><td>Consumidor con <code>ack</code> manual.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Una cola es lo mismo que una base de datos?</summary>
+            <div>
+              <p>No. Una base de datos guarda estado y permite consultarlo; una cola transporta mensajes hacia un consumidor y los elimina al confirmarse. Si necesitas saber «cuántos pedidos pendientes hay» o «qué pasó en marzo», eso vive en la base de datos, no en el broker.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Si el consumidor está apagado, ¿se pierde el mensaje?</summary>
+            <div>
+              <p>Con un broker y una cola durable, no: el mensaje queda almacenado hasta que haya un consumidor. Con una cola en memoria como la del ejemplo mínimo, sí. La diferencia entre ambos casos es exactamente el motivo por el que existe RabbitMQ.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La cola garantiza que el mensaje se procesa una sola vez?</summary>
+            <div>
+              <p>No. La garantía habitual es at-least-once: si el consumidor cae antes de confirmar, el broker reentrega. Para acercarte a «una sola vez» necesitas una clave de negocio única y deduplicación en el consumidor. Es responsabilidad tuya, no del broker.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Necesito mensajería para un cron que se ejecuta una vez al día?</summary>
+            <div>
+              <p>Probablemente no. Si la tarea es única, barata y no compite con tráfico de usuario, un cron con logs y reintentos puede ser suficiente. La mensajería aporta cuando hay picos, varios consumidores, trabajos lentos o necesidad de desacoplar fallos. Añadir un broker sin esos requisitos es coste operativo sin beneficio.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

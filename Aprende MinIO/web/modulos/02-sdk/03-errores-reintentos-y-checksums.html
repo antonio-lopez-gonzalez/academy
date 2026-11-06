@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="03-errores-reintentos-y-checksums">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Errores, reintentos y checksums — Módulo 2 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Errores, reintentos y checksums</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · SDK y aplicación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El código que sube documentos funciona en tu portátil y falla el día que la red se corta a mitad de un PDF, el servidor reinicia durante un despliegue o el proxy devuelve un 503. Ninguno de esos fallos es exótico: son el estado normal de un sistema distribuido. Lo que distingue a una aplicación robusta no es no tener errores, sino saber cuáles se reintentan, cuáles no, y cómo comprobar que lo que llegó es lo que se envió.</p>
+        <p>Reintentar a ciegas es peor que no reintentar. Un reintento sobre un error permanente multiplica la carga y esconde el problema. Un reintento sobre una operación no idempotente crea objetos duplicados. Y un reintento sin <em>jitter</em> sincroniza a todos los clientes para volver a golpear al servidor en el mismo instante.</p>
+        <p>Esta lección construye la taxonomía completa sobre el cliente de la <a href="./01-cliente-node.html">lección anterior</a>: códigos de error S3, política de reintento con backoff y jitter, idempotencia de las escrituras, y la diferencia entre ETag y checksum —la parte que más malentendidos genera cuando aparece un <code>-3</code> al final de un hash.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué importa más el «no reintentar»</p>
+          <p>Un 403 no se arregla esperando. Un 404 de clave no aparece por reintentar. Reintentar esos errores convierte un fallo claro en una tormenta de peticiones y retrasa el diagnóstico. La primera decisión de una política de reintentos es la lista de errores que <strong>no</strong> entran.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos capas de error que no coinciden</h3>
+        <p>Una respuesta S3 trae un código HTTP y, en el cuerpo, un XML con un código propio. <code>minio-js</code> lo convierte en un <code>Minio.S3Error</code> con <code>code</code>, <code>message</code> y <code>statusCode</code>. No son lo mismo: <code>NoSuchKey</code> y <code>NoSuchBucket</code> comparten el 404, y <code>AccessDenied</code> agrupa varias causas (política, credencial deshabilitada, IP restringida).</p>
+        <pre><code class="language-text">petición HTTP
+    |
+    +-- falla antes de hablar con el servidor --> error de red (ECONNREFUSED, ETIMEDOUT…)
+    |                                            no es S3Error
+    |
+    +-- el servidor responde 4xx/5xx ----------- S3Error
+                                                 code      = NoSuchKey
+                                                 statusCode = 404
+                                                 amzRequestid = 17B9C2F4…</code></pre>
+        <p>Captura las dos familias por separado. Un <code>catch</code> que solo mira <code>err.message</code> pierde el código y acaba tratando igual un fallo de red y un permiso denegado.</p>
+
+        <h3>Catálogo de errores que verás de verdad</h3>
+        <table>
+          <thead><tr><th>Código</th><th>HTTP</th><th>Significado</th><th>¿Reintentar?</th></tr></thead>
+          <tbody>
+            <tr><td><code>NoSuchKey</code></td><td>404</td><td>La clave no existe en ese bucket</td><td>No: es un estado, no un fallo transitorio</td></tr>
+            <tr><td><code>NoSuchBucket</code></td><td>404</td><td>El bucket no existe o está mal escrito</td><td>No</td></tr>
+            <tr><td><code>AccessDenied</code></td><td>403</td><td>La política no permite la acción sobre ese recurso</td><td>No</td></tr>
+            <tr><td><code>InvalidAccessKeyId</code></td><td>403</td><td>El usuario no existe o está deshabilitado</td><td>No</td></tr>
+            <tr><td><code>SignatureDoesNotMatch</code></td><td>403</td><td>Secreto incorrecto o reloj desviado</td><td>No (corrige la causa)</td></tr>
+            <tr><td><code>BucketAlreadyOwnedByYou</code></td><td>409</td><td>El bucket ya es tuyo</td><td>No: trátalo como éxito</td></tr>
+            <tr><td><code>BucketAlreadyExists</code></td><td>409</td><td>El nombre está ocupado por otro</td><td>No</td></tr>
+            <tr><td><code>PreconditionFailed</code></td><td>412</td><td>Falló un <code>If-Match</code> o <code>If-None-Match</code></td><td>No: hay un conflicto real</td></tr>
+            <tr><td><code>EntityTooLarge</code></td><td>400</td><td>El cuerpo supera el límite permitido</td><td>No</td></tr>
+            <tr><td><code>InvalidPart</code></td><td>400</td><td>Una parte multipart no coincide con lo declarado</td><td>No: rehaz la subida</td></tr>
+            <tr><td><code>SlowDown</code></td><td>503</td><td>El servidor pide bajar el ritmo</td><td>Sí, con backoff</td></tr>
+            <tr><td><code>InternalError</code></td><td>500</td><td>Fallo interno transitorio</td><td>Sí, con backoff</td></tr>
+            <tr><td><code>ServiceUnavailable</code></td><td>503</td><td>Servicio no disponible (reinicio, saturación)</td><td>Sí, con backoff</td></tr>
+            <tr><td><code>XMinioInvalidObjectName</code></td><td>400</td><td>Nombre de objeto inválido</td><td>No</td></tr>
+          </tbody>
+        </table>
+        <p><code>minio-js</code> ya reintenta un número limitado de veces las respuestas 408, 429 y 5xx, con backoff exponencial y jitter. Eso no te exime de tener tu propia política: el SDK no sabe si tu operación es idempotente ni cuánto tiempo puede esperar el usuario.</p>
+
+        <h3>Idempotencia: qué se puede repetir sin daño</h3>
+        <table>
+          <thead><tr><th>Operación</th><th>¿Repetirla es seguro?</th><th>Matiz</th></tr></thead>
+          <tbody>
+            <tr><td><code>PUT</code> a la misma clave con los mismos bytes</td><td>Sí</td><td>El resultado final es el mismo objeto; la última escritura gana.</td></tr>
+            <tr><td><code>PUT</code> a la misma clave con bytes distintos</td><td>No</td><td>Estás decidiendo qué versión queda; un reintento tardío puede pisar una escritura posterior.</td></tr>
+            <tr><td><code>GET</code> y <code>HEAD</code></td><td>Sí</td><td>Sin efectos secundarios.</td></tr>
+            <tr><td><code>DELETE</code></td><td>Sí</td><td>S3 devuelve 204 aunque la clave ya no exista.</td></tr>
+            <tr><td>POST de formulario con clave nueva</td><td>No</td><td>Cada intento con una clave distinta crea otro objeto.</td></tr>
+            <tr><td><code>CompleteMultipartUpload</code></td><td>Casi</td><td>Repetirlo con el mismo <code>uploadId</code> y las mismas partes es seguro; con otro conjunto, no.</td></tr>
+          </tbody>
+        </table>
+        <p>La regla práctica: un reintento debe reutilizar <strong>la misma clave y el mismo cuerpo</strong>. Si tu función genera un UUID dentro del bloque que se reintenta, cada intento crea un objeto nuevo y acabas con duplicados que nadie pidió.</p>
+
+        <h3>Backoff con jitter</h3>
+        <p>El backoff exponencial separa los intentos: 200 ms, 400 ms, 800 ms… El jitter rompe la sincronía entre clientes. Sin él, mil instancias que fallan a la vez reintentan a la vez, y el servidor recibe picos idénticos.</p>
+        <pre><code class="language-text">delay = random(0, min(cap, base * 2^(attempt-1)))     &lt;- full jitter
+
+attempt 1  |##                |  0–200 ms
+attempt 2  |####              |  0–400 ms
+attempt 3  |########          |  0–800 ms
+attempt 4  |################  |  0–1600 ms, tope 5 s
+
+Siempre con un deadline total: 4 intentos no pueden durar 10 minutos.</code></pre>
+        <p>Añade tres límites además del número de intentos: un <strong>deadline</strong> por operación, un <strong>presupuesto</strong> de reintentos por petición de usuario y la cabecera <code>Retry-After</code> si el servidor la envía. Y registra cada reintento: un reintento silencioso es un incidente que no ves.</p>
+
+        <h3>ETag no es un checksum (siempre)</h3>
+        <p>En una subida simple, el ETag suele ser el MD5 del contenido. En una subida multipart, es el MD5 de la concatenación de los MD5 de cada parte, con el número de partes como sufijo. Y con SSE-KMS, el ETag deja de ser un hash del contenido.</p>
+        <pre><code class="language-text">Subida simple:
+  ETag = MD5(objeto)                       9c1e0b2a4d5f60718293a4b5c6d7e8f9
+
+Multipart (3 partes):
+  ETag = MD5( MD5(p1) || MD5(p2) || MD5(p3) ) + "-3"
+                                            ^^^ no es el MD5 del objeto
+
+Por eso un ETag "abc…-3" nunca coincidirá con md5sum del fichero completo.</code></pre>
+        <table>
+          <thead><tr><th>Qué miras</th><th>Qué mide</th><th>Cuándo sirve</th></tr></thead>
+          <tbody>
+            <tr><td>ETag simple</td><td>MD5 del contenido (normalmente)</td><td>Comparar dos subidas del mismo tamaño en el mismo bucket</td></tr>
+            <tr><td>ETag multipart</td><td>MD5 de los MD5 de las partes</td><td>Detectar cambios entre versiones, no verificar el contenido</td></tr>
+            <tr><td><code>x-amz-checksum-sha256</code></td><td>SHA-256 del objeto completo</td><td>Integridad de extremo a extremo si el cliente lo envía</td></tr>
+            <tr><td>Metadato propio <code>sha256</code></td><td>El hash que calculó tu aplicación</td><td>Verificación explícita, independiente del ETag</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">No compares ETag con <code>md5sum</code> sin comprobar el formato</p>
+          <p>Si el ETag contiene un guion, es multipart. Si el objeto está cifrado con SSE-KMS, el ETag no es un hash del contenido. En esos casos la comparación falla siempre, y el equipo acaba desactivando la verificación «porque daba falsos positivos».</p>
+        </div>
+
+        <h3>Verificación de integridad en la práctica</h3>
+        <p>Verifica en tres momentos: <strong>al subir</strong> (SHA-256 como metadato y comparación de tamaño), <strong>al descargar</strong> (hash mientras escribes a disco) y <strong>en mantenimiento</strong> (un job que detecta objetos sin checksum o con tamaño cero).</p>
+        <p>MinIO verifica internamente los checksums que recibe y protege los datos con erasure coding, pero eso no sustituye a que <em>tu</em> aplicación compruebe que el PDF que guardó es el que el usuario envió. Son capas distintas.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un <code>put</code> con reintento, jitter y checksum. El cuerpo se lee una vez y se reutiliza en todos los intentos: la clave y los bytes no cambian.</p>
+        <pre><code class="language-javascript">// subir-seguro.mjs
+import * as Minio from 'minio'
+import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
+
+const client = new Minio.Client({ /* configuración de la lección 1 */ })
+const RETRYABLE = new Set(['SlowDown', 'InternalError', 'ServiceUnavailable', 'RequestTimeout'])
+const NETWORK = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'])
+
+function isRetryable(err) {
+  if (err instanceof Minio.S3Error) {
+    if ([408, 429, 500, 502, 503, 504].includes(err.statusCode)) return true
+    return RETRYABLE.has(err.code)
+  }
+  return NETWORK.has(err.code)
+}
+
+async function withRetry(fn, { attempts = 4, baseMs = 200, capMs = 5000 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (attempt &gt;= attempts || !isRetryable(err)) throw err
+      const ceiling = Math.min(capMs, baseMs * 2 ** (attempt - 1))
+      await delay(Math.random() * ceiling) // full jitter
+      console.warn(`reintento ${attempt} tras ${err.code}`)
+    }
+  }
+}</code></pre>
+        <pre><code class="language-javascript">const bucket = 'documentos'
+const key = 'acme/2026/11/informe.pdf'
+const body = await readFile('./informe.pdf')
+const sha256 = createHash('sha256').update(body).digest('hex')
+
+const etag = await withRetry(() =&gt; client.putObject(
+  bucket, key, body, body.length,
+  { 'Content-Type': 'application/pdf', 'X-Amz-Meta-Sha256': sha256 },
+))
+
+const stat = await client.statObject(bucket, key)
+console.log({ etag, sha256, size: stat.size, guardado: stat.metaData.sha256 })
+if (stat.size !== body.length) throw new Error('tamaño distinto al enviado')</code></pre>
+        <pre><code class="language-text">{ etag: '9c1e0b2a4d5f60718293a4b5c6d7e8f9',
+  sha256: 'a3f1…',
+  size: 20480,
+  guardado: 'a3f1…' }</code></pre>
+        <ul>
+          <li><code>body</code> se lee fuera del reintento: si lo leyeras dentro, un fichero modificado entre intentos cambiaría el contenido.</li>
+          <li><code>key</code> también es constante. Generar el UUID dentro de <code>fn</code> rompería la idempotencia.</li>
+          <li><code>attempt &gt;= attempts</code> corta antes de dormir en el último intento.</li>
+          <li><code>Math.random() * ceiling</code> es full jitter: el rango crece, pero el valor es aleatorio.</li>
+          <li><code>stat.metaData.sha256</code> confirma que el metadato viajó; el tamaño confirma que no se truncó.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En el almacén, cada subida registra intentos y verifica el contenido. El logger estructurado permite responder «¿cuántos reintentos hubo a las 10:15?» sin buscar en texto libre.</p>
+        <pre><code class="language-javascript">// src/upload-verified.mjs
+import * as Minio from 'minio'
+import { createHash } from 'node:crypto'
+import { createReadStream, statSync } from 'node:fs'
+import { setTimeout as delay } from 'node:timers/promises'
+
+const RETRYABLE_CODES = new Set(['SlowDown', 'InternalError', 'ServiceUnavailable'])
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504])
+
+function classify(err) {
+  if (!(err instanceof Minio.S3Error)) return 'network'
+  if (err.code === 'NoSuchKey') return 'not_found'
+  if (err.code === 'AccessDenied') return 'forbidden'
+  if (err.code === 'PreconditionFailed') return 'conflict'
+  if (RETRYABLE_STATUS.has(err.statusCode) || RETRYABLE_CODES.has(err.code)) return 'transient'
+  return 'permanent'
+}
+
+export async function uploadVerified({ client, bucket, key, filePath, meta, logger }) {
+  const { size } = statSync(filePath)
+  const started = Date.now()
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const etag = await client.putObject(
+        bucket, key, createReadStream(filePath), size, meta,
+      )
+      const stat = await client.statObject(bucket, key)
+      if (stat.size !== size) throw new Error(`tamaño ${stat.size} != ${size}`)
+      logger.info({ event: 's3.put.ok', bucket, key, etag, attempt, ms: Date.now() - started })
+      return { etag, size }
+    } catch (err) {
+      const kind = classify(err)
+      const retryable = kind === 'transient' || kind === 'network'
+      logger.warn({ event: 's3.put.fail', bucket, key, attempt, kind,
+        code: err.code, statusCode: err.statusCode, requestId: err.amzRequestid })
+
+      if (!retryable || attempt &gt;= 4) {
+        err.attempts = attempt
+        err.kind = kind
+        throw err
+      }
+      const ceiling = Math.min(5000, 200 * 2 ** (attempt - 1))
+      await delay(Math.random() * ceiling)
+    }
+  }
+}</code></pre>
+        <p>Observa el detalle de <code>stat.size !== size</code>: comprobar el tamaño tras la subida es barato y detecta un stream truncado o una discrepancia antes de que el documento entre en el catálogo.</p>
+        <p>Al descargar, recalcula el SHA-256 con un <code>Transform</code> dentro del <code>pipeline</code> y compáralo con el metadato. Si no coincide, no reintentes a ciegas: el objeto almacenado o el metadato están mal, y la solución es investigar o recuperar una versión anterior.</p>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Clasificar por código S3, no por mensaje</td><td>Buscar <code>'Access'</code> dentro de <code>err.message</code></td><td>Los mensajes cambian y se traducen; el código forma parte del contrato.</td></tr>
+            <tr><td>Reintentar solo 408, 429, 5xx y errores de red</td><td>Reintentar cualquier excepción «por si acaso»</td><td>Los 4xx permanentes no mejoran y amplifican la carga.</td></tr>
+            <tr><td>Fijar clave y cuerpo fuera del bucle</td><td>Generar un UUID nuevo en cada intento</td><td>La idempotencia depende de repetir exactamente la misma escritura.</td></tr>
+            <tr><td>Backoff exponencial con jitter y deadline</td><td>Reintentos inmediatos o infinitos</td><td>Evita tormentas y acota la latencia que ve el usuario.</td></tr>
+            <tr><td>Guardar SHA-256 como metadato</td><td>Confiar solo en el ETag</td><td>El ETag multipart no representa el contenido completo.</td></tr>
+            <tr><td>Registrar intento, código y request id</td><td>Loguear el cuerpo o las credenciales</td><td>Permite diagnosticar sin filtrar datos sensibles.</td></tr>
+            <tr><td>Tratar <code>BucketAlreadyOwnedByYou</code> como éxito</td><td>Fallar el arranque porque el bucket ya existía</td><td>Es exactamente el estado que querías conseguir.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Reintentar un <code>AccessDenied</code></h3>
+        <span class="code-label code-label--wrong">Mal — el permiso no aparece esperando</span>
+        <pre><code class="language-javascript">for (let i = 0; i &lt; 5; i++) {
+  try { return await client.getObject(bucket, key) }
+  catch (err) { await delay(1000) } // ❌ también reintenta 403
+}</code></pre>
+        <span class="code-label code-label--right">Bien — solo lo transitorio</span>
+        <pre><code class="language-javascript">if (!isRetryable(err)) throw err
+// AccessDenied, NoSuchKey y 400 salen inmediatamente</code></pre>
+        <p>Cinco reintentos de un 403 solo añaden cinco segundos y cinco líneas de ruido en los logs. La causa está en la política o en la credencial.</p>
+
+        <h3>2. Generar la clave dentro del reintento</h3>
+        <span class="code-label code-label--wrong">Mal — cada intento crea un objeto</span>
+        <pre><code class="language-javascript">await withRetry(async () =&gt; {
+  const key = `${prefix}/${randomUUID()}.pdf` // ❌ nuevo en cada intento
+  return client.putObject(bucket, key, body, body.length)
+})</code></pre>
+        <span class="code-label code-label--right">Bien — la clave se decide una vez</span>
+        <pre><code class="language-javascript">const key = `${prefix}/${randomUUID()}.pdf`
+await withRetry(() =&gt; client.putObject(bucket, key, body, body.length))</code></pre>
+        <p>Si el primer intento llegó a escribir y la respuesta se perdió, el reintento debe sobrescribir <em>la misma</em> clave. Con una clave nueva, el objeto original queda huérfano y el usuario ve dos documentos.</p>
+
+        <h3>3. Comparar un ETag multipart con el MD5 del fichero</h3>
+        <span class="code-label code-label--wrong">Mal — el sufijo <code>-N</code> lo delata</span>
+        <pre><code class="language-bash">md5sum grande.bin
+# 8f14e45fceea167a5a36dedd4bea2543  grande.bin
+mc stat local/documentos/grande.bin
+# ETag: 4a2b7c1e9f0d3a6b8c5e2f1d0a9b8c7d-3
+# ❌ "no coinciden, el archivo está corrupto"</code></pre>
+        <span class="code-label code-label--right">Bien — entender qué representa cada valor</span>
+        <pre><code class="language-text">ETag multipart = MD5(MD5(p1) || MD5(p2) || MD5(p3)) + "-3"
+Para verificar el contenido, usa un checksum completo (SHA-256) o
+recalcula el ETag multipart con el tamaño de parte correcto.</code></pre>
+        <p>El ETag multipart es estable y útil para detectar cambios, pero no es el hash del objeto. Compararlo con <code>md5sum</code> produce un falso positivo garantizado.</p>
+
+        <h3>4. Reintentar sin jitter ni deadline</h3>
+        <span class="code-label code-label--wrong">Mal — todos los clientes a la vez</span>
+        <pre><code class="language-javascript">while (true) {
+  try { return await op() } catch { /* reintento inmediato */ }
+}</code></pre>
+        <span class="code-label code-label--right">Bien — backoff, jitter y un límite</span>
+        <pre><code class="language-javascript">const ceiling = Math.min(5000, 200 * 2 ** (attempt - 1))
+await delay(Math.random() * ceiling)
+if (Date.now() &gt; deadline) throw err</code></pre>
+        <p>Sin jitter, un despliegue que reinicia cien pods provoca cien reintentos sincronizados. Sin deadline, una petición puede quedarse «viva» más que el timeout del proxy y el usuario nunca recibe respuesta.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> comprobar con datos reales la diferencia entre ETag simple y multipart, y ver una política de reintento en acción.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea un fichero pequeño y súbelo:</strong>
+            <pre><code class="language-bash">printf 'contenido estable\n' &gt; pequeno.txt
+mc cp pequeno.txt local/documentos/acme/2026/11/pequeno.txt
+mc stat local/documentos/acme/2026/11/pequeno.txt</code></pre>
+            <pre><code class="language-text">ETag: 8f9c0b1d2e3f4a5b6c7d8e9f0a1b2c3d</code></pre>
+            <p>Compara con <code>md5sum pequeno.txt</code>: debe coincidir.</p>
+          </li>
+          <li>
+            <strong>Genera un fichero de 100 MB y súbelo:</strong>
+            <pre><code class="language-bash">node -e "require('fs').writeFileSync('grande.bin', Buffer.alloc(100*1024*1024))"
+mc cp grande.bin local/documentos/acme/2026/11/grande.bin
+mc stat local/documentos/acme/2026/11/grande.bin</code></pre>
+            <p>El ETag termina en <code>-N</code>, con el número de partes según el tamaño de parte. Ese sufijo es la prueba de que fue multipart.</p>
+          </li>
+          <li>
+            <strong>Comprueba el falso negativo:</strong> ejecuta <code>md5sum grande.bin</code> y compara con el ETag. No coinciden. Ahora calcula el SHA-256 del fichero y guárdalo como metadato con <code>mc cp --attr</code>, o vuelve a subirlo con el script de la sección 3.</li>
+          <li>
+            <strong>Provoca un fallo transitorio:</strong> con una subida en marcha, ejecuta <code>docker pause minio-sdk</code> durante unos segundos y luego <code>docker unpause minio-sdk</code>. Observa los reintentos del SDK y el tiempo total. Repite sin pausa y compara.</li>
+          <li>
+            <strong>Prueba un fallo permanente:</strong> usa una clave en un bucket inexistente (<code>local/no-existe/x.txt</code>). Debe fallar con <code>NoSuchBucket</code> y <strong>sin</strong> reintentos. Añade el código a tu clasificador y comprueba que sale en el primer intento.</li>
+          <li>
+            <strong>Mide el jitter:</strong> ejecuta veinte veces una función que simule un fallo transitorio y registra los retardos. No deben ser todos iguales ni estrictamente crecientes: eso es el jitter haciendo su trabajo.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Tu tabla de decisión debe tener tres columnas: código, ¿reintenta?, acción. Si un código no encaja en ninguna, trátalo como permanente y regístralo: es mejor fallar rápido que reintentar a ciegas.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El verificador de integridad</h3>
+          <p>Construye <code>verify.mjs</code> que recorra el prefijo <code>acme/</code> y clasifique cada objeto en tres grupos: con metadato <code>sha256</code>, con ETag simple y con ETag multipart. Para los que tengan metadato, descarga en streaming y comprueba el hash sin cargar el objeto entero en memoria. Para los multipart, explica en la salida por qué no puedes comparar directamente con el MD5 del fichero.</p>
+          <p>Añade un modo <code>--repair</code> que vuelva a calcular el SHA-256 de los objetos que no lo tengan y actualice el metadato sin cambiar el contenido. Debe ser idempotente: ejecutarlo dos veces no debe producir escrituras innecesarias ni objetos nuevos.</p>
+          <p><em>Pista: para actualizar metadatos en S3 no existe un <code>PATCH</code>; se reescribe el objeto. Investiga <code>copyObject</code> con sustitución de metadatos y comprueba qué pasa con el ETag resultante.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Hay dos familias de error: red (sin respuesta) y S3 (<code>S3Error</code> con <code>code</code> y <code>statusCode</code>).</li>
+          <li>Solo se reintentan 408, 429, 5xx y fallos de transporte; los 4xx permanentes se propagan.</li>
+          <li>Un reintento debe repetir la misma clave y el mismo cuerpo; si no, no es idempotente.</li>
+          <li>Backoff exponencial con jitter, más un deadline total y un máximo de intentos.</li>
+          <li>El ETag simple suele ser MD5; el multipart es MD5 de MD5s con sufijo <code>-N</code>.</li>
+          <li>Para integridad real, usa un checksum completo (SHA-256) y guárdalo como metadato.</li>
+          <li>Registra intento, código y <code>amzRequestid</code>; nunca el cuerpo ni las credenciales.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Situación</th><th>Decisión</th></tr></thead>
+          <tbody>
+            <tr><td><code>ECONNRESET</code> a mitad de un PUT</td><td>Reintentar con la misma clave y el mismo cuerpo</td></tr>
+            <tr><td><code>AccessDenied</code></td><td>No reintentar; revisar política y usuario</td></tr>
+            <tr><td><code>BucketAlreadyOwnedByYou</code> al crear</td><td>Tratar como éxito</td></tr>
+            <tr><td><code>PreconditionFailed</code></td><td>No reintentar; resolver el conflicto de versión</td></tr>
+            <tr><td><code>SlowDown</code> o 503</td><td>Reintentar con backoff y jitter</td></tr>
+            <tr><td>ETag con <code>-N</code></td><td>No comparar con MD5; usar checksum completo</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>Si <code>PUT</code> es idempotente, ¿puedo reintentar siempre?</summary>
+            <div>
+              <p>Solo si repites la misma clave con los mismos bytes. Dos escrituras concurrentes a la misma clave son idempotentes en el sentido de que el resultado es un objeto completo, pero no deterministas: gana la última. Si el contenido puede cambiar entre intentos, no estás reintentando la misma operación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué <code>minio-js</code> ya reintenta y yo tengo que añadir otra capa?</summary>
+            <div>
+              <p>Porque el SDK no conoce tu contexto: no sabe si la operación es idempotente, cuánto puede esperar el usuario ni qué errores de negocio quieres propagar. Su reintento es de transporte; el tuyo es de política. Además, el SDK no registra los intentos con tu formato de logs.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Sirve el ETag para detectar corrupción?</summary>
+            <div>
+              <p>Como señal barata, a veces. Como verificación formal, no: en multipart no cubre el contenido completo y con SSE-KMS no es un hash. Para corrupción usa checksums completos o compara el tamaño y el hash calculado por tu aplicación.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Debo reintentar un <code>409</code> al crear el bucket?</summary>
+            <div>
+              <p>Distingue el código. <code>BucketAlreadyOwnedByYou</code> significa que el bucket ya existe y es tuyo: es el resultado deseado. <code>BucketAlreadyExists</code> significa que el nombre está ocupado por otra cuenta: reintentar no lo va a liberar.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

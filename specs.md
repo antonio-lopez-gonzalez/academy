@@ -52,12 +52,14 @@ curso y en su `AGENTS.md`.
 | `Aprende Cloud` | Cloud: Azure/AWS con Terraform | `spec.md` | `cloud-theme/progress` | 8 | 32 | `proyectos/infra-cloud` |
 | `Aprende System Design` | System Design: arquitectura a escala | `spec.md` | `sysd-theme/progress` | 8 | 32 | `proyectos/case-studies` |
 | `Aprende Git` | Git: del modelo interno al rescate | `spec.md` | `git-theme/progress` | 8 | 32 | `proyectos/laboratorio` |
+| `Aprende RabbitMQ` | RabbitMQ: mensajería fiable (AMQP, DLQ, quorum) | `spec.md` | `rmq-theme/progress` | 8 | 32 | `proyectos/job-queue` |
+| `Aprende MinIO` | MinIO: almacenamiento de objetos S3 | `spec.md` | `minio-theme/progress` | 8 | 32 | `proyectos/document-store` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.
 
-Cursos con proyecto ejecutable real: Docker, Dotnet, NewRelic, Python, React, Redis, SDD, Tailwind,
-TypeScript. Astro y Javascript son solo curso (web).
+Cursos con proyecto ejecutable real: Docker, Dotnet, MinIO, NewRelic, Python, RabbitMQ, React, Redis,
+SDD, Tailwind, TypeScript. Astro y Javascript son solo curso (web).
 
 ---
 
@@ -292,7 +294,7 @@ El **MCP de Context7** se declara una sola vez, en `Academy/opencode.json` (serv
 - Cada tarjeta muestra el **progreso** del curso: lee la clave `<clave>-progress` de `localStorage`
   (con `data-key` y `data-lessons`) y pinta una barra. Requiere navegar desde el **mismo origen**
   (servir la Academy desde una raíz común); si el origen se aísla, se muestra "sin empezar".
-- `<footer>` indica el número de cursos disponibles (hoy **17**).
+- `<footer>` indica el número de cursos disponibles (hoy **19**).
 - Al añadir un curso, añadir su tarjeta (con `data-key` y `data-lessons`) y actualizar el contador.
 
 ---

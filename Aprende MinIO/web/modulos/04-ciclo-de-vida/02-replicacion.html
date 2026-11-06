@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="02-replicacion">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Réplica entre sitios — Módulo 4 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Réplica entre sitios</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Ciclo de vida</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El bucket <code>documentos</code> ya tiene versionado y lifecycle. Si el centro de datos donde vive se inunda, se queda sin red o alguien borra un prefijo entero, la política de retención no sirve de nada: el dato está en un solo sitio. La <strong>réplica</strong> existe para que exista una segunda copia viva, actualizada y consultable en otro lugar.</p>
+        <p>MinIO ofrece dos mecanismos con nombres parecidos y alcances muy distintos:</p>
+        <ul>
+          <li><strong>Bucket replication</strong>: una regla por bucket que copia objetos, versiones y (si se pide) borrados hacia un bucket remoto. Es la unidad de trabajo normal.</li>
+          <li><strong>Site replication</strong>: una configuración de clúster que mantiene varios despliegues MinIO sincronizados, incluidos usuarios, políticas y configuración de buckets. Es una decisión de arquitectura, no un ajuste.</li>
+        </ul>
+        <p>Ninguna de las dos es un backup. La réplica protege contra la pérdida de un sitio, no contra un borrado lógico que se propaga ni contra un cifrado malicioso que llega al primario y se copia al secundario. Esa distinción se desarrolla al final, porque es la que más incidentes causa.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La pregunta que responde la réplica</p>
+          <p>«Si este sitio deja de existir ahora mismo, ¿puedo seguir leyendo los documentos?». Si la respuesta es no, la réplica no está terminada. Si la pregunta es «¿puedo recuperar lo que alguien borró ayer?», la respuesta es backup, no réplica.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Requisito cero: versionado en ambos lados</h3>
+        <p>La replicación de MinIO es <strong>replicación de versiones</strong>. Sin versionado no hay identificador estable que copiar, ni forma de distinguir un borrado de una actualización. Por eso el bucket origen y el destino deben tener versionado activo; el destino suele crearse antes y con <code>mc version enable</code>.</p>
+        <pre><code class="language-text">        SITIO A (origen)                     SITIO B (destino)
+   +------------------------+          +------------------------+
+   | bucket documentos      |          | bucket documentos      |
+   | versionado: Enabled    |  réplica | versionado: Enabled    |
+   |                        | -------&gt; |                        |
+   | v3 (actual)            |          | v3                     |
+   | v2                     |          | v2                     |
+   | v1                     |          | v1                     |
+   +------------------------+          +------------------------+
+        delete marker  ------ opcional ----&gt;  delete marker</code></pre>
+        <p>Si el destino no tiene versionado, la regla falla al crearse o al replicar. No es un detalle de configuración: es el contrato del mecanismo.</p>
+        <h3>Qué viaja y qué no</h3>
+        <table>
+          <thead><tr><th>Elemento</th><th>¿Se replica?</th><th>Matiz</th></tr></thead>
+          <tbody>
+            <tr><td>Objetos nuevos</td><td>Sí, por defecto</td><td>Asíncrono: hay un retardo variable.</td></tr>
+            <tr><td>Versiones antiguas</td><td>Con <code>existing-objects</code> o <code>resync</code></td><td>Sin eso, solo se copia lo que llega después de crear la regla.</td></tr>
+            <tr><td>Metadatos y tags</td><td>Sí</td><td>Se conserva el contenido y los metadatos del objeto.</td></tr>
+            <tr><td>Borrado de un objeto</td><td>Solo con <code>delete-marker</code></td><td>Sin esa opción, el destino conserva el objeto.</td></tr>
+            <tr><td>Borrado de una versión</td><td>Solo con <code>delete</code></td><td>Borra la versión concreta en el destino.</td></tr>
+            <tr><td>Borrados por lifecycle</td><td><strong>No</strong></td><td>MinIO solo replica borrados iniciados por un cliente.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">El borrado por lifecycle no viaja</p>
+          <p>Es contraintuitivo y muy importante. Si el origen expira <code>tmp/</code> a los 7 días, el destino <strong>no</strong> lo expira. Con el tiempo, el secundario acumula objetos que el primario ya no tiene. La solución no es replicar el borrado: es declarar la misma política de lifecycle en ambos sitios. Lo viste en la <a href="01-lifecycle-e-ilm.html">lección anterior</a>.</p>
+        </div>
+        <h3>Asíncrono: qué significa para tu RPO</h3>
+        <p>La replicación de MinIO es <strong>asíncrona</strong>. El <code>PUT</code> responde al cliente cuando el objeto está confirmado en el origen; la copia al destino ocurre después, en segundo plano. Eso tiene tres consecuencias:</p>
+        <ul>
+          <li>El <strong>RPO no es cero</strong>. Si el sitio cae, pierdes todo lo que aún no se había replicado. En un sistema sano suele ser segundos o minutos; bajo carga o con red lenta, más.</li>
+          <li>El destino puede ir <strong>por detrás</strong> y no es un fallo: es el estado normal. Se mide con <code>mc replicate status</code>.</li>
+          <li>Una lectura inmediata en el destino puede devolver <code>NoSuchKey</code>. Si la aplicación conmuta de sitio, necesita tolerar esa ventana o esperar a que el backlog llegue a cero.</li>
+        </ul>
+        <pre><code class="language-text">cliente        sitio A                 cola de réplica        sitio B
+   |  PUT v4      |                          |                    |
+   |-------------&gt;|  confirma en disco       |                    |
+   |&lt;-------------|  responde 200 OK         |                    |
+   |              |--- encola v4 -----------&gt;|--- envía v4 -----&gt;|
+   |              |&lt;-- estado: replicado ----|&lt;-- ack -----------|</code></pre>
+        <h3>Borrados: dos interruptores distintos</h3>
+        <p><code>--replicate</code> acepta una lista separada por comas. Los dos valores que más se malinterpretan son:</p>
+        <table>
+          <thead><tr><th>Valor</th><th>Qué replica</th><th>Efecto práctico</th></tr></thead>
+          <tbody>
+            <tr><td><code>delete-marker</code></td><td>El marcador que crea un <code>DELETE</code> sobre la versión actual</td><td>El objeto «desaparece» también en el destino, pero las versiones siguen allí.</td></tr>
+            <tr><td><code>delete</code></td><td>El borrado de una versión concreta</td><td>La versión se elimina físicamente en el destino. Es irreversible.</td></tr>
+            <tr><td><code>existing-objects</code></td><td>Lo que ya existía al crear la regla</td><td>Necesario para migrar un bucket con datos; también se puede lanzar con <code>resync</code>.</td></tr>
+          </tbody>
+        </table>
+        <p>Si <strong>no</strong> activas los borrados, el destino se convierte en un archivo de lo que el origen tuvo. Eso puede ser deseable como red de seguridad, pero rompe la expectativa de «réplica exacta»: los dos sitios dejan de ser intercambiables y las listas divergen.</p>
+        <h3>Bucket replication frente a site replication</h3>
+        <table>
+          <thead><tr><th></th><th>Bucket replication</th><th>Site replication</th></tr></thead>
+          <tbody>
+            <tr><td>Alcance</td><td>Un bucket (o prefijo)</td><td>Todo el despliegue</td></tr>
+            <tr><td>Dirección</td><td>Uno o dos sentidos, configurable</td><td>Activo-activo entre todos los sitios</td></tr>
+            <tr><td>Usuarios y políticas</td><td>No</td><td>Sí</td></tr>
+            <tr><td>Config de buckets</td><td>No</td><td>Sí (versionado, lifecycle, tags, locking)</td></tr>
+            <tr><td>Requisito</td><td>Versionado en ambos buckets</td><td>Despliegues distribuidos, mismas credenciales root e IDP</td></tr>
+            <tr><td>Complejidad</td><td>Baja y localizada</td><td>Alta: es una topología, no un ajuste</td></tr>
+          </tbody>
+        </table>
+        <p>Site replication exige que los sitios sean despliegues <strong>distribuidos</strong>, compartan las mismas credenciales root y la misma configuración de identidad, y que como máximo <em>uno</em> contenga datos al iniciar. Además fuerza versionado en todos los buckets y no se puede desactivar. No es algo que se prueba un viernes por la tarde.</p>
+        <h3>Conflictos y orden</h3>
+        <p>En activo-activo, dos clientes pueden escribir la misma clave en sitios distintos casi a la vez. MinIO no fusiona contenidos: conserva versiones y aplica una resolución determinista. Lo que sí puede ocurrir:</p>
+        <ul>
+          <li>Dos versiones distintas de la misma clave, con una como actual y otra como no actual.</li>
+          <li>Dos delete markers duplicados si ambos sitios borran durante una partición de red.</li>
+          <li>Un objeto que existe en un sitio y aún no en el otro: las lecturas <code>GET/HEAD</code> pueden proxificarse al peer sano, pero <code>LIST</code> no.</li>
+        </ul>
+        <p>La conclusión de diseño es incómoda pero clara: <strong>no diseñes para escrituras concurrentes de la misma clave en dos regiones</strong>. Si lo necesitas, usa claves derivadas de la región o un servicio de coordinación. Y si configuras varias reglas de réplica sobre el mismo bucket, la <strong>prioridad</strong> decide cuál gana; una regla por prefijo sigue siendo la opción mantenible.</p>
+        <h3>Réplica frente a <code>mc mirror</code></h3>
+        <table>
+          <thead><tr><th></th><th>Replicación de MinIO</th><th><code>mc mirror</code></th></tr></thead>
+          <tbody>
+            <tr><td>Dónde se ejecuta</td><td>En el servidor</td><td>En la máquina donde corre <code>mc</code></td></tr>
+            <tr><td>Continuidad</td><td>Continuo y automático</td><td>Una pasada, o <code>--watch</code> mientras el proceso viva</td></tr>
+            <tr><td>Versiones</td><td>Todas, con su ID</td><td>Solo la actual (salvo <code>--versions</code>)</td></tr>
+            <tr><td>Delete markers</td><td>Sí, si se activan</td><td>No; con <code>--remove</code> borra en destino lo que falta en origen</td></tr>
+            <tr><td>Estado y resync</td><td><code>mc replicate status</code>, <code>resync</code></td><td>Hay que comparar con <code>mc diff</code></td></tr>
+          </tbody>
+        </table>
+        <p><code>mc mirror</code> es una herramienta de cliente: útil, scriptable y perfecta para copias, pero no sustituye a la replicación porque depende de que alguien la ejecute y no conserva el historial de versiones por defecto.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Replicar un bucket versionado hacia otro bucket remoto, incluyendo borrados y objetos que ya existían:</p>
+        <pre><code class="language-bash"># 1. El destino debe existir y tener versionado
+mc mb --ignore-existing site-b/documentos
+mc version enable site-b/documentos
+# 2. Declarar el remoto (devuelve un ARN)
+mc admin bucket remote add site-a/documentos \
+  "https://replica:$REPLICA_SECRET@site-b.example.net:9000/documentos" \
+  --service replication
+# 3. Crear la regla
+mc replicate add site-a/documentos \
+  --remote-bucket "arn:minio:replication::8f2c1d7a:documentos" \
+  --replicate "delete,delete-marker,existing-objects" \
+  --priority 1
+</code></pre>
+        <p>Qué hace cada pieza:</p>
+        <ul>
+          <li><code>mc admin bucket remote add</code>: registra el destino y devuelve un ARN. Es la forma recomendada porque la credencial queda asociada al destino y no se repite en cada regla.</li>
+          <li><code>--service replication</code>: el remoto se usa para replicación, no para otro fin.</li>
+          <li><code>--remote-bucket</code>: acepta el ARN o, desde versiones recientes de <code>mc</code>, un alias y bucket. El ARN es explícito y no filtra secretos en el historial del shell.</li>
+          <li><code>--replicate</code>: activa borrados de versión, delete markers y la copia inicial de lo existente.</li>
+          <li><code>--priority 1</code>: deja espacio para reglas más específicas con prioridad mayor.</li>
+        </ul>
+        <p>Comprueba el estado:</p>
+        <pre><code class="language-bash">mc replicate status site-a/documentos
+</code></pre>
+        <pre><code class="language-text">● Bucket replication status:
+   Target: site-b/documentos · Delete markers: Enabled · Version deletes: Enabled
+   Pending: 0
+   Failed: 0</code></pre>
+        <p>Mientras <code>Pending</code> no llegue a cero, el destino va por detrás. Ese número, y no la sensación de «ya está», es tu indicador de RPO real.</p>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos necesita dos cosas distintas y no conviene mezclarlas:</p>
+        <ol>
+          <li><strong>DR del bucket <code>documentos</code></strong> hacia un sitio secundario, con versiones y delete markers.</li>
+          <li><strong>Copia de seguridad</strong> de <code>contratos</code> a un destino externo que no se pueda borrar desde la aplicación.</li>
+        </ol>
+        <p>La primera se resuelve con replicación; la segunda, en la <a href="04-backups-y-retencion.html">lección de backups</a>.</p>
+        <h3>Topología</h3>
+        <p>Un sitio primario con <code>documentos</code> y <code>contratos</code>, un sitio DR que recibe la réplica asíncrona y un destino externo inmutable para el backup. La réplica da continuidad; el backup, vuelta atrás.</p>
+        <h3>Configuración de la regla</h3>
+        <pre><code class="language-bash">mc alias set site-b https://minio-dr.example.net:9000 \
+  "$DR_ACCESS_KEY" "$DR_SECRET_KEY"
+mc mb --ignore-existing site-b/documentos
+mc version enable site-b/documentos
+mc admin bucket remote add site-a/documentos \
+  "https://$DR_ACCESS_KEY:$DR_SECRET_KEY@minio-dr.example.net:9000/documentos" \
+  --service replication
+mc replicate add site-a/documentos \
+  --remote-bucket "arn:minio:replication::4b9e77c1:documentos" \
+  --replicate "delete,delete-marker,existing-objects" \
+  --priority 10
+mc replicate status site-a/documentos
+</code></pre>
+        <h3>Qué pasa cuando alguien borra un documento</h3>
+        <pre><code class="language-text">1. DELETE documentos/2026/acta.pdf
+2. El origen crea un delete marker (versionado)
+3. La réplica copia el delete marker al destino
+4. GET en ambos sitios devuelve 404
+5. Las versiones anteriores siguen existiendo en ambos
+6. Recuperar = borrar el delete marker o leer una versión concreta</code></pre>
+        <p>Ese paso 6 es la razón por la que el versionado no es opcional: sin él, el borrado sería físico y la réplica lo habría copiado. Con él, el «desastre» es recuperable mientras las versiones no se hayan expirado. Y aquí se conecta con lifecycle: si en el origen expiras las versiones no actuales a 30 días, el destino también debe hacerlo o acumulará historial para siempre.</p>
+        <h3>Verificar de verdad</h3>
+        <pre><code class="language-bash"># Estado de la regla
+mc replicate status site-a/documentos
+# Diferencias entre sitios (solo versión actual)
+mc diff site-a/documentos site-b/documentos
+# Versiones y delete markers
+mc ls --versions site-b/documentos/2026/
+# Forzar una resincronización si el destino estuvo caído
+mc replicate resync start site-a/documentos \
+  --remote "arn:minio:replication::4b9e77c1:documentos"
+</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">Resync no es gratis</p>
+          <p><code>resync</code> recorre el bucket y vuelve a comparar versiones. Consume CPU, disco y red, y en un bucket grande puede tardar horas. Prográmalo en ventana de mantenimiento y vigila el backlog; no lo lances «por si acaso» cada mañana.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Versionado activo en origen y destino antes de crear la regla</td>
+              <td>Activar la réplica y descubrir el fallo con el primer <code>PUT</code></td>
+              <td>La replicación copia versiones; sin versionado no hay nada que copiar.</td>
+            </tr>
+            <tr>
+              <td>Definir explícitamente si los borrados se replican</td>
+              <td>Dejarlo «por defecto» y suponer que el destino es idéntico</td>
+              <td>Sin <code>delete-marker</code>, los sitios divergen; con él, un borrado se propaga.</td>
+            </tr>
+            <tr>
+              <td>Vigilar <code>Pending</code> y <code>Failed</code> en <code>mc replicate status</code></td>
+              <td>Mirar solo que la regla exista</td>
+              <td>Una regla creada puede llevar días sin replicar y nadie lo ve.</td>
+            </tr>
+            <tr>
+              <td>Mismas reglas de lifecycle en todos los sitios</td>
+              <td>Confiar en que la expiración se replica</td>
+              <td>MinIO no replica borrados por lifecycle; el secundario crecería sin límite.</td>
+            </tr>
+            <tr>
+              <td>HTTPS y credenciales de mínimo privilegio para el remoto</td>
+              <td>Replicar por HTTP plano entre centros de datos</td>
+              <td>La réplica mueve documentos íntegros por la red; no es tráfico interno inocuo.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Creer que la réplica es síncrona</h3>
+        <span class="code-label code-label--wrong">Mal — conmutar en el mismo segundo</span>
+        <pre><code class="language-bash"># El cliente escribe en site-a y la aplicación conmuta a site-b
+mc cat site-b/documentos/2026/acta.pdf
+# ❌ NoSuchKey: el objeto aún está en la cola de replicación
+</code></pre>
+        <span class="code-label code-label--right">Bien — comprobar backlog antes de conmutar</span>
+        <pre><code class="language-bash">mc replicate status site-a/documentos
+# Pending debe ser 0 (o aceptable según tu RPO) antes del cambio de tráfico
+mc cat site-b/documentos/2026/acta.pdf
+</code></pre>
+        <p>La replicación es asíncrona por diseño. El RPO se declara y se mide; no se supone cero.</p>
+        <h3>2. Olvidar los delete markers</h3>
+        <span class="code-label code-label--wrong">Mal — replicar solo «lo nuevo»</span>
+        <pre><code class="language-bash">mc replicate add site-a/documentos \
+  --remote-bucket "$ARN"
+# ❌ Los borrados no viajan: el destino conserva documentos que el origen ya ocultó.
+</code></pre>
+        <span class="code-label code-label--right">Bien — decidir y declarar el comportamiento</span>
+        <pre><code class="language-bash">mc replicate add site-a/documentos \
+  --remote-bucket "$ARN" \
+  --replicate "delete,delete-marker"
+</code></pre>
+        <p>Si decides <em>no</em> replicar borrados, hazlo consciente y documenta que el secundario es un archivo, no un espejo. Lo que no vale es descubrirlo en una auditoría.</p>
+        <h3>3. Suponer que la réplica protege de un borrado accidental</h3>
+        <span class="code-label code-label--wrong">Mal — «tengo réplica, puedo borrar sin miedo»</span>
+        <pre><code class="language-bash">mc rm --recursive --force site-a/documentos/2026/
+# ❌ Con delete-marker activo, el borrado se propaga al destino en segundos.
+</code></pre>
+        <span class="code-label code-label--right">Bien — copia independiente + retención</span>
+        <pre><code class="language-bash">mc mb --with-lock site-a/contratos
+mc retention set --default COMPLIANCE 365d site-a/contratos
+mc mirror --overwrite site-a/contratos backup-externo/contratos
+</code></pre>
+        <p>La réplica copia también los errores. Un borrado lógico, un ransomware o una migración defectuosa se propagan igual de bien que los datos buenos.</p>
+        <h3>4. Mezclar site replication con un sitio que ya tiene datos</h3>
+        <span class="code-label code-label--wrong">Mal — añadir un clúster en producción sin vaciarlo</span>
+        <pre><code class="language-bash">mc admin replicate add site-a site-b
+# ❌ Si ambos tienen datos, la configuración no se establece o los datos divergen.
+</code></pre>
+        <span class="code-label code-label--right">Bien — un solo sitio con datos y el resto vacío</span>
+        <pre><code class="language-bash">mc admin replicate add site-a site-b site-c
+mc admin replicate info site-a
+mc admin replicate status site-a
+</code></pre>
+        <p>Site replication asume que los sitios son iguales desde el principio. Para incorporar un sitio con datos, primero se vacía o se migra con bucket replication y después se une a la topología.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> montar una réplica entre dos buckets del mismo MinIO local, provocar un borrado y comprobar cómo se comporta el destino con y sin delete markers.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea origen y destino con versionado:</strong>
+            <pre><code class="language-bash">mc mb --ignore-existing myminio/lab-origen
+mc mb --ignore-existing myminio/lab-destino
+mc version enable myminio/lab-origen
+mc version enable myminio/lab-destino
+mc version info myminio/lab-origen
+</code></pre>
+            <p>Salida esperada: <code>lab-origen is versioned</code> (y lo mismo para el destino).</p>
+          </li>
+          <li>
+            <strong>Declara el remoto y crea la regla:</strong>
+            <pre><code class="language-bash">mc admin bucket remote add myminio/lab-origen \
+  "http://$MINIO_USER:$MINIO_PASSWORD@127.0.0.1:9000/lab-destino" \
+  --service replication
+</code></pre>
+            <p>Copia el ARN que imprime el comando y úsalo en el siguiente paso:</p>
+            <pre><code class="language-bash">mc replicate add myminio/lab-origen \
+  --remote-bucket "arn:minio:replication::..." \
+  --replicate "delete,delete-marker,existing-objects"
+</code></pre>
+          </li>
+          <li>
+            <strong>Sube un objeto y espera a que el estado llegue a cero:</strong>
+            <pre><code class="language-bash">printf 'acta de prueba\n' | mc pipe myminio/lab-origen/2026/acta.txt
+mc replicate status myminio/lab-origen
+mc cat myminio/lab-destino/2026/acta.txt
+</code></pre>
+            <p>Salida esperada: el contenido aparece en el destino y <code>Pending: 0</code>.</p>
+          </li>
+          <li>
+            <strong>Borra el objeto y observa el delete marker:</strong>
+            <pre><code class="language-bash">mc rm myminio/lab-origen/2026/acta.txt
+mc ls --versions myminio/lab-origen/2026/
+mc ls --versions myminio/lab-destino/2026/
+</code></pre>
+            <p>Ambos listados deben mostrar una versión de datos y un delete marker. Recupera el objeto borrando el delete marker o copiando la versión concreta a una clave nueva.</p>
+          </li>
+          <li>
+            <strong>Compara con una regla sin delete markers:</strong> crea un segundo bucket de laboratorio, replica sin <code>delete-marker</code>, borra en origen y comprueba que el destino conserva el objeto. Documenta la diferencia en una tabla.</li>
+          <li>
+            <strong>Limpia:</strong> <code>mc replicate rm myminio/lab-origen --all</code>, borra los buckets y elimina el remoto con <code>mc admin bucket remote rm</code>. No dejes reglas apuntando a buckets de prueba.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p>Ejecuta <code>mc diff myminio/lab-origen myminio/lab-destino</code>. Solo compara la versión actual, así que un delete marker correctamente replicado debe hacer que ambos lados coincidan en «no existe». Si el destino sigue teniendo el archivo, la regla no está replicando borrados.</p>
+        </div>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Medir el RPO real de tu réplica</h3>
+          <p>Diseña un experimento que estime el RPO efectivo del bucket <code>documentos</code>: escribe objetos a un ritmo conocido, mide cuánto tarda cada uno en aparecer en el destino y calcula el percentil 95. Después repite con el enlace de red limitado o con el destino bajo carga y explica qué cambia.</p>
+          <p>Añade una prueba de conmutación: para la escritura en el origen, espera a que <code>Pending</code> llegue a cero y verifica que el destino puede servir las últimas 100 claves. ¿Qué haría tu aplicación si el RPO medido fuese de 90 segundos?</p>
+          <p><em>Pista: <code>mc replicate status</code> da el backlog, pero no la latencia por objeto. Puedes comparar marcas de tiempo con <code>mc stat --json</code> en ambos sitios.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La réplica de MinIO es <strong>asíncrona</strong> y copia <strong>versiones</strong>: el versionado es requisito en ambos buckets.</li>
+          <li>Los borrados se replican solo si se piden con <code>delete</code> y <code>delete-marker</code>; sin ellos, el destino es un archivo, no un espejo.</li>
+          <li>Los borrados por <strong>lifecycle no se replican</strong>: declara la misma política en todos los sitios.</li>
+          <li><strong>Site replication</strong> sincroniza buckets, objetos, IAM y configuración entre despliegues distribuidos; es una topología, no un ajuste.</li>
+          <li>En activo-activo puede haber versiones divergentes y delete markers duplicados: evita escrituras concurrentes de la misma clave.</li>
+          <li><code>mc mirror</code> es una copia de cliente; no sustituye a la replicación ni conserva historial por defecto.</li>
+          <li>La réplica <strong>no es un backup</strong>: propaga también borrados, errores y cifrado malicioso.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc admin bucket remote add</code></td><td>Registra el destino y devuelve un ARN</td></tr>
+            <tr><td><code>mc replicate add</code></td><td>Crea la regla de replicación de un bucket</td></tr>
+            <tr><td><code>mc replicate status</code></td><td>Muestra estado, pendientes y fallos</td></tr>
+            <tr><td><code>mc replicate resync start</code></td><td>Recompara y reenvía versiones al destino</td></tr>
+            <tr><td><code>mc replicate rm --all</code></td><td>Elimina las reglas de replicación del bucket</td></tr>
+            <tr><td><code>mc admin replicate add</code></td><td>Configura site replication entre sitios</td></tr>
+            <tr><td><code>mc admin replicate status</code></td><td>Comprueba la sincronización global</td></tr>
+            <tr><td><code>mc diff</code></td><td>Compara la versión actual de dos buckets</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿La réplica copia los objetos que ya existían antes de la regla?</summary>
+            <div>
+              <p>Solo si incluyes <code>existing-objects</code> en <code>--replicate</code> o lanzas un <code>mc replicate resync start</code>. Sin eso, la regla empieza a copiar lo que llega a partir de su creación; lo anterior se queda únicamente en el origen.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo usar el destino para leer mientras el origen está caído?</summary>
+            <div>
+              <p>Sí, si el destino es un MinIO completo y la aplicación apunta a él. Asume que puede faltar lo último que no llegó a replicarse. En site replication, además, las lecturas <code>GET/HEAD</code> pueden proxificarse entre peers, pero <code>LIST</code> no: una aplicación que dependa de listados debe apuntar al sitio correcto.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué pasa si borro la regla de replicación?</summary>
+            <div>
+              <p>Se detiene la copia de nuevos objetos. Los ya replicados permanecen en el destino y las versiones no se sincronizan más. Si vuelves a crear la regla, necesitarás <code>existing-objects</code> o un <code>resync</code> para cerrar el hueco.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Site replication sustituye a bucket replication?</summary>
+            <div>
+              <p>No exactamente. Site replication cubre todo el despliegue e incluye IAM y configuración, lo que simplifica una topología activo-activo. Bucket replication es más granular y más fácil de razonar: un bucket, una regla, un destino. Para un solo bucket crítico, bucket replication suele ser la opción proporcionada.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

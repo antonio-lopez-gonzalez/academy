@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="04-versionado-y-object-locking">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Versionado y object locking — Módulo 1 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Versionado y object locking</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Objetos y buckets</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un script con un error de variable sobrescribe 4 000 contratos con un fichero vacío. Un `mc rm --recursive --force` mal copiado borra el prefijo del año en curso. Alguien sube una versión corregida de un informe y descubre que la anterior ya no existe. En object storage, sin protección adicional, cada <code>PUT</code> y cada <code>DELETE</code> son definitivos.</p>
+        <p>El <strong>versionado</strong> convierte cada escritura en una versión numerada y cada borrado en un marcador que oculta, pero no elimina. El <strong>object locking</strong> va un paso más allá: impide borrar o modificar versiones durante un periodo de retención, incluso para un administrador. Juntos son la base de la recuperación ante errores humanos y del cumplimiento normativo (WORM: <em>write once, read many</em>).</p>
+        <p>Esta lección explica cómo se comportan las versiones, qué es un <em>delete marker</em>, qué diferencia hay entre suspender y desactivar, cómo se activa la retención —y por qué solo se puede al crear el bucket—, y cuándo el versionado es una mala idea por coste. Al terminar podrás recuperar un documento borrado y bloquear un contrato durante siete años.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">La diferencia entre «borrado» y «oculto»</p>
+          <p>En un bucket versionado, borrar sin especificar versión no borra datos: crea un marcador. El objeto desaparece de <code>ls</code>, pero sigue ahí. Esa distinción es la que permite deshacer un borrado accidental y la que explica por qué el espacio no baja después de «limpiar» un bucket.</p>
+        </div>
+      </section>
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Tres estados, no dos</h3>
+        <table>
+          <thead><tr><th>Estado</th><th>Un <code>PUT</code> sobre una clave existente</th><th>Un <code>DELETE</code> sin versión</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Desactivado</strong></td><td>Sustituye el objeto; no hay historial</td><td>Borra el objeto de forma permanente</td></tr>
+            <tr><td><strong>Activado</strong></td><td>Crea una versión nueva con ID único</td><td>Crea un <em>delete marker</em>; las versiones siguen</td></tr>
+            <tr><td><strong>Suspendido</strong></td><td>Crea una versión con ID <code>null</code> y sobrescribe la anterior <code>null</code></td><td>Crea un marcador con ID <code>null</code></td></tr>
+          </tbody>
+        </table>
+        <p>«Suspendido» no es «desactivado». Al suspender, MinIO deja de asignar IDs nuevos, pero conserva todas las versiones anteriores y sigue usando marcadores. Es útil para congelar el crecimiento sin perder el historial; no es una forma de volver al comportamiento simple.</p>
+        <p>Los objetos que existían antes de activar el versionado reciben el ID <code>null</code>. Si activas versionado después de un incidente, no recuperas lo borrado: solo proteges lo que venga a partir de ese momento.</p>
+        <h3>Versiones y marcadores</h3>
+        <pre><code class="language-text">PUT contrato.pdf          -> v1  (id 1a2b...)
+PUT contrato.pdf          -> v2  (id 3c4d...)   &lt;- latest
+PUT contrato.pdf          -> v3  (id 5e6f...)   &lt;- latest
+DELETE contrato.pdf       -> delete marker (id 7g8h...)  &lt;- latest
+                              GET sin versión -> 404
+                              GET versionId=5e6f -> 200 (v3)
+DELETE versionId=7g8h     -> se elimina el marcador
+                              GET sin versión -> 200 (v3)  &lt;- restaurado</code></pre>
+        <p>Un <em>delete marker</em> es un objeto de 0 bytes sin datos, con su propio version ID. Ocultar el objeto es su única función. Si borras el marcador, la versión anterior vuelve a ser la actual. Si borras una versión concreta con <code>--version-id</code>, esa versión desaparece para siempre y no se crea ningún marcador.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">Dos operaciones que parecen iguales y no lo son</p>
+          <p><code>mc rm local/bucket/key</code> sobre un bucket versionado <strong>oculta</strong>. <code>mc rm --version-id &lt;id&gt; local/bucket/key</code> <strong>destruye</strong>. Y <code>mc rm --versions</code> destruye todas las versiones. La primera es reversible; las otras dos, no.</p>
+        </div>
+        <h3>Recuperar: dos caminos</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>Operación</th><th>Resultado</th></tr></thead>
+          <tbody>
+            <tr><td>Borrado accidental (hay marcador)</td><td>Borrar el <em>delete marker</em></td><td>La versión anterior vuelve a ser la actual</td></tr>
+            <tr><td>Quieres una versión antigua sin cambiar la actual</td><td><code>mc cp --version-id &lt;id&gt; … nuevo-key</code></td><td>Una copia con otra clave</td></tr>
+            <tr><td>Quieres que una versión antigua sea la actual</td><td>Copiar esa versión sobre la misma clave</td><td>Se crea una versión nueva con el contenido antiguo</td></tr>
+            <tr><td>Quieres eliminar una versión concreta</td><td><code>mc rm --version-id &lt;id&gt;</code></td><td>Irreversible</td></tr>
+          </tbody>
+        </table>
+        <p>El tercer caso es el más seguro para «rollback»: no borras historia, publicas una versión nueva que restaura el contenido. La versión defectuosa sigue disponible para auditar qué pasó.</p>
+        <h3>Object locking: WORM de verdad</h3>
+        <p>El versionado protege de un borrado accidental, pero un usuario con permisos puede borrar todas las versiones. El <strong>object locking</strong> añade una retención que el servidor hace cumplir. Requiere versionado y <strong>solo se puede activar al crear el bucket</strong>:</p>
+        <pre><code class="language-bash">mc mb --with-lock local/contratos</code></pre>
+        <p>No hay un <code>mc bucket lock enable</code> para un bucket existente. Si no lo activaste al crearlo, la única vía es crear otro bucket y migrar los objetos. Esa es una decisión de arquitectura, no un flag que se añade después.</p>
+        <table>
+          <thead><tr><th>Modo</th><th>Quién puede saltárselo</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>GOVERNANCE</strong></td>
+              <td>Un usuario con permiso <code>s3:BypassGovernanceRetention</code>, usando <code>--bypass</code></td>
+              <td>Protección operativa contra errores; un administrador puede corregir</td>
+            </tr>
+            <tr>
+              <td><strong>COMPLIANCE</strong></td>
+              <td>Nadie, ni siquiera root, hasta que expire el plazo</td>
+              <td>Retención legal, auditoría, contratos</td>
+            </tr>
+            <tr>
+              <td><strong>Legal hold</strong></td>
+              <td>Se activa y desactiva con permiso; no tiene fecha</td>
+              <td>Litigios, investigaciones, conservación indefinida</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>La retención se puede fijar por defecto en el bucket o por versión concreta:</p>
+        <pre><code class="language-bash"># Retención por defecto para todo objeto nuevo
+mc retention set --default GOVERNANCE 30d local/contratos
+# Retención de una versión concreta
+mc retention set --version-id "$VID" COMPLIANCE 7y local/contratos/2026/acme/CTR-2026-0142.pdf
+# Legal hold: sin fecha, hasta que se retire
+mc legalhold set local/contratos/2026/acme/CTR-2026-0142.pdf
+mc legalhold clear local/contratos/2026/acme/CTR-2026-0142.pdf</code></pre>
+        <p><strong>COMPLIANCE no se puede acortar ni saltar.</strong> Si aplicas siete años en un entorno de pruebas, esos objetos serán imborrables durante siete años. Usa GOVERNANCE para pruebas y COMPLIANCE solo cuando la obligación legal esté clara.</p>
+        <h3>Interacción con lifecycle</h3>
+        <p>El lifecycle y la retención se complementan, pero no se pisan:</p>
+        <ul>
+          <li>Lifecycle puede expirar <strong>versiones no actuales</strong> después de N días, pero no puede borrar una versión retenida antes de que expire su plazo.</li>
+          <li>Los <em>delete markers</em> también se pueden expirar, lo que revela la versión anterior si sigue existiendo.</li>
+          <li>El versionado no guarda diferencias: cada versión ocupa el tamaño completo del objeto. Un fichero de 1 GB reescrito diez veces ocupa 10 GB.</li>
+          <li>Para controlar el coste, define <code>--noncurrent-expire-days</code> y limita el número de versiones que conservas.</li>
+        </ul>
+        <pre><code class="language-bash"># En el bucket documentos: conservar versiones antiguas 90 días
+mc ilm rule add --noncurrent-expire-days 90 --prefix "2026/" local/documentos
+# Ver las reglas
+mc ilm rule ls local/documentos</code></pre>
+        <p>La retención tiene prioridad: si una versión está bloqueada, el lifecycle no la elimina aunque su regla diga que ya expiró. Cuando la retención termine, la siguiente evaluación del lifecycle podrá limpiarla.</p>
+        <h3>Cuándo no usar versionado</h3>
+        <table>
+          <thead><tr><th>Situación</th><th>Por qué evitarlo</th><th>Alternativa</th></tr></thead>
+          <tbody>
+            <tr><td>Temporales que se reescriben cada minuto</td><td>Miles de versiones por objeto; el coste se dispara</td><td>Prefijo temporal con lifecycle corto, sin versionado</td></tr>
+            <tr><td>Caché o artefactos regenerables</td><td>No hay valor en recuperar versiones</td><td>Un bucket sin versionado, con expiración</td></tr>
+            <tr><td>Objetos enormes con cambios frecuentes</td><td>Cada versión es una copia completa</td><td>Versionado solo en la capa de negocio o snapshots</td></tr>
+            <tr><td>Datos que deben ser inmutables de por vida</td><td>El versionado solo no impide borrar versiones</td><td>Object lock en modo COMPLIANCE</td></tr>
+          </tbody>
+        </table>
+        <p>El versionado no es gratis ni en espacio ni en complejidad operativa. Actívalo donde la recuperación tenga valor y acompáñalo siempre de una política de expiración de versiones no actuales.</p>
+      </section>
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Activar versionado, crear dos versiones, borrar y recuperar:</p>
+        <pre><code class="language-bash">mc mb --ignore-existing local/documentos
+mc version enable local/documentos
+printf 'v1\n' &gt; contrato.txt
+mc cp ./contrato.txt local/documentos/2026/acme/contrato.txt
+printf 'v2 corregida\n' &gt; contrato.txt
+mc cp ./contrato.txt local/documentos/2026/acme/contrato.txt
+mc ls --versions local/documentos/2026/acme/</code></pre>
+        <pre><code class="language-text">[2026-02-11 10:02:11 CET]    13B 8f3a... v2 2026/acme/contrato.txt
+[2026-02-11 10:01:54 CET]     3B 1c9d... v1 2026/acme/contrato.txt</code></pre>
+        <p>Ahora borra sin especificar versión:</p>
+        <pre><code class="language-bash">mc rm local/documentos/2026/acme/contrato.txt
+mc ls local/documentos/2026/acme/                 # no aparece
+mc ls --versions local/documentos/2026/acme/      # aparece el marcador</code></pre>
+        <p>Para restaurar, identifica el version ID del <em>delete marker</em> y bórralo:</p>
+        <pre><code class="language-bash">MARKER=$(mc ls --versions --json local/documentos/2026/acme/contrato.txt \
+  | jq -r 'select(.isDeleteMarker == true) | .versionId' | head -1)
+mc rm --version-id "$MARKER" local/documentos/2026/acme/contrato.txt
+mc cat local/documentos/2026/acme/contrato.txt</code></pre>
+        <pre><code class="language-text">v2 corregida</code></pre>
+        <p>Qué ha pasado en cada paso:</p>
+        <ul>
+          <li><code>version enable</code> hace que cada <code>PUT</code> cree una versión con ID único.</li>
+          <li><code>ls --versions</code> muestra todas, incluidas las que ya no son actuales.</li>
+          <li><code>rm</code> sin <code>--version-id</code> crea un marcador; no borra bytes.</li>
+          <li>Borrar el marcador revela de nuevo la versión anterior. El contenido no se ha movido.</li>
+        </ul>
+        <p>Si en lugar de borrar el marcador quieres una copia con otro nombre:</p>
+        <pre><code class="language-bash">mc cp --version-id "$VID" \
+  local/documentos/2026/acme/contrato.txt \
+  local/documentos/2026/acme/contrato-restaurado.txt</code></pre>
+      </section>
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos tiene dos necesidades distintas y, por tanto, dos buckets. El object lock se activa por bucket, no por prefijo: si solo los contratos son WORM, no puedes bloquear <code>documentos/2026/contratos/</code> sin bloquear también los borradores.</p>
+        <table>
+          <thead><tr><th>Bucket</th><th>Versionado</th><th>Retención</th><th>Lifecycle</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>documentos</code></td>
+              <td>Activado</td>
+              <td>Sin object lock</td>
+              <td>Versiones no actuales: 90 días; temporales: 7 días</td>
+            </tr>
+            <tr>
+              <td><code>contratos</code></td>
+              <td>Activado (lo exige el lock)</td>
+              <td><code>COMPLIANCE</code> 7 años por defecto</td>
+              <td>Solo limpieza de subidas incompletas; no expira versiones retenidas</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>Creación del bucket inmutable:</p>
+        <pre><code class="language-bash">mc mb --with-lock local/contratos
+mc version info local/contratos
+mc retention set --default COMPLIANCE 7y local/contratos
+mc retention info local/contratos</code></pre>
+        <p>Subida de un contrato y comprobación de su retención:</p>
+        <pre><code class="language-bash">mc cp --attr "tenant=acme;doc-id=CTR-2026-0142" \
+  ./contrato.pdf \
+  local/contratos/2026/acme/CTR-2026-0142.pdf
+VID=$(mc stat --json local/contratos/2026/acme/CTR-2026-0142.pdf | jq -r '.versionID')
+mc retention info --version-id "$VID" \
+  local/contratos/2026/acme/CTR-2026-0142.pdf</code></pre>
+        <pre><code class="language-text">Mode      : COMPLIANCE
+Retain Until: 2033-02-11 10:15:00 CET
+Version   : 5e6f...
+</code></pre>
+        <p>El contrato ya no se puede borrar ni sobrescribir de forma que desaparezca hasta 2033. Un <code>PUT</code> nuevo crea otra versión también retenida; el original sigue intacto. Eso es WORM: se añade, no se modifica.</p>
+        <h3>Un borrado accidental, paso a paso</h3>
+        <pre><code class="language-bash"># El script mal configurado oculta todo el prefijo de 2026
+mc rm --recursive local/documentos/2026/
+# El listado normal está vacío
+mc ls --recursive local/documentos/2026/
+# Pero las versiones siguen ahí
+mc ls --versions --recursive local/documentos/2026/ | head
+# Restaurar un objeto concreto: borrar su marcador más reciente
+MARKER=$(mc ls --versions --json local/documentos/2026/informes/acme/INF-2026-0007.pdf \
+  | jq -r 'select(.isDeleteMarker == true) | .versionId' | head -1)
+mc rm --version-id "$MARKER" local/documentos/2026/informes/acme/INF-2026-0007.pdf
+mc stat local/documentos/2026/informes/acme/INF-2026-0007.pdf</code></pre>
+        <p>Restaurar 4 000 objetos uno a uno no es un plan. Para eso existen los scripts de recuperación masiva o una réplica en otro sitio; el versionado te da la materia prima, no el botón de «deshacer todo». Diseña y prueba el procedimiento antes de necesitarlo.</p>
+        <h3>Legal hold: cuando no hay fecha</h3>
+        <pre><code class="language-bash">mc legalhold set local/contratos/2026/acme/CTR-2026-0142.pdf
+mc legalhold info local/contratos/2026/acme/CTR-2026-0142.pdf
+mc legalhold clear local/contratos/2026/acme/CTR-2026-0142.pdf</code></pre>
+        <p>El legal hold es independiente de la retención: un objeto puede tener retención de 30 días y legal hold indefinido. Mientras esté activo, no se puede borrar la versión aunque la retención haya expirado. Se usa para litigios y auditorías, no como sustituto de una política de retención.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Separar por bucket también separa permisos</p>
+          <p>La aplicación que sube documentos no debería poder borrar versiones de <code>contratos</code>. Al estar en otro bucket, la política se escribe una vez y el radio de impacto de un error queda acotado. Mezclar borradores y contratos en el mismo bucket obliga a políticas por prefijo, que son más frágiles.</p>
+        </div>
+      </section>
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Activar versionado antes de la primera escritura</td>
+              <td>Activarlo después de un borrado</td>
+              <td>No recupera lo que ya no existe; solo protege lo nuevo.</td>
+            </tr>
+            <tr>
+              <td>Definir expiración de versiones no actuales</td>
+              <td>Dejar que el historial crezca sin límite</td>
+              <td>Cada versión ocupa el tamaño completo y se factura.</td>
+            </tr>
+            <tr>
+              <td>Separar datos WORM en su propio bucket</td>
+              <td>Bloquear un bucket entero por un prefijo</td>
+              <td>Object lock es por bucket, no por prefijo.</td>
+            </tr>
+            <tr>
+              <td>Limitar quién puede borrar versiones</td>
+              <td>Dar <code>s3:*</code> al usuario de la aplicación</td>
+              <td>El versionado no protege si cualquiera puede ejecutar <code>rm --versions</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Activar versionado después del desastre</h3>
+        <span class="code-label code-label--wrong">Mal — creer que recupera el pasado</span>
+        <pre><code class="language-bash"># ❌ Los objetos borrados ayer no vuelven por activar versionado hoy.
+mc rm --recursive --force local/documentos/2025/
+mc version enable local/documentos</code></pre>
+        <span class="code-label code-label--right">Bien — activarlo antes y probar la recuperación</span>
+        <pre><code class="language-bash">mc version enable local/documentos
+mc cp ./documento.pdf local/documentos/2026/documento.pdf
+mc rm local/documentos/2026/documento.pdf
+mc ls --versions local/documentos/2026/</code></pre>
+        <p>El versionado es una decisión previa. Activarlo a posteriori solo cambia el comportamiento de las escrituras futuras; los datos que ya no están no se reconstruyen.</p>
+        <h3>2. «He borrado el bucket y sigue ocupando espacio»</h3>
+        <span class="code-label code-label--wrong">Mal — asumir que <code>rm</code> libera capacidad</span>
+        <pre><code class="language-bash"># ❌ En un bucket versionado, esto crea marcadores; el espacio sigue.
+mc rm --recursive --force local/documentos/2026/</code></pre>
+        <span class="code-label code-label--right">Bien — decidir explícitamente qué versiones se destruyen</span>
+        <pre><code class="language-bash">mc ls --versions --recursive local/documentos/2026/ | wc -l
+mc rm --recursive --force --versions --older-than 90d \
+  local/documentos/2026/</code></pre>
+        <p><code>--versions</code> borra todas las versiones, no solo la actual. Es irreversible. Úsalo con <code>--dry-run</code> y con un criterio de antigüedad, nunca como primer reflejo.</p>
+        <h3>3. Confundir suspender con desactivar</h3>
+        <span class="code-label code-label--wrong">Mal — esperar que suspender haga las escrituras simples</span>
+        <pre><code class="language-bash"># ❌ Las versiones antiguas siguen; las nuevas se escriben como "null"
+#    y se sobrescriben entre sí. No es lo mismo que desactivar.
+mc version suspend local/documentos</code></pre>
+        <span class="code-label code-label--right">Bien — usar el estado que corresponde al objetivo</span>
+        <pre><code class="language-bash">mc version enable local/documentos     # historial completo
+mc version suspend local/documentos    # congelar nuevas versiones con ID null
+mc version info local/documentos</code></pre>
+        <p>MinIO no permite «desactivar» un bucket que ya tuvo versiones: se suspende. Si necesitas volver al comportamiento simple, crea otro bucket y migra; no hay marcha atrás limpia.</p>
+      </section>
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear un bucket con object lock, comprobar la retención, borrar con marcador, restaurar y ver la diferencia entre GOVERNANCE y legal hold.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea un bucket con lock y comprueba el estado.</strong>
+            <pre><code class="language-bash">mc mb --with-lock local/contratos-lab
+mc version info local/contratos-lab
+mc retention info local/contratos-lab</code></pre>
+            <p>El versionado debe aparecer como <code>Enabled</code>. El lock solo existe porque se activó al crear el bucket.</p>
+          </li>
+          <li>
+            <strong>Sube tres versiones del mismo contrato.</strong>
+            <pre><code class="language-bash">for v in 1 2 3; do
+  printf 'contrato version %s\n' "$v" &gt; contrato.txt
+  mc cp ./contrato.txt local/contratos-lab/2026/acme/contrato.txt
+done
+mc ls --versions local/contratos-lab/2026/acme/</code></pre>
+            <p>Deben aparecer tres versiones con IDs distintos; la última es la actual.</p>
+          </li>
+          <li>
+            <strong>Aplica retención GOVERNANCE de un día.</strong>
+            <pre><code class="language-bash">mc retention set --default GOVERNANCE 1d local/contratos-lab
+VID=$(mc stat --json local/contratos-lab/2026/acme/contrato.txt | jq -r '.versionID')
+mc retention set --version-id "$VID" GOVERNANCE 1d local/contratos-lab/2026/acme/contrato.txt
+mc retention info --version-id "$VID" local/contratos-lab/2026/acme/contrato.txt</code></pre>
+            <p>Anota la fecha <code>Retain Until</code>. Intenta borrar esa versión sin bypass: debe fallar con <code>AccessDenied</code>.</p>
+          </li>
+          <li>
+            <strong>Comprueba el bypass de GOVERNANCE.</strong>
+            <pre><code class="language-bash">mc rm --version-id "$VID" local/contratos-lab/2026/acme/contrato.txt
+mc rm --bypass --version-id "$VID" local/contratos-lab/2026/acme/contrato.txt</code></pre>
+            <p>El primer comando falla; el segundo funciona porque root tiene el permiso de bypass. Con COMPLIANCE, el segundo también fallaría. No uses COMPLIANCE en este laboratorio.</p>
+          </li>
+          <li>
+            <strong>Prueba el legal hold.</strong>
+            <pre><code class="language-bash">mc legalhold set local/contratos-lab/2026/acme/contrato.txt
+mc legalhold info local/contratos-lab/2026/acme/contrato.txt
+mc rm local/contratos-lab/2026/acme/contrato.txt   # falla
+mc legalhold clear local/contratos-lab/2026/acme/contrato.txt
+mc rm local/contratos-lab/2026/acme/contrato.txt   # ahora crea marcador</code></pre>
+            <p>El legal hold no tiene fecha: mientras esté activo, la versión actual no se puede borrar. Retirarlo requiere permiso explícito.</p>
+          </li>
+          <li>
+            <strong>Restaura el borrado y limpia con criterio.</strong>
+            <pre><code class="language-bash">MARKER=$(mc ls --versions --json local/contratos-lab/2026/acme/contrato.txt \
+  | jq -r 'select(.isDeleteMarker == true) | .versionId' | head -1)
+mc rm --version-id "$MARKER" local/contratos-lab/2026/acme/contrato.txt
+mc cat local/contratos-lab/2026/acme/contrato.txt
+mc rm --recursive --force --versions local/contratos-lab/2026/acme/
+mc ls --versions local/contratos-lab/2026/acme/</code></pre>
+            <p>Tras borrar el marcador, el contrato vuelve. La limpieza final destruye todas las versiones: es el paso irreversible y solo se hace en un bucket de laboratorio.</p>
+          </li>
+        </ol>
+      </section>
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Retención a siete años sin arruinar el presupuesto</h3>
+          <p>Diseña la política de retención del archivo legal: contratos firmados durante siete años, borradores durante 90 días, versiones intermedias de un contrato durante un año y subidas incompletas durante tres días. El equipo quiere poder liberar un contrato antes si hay una orden judicial, pero no quiere que un administrador pueda borrarlo por error.</p>
+          <p>Define buckets, modos de retención, legal holds, reglas de lifecycle y permisos. Calcula el crecimiento esperado si cada contrato se reescribe tres veces antes de firmarse y explica cómo evitarías pagar siete años por las versiones intermedias. Incluye cómo verificarías que la política funciona sin esperar siete años.</p>
+          <p><em>Pista: COMPLIANCE no se puede acortar, así que la liberación anticipada no puede depender de borrar la versión. Piensa en qué se conserva, qué se puede expirar y cómo separar el original firmado de sus borradores. GOVERNANCE y legal hold responden a amenazas distintas.</em></p>
+        </div>
+      </section>
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El versionado convierte cada escritura en una versión con ID y cada borrado en un <strong>delete marker</strong>.</li>
+          <li><code>GET</code> sin versión devuelve la última; con <code>versionId</code>, la que pidas, incluso detrás de un marcador.</li>
+          <li>Borrar el marcador restaura la versión anterior; borrar una versión concreta es permanente.</li>
+          <li>Suspender no es desactivar: las versiones antiguas siguen y las nuevas usan el ID <code>null</code>.</li>
+          <li>El <strong>object lock</strong> exige versionado y solo se activa al crear el bucket con <code>mc mb --with-lock</code>.</li>
+          <li><strong>GOVERNANCE</strong> se puede saltar con permiso; <strong>COMPLIANCE</strong> no se puede saltar ni acortar; el <strong>legal hold</strong> no tiene fecha.</li>
+          <li>Lifecycle expira versiones no actuales, pero nunca antes de que termine la retención.</li>
+          <li>Cada versión ocupa el tamaño completo: sin política de expiración, el coste crece rápido.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mc version enable|suspend</code></td><td>Activa o suspende el versionado</td></tr>
+            <tr><td><code>mc version info</code></td><td>Muestra el estado actual</td></tr>
+            <tr><td><code>mc ls --versions</code></td><td>Lista versiones y marcadores</td></tr>
+            <tr><td><code>mc cp --version-id</code></td><td>Copia una versión concreta</td></tr>
+            <tr><td><code>mc rm --version-id</code></td><td>Destruye una versión o un marcador</td></tr>
+            <tr><td><code>mc rm --versions</code></td><td>Destruye todas las versiones</td></tr>
+            <tr><td><code>mc mb --with-lock</code></td><td>Crea un bucket con object lock</td></tr>
+            <tr><td><code>mc retention set</code></td><td>Fija retención por defecto o por versión</td></tr>
+            <tr><td><code>mc legalhold set|clear</code></td><td>Activa o retira un legal hold</td></tr>
+            <tr><td><code>mc ilm rule add --noncurrent-expire-days</code></td><td>Expira versiones no actuales</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿El versionado protege contra ransomware?</summary>
+            <div>
+              <p>Solo parcialmente. Si el atacante tiene credenciales que pueden borrar versiones, puede destruir el historial. Para una protección real necesitas object lock en modo COMPLIANCE, permisos de mínimo privilegio que impidan borrar versiones y una réplica en otro sistema. El versionado solo evita el borrado accidental de la versión actual; no es un plan de recuperación por sí mismo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cuánto ocupa una versión?</summary>
+            <div>
+              <p>El tamaño completo del objeto. MinIO no guarda diferencias incrementales entre versiones. Un PDF de 2 MB con diez versiones ocupa unos 20 MB, más los metadatos. Por eso conviene expirar versiones no actuales y separar los objetos que se reescriben mucho de los que son inmutables por naturaleza.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo desactivar el versionado por completo?</summary>
+            <div>
+              <p>No en un bucket que ya lo tuvo: se suspende. Al suspender, las versiones existentes se conservan y las nuevas escrituras usan el ID <code>null</code>, sobrescribiéndose entre sí. Si necesitas un bucket sin historial, crea uno nuevo y migra solo la versión actual con <code>mc mirror</code> o <code>mc cp</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Puedo activar object lock en un bucket existente?</summary>
+            <div>
+              <p>No. El object lock se configura al crear el bucket, porque cambia el comportamiento de versionado y retención desde el primer objeto. Si no lo activaste, crea un bucket nuevo con <code>mc mb --with-lock</code>, copia los objetos y actualiza la aplicación. Planifica esta decisión antes de la primera escritura, no después de la auditoría.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

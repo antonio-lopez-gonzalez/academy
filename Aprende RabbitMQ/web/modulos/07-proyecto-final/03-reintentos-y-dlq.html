@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-reintentos-y-dlq">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reintentos y DLQ — Módulo 7 · Curso RabbitMQ</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rmq-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Reintentos y DLQ</h1>
+        <div class="lesson-header__meta">
+          <span class="badge badge--project">Módulo 7 · Proyecto final</span>
+          <span>🕐 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ======================== 1 · INTRODUCCIÓN ======================== -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <a href="02-api-y-worker.html">worker ya procesa jobs</a>, pero todo fallo va hoy a la DLQ. Eso es demasiado pesimista: la mitad de los fallos de un sistema real son transitorios —un timeout del proveedor de PDF, un <code>429</code> de la API de facturación, una conexión que se cae un segundo— y merecen otro intento. La otra mitad son permanentes: un pedido que no existe, un JSON que no valida, un permiso denegado. Reintentar esos solo gasta tiempo y llena la cola de basura.</p>
+        <p>La política de reintentos tiene tres decisiones y ninguna es neutral:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Pregunta</th><th>Consecuencia de equivocarse</th></tr></thead>
+          <tbody>
+            <tr><td>¿Qué se reintenta?</td><td>¿Transitorio o permanente?</td><td>Reintentar lo permanente crea un bucle; no reintentar lo transitorio pierde trabajos recuperables.</td></tr>
+            <tr><td>¿Cuánto se espera?</td><td>¿Backoff fijo, exponencial, con jitter?</td><td>Reintentos inmediatos martillean al proveedor caído y agravan la caída.</td></tr>
+            <tr><td>¿Cuándo se para?</td><td>¿Cuántos intentos? ¿A dónde va el fallido?</td><td>Sin límite, un mensaje veneno consume el worker para siempre; sin DLQ, el fallo se pierde.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--why">
+          <p class="callout__title">Reintentar no es «volver a llamar»</p>
+          <p>Un reintento bien hecho devuelve el mensaje a una cola <strong>sin bloquear al worker</strong>, conserva el contador de intentos y respeta una espera. Un <code>while</code> con <code>sleep</code> o un <code>nack(requeue=true)</code> inmediato no son reintentos: son bucles que ocupan el worker y esconden el problema.</p>
+        </div>
+        <p>Al final de la lección, un job que falla repetidamente espera 5 segundos, luego un minuto, luego diez; si vuelve a fallar, aparece en una DLQ con el motivo y las cabeceras intactas, listo para inspeccionar o reprocesar.</p>
+      </section>
+
+      <!-- ======================== 2 · TEORÍA ======================== -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Tipos de fallo y decisión</h3>
+        <table>
+          <thead><tr><th>Tipo</th><th>Ejemplos</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Transitorio</strong></td><td>Timeout, <code>503</code> del proveedor, bloqueo temporal, rate limit</td><td>Reintentar con backoff y límite</td></tr>
+            <tr><td><strong>Permanente</strong></td><td>Validación, pedido inexistente, permiso denegado, tipo desconocido</td><td>DLQ inmediata con motivo</td></tr>
+            <tr><td><strong>Veneno</strong></td><td>Mensaje que siempre hace crashear al worker (bug, formato corrupto)</td><td>DLQ tras el primer o segundo fallo reproducible</td></tr>
+          </tbody>
+        </table>
+        <p>La clasificación no la hace RabbitMQ: la hace el worker. Una buena práctica es que el error de negocio lleve una marca explícita (<code>err.permanent = true</code>) y que los errores desconocidos se traten como transitorios con un límite bajo. Así no se reintenta eternamente un bug, pero tampoco se descarta un fallo de red.</p>
+
+        <h3>El mecanismo: TTL + DLX</h3>
+        <p>RabbitMQ no tiene un «reintentar en 5 minutos» nativo en AMQP 0-9-1. El patrón es una cola intermedia sin consumidores, con un TTL: cuando el mensaje expira, el broker lo dead-letterea de vuelta a la cola de trabajo.</p>
+        <pre><code class="language-text">fallo transitorio
+      |
+      v
+worker publica en taller.jobs.retry (confirm)
+      | routing key "retry.5s"
+      v
+taller.jobs.retry.5s  (quorum, x-message-ttl=5000)
+      |  sin consumidores: el mensaje espera
+      |  al expirar -> dead-letter
+      v
+taller.jobs (job.run) -> taller.jobs.work -> otro intento</code></pre>
+        <p>El worker no se queda esperando: publica el mensaje con el retardo y hace <code>ack</code> del original. El retardo lo sostiene el broker. Por eso hay una cola por nivel de espera: si usas TTL por mensaje en una sola cola, un mensaje con TTL largo puede quedar delante de uno corto y bloquearlo (<em>head-of-line blocking</em>).</p>
+
+        <h3>El contador de intentos: cabecera propia frente a <code>x-death</code></h3>
+        <p>Cada reintento debe saber cuántos lleva. Hay dos fuentes posibles:</p>
+        <table>
+          <thead><tr><th>Fuente</th><th>Quién la escribe</th><th>Ventaja</th><th>Problema</th></tr></thead>
+          <tbody>
+            <tr><td><code>x-attempt</code> (propia)</td><td>El worker al reprogramar</td><td>Control total, independiente del mecanismo</td><td>Hay que copiarla en cada publicación y no perderla</td></tr>
+            <tr><td><code>x-death</code></td><td>El broker al dead-letterear</td><td>No hay que mantenerla</td><td>Cuenta muertes del broker, no intentos lógicos; no existe si publicas directamente</td></tr>
+          </tbody>
+        </table>
+        <p><code>x-death</code> es un array de objetos con <code>count</code>, <code>reason</code>, <code>queue</code>, <code>time</code>, <code>exchange</code> y <code>routing-keys</code>. Los motivos habituales son <code>rejected</code> (nack/reject sin requeue), <code>expired</code> (TTL), <code>maxlen</code> (límite de longitud) y <code>delivery_limit</code> (quorum). En nuestro diseño, el mensaje acumulará una entrada <code>expired</code> cada vez que vuelva de una cola de reintento, así que <code>x-death[0].count</code> puede servir como señal, pero el contador autoritativo es <code>x-attempt</code>.</p>
+        <pre><code class="language-json">[{
+  "count": 2,
+  "reason": "expired",
+  "queue": "taller.jobs.retry.5s",
+  "exchange": "taller.jobs.retry",
+  "routing-keys": ["retry.5s"],
+  "time": "2026-11-05T10:05:00.000Z"
+}]</code></pre>
+
+        <h3>Backoff: la tabla de decisión</h3>
+        <table>
+          <thead><tr><th>Intento actual</th><th>Resultado</th><th>Espera</th><th>Cola</th></tr></thead>
+          <tbody>
+            <tr><td><code>0</code> (primer fallo)</td><td>Reintentar</td><td>5 s</td><td><code>taller.jobs.retry.5s</code></td></tr>
+            <tr><td><code>1</code></td><td>Reintentar</td><td>1 min</td><td><code>taller.jobs.retry.1m</code></td></tr>
+            <tr><td><code>2</code></td><td>Reintentar</td><td>10 min</td><td><code>taller.jobs.retry.10m</code></td></tr>
+            <tr><td><code>3</code></td><td>DLQ</td><td>—</td><td><code>taller.jobs.dead</code></td></tr>
+          </tbody>
+        </table>
+        <p>Son tres reintentos y cuatro ejecuciones como máximo. El backoff debe cubrir la ventana de recuperación del proveedor: si sus caídas medias duran 30 segundos, 5 s y 1 min tienen sentido; si duran 15 minutos, el tercer nivel se queda corto. Ajusta los niveles a la realidad, no a una simetría bonita.</p>
+        <p>El <strong>jitter</strong> (variación aleatoria de ±20 %) evita que cien workers reintenten a la vez y produzcan una estampida contra un servicio que acaba de volver. Con TTL fijo por cola, el jitter no se puede aplicar por mensaje sin renunciar a las colas fijas; una opción es añadir más niveles o aceptar la sincronización. Para el proyecto, tres niveles sin jitter son suficientes; en producción con muchos jobs, valora TTL por mensaje con el coste de head-of-line blocking.</p>
+
+        <h3>Publicar el reintento y luego hacer <code>ack</code></h3>
+        <p>El orden es crítico: primero se publica en la cola de reintento y se espera el confirm; después se hace <code>ack</code> del mensaje original. Si el <code>ack</code> ocurriera antes y la publicación fallara, el job desaparecería. Si la publicación tiene éxito y el <code>ack</code> se pierde, el original se reentrega y puede generar un reintento duplicado: es aceptable porque el contador y la idempotencia lo absorben.</p>
+        <pre><code class="language-text">1. plan = decidir(intento, error)
+2. si plan.action = retry:
+      publish(retry_exchange, plan.key, body, headers + x-attempt)
+      waitForConfirms()
+      store.markRetry(jobId, plan.attempt, plan.delayMs)
+      ack(original)
+3. si plan.action = dead:
+      publish(dlx, "job.dead", body, headers + x-error)
+      waitForConfirms()
+      store.markFailed(jobId, motivo)
+      ack(original)</code></pre>
+
+        <h3>La DLQ no es un vertedero</h3>
+        <p>La cola de mensajes muertos debe ser durable, sin TTL y sin consumidor automático que reintente todo. Su función es conservar el mensaje y su contexto para que alguien pueda responder: ¿qué job era?, ¿cuántos intentos?, ¿qué error?, ¿desde cuándo está ahí? Un consumidor ciego que reenvía todo a la cola principal convierte la DLQ en un reintento infinito con otro nombre.</p>
+        <table>
+          <thead><tr><th>Señal</th><th>Umbral de ejemplo</th><th>Acción</th></tr></thead>
+          <tbody>
+            <tr><td>Profundidad de la DLQ</td><td>&gt; 0 durante 5 min</td><td>Alerta al equipo; inspeccionar el motivo</td></tr>
+            <tr><td>Crecimiento de una cola de reintento</td><td>&gt; 100 y creciente</td><td>El proveedor está caído o el backoff es demasiado corto</td></tr>
+            <tr><td>Jobs con <code>attempts = max</code></td><td>&gt; 5 por hora</td><td>Investigar el error dominante antes de reprocesar</td></tr>
+            <tr><td>Antigüedad del mensaje más viejo en DLQ</td><td>&gt; 24 h</td><td>Revisión obligatoria: nadie está mirando la DLQ</td></tr>
+          </tbody>
+        </table>
+        <h3>Reprocesar: manual, filtrado y con confirm</h3>
+        <p>Cuando el bug se corrige, los mensajes de la DLQ se pueden devolver a la cola de trabajo. El reproceso debe ser una herramienta explícita, no un consumidor permanente:</p>
+        <ol>
+          <li>Filtrar por tipo, fecha o <code>jobId</code>; no reprocesar todo «por si acaso».</li>
+          <li>Leer con <code>noAck: false</code> y publicar con confirm en el exchange principal.</li>
+          <li>Resetear <code>x-attempt</code> a 0 y añadir <code>x-replayed-at</code>; conservar <code>x-death</code> como histórico.</li>
+          <li>Hacer <code>ack</code> del mensaje de la DLQ solo después del confirm.</li>
+          <li>Actualizar el estado del job a <code>queued</code> y registrar quién reprocesó.</li>
+        </ol>
+        <p>Para volúmenes grandes existe el plugin Shovel, que puede mover mensajes entre colas con confirmaciones. Para unos pocos cientos, un script con <code>basic.get</code> es más fácil de auditar y de filtrar.</p>
+
+        <h3>La alternativa de quorum: <code>delivery-limit</code></h3>
+        <p>Las quorum queues pueden dead-letterear un mensaje tras N entregas sin <code>ack</code> usando <code>x-delivery-limit</code>. Es una red de seguridad excelente para mensajes veneno, pero no implementa backoff: las reentregas ocurren cuando el consumidor falla, no en intervalos crecientes. Para reintentos de negocio con espera, sigue haciendo falta el patrón TTL + DLX.</p>
+        <table>
+          <thead><tr><th>Mecanismo</th><th>Backoff</th><th>Control del intervalo</th><th>Uso</th></tr></thead>
+          <tbody>
+            <tr><td>TTL + DLX (este proyecto)</td><td>Sí, por niveles</td><td>Total</td><td>Fallos transitorios de negocio</td></tr>
+            <tr><td><code>x-delivery-limit</code></td><td>No</td><td>Ninguno</td><td>Red de seguridad ante crashes y mensajes veneno</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 3 · EJEMPLO MÍNIMO ======================== -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>La decisión de reintentar debe ser una función pura, sin broker ni base de datos. Así se prueba con <code>node --test</code> en milisegundos y se reutiliza en el worker.</p>
+        <pre><code class="language-javascript">// src/retry-policy.js
+export const TIERS = [
+  { attempt: 1, routingKey: 'retry.5s', delayMs: 5_000 },
+  { attempt: 2, routingKey: 'retry.1m', delayMs: 60_000 },
+  { attempt: 3, routingKey: 'retry.10m', delayMs: 600_000 },
+];
+
+export function planRetry(attempt, error) {
+  if (error?.permanent) return { action: 'dead', reason: 'permanent' };
+
+  const next = attempt + 1;
+  const tier = TIERS.find((t) =&gt; t.attempt === next);
+  if (!tier) return { action: 'dead', reason: 'attempts_exhausted' };
+
+  return { action: 'retry', ...tier };
+}</code></pre>
+        <p>Con <code>attempt = 0</code> y un error transitorio devuelve <code>{ action: 'retry', attempt: 1, routingKey: 'retry.5s', delayMs: 5000 }</code>. Con <code>attempt = 3</code> devuelve <code>{ action: 'dead', reason: 'attempts_exhausted' }</code>. Con un error marcado como permanente, va directo a la DLQ sin importar el intento.</p>
+        <p>La función no decide si el error es transitorio: eso lo sabe el adaptador del servicio externo. Lo que hace es traducir «intento + clasificación» en una acción concreta. Esa separación permite cambiar los niveles sin tocar el worker y probar los límites sin levantar RabbitMQ.</p>
+      </section>
+
+      <!-- ======================== 4 · EJEMPLO REAL ======================== -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El worker del taller implementa el plan con dos publicaciones y un <code>ack</code>. Fíjate en que el contador viaja en la cabecera y en que se espera el confirm antes de cerrar el mensaje original.</p>
+        <pre><code class="language-javascript">async function scheduleRetry(msg, job, err) {
+  const attempt = Number(msg.properties.headers?.['x-attempt'] ?? 0);
+  const plan = planRetry(attempt, err);
+
+  const headers = {
+    ...msg.properties.headers,
+    'x-error': String(err.message).slice(0, 500),
+    'x-failed-at': new Date().toISOString(),
+  };
+
+  if (plan.action === 'retry') {
+    confirm.publish(RETRY_EXCHANGE, plan.routingKey, msg.content, {
+      persistent: true,
+      messageId: job.jobId,
+      contentType: 'application/json',
+      headers: { ...headers, 'x-attempt': plan.attempt },
+    });
+    await confirm.waitForConfirms();
+    await store.markRetry(job.jobId, plan.attempt, plan.delayMs, err.message);
+  } else {
+    confirm.publish(DLX, 'job.dead', msg.content, {
+      persistent: true,
+      messageId: job.jobId,
+      contentType: 'application/json',
+      headers: { ...headers, 'x-attempt': attempt, 'x-dead-reason': plan.reason },
+    });
+    await confirm.waitForConfirms();
+    await store.markFailed(job.jobId, plan.reason, err.message);
+  }
+
+  channel.ack(msg);
+}</code></pre>
+        <p>El mensaje original se hace <code>ack</code> al final, tanto si se reprogramó como si se envió a la DLQ. Si el confirm falla, el <code>ack</code> no se ejecuta y el broker reentrega el original: se reintenta la operación de publicación, no se pierde el job. Esa es la ventana en la que puede aparecer un duplicado; la idempotencia del consumidor lo cubre.</p>
+        <p>El <code>confirm</code> es el mismo canal de confirmación del worker, no el canal de consumo. Publicar en el canal de consumo y esperar confirms mezcla estados y, ante un error, cierra el canal que está entregando mensajes.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">No marques el job como fallido antes del confirm</p>
+          <p>Si actualizas el estado a <code>failed</code> y la publicación a la DLQ falla, el mensaje se reentrega pero el estado ya dice que terminó. El worker podría descartarlo en la siguiente entrega y el mensaje quedaría huérfano. Cambia el estado <strong>después</strong> de confirmar la publicación, o usa un estado intermedio que el reintento sepa interpretar.</p>
+        </div>
+        <p>Para reprocesar la DLQ, un script de operación lee, publica y confirma. Nunca hace <code>ack</code> antes del confirm:</p>
+        <pre><code class="language-javascript">const DLQ = 'taller.jobs.dead';
+
+const only = (job) =&gt; job.type === process.env.REPLAY_TYPE;
+let msg;
+while ((msg = await channel.get(DLQ, { noAck: false }))) {
+  const job = JSON.parse(msg.content.toString());
+  if (only &amp;&amp; !only(job)) {          // filtro: tipo, fecha, jobId...
+    channel.nack(msg, false, true);   // vuelve a la DLQ
+    continue;
+  }
+
+  confirm.publish(EXCHANGE, 'job.run', msg.content, {
+    persistent: true,
+    messageId: job.jobId,
+    contentType: 'application/json',
+    headers: {
+      ...msg.properties.headers,
+      'x-attempt': 0,
+      'x-replayed-at': new Date().toISOString(),
+      'x-replayed-by': process.env.USER ?? 'operator',
+    },
+  });
+  await confirm.waitForConfirms();
+  await store.markQueued(job.jobId);
+  channel.ack(msg);
+}</code></pre>
+        <p>El <code>nack(requeue=true)</code> del filtro devuelve el mensaje a la DLQ, pero lo pone al principio de la cola y el bucle puede volver a leerlo inmediatamente: si el filtro descarta muchos, añade un contador o procesa en lotes. Para un script manual, es aceptable; para un job automático, diseña una cola de cuarentena separada.</p>
+      </section>
+
+      <!-- ======================== 5 · BUENAS PRÁCTICAS ======================== -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Clasificar el error antes de decidir</td><td>Reintentar todo con el mismo intervalo</td><td>Un error de validación nunca se arregla esperando.</td></tr>
+            <tr><td>Backoff creciente y límite explícito</td><td>Reintentos cada segundo o infinitos</td><td>Da tiempo al proveedor y acota el coste.</td></tr>
+            <tr><td>Colas de reintento sin consumidores</td><td>Un worker que duerme y retiene el mensaje</td><td>El retardo no ocupa slots de prefetch.</td></tr>
+            <tr><td>Conservar <code>jobId</code>, <code>contentType</code> y <code>x-attempt</code></td><td>Reconstruir el mensaje con solo el body</td><td>La trazabilidad y el contador se pierden.</td></tr>
+            <tr><td>Publicar con confirm antes del <code>ack</code></td><td>Hacer <code>ack</code> y luego publicar el reintento</td><td>Un fallo de publicación perdería el job.</td></tr>
+            <tr><td>DLQ durable, sin TTL y monitorizada</td><td>DLQ con TTL o sin alertas</td><td>Los fallos desaparecen solos o nadie los ve.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 6 · ERRORES HABITUALES ======================== -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. <code>nack(requeue=true)</code> en bucle</h3>
+        <span class="code-label code-label--wrong">Mal — reintento inmediato e infinito</span>
+        <pre><code class="language-javascript">catch (err) {
+  channel.nack(msg, false, true);   // vuelve a la cola al instante
+}</code></pre>
+        <span class="code-label code-label--right">Bien — publicar en la cola de reintento</span>
+        <pre><code class="language-javascript">catch (err) {
+  await scheduleRetry(msg, job, err);   // publica, confirma, luego ack
+}</code></pre>
+        <p>El mensaje vuelve a estar disponible al instante, el worker lo recibe otra vez y falla otra vez. La CPU se dispara, el log se llena y el proveedor caído recibe martilleo. No hay backoff ni límite.</p>
+
+        <h3>2. Dormir dentro del handler</h3>
+        <span class="code-label code-label--wrong">Mal — el worker retiene el mensaje y el slot</span>
+        <pre><code class="language-javascript">catch (err) {
+  await new Promise((r) =&gt; setTimeout(r, 60_000));
+  channel.nack(msg, false, true);
+}</code></pre>
+        <span class="code-label code-label--right">Bien — el retardo lo hace el broker</span>
+        <pre><code class="language-javascript">await scheduleRetry(msg, job, err);
+channel.ack(msg);</code></pre>
+        <p>Con prefetch 10, diez mensajes pueden dejar el worker dormido un minuto sin procesar nada más. Además, el <code>ack</code> timeout del broker puede cerrar el canal antes de que termine la espera.</p>
+
+        <h3>3. Perder el contador</h3>
+        <span class="code-label code-label--wrong">Mal — el reintento vuelve a empezar en 0</span>
+        <pre><code class="language-javascript">confirm.publish(RETRY_EXCHANGE, 'retry.5s', msg.content, {
+  persistent: true,
+  // sin headers: x-attempt desaparece
+});</code></pre>
+        <span class="code-label code-label--right">Bien — copiar cabeceras e incrementar</span>
+        <pre><code class="language-javascript">confirm.publish(RETRY_EXCHANGE, plan.routingKey, msg.content, {
+  persistent: true,
+  messageId: job.jobId,
+  headers: { ...msg.properties.headers, 'x-attempt': plan.attempt },
+});</code></pre>
+        <p>Sin el contador, cada reintento parece el primero: el job se reintenta para siempre y la DLQ nunca recibe nada. Es un fallo silencioso que solo se detecta cuando la cola de reintento crece sin parar.</p>
+
+        <h3>4. DLX inexistente o sin binding</h3>
+        <span class="code-label code-label--wrong">Mal — publicar a un destino fantasma</span>
+        <pre><code class="language-javascript">confirm.publish('taller.dlx', 'job.dead', body);   // exchange no declarado
+await confirm.waitForConfirms();</code></pre>
+        <span class="code-label code-label--right">Bien — topología declarada y verificada</span>
+        <pre><code class="language-javascript">await declareTopology(channel);
+await channel.assertQueue('taller.jobs.dead', { durable: true });
+await channel.bindQueue('taller.jobs.dead', DLX, 'job.dead');</code></pre>
+        <p>Si el exchange no existe, el <code>publish</code> cierra el canal con <code>404 NOT_FOUND</code>; si existe pero no hay binding, el mensaje se descarta en silencio. La comprobación de topología al arrancar y una alerta de DLQ vacía tras un fallo lo detectan antes.</p>
+      </section>
+
+      <!-- ======================== 7 · EJERCICIO GUIADO ======================== -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> provocar fallos transitorios y permanentes, observar los reintentos en el broker y reprocesar un mensaje desde la DLQ.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara el worker con fallos controlados:</strong> añade una variable <code>FAIL_MODE</code> que acepte <code>transient-once</code>, <code>permanent</code> o <code>none</code>. Para el ejercicio, haz que el primer intento lance un error transitorio y el segundo funcione.</li>
+          <li>
+            <strong>Publica un job y observa la primera espera:</strong>
+            <pre><code class="language-bash">docker exec rabbitmq rabbitmqctl list_queues -p taller-prod \
+  name messages consumers</code></pre>
+            <p>Esperado: <code>taller.jobs.retry.5s</code> con 1 mensaje y 0 consumidores. A los cinco segundos, el mensaje desaparece de ahí y aparece en <code>taller.jobs.work</code> (o en <code>messages_unacknowledged</code> si el worker lo coge al instante).</p>
+          </li>
+          <li>
+            <strong>Comprueba el contador:</strong> con el worker parado, haz <code>basic.get</code> del mensaje en la cola de trabajo y mira <code>properties.headers['x-attempt']</code>. Debe ser <code>1</code> tras el primer reintento. Revisa también <code>x-death</code>: tendrá una entrada <code>expired</code> de la cola de reintento.</li>
+          <li>
+            <strong>Fuerza un error permanente:</strong> publica un job con un tipo desconocido. Debe ir directo a <code>taller.jobs.dead</code> sin pasar por las colas de reintento. Comprueba las cabeceras <code>x-error</code> y <code>x-dead-reason</code>.</li>
+          <li>
+            <strong>Inspecciona la DLQ desde la management UI:</strong> abre la cola <code>taller.jobs.dead</code>, haz <em>Get messages</em> con <code>requeue: true</code> y revisa el payload y las propiedades. No consumas con <code>ack</code>: el mensaje debe quedar disponible para el paso siguiente.</li>
+          <li>
+            <strong>Reprocesa con el script:</strong> ejecuta el bucle del ejemplo real con un filtro por <code>jobId</code>. Debe publicar con <code>x-attempt: 0</code> y hacer <code>ack</code> de la DLQ solo después del confirm. Verifica que el job termina en <code>succeeded</code> y que la DLQ queda vacía.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Para probar sin esperar diez minutos</p>
+          <p>Haz que los TTL de las colas de reintento se lean de una configuración (<code>RETRY_5S_MS</code>, <code>RETRY_1M_MS</code>, …) y usa valores de 100–500 ms en las pruebas. El diseño es el mismo; solo cambia la escala. En producción, los valores salen del entorno y nunca se codifican en el worker.</p>
+        </div>
+      </section>
+
+      <!-- ======================== 8 · RETO ======================== -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Backoff con jitter y triaje de DLQ</h3>
+          <p>El taller quiere dos cosas a la vez: reintentos con backoff exponencial y jitter para no sincronizar a los workers, y una DLQ que permita distinguir «fallo permanente» de «intentos agotados» sin abrir mensaje por mensaje.</p>
+          <p>Diseña el mecanismo de retardo (¿más niveles? ¿TTL por mensaje? ¿plugin?) y el formato de cabeceras que permita filtrar la DLQ por motivo, tipo y fecha. Explica cómo evitarías el head-of-line blocking si usas TTL por mensaje, cómo medirías el jitter real y cómo reprocesarías solo los mensajes de un tipo sin bloquear la cola. Incluye las métricas y alertas que demostrarían que el sistema funciona.</p>
+          <p><em>Pista: el jitter por mensaje exige que cada mensaje lleve su propio TTL y que la cola no tenga TTL fijo; el coste es que un mensaje con espera larga puede retrasar a uno corto. Piensa si te compensa separar por niveles y añadir un pequeño jitter dentro de cada nivel.</em></p>
+        </div>
+      </section>
+
+      <!-- ======================== 9 · RESUMEN ======================== -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Reintenta solo fallos transitorios; los permanentes van directos a la DLQ.</li>
+          <li>El retardo se implementa con colas TTL + DLX, no con <code>sleep</code> ni requeue inmediato.</li>
+          <li>El contador autoritativo es <code>x-attempt</code>; <code>x-death</code> es diagnóstico del broker.</li>
+          <li>Publica el reintento con confirm y haz <code>ack</code> del original después.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Elemento</th><th>Valor / nombre</th><th>Función</th></tr></thead>
+          <tbody>
+            <tr><td>Niveles</td><td>5 s · 1 min · 10 min</td><td>Backoff creciente con tres reintentos</td></tr>
+            <tr><td>Cabecera</td><td><code>x-attempt</code></td><td>Contador lógico de intentos</td></tr>
+            <tr><td>Cola</td><td><code>taller.jobs.dead</code></td><td>DLQ final, sin TTL</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ======================== 10 · FAQ ======================== -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar el plugin de mensajes retardados en vez de TTL + DLX?</summary>
+            <div>
+              <p>Sí. El plugin <code>rabbitmq_delayed_message_exchange</code> permite publicar con un <code>x-delay</code> por mensaje y evita las colas TTL intermedias. Añade un plugin que hay que instalar, versionar y operar, y su comportamiento con réplicas y clústeres tiene matices. Para el proyecto, TTL + DLX usa solo mecanismos del broker y es más fácil de explicar; en una plataforma madura, el plugin puede simplificar la topología.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué no reintentar directamente en el worker con un contador en memoria?</summary>
+            <div>
+              <p>Porque el contador se pierde al reiniciar y el worker queda ocupado durante la espera. Si el proceso muere, el mensaje se reentrega sin memoria del intento anterior. El estado del reintento debe vivir en el mensaje (cabecera) y en el almacén, no en una variable del proceso.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿La DLQ debe tener TTL para no crecer sin control?</summary>
+            <div>
+              <p>No por defecto. Un TTL en la DLQ borra los fallos que aún no has investigado y convierte un problema visible en una pérdida silenciosa. Si el volumen es un riesgo, aplica un límite con alerta y un proceso de archivado a object storage, no un TTL ciego. La DLQ debe crecer cuando algo va mal; la alerta es la que evita que crezca para siempre.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo distingo un mensaje veneno de un fallo transitorio?</summary>
+            <div>
+              <p>Por la firma del error y la reproducibilidad. Un mensaje veneno falla siempre en el mismo punto, con la misma excepción y el mismo payload; un fallo transitorio cambia de mensaje y desaparece al reintentar. Registra el tipo de error y el <code>jobId</code>; si los últimos N fallos comparten firma, para y manda a la DLQ. No esperes a agotar todos los reintentos para descubrirlo.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué hago con los mensajes de la DLQ que ya no son válidos?</summary>
+            <div>
+              <p>Archivarlos y borrarlos con un proceso explícito, no dejarlos crecer. Antes de borrar, guarda el payload y las cabeceras en un almacén de auditoría y registra la decisión. Si el mensaje contiene datos personales, aplica la retención y el borrado que exija tu política. La DLQ no es un archivo histórico; es una cola de trabajo pendiente de decisión.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

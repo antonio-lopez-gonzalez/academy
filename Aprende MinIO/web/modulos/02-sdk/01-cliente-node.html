@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="02" data-lesson="01-cliente-node">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>El cliente de Node.js — Módulo 2 · Curso MinIO</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('minio-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>El cliente de Node.js</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 2 · SDK y aplicación</span>
+          <span>🕐 35 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora has hablado con MinIO desde <code>mc</code> y desde la consola web. Las dos herramientas son cómodas para explorar, pero ninguna es una aplicación: no validan un formulario, no registran quién sube qué y no reaccionan a un evento. Cuando el almacenamiento pasa a formar parte de un producto, quien escribe y lee objetos es tu código.</p>
+        <p>La API S3 es HTTP con firma <strong>SigV4</strong>. Podrías construir cada petición a mano, pero estarías reimplementando canonicalización de cabeceras, codificación de claves, subidas multipart y reintentos. <code>minio-js</code> existe para eso: es un cliente oficial, pequeño y sin dependencias pesadas, que convierte las operaciones S3 en métodos asíncronos de JavaScript.</p>
+        <p>En esta lección montamos el cliente que usaremos durante todo el módulo: configuración desde variables de entorno, creación idempotente del bucket, subida, lectura, listado, metadatos y borrado. El objetivo no es memorizar la lista de métodos, sino entender <em>qué petición hay detrás de cada uno</em> y qué errores aparecen cuando la configuración no coincide con el servidor.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">Por qué esta lección es la base del módulo</p>
+          <p>Las tres lecciones siguientes —subidas directas, reintentos y descargas— asumen que ya sabes construir un cliente y que distingues un fallo de configuración de un fallo de permisos. Si el cliente está mal montado, cada error posterior parece un misterio del servidor.</p>
+        </div>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué es y qué no es <code>minio-js</code></h3>
+        <p>Es un SDK para el <strong>lado servidor</strong>: se ejecuta en Node.js, no en el navegador, porque necesita tu <code>secretKey</code> para firmar cada petición. El navegador nunca debe ver esa clave; por eso las subidas desde el cliente se hacen con presigned URLs, como veremos en la <a href="./02-subidas-directas.html">siguiente lección</a>.</p>
+        <p>El SDK no guarda estado remoto ni crea una sesión: cada método compone una petición HTTP, la firma con las credenciales y la envía al endpoint configurado. Esa frase explica casi todo su comportamiento:</p>
+        <ul>
+          <li>No hay «conexión abierta» que mantener: hay un <em>pool</em> de sockets HTTP reutilizados.</li>
+          <li>Los permisos se evalúan en el servidor en cada petición, no al construir el cliente.</li>
+          <li>Cambiar una variable de entorno después de arrancar no cambia el cliente: hay que reiniciar el proceso.</li>
+        </ul>
+
+        <h3>El viaje de una petición</h3>
+        <pre><code class="language-text">app.mjs                    minio-js                         MinIO :9000
+   |                          |                                 |
+   | putObject(bucket, key)   |                                 |
+   |------------------------->| 1. calcula el hash del cuerpo    |
+   |                          | 2. firma SigV4 con secretKey     |
+   |                          | 3. PUT /documentos/acme/2026/...      |
+   |                          |-------------------------------->|
+   |                          |<--------------------------------|
+   |<-------------------------| 200 OK + ETag + x-amz-request-id |
+   |                          |                                 |
+   |  (si el cuerpo es grande, el SDK lo parte en multipart)     |</code></pre>
+        <p>Los tres datos que debes saber leer de la respuesta son el <strong>ETag</strong>, el <strong>tamaño</strong> y el <strong>request id</strong>. El primero identifica la versión del contenido en la mayoría de los casos; el segundo confirma cuántos bytes se guardaron; el tercero es lo único que el soporte del servidor puede buscar en sus logs.</p>
+
+        <h3>Configurar el cliente sin adivinar</h3>
+        <table>
+          <thead><tr><th>Opción</th><th>Valor local típico</th><th>Qué pasa si se equivoca</th></tr></thead>
+          <tbody>
+            <tr><td><code>endPoint</code></td><td><code>localhost</code> o <code>minio</code> dentro de Compose</td><td>Si incluyes <code>http://</code>, el SDK intenta resolver un host llamado «http» y falla con <code>ENOTFOUND</code>.</td></tr>
+            <tr><td><code>port</code></td><td><code>9000</code> (API S3)</td><td><code>9001</code> es la consola web: responde HTML, no S3, y las peticiones fallan de forma confusa.</td></tr>
+            <tr><td><code>useSSL</code></td><td><code>false</code> en local, <code>true</code> fuera</td><td>Su valor por defecto es <code>true</code>. Contra un MinIO HTTP produce un error de protocolo TLS.</td></tr>
+            <tr><td><code>accessKey</code></td><td>Usuario de la aplicación</td><td>Si es root, la aplicación hereda todos los permisos del servidor.</td></tr>
+            <tr><td><code>secretKey</code></td><td>Secreto del usuario</td><td>Nunca en el código ni en el repositorio: solo en el entorno o en un gestor de secretos.</td></tr>
+            <tr><td><code>region</code></td><td><code>us-east-1</code> por defecto</td><td>MinIO acepta la región configurada; un valor inventado puede provocar firmas rechazadas.</td></tr>
+            <tr><td><code>pathStyle</code></td><td><code>true</code> por defecto</td><td>MinIO usa estilo de ruta (<code>/bucket/key</code>), no subdominios por bucket.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--note">
+          <p class="callout__title">Endpoint no es URL</p>
+          <p><code>endPoint</code> es solo el nombre del host o la IP. El esquema lo decide <code>useSSL</code> y el puerto se pasa aparte. Esta es la causa número uno de clientes que «no conectan» en el primer intento.</p>
+        </div>
+
+        <h3>Streams: el contrato que hay que respetar</h3>
+        <p><code>getObject</code> devuelve un <code>Readable</code>. Mientras no lo consumas, el socket queda ocupado y el objeto no se libera. Y si el stream emite un error y nadie lo escucha, Node termina el proceso. Las dos formas correctas son:</p>
+        <ul>
+          <li><code>pipeline(stream, destino)</code> de <code>node:stream/promises</code>: propaga errores y cierra ambos extremos.</li>
+          <li><code>for await (const chunk of stream)</code>: consume por partes con <em>backpressure</em> automática.</li>
+        </ul>
+        <p>Para subir, <code>putObject</code> acepta un <code>Buffer</code> o un <code>Readable</code>. Con un stream <strong>debes</strong> pasar el tamaño en bytes; el SDK lo necesita para decidir entre una subida simple y una multipart. Si no lo sabes de antemano, escribe primero a un fichero temporal o calcula el tamaño con <code>fs.stat</code>.</p>
+
+        <h3>La edición Community y su licencia</h3>
+        <p>El servidor que estás usando es <strong>MinIO Community</strong>, distribuido bajo <strong>AGPLv3</strong>. Es software libre, pero la licencia tiene obligaciones si ofreces el servicio modificado a terceros. El SDK, en cambio, es Apache-2.0. No confundas las licencias del cliente y del servidor al elegir qué puedes redistribuir.</p>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El programa más pequeño que crea un bucket, escribe un objeto y lo verifica. Necesitas un MinIO escuchando en <code>localhost:9000</code>; si no lo tienes, los pasos del ejercicio lo levantan.</p>
+        <pre><code class="language-bash">mkdir laboratorio-sdk
+cd laboratorio-sdk
+npm init -y
+npm pkg set type=module
+npm install minio@^8.0.7</code></pre>
+        <pre><code class="language-javascript">// cliente.mjs
+import * as Minio from 'minio'
+
+const client = new Minio.Client({
+  endPoint: process.env.MINIO_ENDPOINT ?? 'localhost',
+  port: Number(process.env.MINIO_PORT ?? 9000),
+  useSSL: process.env.MINIO_USE_SSL === 'true',
+  accessKey: process.env.MINIO_ACCESS_KEY,
+  secretKey: process.env.MINIO_SECRET_KEY,
+})
+
+const bucket = 'documentos'
+const key = 'acme/2026/11/hola.txt'
+
+if (!(await client.bucketExists(bucket))) {
+  await client.makeBucket(bucket, 'us-east-1')
+  console.log(`bucket ${bucket} creado`)
+}
+
+await client.putObject(bucket, key, Buffer.from('hola\n'), 5, {
+  'Content-Type': 'text/plain; charset=utf-8',
+  'X-Amz-Meta-Tenant': 'acme',
+})
+
+const stat = await client.statObject(bucket, key)
+console.log(stat.size, stat.etag, stat.metaData['content-type'])
+console.log(stat.metaData.tenant)</code></pre>
+        <pre><code class="language-bash">node --env-file=.env cliente.mjs</code></pre>
+        <pre><code class="language-text">bucket documentos creado
+5 9c1e0b2a4d5f60718293a4b5c6d7e8f9 text/plain; charset=utf-8
+acme</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>import * as Minio</code> trae el espacio de nombres completo; el cliente se instancia con <code>new Minio.Client</code>.</li>
+          <li><code>Number(...)</code> convierte el puerto, que siempre llega como cadena desde el entorno.</li>
+          <li><code>useSSL === 'true'</code> evita el error clásico de <code>'false'</code> como cadena, que es <em>truthy</em>.</li>
+          <li><code>bucketExists</code> hace un <code>HEAD</code> al bucket; <code>makeBucket</code> solo se llama si no existe.</li>
+          <li><code>putObject</code> recibe el tamaño <code>5</code> porque el cuerpo es un buffer pequeño; con streams es obligatorio.</li>
+          <li><code>statObject</code> devuelve <code>size</code>, <code>etag</code>, <code>lastModified</code> y <code>metaData</code>; las claves <code>x-amz-meta-*</code> vuelven sin el prefijo.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El almacén de documentos necesita un módulo de almacenamiento que la API pueda importar sin saber nada de S3. Estas son las operaciones que usaremos durante el resto del curso, con configuración validada al arrancar.</p>
+        <pre><code class="language-javascript">// src/storage.mjs
+import * as Minio from 'minio'
+import { createReadStream, statSync } from 'node:fs'
+import { basename } from 'node:path'
+import { randomUUID } from 'node:crypto'
+
+const BUCKET = process.env.MINIO_BUCKET ?? 'documentos'
+
+function required(name) {
+  const value = process.env[name]
+  if (!value) throw new Error(`falta la variable ${name}`)
+  return value
+}
+
+export const client = new Minio.Client({
+  endPoint: required('MINIO_ENDPOINT'),
+  port: Number(process.env.MINIO_PORT ?? 9000),
+  useSSL: process.env.MINIO_USE_SSL === 'true',
+  accessKey: required('MINIO_ACCESS_KEY'),
+  secretKey: required('MINIO_SECRET_KEY'),
+})
+
+export async function ensureBucket() {
+  if (!(await client.bucketExists(BUCKET))) {
+    await client.makeBucket(BUCKET, 'us-east-1')
+  }
+}
+
+export function buildKey({ tenant, kind, filename }) {
+  const year = new Date().getUTCFullYear()
+  const safe = basename(filename).replace(/[^\w.-]+/g, '-').toLowerCase()
+  return `${tenant}/${year}/${kind}/${randomUUID()}-${safe}`
+}</code></pre>
+        <p>La clave la genera el servidor, no el cliente. Así se evita que dos personas suban a la misma ruta, que un nombre con <code>../</code> escape del prefijo y que el tenant se pueda falsificar. El tenant va primero para poder listar y aplicar políticas por cliente; el año dentro del tenant ordena y permite lifecycle por prefijo.</p>
+        <pre><code class="language-javascript">// src/storage.mjs (continuación)
+export async function uploadDocument({ tenant, kind, filePath, contentType }) {
+  const key = buildKey({ tenant, kind, filename: filePath })
+  const size = statSync(filePath).size
+  const metaData = {
+    'Content-Type': contentType,
+    'X-Amz-Meta-Tenant': tenant,
+    'X-Amz-Meta-Kind': kind,
+    'X-Amz-Meta-Original-Name': basename(filePath),
+  }
+  const etag = await client.putObject(
+    BUCKET, key, createReadStream(filePath), size, metaData,
+  )
+  return { key, etag, size }
+}
+
+export async function listDocuments(prefix = '') {
+  const items = []
+  const stream = client.listObjectsV2(BUCKET, prefix, true)
+  for await (const obj of stream) {
+    items.push({
+      key: obj.name,
+      size: obj.size,
+      etag: obj.etag,
+      lastModified: obj.lastModified,
+    })
+  }
+  return items
+}
+
+export async function openDocument(key) {
+  const stat = await client.statObject(BUCKET, key)
+  const stream = await client.getObject(BUCKET, key)
+  return { stream, stat }
+}
+
+export async function deleteDocument(key) {
+  await client.removeObject(BUCKET, key)
+}</code></pre>
+        <p>Con esas funciones, la API sube un PDF, lista el prefijo del tenant y descarga el objeto a disco con <code>pipeline</code>. El listado y la descarga se detallan en la <a href="./04-descargas-y-transformaciones.html">última lección del módulo</a>.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un cliente por proceso</p>
+          <p><code>Minio.Client</code> reutiliza el <em>pool</em> de sockets. Crear uno por petición funciona, pero multiplica conexiones y handshakes TLS. Exporta una instancia y reúsala; si necesitas otro endpoint, crea otro cliente explícitamente.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz</th><th>Evita</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Validar la configuración al arrancar y fallar rápido</td><td>Arrancar con variables vacías y descubrir el fallo en la primera subida</td><td>Un error de configuración es determinista; detectarlo al inicio ahorra depuración en producción.</td></tr>
+            <tr><td>Usar un usuario de aplicación con permisos por prefijo</td><td>Poner las credenciales root en el servicio</td><td>Root no se puede limitar por política y un despliegue comprometido expone todo el servidor.</td></tr>
+            <tr><td>Reutilizar una sola instancia del cliente</td><td>Crear un <code>new Minio.Client</code> por cada petición HTTP</td><td>El pool de sockets y las conexiones TLS se reaprovechan; crear clientes añade latencia.</td></tr>
+            <tr><td>Usar streams y <code>pipeline</code> para ficheros</td><td>Cargar un PDF de 200 MB con <code>readFile</code></td><td>El proceso crece en memoria y puede morir por OOM; el stream mantiene el uso acotado.</td></tr>
+            <tr><td>Comprobar existencia con <code>statObject</code></td><td>Listar el prefijo para ver si «ya está»</td><td><code>statObject</code> es una petición <code>HEAD</code>; listar puede recorrer miles de claves y cuesta más.</td></tr>
+            <tr><td>Registrar <code>amzRequestid</code> con el error</td><td>Guardar solo el mensaje</td><td>El identificador permite correlacionar con los logs del servidor sin exponer credenciales.</td></tr>
+            <tr><td>Fijar una versión del SDK y actualizarla con pruebas</td><td>Depender de <code>latest</code> en producción</td><td>Los cambios de comportamiento en firma o multipart son raros, pero un despliegue reproducible los detecta.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Poner la URL completa en <code>endPoint</code></h3>
+        <span class="code-label code-label--wrong">Mal — mezclar esquema, host y puerto</span>
+        <pre><code class="language-javascript">const client = new Minio.Client({
+  endPoint: 'http://localhost:9000', // ❌ ENOTFOUND http
+  accessKey: 'app',
+  secretKey: 'secreto',
+})</code></pre>
+        <span class="code-label code-label--right">Bien — host, puerto y TLS por separado</span>
+        <pre><code class="language-javascript">const client = new Minio.Client({
+  endPoint: 'localhost',
+  port: 9000,
+  useSSL: false,
+  accessKey: 'app',
+  secretKey: 'secreto',
+})</code></pre>
+        <p>El SDK construye la URL con <code>https://</code> o <code>http://</code> según <code>useSSL</code>. Si le pasas un esquema, lo trata como parte del nombre del host.</p>
+
+        <h3>2. Olvidar que <code>useSSL</code> es <code>true</code> por defecto</h3>
+        <span class="code-label code-label--wrong">Mal — dejar el valor por defecto en local</span>
+        <pre><code class="language-javascript">new Minio.Client({ endPoint: 'localhost', port: 9000, accessKey, secretKey })
+// ❌ write EPROTO ... wrong version number</code></pre>
+        <span class="code-label code-label--right">Bien — decidirlo con una variable explícita</span>
+        <pre><code class="language-javascript">useSSL: process.env.MINIO_USE_SSL === 'true'</code></pre>
+        <p>El error de «wrong version number» significa que el cliente habló TLS contra un puerto que habla HTTP. No es un problema de credenciales.</p>
+
+        <h3>3. Usar <code>localhost</code> dentro de un contenedor</h3>
+        <span class="code-label code-label--wrong">Mal — la API corre en otro contenedor</span>
+        <pre><code class="language-bash">MINIO_ENDPOINT=localhost   # ❌ dentro del contenedor es él mismo</code></pre>
+        <span class="code-label code-label--right">Bien — el nombre del servicio en la red de Compose</span>
+        <pre><code class="language-bash">MINIO_ENDPOINT=minio       # nombre del servicio en docker-compose.yml</code></pre>
+        <p>En tu máquina, <code>localhost:9000</code> funciona porque el puerto está publicado. Dentro de la red de Compose, cada servicio tiene su propio <code>localhost</code> y debe usar el nombre del servicio.</p>
+
+        <h3>4. Pasar un stream sin tamaño</h3>
+        <span class="code-label code-label--wrong">Mal — el SDK no puede planificar la subida</span>
+        <pre><code class="language-javascript">await client.putObject(bucket, key, createReadStream(path))
+// ❌ size must be provided for stream</code></pre>
+        <span class="code-label code-label--right">Bien — tamaño conocido antes de subir</span>
+        <pre><code class="language-javascript">const { size } = statSync(path)
+await client.putObject(bucket, key, createReadStream(path), size, meta)</code></pre>
+        <p>Con un <code>Buffer</code> el tamaño se deduce del contenido. Con un stream no hay forma de saberlo sin consumirlo, y el SDK se niega en lugar de buffearlo entero en memoria.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> levantar MinIO, conectar el cliente, subir un objeto con metadatos y comprobar desde <code>mc</code> que lo que ves en la API coincide con lo que hay en el servidor.</p>
+        <ol class="steps">
+          <li>
+            <strong>Arranca MinIO con credenciales de desarrollo:</strong>
+            <pre><code class="language-bash">docker run -d --name minio-sdk \
+  -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin123 \
+  -v minio-sdk-data:/data \
+  quay.io/minio/minio server /data --console-address ":9001"</code></pre>
+            <p>Salida esperada: el id del contenedor. La consola queda en <code>http://localhost:9001</code>.</p>
+          </li>
+          <li>
+            <strong>Crea el proyecto y el fichero de entorno:</strong>
+            <pre><code class="language-bash">mkdir laboratorio-sdk &amp;&amp; cd laboratorio-sdk
+npm init -y
+npm pkg set type=module
+npm install minio@^8.0.7
+cp .env.example .env</code></pre>
+            <p><code>.env.example</code> contiene los nombres, nunca los secretos reales:</p>
+            <pre><code class="language-bash">MINIO_ENDPOINT=localhost
+MINIO_PORT=9000
+MINIO_USE_SSL=false
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin123
+MINIO_BUCKET=documentos</code></pre>
+          </li>
+          <li>
+            <strong>Guarda el código de la sección 3 como <code>cliente.mjs</code> y ejecútalo:</strong>
+            <pre><code class="language-bash">node --env-file=.env cliente.mjs</code></pre>
+            <pre><code class="language-text">bucket documentos creado
+5 9c1e0b2a4d5f60718293a4b5c6d7e8f9 text/plain; charset=utf-8
+acme</code></pre>
+          </li>
+          <li>
+            <strong>Verifica desde <code>mc</code>:</strong>
+            <pre><code class="language-bash">mc alias set local http://localhost:9000 minioadmin minioadmin123
+mc ls -r local/documentos
+mc stat local/documentos/acme/2026/11/hola.txt</code></pre>
+            <pre><code class="language-text">[2026-11-05 10:12:44 CET]     5B STANDARD hola.txt
+Name      : hola.txt
+Size      : 5 B
+ETag      : 9c1e0b2a4d5f60718293a4b5c6d7e8f9
+Type      : text/plain
+Metadata  :
+  X-Amz-Meta-Tenant : acme</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba la idempotencia del bucket y la sobrescritura:</strong> vuelve a ejecutar el programa. No debe aparecer «bucket creado», y el <code>ETag</code> será el mismo porque el contenido es idéntico. Cambia el texto a <code>hola otra vez</code>, vuelve a ejecutar y observa que el <code>ETag</code> y el tamaño cambian.</li>
+          <li>
+            <strong>Provoca un error de configuración controlado:</strong> arranca con <code>MINIO_USE_SSL=true</code> y anota el mensaje. Después prueba con <code>MINIO_PORT=9001</code>. Los dos fallan, pero por motivos distintos: uno es TLS y el otro es la consola web. Saber distinguirlos es el objetivo del paso.</li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Comprobación final</p>
+          <p><code>mc ls</code> debe mostrar exactamente la misma clave que devolvió el SDK. Si la clave tiene caracteres raros, revisa que no estés construyéndola con rutas absolutas de Windows: la clave S3 siempre usa <code>/</code>.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un inspector de objetos</h3>
+          <p>Escribe <code>inspect.mjs &lt;key&gt;</code> que imprima tamaño, ETag, fecha, content-type y todos los metadatos de usuario de un objeto. Debe detectar si el ETag corresponde a una subida multipart (contiene un guion y un número de partes) y, en ese caso, avisar de que <strong>no</strong> es el MD5 del contenido.</p>
+          <p>Después, haz que acepte un prefijo en lugar de una clave: si termina en <code>/</code>, lista los objetos y muestra un resumen por <em>kind</em> (el metadato que pusimos al subir). Debe funcionar con más de 1000 objetos, sin cargar todo en memoria de golpe.</p>
+          <p><em>Pista: <code>statObject</code> para la clave exacta y <code>listObjectsV2</code> para el prefijo. Para el resumen, agrupa mientras recorres el stream; no necesitas un array intermedio.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>minio-js</code> es un cliente de servidor: firma cada petición con SigV4 y no debe usarse en el navegador.</li>
+          <li><code>endPoint</code> es un host, no una URL; el esquema lo decide <code>useSSL</code> y el puerto va aparte.</li>
+          <li><code>useSSL</code> vale <code>true</code> por defecto: en local hay que desactivarlo explícitamente.</li>
+          <li>El cliente se crea una vez y se reutiliza; los permisos se evalúan en el servidor en cada operación.</li>
+          <li><code>getObject</code> devuelve un stream: consúmelo con <code>pipeline</code> o <code>for await</code>.</li>
+          <li>Con streams, <code>putObject</code> exige el tamaño; con buffers, no.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Método</th><th>Petición</th><th>Para qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>bucketExists(name)</code></td><td><code>HEAD /bucket</code></td><td>Saber si el bucket existe antes de crearlo</td></tr>
+            <tr><td><code>makeBucket(name, region)</code></td><td><code>PUT /bucket</code></td><td>Crear un bucket; falla si ya existe</td></tr>
+            <tr><td><code>putObject(bucket, key, body, size, meta)</code></td><td><code>PUT /bucket/key</code></td><td>Subir un objeto con content-type y metadatos</td></tr>
+            <tr><td><code>getObject(bucket, key)</code></td><td><code>GET /bucket/key</code></td><td>Descargar como stream</td></tr>
+            <tr><td><code>listObjectsV2(bucket, prefix, recursive)</code></td><td><code>GET /bucket?list-type=2</code></td><td>Recorrer claves por prefijo, paginando solo</td></tr>
+            <tr><td><code>statObject(bucket, key)</code></td><td><code>HEAD /bucket/key</code></td><td>Leer tamaño, ETag y metadatos sin descargar</td></tr>
+            <tr><td><code>removeObject(bucket, key)</code></td><td><code>DELETE /bucket/key</code></td><td>Borrar un objeto o una versión concreta</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <div class="faq">
+          <details>
+            <summary>¿Puedo usar <code>minio-js</code> en el navegador?</summary>
+            <div>
+              <p>No para operaciones autenticadas. El cliente necesita la <code>secretKey</code> para firmar, y cualquier secreto que llegue al navegador deja de ser secreto. Para subidas y descargas desde el navegador se usan presigned URLs, que veremos en la <a href="./02-subidas-directas.html">lección 2</a>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Por qué el ETag no coincide con el MD5 que calculo?</summary>
+            <div>
+              <p>En una subida simple, el ETag suele ser el MD5 del contenido. En una subida multipart es el MD5 de los MD5 de cada parte, con el sufijo <code>-N</code>. Y con cifrado SSE-KMS el ETag deja de ser un hash del contenido. No uses el ETag como verificación de integridad sin entender el caso; lo detallamos en la <a href="./03-errores-reintentos-y-checksums.html">lección 3</a>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Tengo que crear el bucket desde la aplicación?</summary>
+            <div>
+              <p>Puedes, pero en producción suele ser una tarea de aprovisionamiento: el bucket se crea con <code>mc mb</code> o con infraestructura declarativa, y la aplicación solo comprueba que existe. Si la aplicación lo crea, dale permiso <code>s3:CreateBucket</code> solo al usuario de arranque, no al de cada petición.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Qué región pongo si MinIO no es AWS?</summary>
+            <div>
+              <p>MinIO acepta <code>us-east-1</code> por defecto y no requiere una región real. Si tu despliegue tiene una región configurada, usa la misma. Lo importante es que la firma y el servidor coincidan; un valor inventado puede producir <code>AuthorizationHeaderMalformed</code>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>¿Cómo distingo un problema de red de uno de permisos?</summary>
+            <div>
+              <p>Los errores de red no son <code>S3Error</code>: llegan como <code>ECONNREFUSED</code>, <code>ENOTFOUND</code>, <code>ETIMEDOUT</code> o errores de TLS. Los de permisos sí son <code>S3Error</code> con <code>code: 'AccessDenied'</code> y un <code>statusCode</code> 403. Captura ambos por separado; en la lección 3 montamos la taxonomía completa.</p>
+            </div>
+          </details>
+        </div>
+      </section>
+    </article>
+  </main>
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>
