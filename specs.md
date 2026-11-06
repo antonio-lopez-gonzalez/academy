@@ -54,7 +54,7 @@ curso y en su `AGENTS.md`.
 | `Aprende Git` | Git: del modelo interno al rescate | `spec.md` | `git-theme/progress` | 8 | 32 | `proyectos/laboratorio` |
 | `Aprende RabbitMQ` | RabbitMQ: mensajería fiable (AMQP, DLQ, quorum) | `spec.md` | `rmq-theme/progress` | 8 | 32 | `proyectos/job-queue` |
 | `Aprende MinIO` | MinIO: almacenamiento de objetos S3 | `spec.md` | `minio-theme/progress` | 8 | 32 | `proyectos/document-store` |
-| `Aprende AI-DLC con Cursor y Claude` | AI-DLC: ciclo de vida auditable (Cursor + Claude) | `spec.md` | `aidlc-theme/progress` | 8 | 32 | `proyectos/aidlc-lite` |
+| `Aprende AI-DLC con Cursor y Claude` | AI-DLC: ciclo de vida auditable (Cursor + Claude) | `spec.md` | `aidlc-theme/progress` | 9 | 36 | `proyectos/aidlc-lite` |
 
 > Los conteos de módulos/lecciones son los de `web/modulos/`. Cada curso añade además `web/recursos/`
 > (cheatsheet, glosario, FAQ). Las claves se escriben completas como `<clave>-theme` y `<clave>-progress`.

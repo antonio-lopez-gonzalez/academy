@@ -19,6 +19,8 @@ El curso enseña el **por qué**:
 El hilo conductor es **un equipo pequeño que construye una API de inventario** y aprende a operarla con AI-DLC primero en Claude Code, luego en Cursor y finalmente en ambos a la vez.
 
 > Stack fijado: **AI-DLC 2.x** (repositorio `awslabs/aidlc-workflows`, licencia MIT-0), **Claude Code** como harness CLI y **Cursor** como harness IDE. Node.js 22 LTS para el proyecto ejecutable. No se enseña a modificar el motor interno de AI-DLC; se enseña a usarlo y a entender su arquitectura.
+>
+> **Versión fijada:** línea estable **2.11.3** en el momento de la redacción. Los conceptos (5 fases, 33 etapas, 14 agentes, 11 perfiles, gates, sensores, audit trail) son los de 2.x; los detalles que cambian entre releases menores se señalan en la lección correspondiente. `aidlc-lite` es un motor didáctico inspirado en esta mecánica, no un clon de AI-DLC 2.x.
 
 ---
 
@@ -113,43 +115,49 @@ Cada lección sigue EXACTAMENTE las 10 secciones del contrato Academy:
 - **03-fases-y-etapas.html** — Las 5 fases y las 33 etapas; inicialización, ideación, inception, construction y operation.
 - **04-perfiles-de-workflow.html** — Los 11 perfiles: classic, express, feature, enterprise, mvp, poc, bugfix, refactor, infra, security-patch y workshop.
 
-## Módulo 1 — Claude Code
+## Módulo 1 — Initialization
+- **01-que-es-initialization.html** — La fase de arranque: setup del proyecto y estado inicial del intent.
+- **02-configurar-el-proyecto.html** — `aidlc config`, qué escribe, qué commitear y cómo refrescar.
+- **03-spaces-e-intents.html** — `aidlc/`, spaces, intents, `aidlc-state.md` y estado compartido.
+- **04-claude-vs-cursor.html** — Comparativa de harnesses, equipos híbridos y sincronización.
+
+## Módulo 2 — Claude Code
 - **01-instalar-claude-code.html** — Requisitos, instalación y autenticación de Claude Code.
 - **02-instalar-aidlc-para-claude.html** — Instalador nativo y `aidlc config --harness claude`.
 - **03-estructura-y-doctor.html** — `.claude/`, `aidlc/`, `CLAUDE.md` y `aidlc doctor`.
 - **04-primer-workflow-en-claude.html** — `/aidlc`, propuesta de plan y primer gate.
 
-## Módulo 2 — Cursor
+## Módulo 3 — Cursor
 - **01-cursor-ide-y-cli.html** — Cursor IDE, CLI `agent`, requisitos y plan de pago.
 - **02-instalar-aidlc-para-cursor.html** — `git init`, `aidlc config --harness cursor` y hooks.
 - **03-reglas-y-hooks-en-cursor.html** — `.cursor/rules`, `.cursor/hooks.json` y subagentes.
 - **04-primer-workflow-en-cursor.html** — `/aidlc`, `/aidlc-status` y diferencias de renderizado.
 
-## Módulo 3 — Perfiles y comparativa
-- **01-elegir-perfil.html** — Cómo elegir el perfil correcto para cada trabajo.
-- **02-depth-y-test-strategy.html** — Profundidad, estrategia de pruebas y techo de revisión.
-- **03-claude-vs-cursor.html** — Comparativa práctica: cuándo usar cada harness.
-- **04-equipos-hibridos.html** — Sincronizar reglas, conocimiento y estado entre ambos.
-
-## Módulo 4 — Inception
+## Módulo 4 — Ideation
 - **01-intent-capture.html** — De la petición al enunciado de intención.
-- **02-feasibility-y-requisitos.html** — Viabilidad, requisitos y NFRs.
-- **03-diseno-y-plan.html** — Diseño, unidades de trabajo y plan aprobado.
-- **04-gates-de-aprobacion.html** — Aprobar, cambiar, saltar o rechazar en cada harness.
+- **02-viabilidad-y-restricciones.html** — Veredicto de viabilidad, evidencia y restricciones.
+- **03-alternativas-y-riesgos.html** — Opciones, trade-offs, riesgos, supuestos y decisiones descartadas.
+- **04-gate-de-ideation.html** — El gate que autoriza a pasar a Inception.
 
-## Módulo 5 — Construction
+## Módulo 5 — Inception
+- **01-requisitos-y-nfrs.html** — Requisitos funcionales, NFRs, criterios de aceptación y trazabilidad.
+- **02-diseno-y-plan.html** — Diseño, ADR, unidades, plan y fingerprint.
+- **03-plan-unidades-y-trazabilidad.html** — Unidades, dependencias, depth, test strategy y trazabilidad.
+- **04-gate-de-inception.html** — Aprobar, cambiar, saltar o rechazar la spec y el plan.
+
+## Módulo 6 — Construction
 - **01-code-generation.html** — Generación de código bajo plan approval.
 - **02-tests-y-checkpoints.html** — Pruebas, verificación y checkpoints por unidad.
-- **03-revisores-y-evidencias.html** — Agentes revisores y evidencia ligada a fuentes.
-- **04-units-y-swarm.html** — Unidades de trabajo, orden stage-major/unit-major y swarm.
+- **03-revisores-y-evidencias.html** — Agentes revisores, sensores y evidencia ligada a fuentes.
+- **04-units-y-swarm.html** — Unidades, orden stage-major/unit-major, swarm y guard policy.
 
-## Módulo 6 — Sensores y operación
-- **01-sensores-deterministas.html** — Sensores, checks y evidencia.
-- **02-guard-policy.html** — Guard policy, fences y límites.
-- **03-audit-trail.html** — Estado persistente, audit trail y reconstrucción.
-- **04-operacion-y-feedback.html** — Deploy, feedback, incidentes y learnings.
+## Módulo 7 — Operation
+- **01-deploy-y-verificacion.html** — Despliegue, smoke tests, SLOs, rollback y gate de operación.
+- **02-feedback-e-incidentes.html** — Telemetría, soporte, incidentes y postmortem.
+- **03-auditoria-y-reconstruccion.html** — Estado, audit trail y reconstrucción de incidentes.
+- **04-learnings-y-mejora-continua.html** — De la corrección a la regla, el sensor o el cambio de perfil.
 
-## Módulo 7 — Proyecto final
+## Módulo 8 — Proyecto final
 - **01-arquitectura-aidlc-lite.html** — Diseño del motor didáctico. *(project)*
 - **02-estado-y-gates.html** — Máquina de estados y gates. *(project)*
 - **03-reglas-y-proyeccion.html** — Reglas por capas y proyección a Cursor/Claude. *(project)*
@@ -160,7 +168,7 @@ Cada lección sigue EXACTAMENTE las 10 secciones del contrato Academy:
 - **glosario.html** — Stage, gate, scope, sensor, guard, audit, harness…
 - **faq.html** — FAQ general del curso.
 
-**Total: 8 módulos (0-7), 32 lecciones + 3 recursos.**
+**Total: 9 módulos (0-8), 36 lecciones + 3 recursos.**
 
 ---
 
@@ -176,7 +184,7 @@ Aprende AI-DLC con Cursor y Claude/
 ├── web/
 │   ├── index.html
 │   ├── assets/{css,js,fonts,favicon.svg}
-│   ├── modulos/00-fundamentos/ … 07-proyecto-final/
+│   ├── modulos/00-fundamentos/ … 08-proyecto-final/
 │   ├── recursos/{cheatsheet,glosario,faq}.html
 │   └── descargas/Aprende-AI-DLC-con-Cursor-y-Claude.zip
 ├── scripts/serve-web.mjs
@@ -238,7 +246,7 @@ Hero con eyebrow, firma animada, lead, botones (empezar, índice, cheatsheet, de
 - [x] Portada `web/index.html` + firma.
 
 ## Fase 2 — Lecciones ✅
-- [x] 00-fundamentos … 07-proyecto-final (32 lecciones).
+- [x] 00-fundamentos … 08-proyecto-final (36 lecciones).
 
 ## Fase 3 — Recursos ✅
 - [x] `web/recursos/{cheatsheet,glosario,faq}.html`.
