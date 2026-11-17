@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="03-servidor-y-tests">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Servidor HTTP y tests — Módulo 7 · Curso Rust</title>
+  <meta name="description" content="El servidor de urlshort con axum 0.8: router con Service como estado, POST /links, redirección 302, errores como JSON y tests de integración con tower::oneshot y un puerto real.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Servidor HTTP y tests</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El <code>Service</code> ya sabe acortar, resolver y borrar. El servidor es una segunda puerta al mismo mostrador: traduce HTTP a llamadas de caso de uso y traduce los errores de vuelta a códigos de estado. Nada de la lógica de urlshort se duplica aquí; si algo se duplica, está en el sitio equivocado.</p>
+        <p>Con <code>axum</code> 0.8 el servidor cabe en un fichero. Lo difícil no es montarlo: es <strong>demostrar que funciona</strong>. Un test que abre un puerto, espera y hace peticiones es lento y frágil; el mismo router se puede ejercitar en memoria, sin red, en milisegundos.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque la diferencia entre «funciona en mi máquina» y «funciona» son los tests de integración. Aquí aprendes a llamar al router como si fueras un cliente HTTP sin abrir un socket, a arrancar uno de verdad en un puerto efímero para probar el cableado, y a comprobar que cincuenta peticiones concurrentes cuentan cincuenta visitas y no cuarenta y nueve.</p>
+        </div>
+        <p>Al terminar tendrás cuatro rutas (<code>GET /health</code>, <code>POST /links</code>, <code>GET /links/{code}</code>, <code>DELETE /links/{code}</code>), errores como JSON con el estado correcto, <code>ApiError</code> implementando <code>IntoResponse</code> y una batería de tests que corre en CI.</p>
+        <ul>
+          <li>Devolver <code>200</code> en todo y dejar que el cliente adivine si hubo error.</li>
+          <li>Escribir el error como texto plano en una ruta y como JSON en otra.</li>
+          <li>Testear el servidor solo con <code>curl</code> a mano: nadie lo repetirá en CI.</li>
+          <li>Compartir el store con un <code>Mutex</code> externo y serializar peticiones que solo leen.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Un router, cuatro rutas y un estado</h3>
+        <p><code>Router::with_state(service)</code> entrega una copia del <code>Service</code> a cada handler que lo pida con <code>State&lt;Service&gt;</code>. Como <code>Service</code> es <code>Clone</code>, la copia es un <code>Arc</code> más un <code>String</code>; el estado real (el mapa) sigue compartido dentro del adaptador.</p>
+        <pre class="diagram">        petición HTTP
+             │
+             ▼
+   ┌───────────────────────┐
+   │ Router                │  /health · /links · /links/{code}
+   │ layer TraceLayer      │
+   └──────────┬────────────┘
+              │ State&lt;Service&gt; (copia barata)
+   ┌──────────▼────────────┐
+   │ handler               │  extrae Path / Json, llama al Service
+   └──────────┬────────────┘
+              │ Result&lt;T, Error&gt;
+   ┌──────────▼────────────┐
+   │ ApiError: IntoResponse│  InvalidUrl 400 · NotFound 404
+   └───────────────────────┘  Conflict 409 · resto 500</pre>
+        <table>
+          <thead><tr><th>Ruta</th><th>Éxito</th><th>Fallo típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /health</code></td><td><code>200</code> con <code>ok</code></td><td>—</td></tr>
+            <tr><td><code>POST /links</code></td><td><code>201</code> + <code>Location</code> + JSON del enlace</td><td><code>400</code> URL inválida, <code>409</code> sin códigos libres</td></tr>
+            <tr><td><code>GET /links/{code}</code></td><td><code>302</code> + <code>Location</code> a la URL original</td><td><code>404</code> código desconocido</td></tr>
+            <tr><td><code>DELETE /links/{code}</code></td><td><code>204</code> sin cuerpo</td><td><code>404</code> código desconocido</td></tr>
+          </tbody>
+        </table>
+        <p>El mapeo vive en <code>impl From&lt;Error&gt; for ApiError</code>: un solo sitio que mirar cuando cambia el contrato. <code>InvalidUrl</code> es culpa del cliente (400), <code>NotFound</code> es 404, <code>Conflict</code> es 409 —el cliente puede reintentar con otra URL— y todo lo demás es 500.</p>
+        <h3>302 y no 200: la diferencia entre redirigir y contar</h3>
+        <p>Un acortador existe para que el navegador vaya a otro sitio. <code>302 Found</code> con <code>Location</code> es la respuesta clásica: el cliente vuelve a pedir la URL original y la barra de direcciones cambia. <code>307</code> conserva el método; <code>301</code>/<code>308</code> se cachean y harían difícil cambiar el destino. Aquí usamos <code>StatusCode::FOUND</code>.</p>
+        <h3>Concurrencia: quién protege qué</h3>
+        <p>El trait <code>Store: Send + Sync</code> y el <code>Mutex</code> interno son la única protección. <code>Service</code> se clona por petición; los handlers no comparten nada mutable. <code>MemoryStore</code> y <code>JsonStore</code> serializan sus accesos con <code>std::sync::Mutex</code>, que es correcto porque <strong>el candado no se cruza con un <code>.await</code></strong>: se toma, se opera y se suelta dentro de una función síncrona.</p>
+        <p>Si algún día el adaptador hiciera E/S remota, el candado de <code>std</code> bloquearía un hilo del runtime. Entonces tocaría <code>tokio::sync::Mutex</code> o <code>spawn_blocking</code>. Con un fichero local, el bloqueo es de microsegundos y el diseño simple gana.</p>
+        <h3>Qué se prueba y con qué</h3>
+        <table>
+          <thead><tr><th>Nivel</th><th>Qué demuestra</th><th>Coste</th></tr></thead>
+          <tbody>
+            <tr><td><code>oneshot</code></td><td>Rutas, extractores, códigos y cuerpos, sin red</td><td>Milisegundos; el 90 % de los tests</td></tr>
+            <tr><td>Puerto efímero</td><td>Que el cableado (listener + <code>axum::serve</code>) funciona</td><td>Un socket y unos milisegundos</td></tr>
+            <tr><td>Concurrencia</td><td>Que el store no pierde incrementos</td><td>Varias tareas y un runtime multi-hilo</td></tr>
+            <tr><td>CI</td><td>Que todo lo anterior se ejecuta en cada PR</td><td>Un YAML y minutos de máquina</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un servidor con estado y una ruta, sin dominio. Compila con <code>cargo add axum tokio --features tokio/full</code>.</p>
+        <pre><code class="language-rust">use axum::{extract::State, routing::get, Json, Router};
+use serde_json::{json, Value};
+
+#[derive(Clone)]
+struct AppState {
+    base_url: String,
+}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState { base_url: "http://localhost:3000".into() };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/info", get(info))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn health() -&gt; &amp;'static str {
+    "ok"
+}
+
+async fn info(State(state): State&lt;AppState&gt;) -&gt; Json&lt;Value&gt; {
+    Json(json!({ "base_url": state.base_url }))
+}</code></pre>
+        <p>Las piezas que importan:</p>
+        <ul>
+          <li><code>with_state</code> convierte <code>Router&lt;AppState&gt;</code> en <code>Router&lt;()&gt;</code>, el único que puede servirse.</li>
+          <li><code>State&lt;AppState&gt;</code> es un extractor: axum clona el estado por petición, por eso debe ser <code>Clone</code>.</li>
+          <li><code>Json&lt;Value&gt;</code> como retorno fija el <code>Content-Type: application/json</code> sin escribirlo a mano.</li>
+          <li><code>axum::serve(listener, app)</code> es la forma canónica en 0.8; ya no se usa <code>Server::bind</code>.</li>
+        </ul>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>server.rs</code> completo. La primera mitad traduce dominio a JSON; la segunda, errores a respuestas HTTP.</p>
+        <pre><code class="language-rust">// src/server.rs
+use std::net::SocketAddr;
+
+use axum::{
+    extract::{Path, State},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use tower_http::trace::TraceLayer;
+
+use crate::domain::Link;
+use crate::error::Error;
+use crate::service::Service;
+
+#[derive(Debug, Deserialize)]
+pub struct CreateLink {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LinkResponse {
+    pub code: String,
+    pub url: String,
+    pub short_url: String,
+    pub hits: u64,
+    pub created_at: String,
+}
+
+impl LinkResponse {
+    fn new(link: &amp;Link, short_url: String) -&gt; Self {
+        Self {
+            code: link.code().to_string(),
+            url: link.url().to_string(),
+            short_url,
+            hits: link.hits(),
+            created_at: link.created_at().to_string(),
+        }
+    }
+}
+
+pub fn router(service: Service) -&gt; Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/links", post(create_link))
+        .route("/links/{code}", get(resolve_link).delete(delete_link))
+        .layer(TraceLayer::new_for_http())
+        .with_state(service)
+}
+
+pub async fn serve(service: Service, addr: SocketAddr) -&gt; std::io::Result&lt;()&gt; {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("urlshort escuchando en http://{addr}");
+    axum::serve(listener, router(service)).await
+}</code></pre>
+        <p>Los cuatro handlers. Fíjate en que ninguno imprime ni registra: devuelven datos o un <code>ApiError</code>, y el middleware decide qué se anota.</p>
+        <pre><code class="language-rust">async fn health() -&gt; &amp;'static str { "ok" }
+
+async fn create_link(
+    State(service): State&lt;Service&gt;,
+    Json(body): Json&lt;CreateLink&gt;,
+) -&gt; Result&lt;impl IntoResponse, ApiError&gt; {
+    let link = service.short(&amp;body.url)?;
+    let short_url = link.short_url(service.base_url());
+    let location = HeaderValue::from_str(&amp;short_url)
+        .map_err(|_| ApiError::internal("la URL corta no es cabecera válida"))?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        Json(LinkResponse::new(&amp;link, short_url)),
+    ))
+}
+async fn resolve_link(
+    State(service): State&lt;Service&gt;,
+    Path(code): Path&lt;String&gt;,
+) -&gt; Result&lt;impl IntoResponse, ApiError&gt; {
+    let link = service.resolve(&amp;code)?;          // suma una visita
+    let location = HeaderValue::from_str(link.url())
+        .map_err(|_| ApiError::internal("la URL guardada no es cabecera válida"))?;
+    Ok((StatusCode::FOUND, [(header::LOCATION, location)]))
+}
+async fn delete_link(
+    State(service): State&lt;Service&gt;,
+    Path(code): Path&lt;String&gt;,
+) -&gt; Result&lt;StatusCode, ApiError&gt; {
+    service.delete(&amp;code)?;
+    Ok(StatusCode::NO_CONTENT)
+}</code></pre>
+        <p>El error HTTP es una estructura, no un <code>String</code>. El mapeo desde <code>Error</code> es la única tabla de traducción del proyecto, y los detalles internos no salen al cliente.</p>
+        <pre><code class="language-rust">pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn internal(message: impl Into&lt;String&gt;) -&gt; Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: message.into() }
+    }
+}
+
+impl From&lt;Error&gt; for ApiError {
+    fn from(err: Error) -&gt; Self {
+        let status = match &amp;err {
+            Error::InvalidUrl(_) =&gt; StatusCode::BAD_REQUEST,
+            Error::NotFound(_) =&gt; StatusCode::NOT_FOUND,
+            Error::Conflict(_) =&gt; StatusCode::CONFLICT,
+            _ =&gt; StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        // Un 500 no cuenta al cliente si el disco falló: se registra y se dice poco.
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "error interno".to_string()
+        } else {
+            err.to_string()
+        };
+        Self { status, message }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -&gt; Response {
+        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+    }
+}</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title"><code>TraceLayer</code> no imprime por artefacto</p>
+          <p><code>TraceLayer::new_for_http()</code> emite eventos de <code>tracing</code>. Sin un <code>tracing-subscriber</code> instalado no verás nada: añade <code>tracing-subscriber</code> con la feature <code>env-filter</code> y llama a <code>fmt().with_env_filter(…).init()</code> en <code>main</code>. El middleware ya está en su sitio; falta enchufar la salida.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un <code>impl From&lt;Error&gt; for ApiError</code></td><td>Un <code>match</code> de errores en cada handler</td><td>La tabla de estados se lee una vez y no se desincroniza.</td></tr>
+            <tr><td><code>Json&lt;CreateLink&gt;</code> como extractor</td><td>Leer el cuerpo a mano y parsearlo</td><td>axum responde 400/415 por ti y el tipo documenta el contrato.</td></tr>
+            <tr><td>Rutas con <code>{code}</code></td><td><code>:code</code> (sintaxis de axum 0.7)</td><td>En 0.8 los dos puntos no son un parámetro: el router entra en pánico al arrancar.</td></tr>
+            <tr><td><code>oneshot</code> para casi todo</td><td>Un puerto por cada test</td><td>Sin red los tests son deterministas y rápidos.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Un 409 también es un contrato</p>
+          <p><code>Conflict</code> al crear un enlace significa «no hay código libre». Es raro, pero si ocurre el cliente debe poder distinguirlo de un 500 y reintentar. Documenta cada estado en el README: los estados son parte de la API, igual que los campos del JSON.</p>
+        </div>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Usar <code>:code</code> en axum 0.8</h3>
+        <pre><code class="language-rust">let app = Router::new().route("/links/:code", get(resolve_link));</code></pre>
+        <p><strong>El error real</strong> no es de compilación: es un <em>panic</em> al construir el router.</p>
+        <pre><code class="language-text">thread 'main' panicked at ...:
+Invalid route: `:code` is not a valid path segment.
+Path segments must be enclosed in braces, e.g. `/links/{code}`</code></pre>
+        <p><strong>Por qué:</strong> axum 0.8 cambió la sintaxis para alinearse con <code>matchit</code> 0.8. <strong>Bien:</strong> <code>/links/{code}</code>. El <code>Path&lt;String&gt;</code> del handler no cambia.</p>
+        <h3>2. Olvidar <code>with_state</code></h3>
+        <pre><code class="language-rust">let app = Router::new().route("/links", post(create_link));   // falta el estado
+axum::serve(listener, app).await.unwrap();</code></pre>
+        <p><strong>El error real:</strong> <code>error[E0277]: the trait bound `Router&lt;Service&gt;: Service&lt;…&gt;` is not satisfied</code>, con la nota «the trait <code>Service</code> is implemented for <code>Router&lt;()&gt;</code>». <strong>Por qué:</strong> solo <code>Router&lt;()&gt;</code> puede servirse; mientras falte estado, el tipo lo dice. <strong>Bien:</strong> <code>.with_state(service)</code> al final de la cadena.</p>
+        <h3>3. Devolver 200 con el error dentro</h3>
+        <p><strong>Mal:</strong> <code>Ok(Json(json!({ "error": "no existe" })))</code>. El cliente tiene que leer el cuerpo para saber si fue bien y los reintentos automáticos no funcionan. <strong>Bien:</strong> <code>Err(ApiError::from(Error::NotFound(code)))</code> y el <code>IntoResponse</code> pone el 404.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> cubrir el router con tests que no abren puerto y uno que sí, más una prueba de concurrencia. Todo en <code>tests/server.rs</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Prepara el servicio de prueba.</strong> <code>MemoryStore</code> detrás de un <code>Arc</code>; el <code>Service</code> es <code>Clone</code>, así que puedes conservar una copia para inspeccionar el estado.
+            <pre><code class="language-rust">use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use tower::ServiceExt;
+use urlshort::server::router;
+use urlshort::service::Service;
+use urlshort::store::MemoryStore;
+
+fn service() -&gt; Service {
+    Service::new(Arc::new(MemoryStore::new()), "http://localhost:3000")
+}</code></pre>
+          </li>
+          <li>
+            <strong>Prueba el alta y la redirección.</strong> <code>oneshot</code> consume el router; clónalo si necesitas otra petición.
+            <pre><code class="language-rust">#[tokio::test]
+async fn post_devuelve_201_y_location() {
+    let app = router(service());
+    let response = app.oneshot(
+        Request::post("/links")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"url":"https://www.rust-lang.org"}"#))
+            .unwrap(),
+    ).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("http://localhost:3000/"));
+}
+
+#[tokio::test]
+async fn get_redirige_y_cuenta_la_visita() {
+    let service = service();
+    let code = service.short("https://example.com").unwrap().code().to_string();
+    let app = router(service.clone());
+
+    let response = app
+        .oneshot(Request::get(format!("/links/{code}")).body(Body::empty()).unwrap())
+        .await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.headers()[header::LOCATION].to_str().unwrap(), "https://example.com");
+    assert_eq!(service.list().unwrap()[0].hits(), 1);
+}</code></pre>
+          </li>
+          <li>
+            <strong>Arranca un puerto real, una vez.</strong> Puerto <code>0</code>: el sistema elige uno libre y lo lees con <code>local_addr</code>.
+            <pre><code class="language-rust">#[tokio::test]
+async fn responde_en_un_puerto_efimero() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router(service())).await.unwrap() });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await.unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&amp;mut raw).await.unwrap();
+    assert!(raw.starts_with("HTTP/1.1 200"));
+}</code></pre>
+          </li>
+          <li>
+            <strong>Prueba la concurrencia.</strong> Cincuenta tareas resuelven el mismo código; el contador debe sumar exactamente cincuenta, sin incrementos perdidos.
+            <pre><code class="language-rust">#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cincuenta_visitas_suman_cincuenta() {
+    let service = service();
+    let code = service.short("https://example.com").unwrap().code().to_string();
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let service = service.clone();
+        let code = code.clone();
+        handles.push(tokio::spawn(async move { service.resolve(&amp;code).unwrap() }));
+    }
+    for handle in handles { handle.await.unwrap(); }
+
+    assert_eq!(service.list().unwrap()[0].hits(), 50);
+}</code></pre>
+          </li>
+          <li>
+            <strong>Pasa todo y añade CI.</strong> <code>cargo test --all-targets</code> y <code>cargo clippy --all-targets -- -D warnings</code> en local; después, el mismo contrato en GitHub Actions.
+
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Puedes romper una ruta (<code>/links/{code}</code> por <code>/link/{code}</code>) y ver fallar exactamente los tests que la usan, mientras el resto sigue en verde. Eso es una suite que localiza el fallo, no una que se cae entera.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Enlaces caducados que responden 410</h3>
+          <p>Con la caducidad del reto anterior, un código vencido ya no existe para el dominio, pero un cliente HTTP merece saber que <em>existía</em> y ya no: <code>410 Gone</code>. Añade <code>GET /links/{code}</code> con esa distinción y un test que lo demuestre.</p>
+          <p>Restricciones: el dominio no debe importar axum; el mapeo vive en <code>server.rs</code>; el 410 debe incluir el mismo cuerpo JSON de error que el 404; y <code>list</code> no debe mostrar los caducados. ¿Creas una variante nueva en <code>Error</code> o reutilizas <code>NotFound</code> con un mensaje distinto? ¿Qué pasa con los hits de un enlace caducado?</p>
+          <p><em>Pista: si el dominio devuelve <code>NotFound</code> para ambos casos, la capa HTTP no puede distinguirlos sin mirar el mensaje, y eso es frágil. Una variante explícita (<code>Error::Expired</code>) mantiene el <code>match</code> exhaustivo: el compilador te obligará a mapearla en todos los adaptadores. Y no olvides que el reto de la lección 01 ya tocó el reloj: reutiliza esa decisión.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>router(service)</code> monta cuatro rutas y entrega el estado con <code>with_state</code>; los handlers reciben <code>State&lt;Service&gt;</code>.</li>
+          <li>En axum 0.8 los parámetros van con llaves: <code>/links/{code}</code>, nunca <code>:code</code>.</li>
+          <li><code>POST /links</code> responde 201 con <code>Location</code> y el enlace; <code>GET</code> responde 302 o 404; <code>DELETE</code>, 204 o 404.</li>
+          <li><code>ApiError</code> implementa <code>IntoResponse</code> y traduce <code>Error</code> a 400/404/409/500 en un solo sitio.</li>
+          <li><code>oneshot</code> prueba el router sin red; un puerto efímero (<code>:0</code>) prueba el cableado real.</li>
+          <li>Un test multi-hilo con cincuenta tareas demuestra que el <code>Mutex</code> del adaptador no pierde incrementos.</li>
+          <li>CI repite <code>fmt</code>, <code>clippy -D warnings</code> y <code>test --all-targets</code> en cada PR.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>Router::new().route(...)</code></td><td>Declara rutas y métodos; <code>{code}</code> es el parámetro de ruta.</td></tr>
+            <tr><td><code>.with_state(service)</code></td><td>Convierte <code>Router&lt;Service&gt;</code> en <code>Router&lt;()&gt;</code> servible.</td></tr>
+            <tr><td><code>State&lt;Service&gt;</code> / <code>Path&lt;String&gt;</code> / <code>Json&lt;T&gt;</code></td><td>Extractores de estado, ruta y cuerpo.</td></tr>
+            <tr><td><code>tower::ServiceExt::oneshot</code></td><td>Una petición contra el router sin abrir socket.</td></tr>
+            <tr><td><code>TcpListener::bind("127.0.0.1:0")</code></td><td>Puerto efímero para el test de cableado.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Por qué 302 y no 301?</summary>
+          <div>
+            <p>Porque un 301 es permanente y los navegadores lo cachean: si mañana cambias el destino del mismo código, algunos clientes seguirán yendo al viejo. El 302 (y el 307, que conserva el método) se consultan cada vez. Para un acortador, la flexibilidad vale más que ahorrar una petición.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿El <code>Service</code> debería ser un <code>Arc&lt;Service&gt;</code> en el estado?</summary>
+          <div>
+            <p>No hace falta: <code>Service</code> ya es <code>Clone</code> y clonarlo copia un <code>Arc&lt;dyn Store&gt;</code>, no el store. <code>State&lt;Service&gt;</code> es más simple y el router no acumula genéricos. Si el servicio tuviera un campo caro de clonar (un pool sin <code>Arc</code>), entonces sí envolverías en <code>Arc</code>.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Cómo pruebo que el cuerpo del error es JSON?</summary>
+          <div>
+            <p>Con <code>http_body_util::BodyExt</code>: <code>response.into_body().collect().await?.to_bytes()</code> y luego <code>serde_json::from_slice</code>. Merece la pena en uno o dos tests, no en todos: el contrato importante es el estado y el <code>Content-Type</code>; el texto exacto del mensaje cambia más a menudo.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Y si quiero HTTPS?</summary>
+          <div>
+            <p>En producción lo normal es terminar TLS en un proxy (nginx, Caddy, el balanceador del cloud) y servir HTTP en la red interna. Hacer TLS en el proceso exige <code>axum-server</code> con <code>rustls</code> y gestionar certificados; para urlshort es complejidad que no demuestra nada del lenguaje. Documenta que el binario escucha en <code>127.0.0.1</code> por defecto.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

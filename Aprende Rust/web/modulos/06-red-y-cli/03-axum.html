@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="03-axum">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Servidor HTTP con Axum — Módulo 6 · Curso Rust</title>
+  <meta name="description" content="Servidor HTTP en Rust con Axum 0.8: Router, estado compartido, extractores Path/Query/Json, errores con IntoResponse, middleware de tower y tests con oneshot.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Servidor HTTP con Axum</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Red y CLI real</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El CLI ya acorta URLs, pero un acortador vive de que alguien pinte el enlace en un navegador. Eso exige un servidor: recibir <code>GET /rust</code>, buscar el código y devolver un <code>302</code> con la URL original. Y exige una API: crear enlaces con <code>POST /links</code>, consultarlos, listarlos y borrarlos.</p>
+        <p><strong>Axum</strong> es el framework HTTP del ecosistema Tokio. No inventa un modelo nuevo: compone <code>hyper</code> (protocolo), <code>tower</code> (middleware) y <code>tokio</code> (runtime), y añade lo justo para que escribir un <em>handler</em> sea escribir una función async con parámetros tipados. El router empareja rutas, los <strong>extractores</strong> convierten la petición en argumentos y el valor devuelto se convierte en respuesta.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque un servidor no es «una función que devuelve JSON». Es estado compartido entre tareas, errores que deben llegar al cliente con el código correcto, rutas que no pueden entrar en pánico y un <em>handler</em> que se pueda probar sin abrir un puerto. Axum obliga a pensar en esas cuatro cosas; aquí verás el patrón completo.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> usar la sintaxis de rutas de 0.7 (<code>/links/:code</code>) en Axum 0.8; guardar el estado en un <code>Mutex</code> global en vez de pasarlo con <code>State</code>; devolver <code>200</code> con un error dentro; poner el extractor del cuerpo antes que los demás; olvidar <code>.with_state()</code>; bloquear el runtime dentro de un <em>handler</em>.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>La arquitectura de una petición</h3>
+        <p>Axum es una cadena de transformaciones. Cada eslabón es un tipo que implementa un trait de <code>tower</code>, lo que permite componer middleware sin tocar los <em>handlers</em>:</p>
+        <pre class="diagram">  TCP ──► hyper ──► tower ──────────► Router (matchit) ──► handler
+                     (Trace, CORS,       │                    │
+                      timeout…)           │ /links/{code}      │
+                                          ▼                    ▼
+                                     extractores        async fn(State, Path, Json)
+                                     State / Path /            │
+                                     Query / Json              ▼
+                                                        IntoResponse
+                                                        (status, headers, body)</pre>
+        <table>
+          <thead><tr><th>Pieza</th><th>Responsabilidad</th></tr></thead>
+          <tbody>
+            <tr><td><code>Router</code></td><td>Empareja método + ruta y decide qué <em>handler</em> se ejecuta. En 0.8 los parámetros se escriben con llaves: <code>/links/{code}</code>.</td></tr>
+            <tr><td><strong>Extractor</strong></td><td>Convierte partes de la petición en argumentos: <code>State&lt;T&gt;</code>, <code>Path&lt;T&gt;</code>, <code>Query&lt;T&gt;</code>, <code>Json&lt;T&gt;</code>, <code>HeaderMap</code>…</td></tr>
+            <tr><td><strong>Handler</strong></td><td>Una <code>async fn</code> cuyos argumentos implementan <code>FromRequestParts</code> (o <code>FromRequest</code> para el cuerpo) y cuyo retorno implementa <code>IntoResponse</code>.</td></tr>
+            <tr><td><code>IntoResponse</code></td><td>Traduce el valor devuelto a una respuesta HTTP: <code>&amp;str</code>, <code>Json&lt;T&gt;</code>, <code>(StatusCode, T)</code>, <code>Result&lt;T, E&gt;</code>…</td></tr>
+            <tr><td><strong>Layer</strong></td><td>Middleware de <code>tower</code>: trazas, CORS, compresión, timeouts. Se aplica con <code>.layer()</code>.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Estado: <code>Arc</code> y clon barato</h3>
+        <p>Un <em>handler</em> es una función pura: no hay <code>self</code> ni variables globales. Todo lo que necesita se pasa con <code>State&lt;T&gt;</code>, y <code>T</code> debe ser <code>Clone + Send + Sync + 'static</code> porque Axum lo clona por petición. Por eso el estado se envuelve en <code>Arc</code>: clonar el <code>Arc</code> copia un puntero, no el mapa.</p>
+        <pre><code class="language-rust">#[derive(Clone)]
+pub struct AppState {
+    links: Arc&lt;RwLock&lt;HashMap&lt;String, Link&gt;&gt;&gt;,
+}</code></pre>
+        <p>El <code>RwLock</code> es de <code>tokio</code>, no de <code>std</code>: el <em>guard</em> se puede mantener a través de un <code>.await</code> sin romper <code>Send</code>. Las lecturas concurrentes son compatibles; la escritura es exclusiva.</p>
+        <div class="callout callout--analogy">
+          <p class="callout__title">Analogía: la pizarra de la oficina</p>
+          <p><code>AppState</code> es la pizarra común. Cada petición recibe una <strong>llave</strong> (<code>Arc</code>) a la misma pizarra, no una copia. <code>RwLock</code> es la norma de uso: varios pueden leer a la vez, pero para escribir hay que quedarse solo. Copiar la pizarra entera en cada petición sería copiar la base de datos.</p>
+        </div>
+
+        <h3>Extractores: el orden importa</h3>
+        <p>Los extractores que solo leen partes de la petición (<code>State</code>, <code>Path</code>, <code>Query</code>, cabeceras) implementan <code>FromRequestParts</code> y pueden ir en cualquier orden. El que consume el cuerpo (<code>Json</code>, <code>String</code>, <code>Bytes</code>) implementa <code>FromRequest</code> y debe ser <strong>el último argumento</strong>. Solo se puede consumir el cuerpo una vez.</p>
+        <table>
+          <thead><tr><th>Extractor</th><th>De dónde sale</th><th>Fallo típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>Path&lt;String&gt;</code></td><td><code>/links/{code}</code></td><td>Ruta sin el parámetro declarado: no compila o no empareja.</td></tr>
+            <tr><td><code>Path&lt;(String, u32)&gt;</code></td><td>Varios segmentos, en orden</td><td>Orden distinto al de la ruta.</td></tr>
+            <tr><td><code>Query&lt;T&gt;</code></td><td><code>?limit=10&amp;q=rust</code></td><td>Campos obligatorios que no vienen: 400 automático.</td></tr>
+            <tr><td><code>Json&lt;T&gt;</code></td><td>Cuerpo JSON</td><td>Content-Type ausente o cuerpo inválido: 415/422 automático.</td></tr>
+            <tr><td><code>State&lt;T&gt;</code></td><td>El estado del router</td><td>Olvidar <code>.with_state()</code>: error de compilación.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Errores: <code>IntoResponse</code> y <code>thiserror</code></h3>
+        <p>Un <em>handler</em> puede devolver <code>Result&lt;T, E&gt;</code> si <code>E: IntoResponse</code>. El patrón es un enum de error de dominio con <code>thiserror</code> y una implementación de <code>IntoResponse</code> que mapea cada variante a un <code>StatusCode</code> y a un cuerpo JSON. Así el cliente recibe <code>404</code>, <code>409</code> o <code>422</code> de verdad, no un <code>200</code> con <code>{"error": …}</code>.</p>
+        <p>Los rechazos de los extractores (JSON mal formado, query inválida) ya devuelven 4xx por su cuenta. Si quieres un cuerpo de error homogéneo, envuelve el extractor con <code>WithRejection</code> o define un tipo propio que implemente <code>FromRequest</code>.</p>
+
+        <h3>Routers anidados y middleware</h3>
+        <p><code>Router::merge</code> combina dos routers al mismo nivel; <code>Router::nest</code> monta uno bajo un prefijo (<code>/api/v1</code>). El estado se aplica al final con <code>.with_state(state)</code>, que devuelve un <code>Router&lt;()&gt;</code> listo para servir.</p>
+        <p>Los <em>layers</em> se apilan: el último añadido es el más externo y ve la petición primero. <code>TraceLayer</code> registra método, ruta, estado y latencia; <code>CorsLayer</code> añade las cabeceras que un navegador necesita para llamar a tu API desde otro origen. En producción, CORS se restringe a los orígenes reales: <code>permissive()</code> es para desarrollo.</p>
+
+        <h3>Servir y probar</h3>
+        <p><code>axum::serve(listener, app).await</code> toma un <code>TcpListener</code> de Tokio: tú decides la dirección y puedes añadir <code>with_graceful_shutdown</code>. Y como <code>Router</code> implementa <code>tower::Service&lt;Request&lt;Body&gt;&gt;</code>, se puede probar sin red con <code>oneshot</code>: se le pasa una <code>Request</code> construida a mano y se inspecciona la <code>Response</code>. Es la forma canónica de testear <em>handlers</em>.</p>
+        <pre><code class="language-rust">let response = app
+    .oneshot(Request::get("/health").body(Body::empty())?)
+    .await?;
+assert_eq!(response.status(), StatusCode::OK);</code></pre>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un servidor que responde en <code>/health</code>. <code>Cargo.toml</code>:</p>
+        <pre><code class="language-toml">[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }</code></pre>
+        <pre><code class="language-rust">use axum::{routing::get, Router};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let app = Router::new().route("/health", get(|| async { "ok" }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    println!("escuchando en http://{}", listener.local_addr()?);
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}</code></pre>
+        <pre><code class="language-bash">cargo run
+# en otra terminal
+curl -i http://127.0.0.1:3000/health</code></pre>
+        <pre><code class="language-text">HTTP/1.1 200 OK
+content-type: text/plain; charset=utf-8
+content-length: 2
+
+ok</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>Router::new()</code> crea una tabla de rutas vacía. <code>.route(ruta, método(handler))</code> añade una entrada.</li>
+          <li><code>get(...)</code> recibe cualquier <code>Handler</code>: aquí una closure async sin argumentos. El valor devuelto, <code>&amp;str</code>, implementa <code>IntoResponse</code>.</li>
+          <li><code>TcpListener::bind</code> es de Tokio y es async. <code>local_addr()</code> sirve para imprimir el puerto real (útil con el puerto 0 en tests).</li>
+          <li><code>axum::serve</code> acepta el listener y el router; se queda esperando conexiones hasta que el proceso termina.</li>
+          <li>No hay <code>unwrap</code>: los dos <code>?</code> convierten errores de bind y de serve en la salida de <code>main</code>.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title">La sintaxis de rutas cambió en 0.8</p>
+          <p>En Axum 0.7 se escribía <code>/links/:code</code>. En 0.8 los parámetros van entre llaves: <code>/links/{code}</code>, y los comodines son <code>/{*resto}</code>. Si copias un ejemplo antiguo, el servidor entra en pánico al arrancar con un mensaje que te lo recuerda.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>La API de urlshort: crear, consultar, listar, borrar y redirigir. El estado es un mapa en memoria; en la lección de persistencia se sustituye por un <code>Store</code> sin tocar los <em>handlers</em>.</p>
+        <pre><code class="language-rust">// src/server.rs
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Link {
+    pub code: String,
+    pub url: String,
+    pub created_at: u64,
+    pub hits: u64,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    links: Arc&lt;RwLock&lt;HashMap&lt;String, Link&gt;&gt;&gt;,
+}
+
+impl AppState {
+    pub fn new() -&gt; Self {
+        Self { links: Arc::new(RwLock::new(HashMap::new())) }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateLink {
+    pub url: String,
+    pub code: Option&lt;String&gt;,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    pub limit: Option&lt;usize&gt;,
+}
+
+// ----- errores de la API ------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("código no encontrado")]
+    NotFound,
+    #[error("la URL debe empezar por http:// o https://")]
+    InvalidUrl,
+    #[error("el código debe tener entre 3 y 16 caracteres alfanuméricos")]
+    InvalidCode,
+    #[error("el código ya existe")]
+    Conflict,
+    #[error("error interno")]
+    Internal(#[from] std::io::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -&gt; Response {
+        let status = match &amp;self {
+            ApiError::NotFound =&gt; StatusCode::NOT_FOUND,
+            ApiError::InvalidUrl | ApiError::InvalidCode =&gt; StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::Conflict =&gt; StatusCode::CONFLICT,
+            ApiError::Internal(_) =&gt; StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        // No filtramos detalles internos al cliente; sí los registramos.
+        let message = match &amp;self {
+            ApiError::Internal(err) =&gt; {
+                tracing::error!(%err, "error interno");
+                "error interno".to_string()
+            }
+            other =&gt; other.to_string(),
+        };
+
+        (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+// ----- handlers ---------------------------------------------------------
+
+async fn health() -&gt; &amp;'static str {
+    "ok"
+}
+
+async fn create_link(
+    State(state): State&lt;AppState&gt;,
+    Json(payload): Json&lt;CreateLink&gt;,
+) -&gt; Result&lt;(StatusCode, Json&lt;Link&gt;), ApiError&gt; {
+    if !(payload.url.starts_with("http://") || payload.url.starts_with("https://")) {
+        return Err(ApiError::InvalidUrl);
+    }
+
+    let code = match payload.code {
+        Some(code) if !valid_code(&amp;code) =&gt; return Err(ApiError::InvalidCode),
+        Some(code) =&gt; code,
+        None =&gt; short_code(&amp;payload.url),
+    };
+
+    let link = Link {
+        code: code.clone(),
+        url: payload.url,
+        created_at: now(),
+        hits: 0,
+    };
+
+    let mut links = state.links.write().await;
+    if links.contains_key(&amp;code) {
+        return Err(ApiError::Conflict);
+    }
+    links.insert(code, link.clone());
+
+    Ok((StatusCode::CREATED, Json(link)))
+}
+
+async fn get_link(
+    State(state): State&lt;AppState&gt;,
+    Path(code): Path&lt;String&gt;,
+) -&gt; Result&lt;Json&lt;Link&gt;, ApiError&gt; {
+    let links = state.links.read().await;
+    let link = links.get(&amp;code).ok_or(ApiError::NotFound)?;
+    Ok(Json(link.clone()))
+}
+
+async fn list_links(
+    State(state): State&lt;AppState&gt;,
+    Query(params): Query&lt;ListParams&gt;,
+) -&gt; Json&lt;Vec&lt;Link&gt;&gt; {
+    let limit = params.limit.unwrap_or(50).min(200);
+
+    let mut out: Vec&lt;Link&gt; = state.links.read().await.values().cloned().collect();
+    out.sort_by(|a, b| b.created_at.cmp(&amp;a.created_at));
+    out.truncate(limit);
+    Json(out)
+}
+
+async fn delete_link(
+    State(state): State&lt;AppState&gt;,
+    Path(code): Path&lt;String&gt;,
+) -&gt; Result&lt;StatusCode, ApiError&gt; {
+    let mut links = state.links.write().await;
+    links.remove(&amp;code).ok_or(ApiError::NotFound)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// 302 Found: el navegador repetirá el GET en la nueva URL.
+async fn redirect(
+    State(state): State&lt;AppState&gt;,
+    Path(code): Path&lt;String&gt;,
+) -&gt; Result&lt;Response, ApiError&gt; {
+    let mut links = state.links.write().await;
+    let link = links.get_mut(&amp;code).ok_or(ApiError::NotFound)?;
+    link.hits += 1;
+    let url = link.url.clone();
+    drop(links);
+
+    Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response())
+}
+
+async fn not_found() -&gt; ApiError {
+    ApiError::NotFound
+}
+
+// ----- router -----------------------------------------------------------
+
+pub fn router(state: AppState) -&gt; Router {
+    let api = Router::new()
+        .route("/links", post(create_link).get(list_links))
+        .route("/links/{code}", get(get_link).delete(delete_link));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(api)
+        .route("/{code}", get(redirect))
+        .fallback(not_found)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())   // en producción: CorsLayer::new().allow_origin(...)
+        .with_state(state)
+}
+
+// ----- utilidades -------------------------------------------------------
+
+fn valid_code(code: &amp;str) -&gt; bool {
+    (3..=16).contains(&amp;code.len())
+        &amp;&amp; code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn short_code(url: &amp;str) -&gt; String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&amp;mut hasher);
+    let mut n = hasher.finish();
+
+    const ALPHABET: &amp;[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
+    let mut code = String::with_capacity(6);
+    for _ in 0..6 {
+        code.push(ALPHABET[(n % ALPHABET.len() as u64) as usize] as char);
+        n /= ALPHABET.len() as u64;
+    }
+    code
+}
+
+fn now() -&gt; u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}</code></pre>
+        <p>Y el arranque, con trazas configuradas por variable de entorno:</p>
+        <pre><code class="language-rust">// src/main.rs
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let app = urlshort::server::router(urlshort::server::AppState::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}</code></pre>
+        <pre><code class="language-bash">$ curl -i -X POST http://127.0.0.1:3000/links \
+    -H 'content-type: application/json' \
+    -d '{"url":"https://www.rust-lang.org/"}'
+HTTP/1.1 201 Created
+content-type: application/json
+
+{"code":"k7m2qd","url":"https://www.rust-lang.org/","created_at":1760000000,"hits":0}
+
+$ curl -i http://127.0.0.1:3000/k7m2qd
+HTTP/1.1 302 Found
+location: https://www.rust-lang.org/</code></pre>
+        <p>Decisiones que importan:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>Arc&lt;RwLock&lt;HashMap&gt;&gt;</code></td><td><code>Clone</code> barato para el estado; lecturas concurrentes y escritura exclusiva. <code>Mutex</code> bastaría, pero las lecturas son mayoría.</td></tr>
+            <tr><td><code>Json</code> como último argumento</td><td>Consume el cuerpo; debe ir después de <code>State</code>. Es una regla del trait, no un estilo.</td></tr>
+            <tr><td><code>Result&lt;T, ApiError&gt;</code></td><td>El estado HTTP lo decide el error, no el <em>handler</em>. Un 404 llega como 404.</td></tr>
+            <tr><td><code>302</code> con <code>LOCATION</code></td><td>Redirección temporal: el enlace puede cambiar. <code>Redirect::temporary</code> daría 307 y conservaría el método.</td></tr>
+            <tr><td><code>drop(links)</code> antes de responder</td><td>Se libera el <em>guard</em> en cuanto se copia la URL; no se retiene durante la respuesta.</td></tr>
+            <tr><td><code>fallback</code> con el mismo error</td><td>Una ruta desconocida devuelve el mismo JSON de error que un código inexistente.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">El estado en memoria se pierde al reiniciar</p>
+          <p>Este servidor es correcto y efímero. En la lección de persistencia, <code>AppState</code> pasará a contener un <code>Store</code> detrás de un <code>Arc</code>; los <em>handlers</em> cambiarán dos líneas y el resto del diseño se mantiene. Esa es la prueba de que el estado estaba bien aislado.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un <code>AppState</code> clonable con <code>Arc</code> dentro</td><td><code>static Mutex&lt;…&gt;</code> global</td><td>El estado se inyecta y se puede sustituir en tests.</td></tr>
+            <tr><td>Rutas con <code>{param}</code></td><td><code>:param</code> copiado de Axum 0.7</td><td>En 0.8 el <code>:</code> hace panic al construir el router.</td></tr>
+            <tr><td><code>Result&lt;T, ApiError&gt;</code> con <code>IntoResponse</code></td><td><code>200</code> con <code>{"error": …}</code></td><td>Los clientes y el middleware de métricas necesitan el estado real.</td></tr>
+            <tr><td><code>Json</code> al final de los argumentos</td><td><code>Json</code> antes de <code>State</code></td><td>El cuerpo solo se consume una vez y debe ir el último.</td></tr>
+            <tr><td>Validar en el <em>handler</em> y devolver 422/409</td><td>Confiar en que el cliente manda datos válidos</td><td>El servidor es la última línea de defensa.</td></tr>
+            <tr><td>Probar con <code>oneshot</code></td><td>Levantar un puerto en cada test</td><td>Rápido, determinista y sin conflictos de puerto.</td></tr>
+            <tr><td><code>CorsLayer</code> restringido en producción</td><td><code>permissive()</code> en producción</td><td>Permitir cualquier origen expone la API a webs de terceros.</td></tr>
+            <tr><td>Nada de trabajo bloqueante en el <em>handler</em></td><td><code>std::fs</code>, <code>std::thread::sleep</code></td><td>Bloquea un worker de Tokio y degrada todas las peticiones.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">Diseña el error antes que la respuesta</p>
+          <p>Escribe el enum <code>ApiError</code> y su tabla de estados antes de los <em>handlers</em>. Si no sabes qué códigos HTTP puede devolver tu API, tampoco sabes qué casos de uso tiene.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. La sintaxis de rutas de 0.7</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let app = Router::new().route("/links/:code", get(get_link));</code></pre>
+        <pre><code class="language-text">thread 'main' panicked at ...:
+Path segments must not start with `:`. For capture groups, use `{capture}`.
+If you need to literally match `:`, call `Router::without_v07_checks`</code></pre>
+        <p><strong>Por qué está mal:</strong> Axum 0.8 cambió la sintaxis para alinearse con matchit. <strong>Bien:</strong> <code>/links/{code}</code> y <code>/{*resto}</code> para el resto de la ruta.</p>
+
+        <h3>2. Estado que no implementa <code>Clone</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">pub struct AppState {
+    links: RwLock&lt;HashMap&lt;String, Link&gt;&gt;,   // sin Arc y sin derive Clone
+}</code></pre>
+        <pre><code class="language-text">error[E0277]: the trait bound `AppState: Clone` is not satisfied
+  |
+  = note: required by a bound in `axum::extract::State`</code></pre>
+        <p><strong>Por qué está mal:</strong> Axum clona el estado por petición. <strong>Bien:</strong> <code>#[derive(Clone)]</code> con <code>Arc</code> alrededor de lo compartido. Clonar el <code>Arc</code> no clona el mapa.</p>
+
+        <h3>3. <code>Json</code> antes que <code>State</code></h3>
+        <p><strong>Mal:</strong> <code>async fn create(Json(p): Json&lt;CreateLink&gt;, State(s): State&lt;AppState&gt;)</code>.</p>
+        <pre><code class="language-text">error[E0277]: the trait bound `Json&lt;CreateLink&gt;: FromRequestParts&lt;AppState&gt;` is not satisfied
+  |
+  = note: Function argument #1 is not a valid extractor</code></pre>
+        <p><strong>Por qué está mal:</strong> el extractor del cuerpo implementa <code>FromRequest</code>, no <code>FromRequestParts</code>, y solo puede ser el último. <strong>Bien:</strong> ponerlo al final.</p>
+
+        <h3>4. Olvidar <code>.with_state()</code></h3>
+        <p><strong>Mal:</strong> construir las rutas con <em>handlers</em> que piden <code>State</code> y servir el router sin aplicarlo.</p>
+        <pre><code class="language-text">error[E0277]: the trait bound `fn(State&lt;AppState&gt;, ...) -&gt; ...: Handler&lt;_, _&gt;`
+is not satisfied
+  = note: consider using `Router::with_state`</code></pre>
+        <p><strong>Por qué está mal:</strong> el tipo del router conserva el parámetro de estado y <code>axum::serve</code> exige <code>Router&lt;()&gt;</code>. <strong>Bien:</strong> <code>.with_state(state)</code> al final de la construcción.</p>
+
+        <h3>5. Bloquear dentro del <em>handler</em></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">async fn list(State(state): State&lt;AppState&gt;) -&gt; String {
+    let texto = std::fs::read_to_string("links.json").unwrap();  // bloquea el worker
+    texto
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> Tokio multiplexa muchas tareas en pocos hilos; una lectura de disco lenta detiene a todas. Además, <code>unwrap</code> convierte un fallo de disco en un 500 opaco. <strong>Bien:</strong> <code>tokio::task::spawn_blocking(move || std::fs::read_to_string(…))</code> o una API async (<code>tokio::fs</code>), y propagar el error.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> levantar la API, probarla con <code>curl</code> y escribir tests de integración con <code>oneshot</code> que no abran ningún puerto.</p>
+        <ol class="steps">
+          <li>
+            <strong>Añade las dependencias.</strong>
+            <pre><code class="language-bash">cargo add axum
+cargo add tokio --features macros,rt-multi-thread,net,signal
+cargo add tower-http --features trace,cors
+cargo add serde --features derive
+cargo add serde_json thiserror tracing
+cargo add tracing-subscriber --features env-filter
+cargo add --dev tower --features util</code></pre>
+          </li>
+          <li>
+            <strong>Pega <code>src/server.rs</code></strong> del ejemplo real, añade <code>pub mod server;</code> en <code>lib.rs</code> y arranca con <code>RUST_LOG=info cargo run</code>. Debes ver una línea de <code>TraceLayer</code> por cada petición.
+          </li>
+          <li>
+            <strong>Ejercita la API con curl.</strong>
+            <pre><code class="language-bash">curl -s -X POST localhost:3000/links -H 'content-type: application/json' \
+  -d '{"url":"https://www.rust-lang.org/"}'
+curl -i localhost:3000/k7m2qd
+curl -s 'localhost:3000/links?limit=5'
+curl -i -X DELETE localhost:3000/k7m2qd</code></pre>
+            <p>Comprueba los códigos: 201, 302, 200 y 204. Y los errores: 404 con código inexistente, 409 al repetir un <code>code</code>, 422 con <code>{"url":"ftp://x"}</code>.</p>
+          </li>
+          <li>
+            <strong>Escribe los tests.</strong>
+            <pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    fn app() -&gt; Router {
+        router(AppState::new())
+    }
+
+    async fn body_json(response: Response) -&gt; serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("cuerpo legible");
+        serde_json::from_slice(&amp;bytes).expect("JSON válido")
+    }
+
+    #[tokio::test]
+    async fn crea_un_enlace_y_redirige() {
+        let app = app();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/links")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"url":"https://www.rust-lang.org/"}"#))
+                    .expect("petición válida"),
+            )
+            .await
+            .expect("respuesta");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = body_json(response).await;
+        let code = created["code"].as_str().expect("code").to_string();
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/{code}"))
+                    .body(Body::empty())
+                    .expect("petición válida"),
+            )
+            .await
+            .expect("respuesta");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers()[header::LOCATION].to_str().expect("location"),
+            "https://www.rust-lang.org/"
+        );
+    }
+
+    #[tokio::test]
+    async fn devuelve_404_con_json_de_error() {
+        let response = app()
+            .oneshot(Request::get("/nope").body(Body::empty()).expect("petición"))
+            .await
+            .expect("respuesta");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"], "código no encontrado");
+    }
+}</code></pre>
+            <p><code>cargo test</code> debe pasar los dos. Fíjate en que no hay ningún <code>bind</code>: <code>oneshot</code> llama al router como si fuera un servicio.</p>
+          </li>
+          <li>
+            <strong>Rompe el contrato.</strong> Cambia <code>/{code}</code> por <code>/:code</code> y ejecuta los tests: el <em>panic</em> ocurre al construir el router. Cámbialo por <code>/{slug}</code> sin tocar el <code>Path&lt;String&gt;</code> y observa que el <em>handler</em> sigue funcionando: el nombre del parámetro no tiene por qué coincidir.
+          </li>
+          <li>
+            <strong>Comprueba CORS y cabeceras.</strong>
+            <pre><code class="language-bash">curl -i -X OPTIONS localhost:3000/links \
+  -H 'Origin: http://localhost:5173' \
+  -H 'Access-Control-Request-Method: POST'</code></pre>
+            <p>Con <code>permissive()</code> verás <code>access-control-allow-origin: *</code>. Sustitúyelo por un <code>CorsLayer</code> con el origen de tu frontend y repite: cualquier otro origen ya no recibe permiso.</p>
+          </li>
+          <li>
+            <strong>Pasa clippy.</strong>
+            <pre><code class="language-bash">cargo fmt
+cargo clippy --all-targets -- -D warnings</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Explicas qué extractor consume el cuerpo, por qué el estado necesita <code>Arc</code>, qué diferencia hay entre <code>merge</code> y <code>nest</code> y cómo un <code>ApiError</code> se convierte en un 409. Y tus tests corren en milisegundos sin puertos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Caducidad, cuota y apagado ordenado</h3>
+          <p>Amplía la API con tres piezas que un acortador real necesita:</p>
+          <ul>
+            <li><strong>Caducidad</strong>: cada enlace puede llevar <code>expires_at</code>; al resolverlo después de la fecha, responde <code>410 Gone</code> en vez de redirigir. Un enlace caducado no debe contar como <em>hit</em>.</li>
+            <li><strong>Cuota por IP</strong>: máximo 10 creaciones por minuto y por IP. Devuelve <code>429</code> con <code>Retry-After</code>. La IP se obtiene de <code>ConnectInfo&lt;SocketAddr&gt;</code> o de <code>X-Forwarded-For</code> si confías en el proxy.</li>
+            <li><strong>Apagado ordenado</strong>: al recibir <code>Ctrl+C</code>, deja de aceptar conexiones, termina las peticiones en vuelo y sale con 0. Usa <code>axum::serve(...).with_graceful_shutdown(...)</code>.</li>
+          </ul>
+          <p><em>Pista: la cuota encaja en un <code>layer</code> propio con <code>tower::Service</code>, o en un crate como <code>tower_governor</code>. Para la IP, <code>Router::into_make_service_with_connect_info::&lt;SocketAddr&gt;()</code> es lo que espera <code>axum::serve</code> cuando usas <code>ConnectInfo</code>. Para el apagado, <code>tokio::signal::ctrl_c().await</code> dentro de una <code>async fn</code> que se pasa a <code>with_graceful_shutdown</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Axum compone <strong>Router → extractores → handler → IntoResponse</strong> sobre hyper, tower y Tokio.</li>
+          <li>En 0.8 los parámetros de ruta usan llaves: <code>/links/{code}</code>; los comodines, <code>/{*resto}</code>.</li>
+          <li>El estado se pasa con <code>State&lt;T&gt;</code>, se deriva <code>Clone</code> y se comparte con <code>Arc</code>; el <code>RwLock</code> de Tokio permite esperar con el <em>guard</em> tomado.</li>
+          <li><code>Path</code>, <code>Query</code>, <code>Json</code> y <code>State</code> convierten la petición en argumentos; el extractor del cuerpo va al final.</li>
+          <li>Los errores se modelan con <code>thiserror</code> + <code>IntoResponse</code>: cada variante tiene su estado HTTP y su cuerpo JSON.</li>
+          <li><code>merge</code>/<code>nest</code> componen routers; <code>layer</code> añade middleware de tower (<code>TraceLayer</code>, <code>CorsLayer</code>).</li>
+          <li>Se sirve con <code>TcpListener</code> + <code>axum::serve</code> y se prueba con <code>tower::ServiceExt::oneshot</code>, sin abrir puertos.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>cargo add axum</code></td><td>Framework HTTP sobre hyper, tower y Tokio.</td></tr>
+            <tr><td><code>Router::new().route(…)</code></td><td>Declara método y ruta; admite <code>get</code>, <code>post</code>, <code>put</code>, <code>delete</code>…</td></tr>
+            <tr><td><code>.with_state(state)</code></td><td>Fija el estado y devuelve un <code>Router&lt;()&gt;</code> listo para servir.</td></tr>
+            <tr><td><code>State&lt;T&gt;</code>, <code>Path&lt;T&gt;</code>, <code>Query&lt;T&gt;</code>, <code>Json&lt;T&gt;</code></td><td>Extractores de estado, ruta, query y cuerpo.</td></tr>
+            <tr><td><code>IntoResponse</code></td><td>Convierte el retorno del <em>handler</em> (o del error) en respuesta HTTP.</td></tr>
+            <tr><td><code>axum::serve(listener, app)</code></td><td>Sirve el router sobre un <code>TcpListener</code> de Tokio.</td></tr>
+            <tr><td><code>tower::ServiceExt::oneshot</code></td><td>Ejecuta el router con una <code>Request</code> en memoria: tests sin red.</td></tr>
+            <tr><td><code>curl -i</code></td><td>Comprueba estado, cabeceras y cuerpo del servidor real.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Axum, Actix Web o Rocket?</summary>
+          <div>
+            <p>Los tres son maduros. Axum se integra con el resto del stack Tokio/tower, tiene extractores tipados y una curva pequeña; Actix Web es muy rápido y con más «baterías incluidas»; Rocket prioriza ergonomía. En este curso Axum encaja porque reutiliza lo aprendido de async y porque sus <em>handlers</em> son funciones normales, fáciles de testear con <code>oneshot</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿<code>Mutex</code> o <code>RwLock</code> para el estado?</summary>
+          <div>
+            <p>Si las lecturas dominan, <code>RwLock</code> permite varias simultáneas. Si todas las operaciones escriben o las secciones críticas son diminutas, <code>Mutex</code> es más simple y a veces más rápido. Lo importante: usa el de <code>tokio</code> si vas a esperar con el <em>guard</em> tomado; el de <code>std</code> no es <code>Send</code> a través de un <code>.await</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo devuelvo un 404 con una página HTML en vez de JSON?</summary>
+          <div>
+            <p>Con otra implementación de <code>IntoResponse</code> o con <code>Html(...)</code>: <code>(StatusCode::NOT_FOUND, Html("&lt;h1&gt;No existe&lt;/h1&gt;")).into_response()</code>. Si tu API y tu web conviven, separa routers (<code>/api</code> con JSON, resto con HTML) y aplica <code>fallback</code> distintos a cada uno.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo limito el tamaño del cuerpo que acepta la API?</summary>
+          <div>
+            <p>Con <code>DefaultBodyLimit</code>: <code>.layer(DefaultBodyLimit::max(64 * 1024))</code>. Por defecto Axum ya impone un límite de 2 MB en <code>Json</code>; si lo subes, hazlo por ruta y no globalmente. Para subidas grandes, usa <code>Multipart</code> y escribe a disco por trozos.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo añado autenticación sin repetirla en cada handler?</summary>
+          <div>
+            <p>Con un extractor propio que implemente <code>FromRequestParts</code> y devuelva un <code>Usuario</code> o un rechazo 401, o con un middleware de tower que valide el token y meta los datos en <code>Extension</code>. El extractor se compone mejor con el tipado; el middleware es mejor si la lógica es común a muchas rutas y quieres aplicarla por prefijo.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

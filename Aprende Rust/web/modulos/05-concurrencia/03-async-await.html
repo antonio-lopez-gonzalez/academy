@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="03-async-await">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>async/await, futures y el runtime — Módulo 5 · Curso Rust</title>
+  <meta name="description" content="Qué es un future en Rust, cómo funcionan poll y Waker, para qué hace falta un runtime, async en traits, Pin y los errores típicos: bloquear el executor, futuros que no son Send y cancelación por drop.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>async/await, futures y el runtime</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Concurrencia y async</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un hilo del sistema operativo cuesta unos 2 MiB de stack y un cambio de contexto. Para cuatro tareas va sobrado. Para diez mil conexiones que pasan el 99 % del tiempo esperando, es un desperdicio: diez mil stacks reservados para no hacer nada.</p>
+        <p><code>async</code>/<code>await</code> propone lo contrario: escribir código que <em>parece</em> secuencial y bloqueante, pero que se compila a una <strong>máquina de estados</strong> que se detiene en cada espera y deja el hilo libre para otra tarea. Diez mil conexiones caben en unos pocos hilos porque ninguna ocupa un hilo mientras espera.</p>
+        <p>A diferencia de JavaScript o C#, Rust <strong>no trae runtime</strong>. La biblioteca estándar define el trait <code>Future</code>, pero no sabe ejecutarlo ni qué es un socket no bloqueante. Eso lo aporta un crate: Tokio, async-std o smol. Si vienes de los <a href="02-canales.html">canales</a>, ya sabes que mover datos evita candados; aquí cambia el medio, no la idea. Esa separación explica la mitad de los errores que verás: <code>async fn</code> sin runtime no hace nada, y bloquear el hilo dentro de una tarea congela a todas las demás.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque <code>async</code> se copia muy bien y se entiende muy mal. Aquí no vas a memorizar <code>.await</code>: vas a ver qué devuelve una <code>async fn</code>, quién la sondea, por qué existe <code>Pin</code> y por qué un <code>MutexGuard</code> atravesando un <code>.await</code> rompe la compilación.</p>
+        </div>
+        <p><strong>Errores típicos al empezar:</strong> usar <code>std::thread::sleep</code> dentro de una tarea; meter código CPU-bound en <code>async</code>; llamar a <code>async fn</code> sin <code>.await</code> y no ver nada; retener un <code>MutexGuard</code> de <code>std</code> a través de un <code>.await</code>; creer que <code>#[tokio::main]</code> paraleliza tus <code>await</code>.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Un future es una máquina de estados</h3>
+        <p>Una <code>async fn</code> no devuelve su valor: devuelve un tipo anónimo que implementa <code>Future</code>. Llamarla no ejecuta nada; solo construye la máquina de estados en su estado inicial. Lo que la hace avanzar es <code>poll</code>:</p>
+        <pre><code class="language-rust">pub trait Future {
+    type Output;
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt;;
+}
+
+pub enum Poll&lt;T&gt; { Ready(T), Pending }</code></pre>
+        <p><code>Ready</code> significa «terminé, aquí está el valor». <code>Pending</code> significa «ahora no puedo avanzar; cuando haya novedades, avisa a este <code>Waker</code> y vuelve a sondearme». El <code>Waker</code> conecta la máquina de estados con el mundo: el reactor de E/S lo llama cuando el socket tiene datos y el executor vuelve a hacer <code>poll</code>.</p>
+        <pre class="diagram">  async fn acortar(url: &amp;str) -&gt; Link {
+      let ok = validar(url).await;      // punto de suspensión 1
+      guardar(url, ok).await;           // punto de suspensión 2
+      Link { .. }
+  }
+
+  estado 0 ──poll──► validar() ──Pending──► control al executor
+      ▲                                        │
+      └──────── wake() cuando la E/S está lista ┘
+  estado 1 ──poll──► guardar() ──Ready──► estado 2 ──► Ready(Link)
+
+  el compilador genera un enum con un estado por cada await</pre>
+        <p>Ese enum guarda las variables locales que sobreviven a cada suspensión: por eso <code>async</code> no reserva memoria en cada llamada, pero sí puede tener un tamaño sorprendente.</p>
+
+        <h3>.await no bloquea: cede</h3>
+        <p>Cuando escribes <code>fut.await</code>, el compilador genera un bucle que sondea <code>fut</code> y propaga <code>Pending</code> hasta el executor. El hilo queda libre y el executor pasa a otra tarea. La ilusión es perfecta: tu código parece una función normal, pero cada <code>.await</code> es un punto donde puede pausarse y reanudarse más tarde, en el mismo hilo o en otro. De ahí que <code>async</code> no sea paralelismo: dos <code>await</code> consecutivos dentro de la misma tarea se suman siempre.</p>
+
+        <h3>Por qué hace falta un runtime</h3>
+        <p>Un future es pasivo: alguien tiene que sondearlo, y alguien tiene que avisar cuando la E/S está lista. Ese «alguien» es el runtime, con tres piezas: el <strong>executor</strong> (cola de tareas listas, las sondea y reencola), el <strong>reactor</strong> (habla con epoll, kqueue o IOCP y despierta a las tareas cuya operación terminó) y los <strong>timers</strong> (la cola de <code>sleep</code>, <code>timeout</code> e <code>interval</code>).</p>
+        <table>
+          <thead><tr><th>Runtime</th><th>Perfil</th><th>Cuándo elegirlo</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Tokio</strong></td><td>Estándar de facto: multihilo por defecto, red, timers, sync, fs</td><td>Servicios y clientes de red; es lo que usan Axum y reqwest</td></tr>
+            <tr><td><strong>async-std</strong></td><td>API que imita a <code>std</code>, comunidad más pequeña</td><td>Código educativo o proyectos ya escritos con él</td></tr>
+            <tr><td><strong>smol</strong></td><td>Minimalista y ligero</td><td>Binarios pequeños o sistemas embebidos</td></tr>
+          </tbody>
+        </table>
+        <p>Este curso usa <strong>Tokio 1</strong> porque es lo que hay detrás de Axum, reqwest y la mayor parte del ecosistema. El código <code>async</code> que escribas no está atado al runtime salvo en el arranque y en las primitivas de sincronización.</p>
+
+        <h3>async en traits: AFIT y async_trait</h3>
+        <p>Desde Rust 1.75 un trait puede declarar <code>async fn</code> directamente (AFIT, <em>async fn in trait</em>): <code>trait Store { async fn resolve(&amp;self, code: &amp;str) -&gt; Option&lt;String&gt;; }</code>. Funciona con genéricos e <code>impl Trait</code>, pero <strong>no</strong> con <code>dyn Trait</code>: cada implementación devuelve un future de tamaño distinto y el objeto trait necesita uno fijo. Para <code>dyn</code> se usa el crate <code>async-trait</code>, que transforma el método en uno que devuelve <code>Pin&lt;Box&lt;dyn Future&gt;&gt;</code>, a cambio de una asignación por llamada. Regla práctica: AFIT si puedes; <code>async-trait</code> solo si necesitas objetos trait, como inyectar el store en Axum.</p>
+
+        <h3>Pin, a alto nivel</h3>
+        <p>Los futures generados pueden guardar referencias a sus propias variables locales: son <strong>auto-referenciales</strong>. Si se movieran en memoria después de empezar, esas referencias quedarían colgando. <code>Pin&lt;&amp;mut F&gt;</code> es la promesa de «no voy a mover este valor», y por eso <code>poll</code> lo pide. En la práctica solo te topas con él al escribir combinadores o cuando <code>select!</code> te pide fijar un future: se resuelve con <code>Box::pin</code> o <code>pin!</code>.</p>
+
+        <h3>Cancelar es soltar</h3>
+        <p>Rust no tiene <code>cancel()</code>: <strong>soltar el future lo cancela</strong>. Si un <code>timeout</code> vence o descartas el <code>JoinHandle</code>, el future se destruye y su estado se pierde en el punto exacto donde estaba suspendido. No hay rollback automático más allá de los <code>Drop</code> de sus campos. Es barato y funciona con cualquier future, pero una operación a medias puede dejar datos inconsistentes: diseña operaciones <strong>cancel-safe</strong> o protégelas con transacciones.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una <code>async fn</code>, su <code>.await</code> y lo mínimo para ejecutarla. Añade Tokio a las dependencias (<code>features = ["full"]</code> trae runtime, timers, red y macros) y <code>thiserror</code>, que ya usas desde el módulo 3:</p>
+        <pre><code class="language-toml">[dependencies]
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"</code></pre>
+        <pre><code class="language-rust">// src/main.rs
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let inicio = std::time::Instant::now();
+    let code = acortar("https://www.rust-lang.org/learn").await;
+    println!("codigo = {code} en {:?}", inicio.elapsed());
+}
+
+async fn acortar(url: &amp;str) -&gt; String {
+    // simula una llamada de red: cede el hilo en lugar de bloquearlo
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:06x}", h &amp; 0xff_ffff)
+}</code></pre>
+        <pre><code class="language-bash">cargo run</code></pre>
+        <pre><code class="language-text">codigo = 3f9c21 en 50.312ms</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>#[tokio::main]</code> es una macro que envuelve tu <code>async fn main</code> en un runtime: crea el executor, monta el reactor y llama a <code>block_on</code>. Sin ella, <code>async fn main</code> no compila como punto de entrada.</li>
+          <li><code>acortar(...)</code> devuelve un future; nada ocurre hasta el <code>.await</code>. Si lo quitas, el compilador avisa de que el future no se usa.</li>
+          <li><code>tokio::time::sleep</code> registra un temporizador y devuelve <code>Pending</code>: el hilo queda libre para otra tarea. Ese es todo el truco.</li>
+          <li>El <code>format!</code> final es código normal: se ejecuta de una vez cuando el future se reanuda. El tiempo medido es ~50 ms, no 0: el <code>await</code> espera de verdad. Lo que no hace es ocupar un hilo mientras espera.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Acortar una URL en urlshort implica validarla, generar el código y guardarla. En la versión asíncrona, validar y guardar son E/S y se componen con <code>?</code> como cualquier otra función.</p>
+        <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+#[derive(Debug)]
+pub struct Link {
+    pub code: String,
+    pub url: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShortError {
+    #[error("la url está vacía")]
+    Empty,
+}
+
+pub struct Store {
+    links: Mutex&lt;HashMap&lt;String, String&gt;&gt;,
+}
+
+impl Store {
+    pub fn new() -&gt; Arc&lt;Self&gt; {
+        Arc::new(Self { links: Mutex::new(HashMap::new()) })
+    }
+
+    /// Simula una comprobación de red (en el módulo 6 será una base de datos).
+    async fn validar(&amp;self, url: &amp;str) -&gt; Result&lt;(), ShortError&gt; {
+        if url.trim().is_empty() {
+            return Err(ShortError::Empty);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        Ok(())
+    }
+
+    async fn guardar(&amp;self, code: String, url: String) -&gt; Result&lt;Link, ShortError&gt; {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.links.lock().await.insert(code.clone(), url.clone());
+        Ok(Link { code, url })
+    }
+}
+
+async fn acortar(store: &amp;Store, url: &amp;str) -&gt; Result&lt;Link, ShortError&gt; {
+    store.validar(url).await?;            // el ? funciona igual que en síncrono
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let code = format!("{:06x}", h &amp; 0xff_ffff);
+    store.guardar(code, url.to_string()).await
+}</code></pre>
+        <p>Y el <code>main</code> que lo usa, con la cuenta del tiempo:</p>
+        <pre><code class="language-rust">#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let store = Store::new();
+    let inicio = std::time::Instant::now();
+
+    for url in ["https://www.rust-lang.org/learn", "https://crates.io/crates/tokio"] {
+        let link = acortar(&amp;store, url).await?;
+        println!("/{}  {}", link.code, link.url);
+    }
+    println!("2 enlaces en {:?}", inicio.elapsed());   // ~500 ms
+    Ok(())
+}</code></pre>
+        <p>El detalle que importa: los dos enlaces tardan <strong>500 ms</strong>, la suma de 250 ms por enlace. Tener un runtime multihilo no paraleliza los <code>await</code> de una misma tarea. La lección siguiente lo resuelve con <code>tokio::join!</code> y <code>tokio::spawn</code>; aquí basta con ver el síntoma y saber que no es un bug.</p>
+        <div class="callout callout--note">
+          <p class="callout__title">Dos decisiones que ya son de producción</p>
+          <p><code>tokio::sync::Mutex</code> en vez de <code>std::sync::Mutex</code> porque el candado cruza un <code>.await</code>; y E/S simulada con <code>sleep</code> detrás de funciones propias, de modo que cambiar la latencia por una base de datos real no cambie ninguna firma.</p>
+        </div>
+      </section>
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>tokio::time::sleep</code></td><td><code>std::thread::sleep</code> en una tarea</td><td>El segundo bloquea el hilo del executor y congela todas las tareas asignadas a él.</td></tr>
+            <tr><td><code>spawn_blocking</code> para E/S de fichero o CPU pesada</td><td>Un bucle de cálculo dentro de <code>async</code></td><td>El executor no tiene más hilos que núcleos: un bucle los secuestra.</td></tr>
+            <tr><td><code>tokio::sync::Mutex</code> si el candado cruza un <code>await</code></td><td><code>std::sync::Mutex</code> retenido entre <code>await</code>s</td><td>El guard de <code>std</code> no es <code>Send</code> y el future deja de serlo.</td></tr>
+            <tr><td>Operaciones cancel-safe o transaccionales</td><td>Asumir que una tarea siempre termina</td><td>Soltar el future cancela: puede quedarse a medias sin avisar.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">La pregunta que lo detecta todo</p>
+          <p>Antes de poner <code>async</code> en un proyecto, pregúntate: <strong>¿el cuello de botella es esperar o calcular?</strong> Si es esperar (red, disco, base de datos), <code>async</code> escala. Si es calcular, necesitas hilos o <code>spawn_blocking</code>, no un executor. Y si son cuatro tareas, ni te molestes: usa hilos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Bloquear el executor con <code>std::thread::sleep</code></h3>
+        <p><strong>Mal:</strong> dos tareas que esperan 200 ms, pero el hilo se duerme en la primera.</p>
+        <pre><code class="language-rust">#[tokio::main]
+async fn main() {
+    let inicio = std::time::Instant::now();
+    tokio::join!(esperar(1), esperar(2));
+    println!("{:?}", inicio.elapsed());        // ~400 ms, no ~200
+}
+
+async fn esperar(id: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(200));   // ¡bloquea!
+    println!("tarea {id}");
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>join!</code> sí conduce ambas tareas a la vez, pero la primera que corre nunca devuelve <code>Pending</code>: se queda dormida dentro del hilo del executor y la segunda no empieza hasta que suelta. Con muchas tareas, el servidor deja de responder.</p>
+        <p><strong>Bien:</strong> usa el temporizador del runtime; el total pasa a ser ~200 ms.</p>
+        <pre><code class="language-rust">async fn esperar(id: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;   // cede
+    println!("tarea {id}");
+}</code></pre>
+
+        <h3>2. Cruzar un <code>.await</code> con un <code>MutexGuard</code> de <code>std</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let store = Arc::new(Mutex::new(HashMap::new()));
+let copia = Arc::clone(&amp;store);
+
+tokio::spawn(async move {
+    let mut guard = copia.lock().expect("lock");
+    guard.insert("k7m2qd".to_string(), "https://rust-lang.org".to_string());
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    println!("{} enlaces", guard.len());     // el guard sigue vivo aquí
+});</code></pre>
+        <pre><code class="language-text">error[E0277]: `std::sync::MutexGuard&lt;'_, HashMap&lt;String, String&gt;&gt;` cannot be sent
+              between threads safely
+   --&gt; src/main.rs:4:10
+    |
+4   |     tokio::spawn(async move {
+    |           ------ ^^^^^^^^^^ future cannot be sent between threads safely
+    |           |      |
+    |           |      within this `{async block@src/main.rs:4:10: 4:30}`
+    |           required by a bound introduced by this call
+    |
+    = help: the trait `Send` is not implemented for
+            `MutexGuard&lt;'_, HashMap&lt;String, String&gt;&gt;`
+note: future is not `Send` as this value is used across an await
+    |
+7   |         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         await occurs here, with `guard` maybe used later</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>tokio::spawn</code> puede mover la tarea a otro hilo, así que exige un future <code>Send</code>. El guard de <code>std</code> no lo es, y el compilador detecta que sigue vivo después del <code>await</code>.</p>
+        <p><strong>Bien:</strong> acorta el ámbito si el candado no necesita cruzar el <code>await</code>; si debe cruzarlo, usa <code>tokio::sync::Mutex</code>.</p>
+        <pre><code class="language-rust">{
+    let mut guard = copia.lock().expect("lock");
+    guard.insert("k7m2qd".to_string(), "https://rust-lang.org".to_string());
+}                                             // guard liberado aquí
+tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+// o bien: candado async, cuyo guard sí es Send
+let links = tokio::sync::Mutex::new(HashMap::&lt;String, String&gt;::new());
+let mut guard = links.lock().await;</code></pre>
+
+        <h3>3. Un temporal que no vive hasta el <code>await</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">async fn registrar(code: &amp;str) {
+    let mensaje = &amp;format!("visita a {code}");     // referencia a un temporal
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    println!("{mensaje}");
+}</code></pre>
+        <pre><code class="language-text">error[E0716]: temporary value dropped while borrowed
+ --&gt; src/main.rs:2:20
+  |
+2 |     let mensaje = &amp;format!("visita a {code}");
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ creates a temporary value which is
+  |                                               freed while still in use
+3 |     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+  |     --------------------------------------------------------- borrow later used here
+  |
+  = note: consider using a `let` binding to create a longer lived value</code></pre>
+        <p><strong>Por qué está mal:</strong> el future debe guardar <code>mensaje</code> mientras está suspendido, pero <code>mensaje</code> apunta a un <code>String</code> temporal que muere al final de la sentencia. En código síncrono el temporal viviría lo suficiente; aquí el <code>await</code> alarga el préstamo más allá de su dueño.</p>
+        <p><strong>Bien:</strong> sé dueño del dato, o créalo antes del <code>await</code>.</p>
+        <pre><code class="language-rust">let mensaje = format!("visita a {code}");   // String con dueño
+tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+println!("{mensaje}");</code></pre>
+        <p>Y si el trabajo es caro de CPU, no lo metas en <code>async</code>: <code>tokio::task::spawn_blocking</code> lo ejecuta en el pool de hilos bloqueantes y deja el executor libre.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> escribir un future a mano y un <code>block_on</code> mínimo, para que <code>poll</code>, <code>Pending</code> y <code>Waker</code> dejen de ser teoría. Sin dependencias externas.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto.</strong>
+            <pre><code class="language-bash">cargo new futures-a-mano --bin
+cd futures-a-mano</code></pre>
+          </li>
+          <li>
+            <strong>Escribe un future que tarda tres sondeos y un executor mínimo.</strong>
+            <pre><code class="language-rust">use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+struct TerceraVez { sondeos: u8 }
+
+impl Future for TerceraVez {
+    type Output = u8;
+
+    fn poll(self: std::pin::Pin&lt;&amp;mut Self&gt;, _cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;u8&gt; {
+        let this = self.get_mut();       // el struct es Unpin
+        this.sondeos += 1;
+        if this.sondeos &lt; 3 { Poll::Pending } else { Poll::Ready(this.sondeos) }
+    }
+}
+
+fn block_on&lt;F: Future&gt;(fut: F) -&gt; F::Output {
+    let mut fut = pin!(fut);             // fija el future en el stack
+    let waker = Waker::noop();           // despertador vacío: reintentamos nosotros
+    let mut cx = Context::from_waker(waker);
+    let mut vueltas = 0u32;
+
+    loop {
+        vueltas += 1;
+        match fut.as_mut().poll(&amp;mut cx) {
+            Poll::Ready(valor) =&gt; {
+                println!("listo tras {vueltas} sondeos");
+                return valor;
+            }
+            Poll::Pending =&gt; std::thread::yield_now(),
+        }
+    }
+}
+
+fn main() {
+    println!("sondeos = {}", block_on(TerceraVez { sondeos: 0 }));
+}</code></pre>
+          </li>
+          <li>
+            <strong>Ejecuta y lee la salida.</strong>
+            <pre><code class="language-bash">cargo run</code></pre>
+            <pre><code class="language-text">listo tras 3 sondeos
+sondeos = 3</code></pre>
+            <p>Eso es un executor en veinte líneas: sondear, recibir <code>Pending</code>, reintentar. <code>Waker::noop()</code> es un despertador que no hace nada; por eso el bucle insiste. Un executor real, en lugar de girar, <em>aparca</em> el hilo hasta que el <code>Waker</code> lo despierta.</p>
+          </li>
+          <li>
+            <strong>Comprueba el coste de girar en vacío.</strong> Cambia <code>yield_now</code> por un contador y mira la CPU con <code>top</code> o el Monitor de actividad. No lo dejes así: es exactamente lo que hace un bucle mal escrito en un servidor async. Termina con:
+            <pre><code class="language-bash">cargo clippy -- -D warnings</code></pre>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Sabes explicar qué devuelve una <code>async fn</code> (un future, no el valor) y quién la hace avanzar (el executor, con <code>poll</code>). Y sabes por qué <code>.await</code> no bloquea el hilo aunque tu código parezca lineal.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Un <code>timeout</code> propio</h3>
+          <p>Escribe un combinador <code>Timeout&lt;F&gt;</code> que implemente <code>Future</code> y devuelva <code>Option&lt;F::Output&gt;</code>: <code>Some(valor)</code> si el future interno termina antes del límite y <code>None</code> si vence. No puedes usar <code>tokio::time::timeout</code>; sí puedes usar <code>tokio::time::Sleep</code> y su método <code>poll_elapsed</code>, fijándolo con <code>Pin&lt;Box&lt;Sleep&gt;&gt;</code>.</p>
+          <p>Debe respetar el contrato: si el future interno devuelve <code>Poll::Pending</code>, también se registra el <code>Waker</code> del temporizador; si vence, se devuelve <code>None</code> y el future interno se descarta. Añade un test con <code>#[tokio::test]</code> y <code>tokio::time::pause()</code> (feature <code>test-util</code>) que compruebe los dos caminos.</p>
+          <p><em>Pista: guarda el future interno como <code>Pin&lt;Box&lt;F&gt;&gt;</code> y sondea con <code>self.as_mut()</code>. Crea el <code>Sleep</code> al construir el combinador, no en el primer <code>poll</code>: si lo creas tarde, el plazo empieza a contar cuando ya has perdido tiempo. Y pasa siempre <code>cx.waker()</code> a ambas mitades.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Una <code>async fn</code> devuelve un future: una máquina de estados que no se ejecuta hasta que alguien la sondea.</li>
+          <li><code>poll</code> devuelve <code>Ready(valor)</code> o <code>Pending</code>; el <code>Waker</code> avisa de cuándo merece la pena volver a sondear.</li>
+          <li><code>.await</code> cede el hilo, no lo bloquea. La concurrencia no es paralelismo: dos <code>await</code> seguidos se suman.</li>
+          <li>Rust no incluye runtime: Tokio, async-std o smol aportan executor, reactor y timers.</li>
+          <li>AFIT (1.75) permite <code>async fn</code> en traits; para <code>dyn Trait</code> hace falta <code>async-trait</code>. <code>Pin</code> impide mover un future auto-referencial y casi siempre se resuelve con <code>Box::pin</code> o <code>pin!</code>.</li>
+          <li>Soltar un future lo cancela: diseña operaciones cancel-safe.</li>
+          <li>Bloquear el executor (sleep, CPU, E/S de <code>std</code>) es el error más caro: usa <code>tokio::time</code> y <code>spawn_blocking</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>#[tokio::main]</code></td><td>Envuelve <code>main</code> en un runtime y lo ejecuta con <code>block_on</code>.</td></tr>
+            <tr><td><code>tokio::time::sleep(d).await</code></td><td>Espera sin bloquear el hilo; el temporizador vive en el runtime.</td></tr>
+            <tr><td><code>tokio::sync::Mutex</code></td><td>Candado que se puede mantener a través de un <code>await</code>.</td></tr>
+            <tr><td><code>tokio::task::spawn_blocking(f)</code></td><td>Mueve trabajo bloqueante al pool de hilos, fuera del executor.</td></tr>
+            <tr><td><code>Box::pin(fut)</code> / <code>pin!(fut)</code></td><td>Fija un future en el heap o en el stack para poder sondearlo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿<code>async</code> es más rápido que los hilos?</summary>
+          <div>
+            <p>Depende de la carga. Con pocas tareas y mucho cálculo, los hilos son igual de rápidos o más, y el código es más simple. Con miles de conexiones que esperan E/S, <code>async</code> gana porque no reserva un stack por conexión ni paga un cambio de contexto por espera. La pregunta correcta no es «¿qué es más rápido?» sino «¿cuántas tareas simultáneas y cuánto esperan?».</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué no hay runtime en la biblioteca estándar?</summary>
+          <div>
+            <p>Porque el runtime ideal depende del caso: unos quieren un executor multihilo con reactor de red, otros un bucle mínimo para un microcontrolador. La biblioteca estándar define el contrato (<code>Future</code>, <code>Poll</code>, <code>Waker</code>) y deja la implementación al ecosistema, igual que con los asignadores.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Puedo mezclar Tokio con <code>std::thread</code>?</summary>
+          <div>
+            <p>Sí, y a veces es lo correcto: un hilo dedicado a un cálculo largo, o <code>spawn_blocking</code> para E/S de fichero. Lo que no puedes es bloquear el hilo del executor con una operación lenta. La regla mental: fuera del runtime, hilos normales; dentro, solo trabajo que cede o <code>spawn_blocking</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Qué es exactamente <code>Pin</code> y cuándo me tengo que preocupar?</summary>
+          <div>
+            <p><code>Pin</code> garantiza que un valor no se mueve de sitio en memoria. Los futures generados por <code>async fn</code> pueden contener referencias a sus propias variables, así que moverlos los rompería. En la práctica solo te topas con él al escribir un combinador a mano o cuando <code>select!</code> te pide fijar un future: se resuelve con <code>Box::pin</code> o <code>pin!</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Si cancelo una tarea, ¿se ejecuta su <code>Drop</code>?</summary>
+          <div>
+            <p>Sí: al soltar el future se destruyen sus campos y se ejecutan sus <code>Drop</code>. Lo que no hay es una «cancelación ordenada» automática: la tarea no recibe una señal ni puede terminar su trabajo antes de morir. Si necesitas cerrar una conexión o revertir algo, ponlo en un <code>Drop</code> o usa un mecanismo explícito como <code>CancellationToken</code>, que verás en la lección 4.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

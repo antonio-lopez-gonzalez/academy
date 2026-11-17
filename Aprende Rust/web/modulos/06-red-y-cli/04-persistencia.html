@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="04-persistencia">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Persistencia: ficheros, SQLite y migraciones — Módulo 6 · Curso Rust</title>
+  <meta name="description" content="Guarda datos en Rust sin corromperlos: escritura atómica en JSON, bloqueo con fs2, SQLite con rusqlite, migraciones versionadas, transacciones, WAL y copias de seguridad.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Persistencia: ficheros, SQLite y migraciones</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Red y CLI real</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora, urlshort guarda los enlaces en un <code>HashMap</code>: al cerrar el proceso, todo desaparece. La persistencia parece el problema más simple del curso —«escribir un fichero»— y es donde más datos se pierden en producción. Un proceso que muere a mitad de escritura deja un JSON truncado; dos procesos que escriben a la vez se pisan; una migración a medias deja la base de datos en un estado que nadie probó.</p>
+        <p>Esta lección construye un <strong><code>Store</code></strong> con dos implementaciones intercambiables: un fichero JSON (sencillo, legible, suficiente para miles de enlaces) y SQLite (transaccional, indexado, suficiente para millones). La misma trait, el mismo contrato, los mismos tests. Cambiar de una a otra es una línea en la configuración.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque «funciona en mi máquina» deja de ser cierto en cuanto hay dos procesos, un corte de luz o una actualización de esquema. La persistencia se diseña con tres preguntas: ¿qué pasa si el proceso muere ahora?, ¿qué pasa si dos escriben a la vez?, ¿qué pasa cuando cambie el formato? JSON y SQLite responden a las tres de forma distinta, y saber cuándo usar cada uno es criterio de ingeniería.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> escribir directamente sobre el fichero bueno; hacer <code>rename</code> antes de <code>fsync</code>; no bloquear el fichero entre procesos; ignorar <code>database is locked</code>; ejecutar migraciones sin tabla de versiones; retener una conexión <code>rusqlite</code> a través de un <code>.await</code>; copiar una base SQLite en caliente con <code>cp</code>.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Una trait, dos motores</h3>
+        <p>El dominio no debe saber si los datos viven en un fichero o en una base de datos. Esa frontera es una trait:</p>
+        <pre><code class="language-rust">pub trait Store {
+    fn insert(&amp;mut self, link: Link) -&gt; Result&lt;(), StoreError&gt;;
+    fn get(&amp;self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt;;
+    fn list(&amp;self, limit: usize) -&gt; Result&lt;Vec&lt;Link&gt;, StoreError&gt;;
+    fn delete(&amp;mut self, code: &amp;str) -&gt; Result&lt;bool, StoreError&gt;;
+    fn register_hit(&amp;mut self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt;;
+}</code></pre>
+        <p>Los métodos son object-safe: <code>Box&lt;dyn Store&gt;</code> funciona y el CLI elige el motor en tiempo de ejecución. El contrato incluye el <strong>significado de los errores</strong>: insertar un código repetido devuelve <code>Duplicate</code> en ambos motores, aunque SQLite lo detecte como violación de clave primaria. Si las implementaciones no coinciden, la trait es una mentira.</p>
+
+        <h3>JSON: escribir sin destruir</h3>
+        <p>Un fichero JSON se reescribe entero en cada cambio. Eso es aceptable hasta unos miles de enlaces, y peligroso si se hace mal. La regla es <strong>nunca escribir sobre el fichero que estás leyendo</strong>:</p>
+        <pre class="diagram">  1. serializar en memoria
+  2. escribir en links.json.tmp
+  3. fsync del temporal      ← los bytes llegan al disco
+  4. rename(tmp, links.json) ← atómico en el mismo sistema de ficheros
+  5. (en Unix) fsync del directorio
+
+  si el proceso muere en 2 o 3: queda un .tmp huérfano, el bueno sigue intacto
+  si muere en 4: el rename es todo o nada</pre>
+        <p>El <code>rename</code> sustituye el fichero de forma atómica dentro del mismo sistema de ficheros. Sin el <code>sync_all</code> previo, el rename puede llegar al disco antes que los datos y dejar un fichero vacío tras un corte de luz. Y como el JSON es un documento completo, dos procesos que lo editen a la vez se pisan: hace falta un <strong>bloqueo de fichero</strong> (<code>fs2</code>) que impida abrirlo dos veces en modo escritura.</p>
+        <table>
+          <thead><tr><th>Aspecto</th><th>JSON</th><th>SQLite</th></tr></thead>
+          <tbody>
+            <tr><td>Escritura</td><td>Reescribe todo el documento: O(n)</td><td>Página a página, con WAL: O(log n)</td></tr>
+            <tr><td>Leer un enlace</td><td>Parsea el fichero entero</td><td>Búsqueda por índice</td></tr>
+            <tr><td>Concurrencia</td><td>Un proceso, con bloqueo exclusivo</td><td>Varios lectores y un escritor (WAL)</td></tr>
+            <tr><td>Atomicidad</td><td>Rename atómico, sin transacciones</td><td>Transacciones ACID</td></tr>
+            <tr><td>Tamaño</td><td>Todos los datos en memoria</td><td>Páginas bajo demanda</td></tr>
+            <tr><td>Inspección</td><td>Legible con cualquier editor</td><td><code>sqlite3</code>, <code>.schema</code>, SQL</td></tr>
+          </tbody>
+        </table>
+        <p>La conclusión práctica: JSON para configuración y volúmenes pequeños; SQLite en cuanto haya escrituras concurrentes, consultas o crecimiento. No es una guerra: son herramientas distintas.</p>
+
+        <h3>SQLite: cuatro pragmas que importan</h3>
+        <ul>
+          <li><code>PRAGMA journal_mode = WAL</code>: escribe en un <em>write-ahead log</em>. Los lectores no bloquean al escritor y viceversa. Es el modo por defecto recomendable para una aplicación. No funciona igual en <code>:memory:</code>.</li>
+          <li><code>PRAGMA busy_timeout = 5000</code>: si otra conexión tiene el bloqueo, espera hasta 5 s antes de devolver <code>SQLITE_BUSY</code>. Sin esto, dos procesos se pelean y uno falla al instante.</li>
+          <li><code>PRAGMA synchronous = NORMAL</code>: con WAL, buen equilibrio entre durabilidad y velocidad. <code>FULL</code> es más seguro y más lento.</li>
+          <li><code>PRAGMA foreign_keys = ON</code>: SQLite no aplica claves foráneas por defecto. Si el esquema las usa, hay que activarlas en cada conexión.</li>
+        </ul>
+        <p>Con WAL sigue habiendo <strong>un solo escritor</strong>. Las transacciones de escritura deben abrirse con <code>BEGIN IMMEDIATE</code> (<code>TransactionBehavior::Immediate</code>) para tomar el bloqueo al principio y no descubrir a mitad que otro se adelantó. Un <code>BEGIN</code> diferido que empieza leyendo y luego quiere escribir puede fallar con <code>SQLITE_BUSY</code> sin poder reintentar con seguridad.</p>
+
+        <h3>Migraciones: el esquema también es código</h3>
+        <p>Una migración es un paso <strong>numerado, ordenado e irreversible en producción</strong>. Se aplica una vez, se registra en una tabla y nunca se edita después:</p>
+        <pre><code class="language-sql">CREATE TABLE _migrations (
+    version    TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);</code></pre>
+        <p>Al arrancar, el programa crea la tabla si no existe, recorre la lista de migraciones y aplica las que faltan, cada una dentro de su propia transacción. Reglas que evitan desastres: solo cambios aditivos (añadir columnas y tablas, no borrar), valores por defecto para las columnas nuevas, rellenar datos en lotes y <strong>hacer copia antes de migrar</strong>. Si una migración falla, el proceso no debe arrancar con el esquema a medias.</p>
+
+        <h3>Transacciones, índices y copias</h3>
+        <p>Un <em>hit</em> es un incremento más una lectura: si se hace en dos pasos sin transacción, dos peticiones pueden leer el mismo contador y perder uno. Con <code>UPDATE … ; SELECT …</code> dentro de una transacción, el resultado es consistente. Los índices aceleran las consultas que de verdad haces (<code>ORDER BY created_at DESC</code>, búsquedas por <code>expires_at</code>) y cuestan espacio y escrituras: no indexes por si acaso.</p>
+        <p>Para copias de seguridad en caliente, <code>VACUUM INTO 'backup.db'</code> produce una copia consistente sin parar el servidor. Copiar a mano <code>links.db</code> mientras hay un WAL activo puede darte una base incoherente: te falta el <code>-wal</code> o lo copias a medias.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Guardar una estructura en JSON y volver a leerla, con escritura atómica. <code>Cargo.toml</code>:</p>
+        <pre><code class="language-toml">[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"</code></pre>
+        <pre><code class="language-rust">use std::{fs, io::Write, path::Path};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Config {
+    format: String,
+    color: bool,
+}
+
+fn save(path: &amp;Path, config: &amp;Config) -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let tmp = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(config)?;
+
+    {
+        let mut file = fs::File::create(&amp;tmp)?;
+        file.write_all(&amp;bytes)?;
+        file.sync_all()?;          // los bytes están en disco
+    }
+
+    fs::rename(&amp;tmp, path)?;       // sustitución atómica
+    Ok(())
+}
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let config = Config { format: "json".into(), color: false };
+    save(Path::new("config.json"), &amp;config)?;
+
+    let texto = fs::read_to_string("config.json")?;
+    let leido: Config = serde_json::from_str(&amp;texto)?;
+    println!("{leido:?}");
+    Ok(())
+}</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>with_extension("tmp")</code> deja <code>config.tmp</code> junto al bueno: el <code>rename</code> debe ser en el mismo sistema de ficheros para ser atómico.</li>
+          <li>El bloque <code>{ … }</code> cierra el fichero antes del <code>rename</code>. En Windows no puedes renombrar un fichero abierto.</li>
+          <li><code>sync_all()</code> fuerza a disco. Sin él, el orden entre datos y rename no está garantizado.</li>
+          <li><code>serde_json::to_vec_pretty</code> serializa a memoria: si falla, no has tocado el fichero bueno.</li>
+          <li><code>from_str</code> valida el esquema: un campo que falta o un tipo distinto produce un error con línea y columna.</li>
+        </ul>
+        <div class="callout callout--warning">
+          <p class="callout__title">Esto todavía no es seguro entre procesos</p>
+          <p>La escritura atómica protege de un corte a mitad, pero no de dos procesos que leen, modifican y escriben a la vez: el último gana y pierde los cambios del otro. Para eso hace falta el bloqueo de fichero que veremos en el ejemplo real.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>Store</code> de urlshort con las dos implementaciones. Primero los tipos comunes:</p>
+        <pre><code class="language-rust">// src/store.rs
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+use fs2::FileExt;
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Link {
+    pub code: String,
+    pub url: String,
+    pub created_at: String,   // RFC 3339; el formato lo fija la capa que crea el enlace
+    pub hits: u32,
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("no se pudo acceder al almacén: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("datos corruptos: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("error de SQLite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("el almacén está bloqueado por otro proceso")]
+    Locked,
+    #[error("el código ya existe: {0}")]
+    Duplicate(String),
+    #[error("configuración inválida: {0}")]
+    Setup(String),
+}
+
+pub trait Store {
+    fn insert(&amp;mut self, link: Link) -&gt; Result&lt;(), StoreError&gt;;
+    fn get(&amp;self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt;;
+    fn list(&amp;self, limit: usize) -&gt; Result&lt;Vec&lt;Link&gt;, StoreError&gt;;
+    fn delete(&amp;mut self, code: &amp;str) -&gt; Result&lt;bool, StoreError&gt;;
+    fn register_hit(&amp;mut self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt;;
+}</code></pre>
+        <p>El motor JSON mantiene el mapa en memoria y vuelca con <code>rename</code>. El bloqueo exclusivo se toma al abrir y se libera al cerrar (o al salir del proceso):</p>
+        <pre><code class="language-rust">pub struct JsonStore {
+    path: PathBuf,
+    links: BTreeMap&lt;String, Link&gt;,
+    _lock: File,
+}
+
+impl JsonStore {
+    pub fn open(path: impl Into&lt;PathBuf&gt;) -&gt; Result&lt;Self, StoreError&gt; {
+        let path = path.into();
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                fs::create_dir_all(dir)?;
+            }
+        }
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.try_lock_exclusive().map_err(|_| StoreError::Locked)?;
+
+        let links = match fs::read(&amp;path) {
+            Ok(bytes) =&gt; serde_json::from_slice(&amp;bytes)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound =&gt; BTreeMap::new(),
+            Err(err) =&gt; return Err(err.into()),
+        };
+
+        Ok(Self { path, links, _lock: lock })
+    }
+
+    fn flush(&amp;self) -&gt; Result&lt;(), StoreError&gt; {
+        let tmp = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&amp;self.links)?;
+
+        {
+            let mut file = File::create(&amp;tmp)?;
+            file.write_all(&amp;bytes)?;
+            file.sync_all()?;
+        }
+
+        fs::rename(&amp;tmp, &amp;self.path)?;
+        Ok(())
+    }
+}
+
+impl Store for JsonStore {
+    fn insert(&amp;mut self, link: Link) -&gt; Result&lt;(), StoreError&gt; {
+        if self.links.contains_key(&amp;link.code) {
+            return Err(StoreError::Duplicate(link.code));
+        }
+        self.links.insert(link.code.clone(), link);
+        self.flush()
+    }
+
+    fn get(&amp;self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt; {
+        Ok(self.links.get(code).cloned())
+    }
+
+    fn list(&amp;self, limit: usize) -&gt; Result&lt;Vec&lt;Link&gt;, StoreError&gt; {
+        Ok(self.links.values().rev().take(limit).cloned().collect())
+    }
+
+    fn delete(&amp;mut self, code: &amp;str) -&gt; Result&lt;bool, StoreError&gt; {
+        let removed = self.links.remove(code).is_some();
+        if removed {
+            self.flush()?;
+        }
+        Ok(removed)
+    }
+
+    fn register_hit(&amp;mut self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt; {
+        let Some(link) = self.links.get_mut(code) else {
+            return Ok(None);
+        };
+        link.hits += 1;
+        let updated = link.clone();
+        self.flush()?;      // el préstamo mutable termina aquí
+        Ok(Some(updated))
+    }
+}</code></pre>
+        <p>Y el motor SQLite, con esquema versionado, WAL y transacciones:</p>
+        <pre><code class="language-rust">pub struct SqliteStore {
+    conn: Connection,
+}
+
+const MIGRATIONS: &amp;[(&amp;str, &amp;str)] = &amp;[
+    (
+        "0001_init",
+        "CREATE TABLE links (
+             code       TEXT PRIMARY KEY,
+             url        TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             hits       INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX idx_links_created_at ON links(created_at DESC);",
+    ),
+    (
+        "0002_hits_index",
+        "CREATE INDEX idx_links_hits ON links(hits DESC);",
+    ),
+];
+
+impl SqliteStore {
+    pub fn open(path: impl AsRef&lt;Path&gt;) -&gt; Result&lt;Self, StoreError&gt; {
+        let conn = Connection::open(path)?;
+
+        // WAL devuelve una fila: hay que leerla, no usar execute.
+        let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Setup(format!("no se pudo activar WAL (modo: {mode})")));
+        }
+        conn.pragma_update(None, "busy_timeout", 5_000)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        migrate(&amp;conn)?;
+        Ok(Self { conn })
+    }
+}
+
+fn migrate(conn: &amp;Connection) -&gt; Result&lt;(), StoreError&gt; {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _migrations (
+             version    TEXT PRIMARY KEY,
+             applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+
+    for &amp;(version, sql) in MIGRATIONS {
+        let applied: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM _migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )?;
+        if applied {
+            continue;
+        }
+
+        // Cada migración es atómica: o entra entera o no entra.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute("INSERT INTO _migrations (version) VALUES (?1)", [version])?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+fn row_to_link(row: &amp;rusqlite::Row&lt;'_&gt;) -&gt; rusqlite::Result&lt;Link&gt; {
+    Ok(Link {
+        code: row.get(0)?,
+        url: row.get(1)?,
+        created_at: row.get(2)?,
+        hits: row.get::&lt;_, i64&gt;(3)? as u32,
+    })
+}
+
+impl Store for SqliteStore {
+    fn insert(&amp;mut self, link: Link) -&gt; Result&lt;(), StoreError&gt; {
+        let result = self.conn.execute(
+            "INSERT INTO links (code, url, created_at, hits) VALUES (?1, ?2, ?3, ?4)",
+            params![link.code, link.url, link.created_at, link.hits as i64],
+        );
+
+        match result {
+            Ok(_) =&gt; Ok(()),
+            // La violación de clave primaria es el "Duplicate" de este motor.
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == ErrorCode::ConstraintViolation =&gt;
+            {
+                Err(StoreError::Duplicate(link.code))
+            }
+            Err(err) =&gt; Err(err.into()),
+        }
+    }
+
+    fn get(&amp;self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt; {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT code, url, created_at, hits FROM links WHERE code = ?1")?;
+        Ok(stmt.query_row([code], row_to_link).optional()?)
+    }
+
+    fn list(&amp;self, limit: usize) -&gt; Result&lt;Vec&lt;Link&gt;, StoreError&gt; {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT code, url, created_at, hits FROM links ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], row_to_link)?;
+        Ok(rows.collect::&lt;Result&lt;Vec&lt;_&gt;, _&gt;&gt;()?)
+    }
+
+    fn delete(&amp;mut self, code: &amp;str) -&gt; Result&lt;bool, StoreError&gt; {
+        let affected = self.conn.execute("DELETE FROM links WHERE code = ?1", [code])?;
+        Ok(affected &gt; 0)
+    }
+
+    fn register_hit(&amp;mut self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, StoreError&gt; {
+        // IMMEDIATE toma el bloqueo de escritura al empezar.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let affected = tx.execute("UPDATE links SET hits = hits + 1 WHERE code = ?1", [code])?;
+        if affected == 0 {
+            return Ok(None);       // el drop hace rollback: no hay nada que guardar
+        }
+
+        let mut stmt = tx.prepare("SELECT code, url, created_at, hits FROM links WHERE code = ?1")?;
+        let link = stmt.query_row([code], row_to_link).optional()?;
+        drop(stmt);
+        tx.commit()?;
+        Ok(link)
+    }
+}</code></pre>
+        <p>El selector es una función y el resto del programa usa <code>Box&lt;dyn Store&gt;</code>:</p>
+        <pre><code class="language-rust">pub fn open_store(backend: &amp;str, path: &amp;Path) -&gt; Result&lt;Box&lt;dyn Store&gt;, StoreError&gt; {
+    match backend {
+        "json" =&gt; Ok(Box::new(JsonStore::open(path)?)),
+        "sqlite" =&gt; Ok(Box::new(SqliteStore::open(path)?)),
+        other =&gt; Err(StoreError::Setup(format!("backend desconocido: {other}"))),
+    }
+}
+
+// src/main.rs — el resto del programa no sabe qué motor hay detrás
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let mut store = open_store("sqlite", Path::new("urlshort.db"))?;
+    store.insert(Link {
+        code: "rust".into(),
+        url: "https://www.rust-lang.org/".into(),
+        created_at: "2026-01-15T10:00:00Z".into(),
+        hits: 0,
+    })?;
+    println!("{:?}", store.get("rust")?);
+    Ok(())
+}</code></pre>
+        <p>El test que demuestra que el contrato se cumple:</p>
+        <pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(code: &amp;str) -&gt; Link {
+        Link {
+            code: code.into(),
+            url: format!("https://example.com/{code}"),
+            created_at: "2026-01-15T10:00:00Z".into(),
+            hits: 0,
+        }
+    }
+
+    fn contrato(store: &amp;mut dyn Store) {
+        store.insert(link("rust")).expect("insertar");
+        store.insert(link("cargo")).expect("insertar");
+
+        assert_eq!(store.get("rust").expect("leer").expect("existe").url, "https://example.com/rust");
+        assert!(store.get("nope").expect("leer").is_none());
+        assert!(matches!(store.insert(link("rust")), Err(StoreError::Duplicate(_))));
+
+        assert_eq!(store.register_hit("rust").expect("hit").expect("existe").hits, 1);
+        assert_eq!(store.list(10).expect("listar").len(), 2);
+
+        assert!(store.delete("cargo").expect("borrar"));
+        assert!(!store.delete("cargo").expect("borrar"));
+        assert_eq!(store.list(10).expect("listar").len(), 1);
+    }
+
+    fn temp(name: &amp;str) -&gt; PathBuf {
+        let dir = std::env::temp_dir().join(format!("urlshort-test-{}", std::process::id()));
+        fs::create_dir_all(&amp;dir).expect("directorio temporal");
+        dir.join(name)
+    }
+
+    #[test]
+    fn json_cumple_el_contrato() {
+        let path = temp("contrato.json");
+        let _ = fs::remove_file(&amp;path);
+        let mut store = JsonStore::open(path.clone()).expect("abrir JSON");
+        contrato(&amp;mut store);
+        drop(store);
+        let _ = fs::remove_file(&amp;path);
+        let _ = fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn sqlite_cumple_el_contrato() {
+        let path = temp("contrato.db");
+        let _ = fs::remove_file(&amp;path);
+        let mut store = SqliteStore::open(&amp;path).expect("abrir SQLite");
+        contrato(&amp;mut store);
+    }
+}</code></pre>
+        <div class="callout callout--analogy">
+          <p class="callout__title">Analogía: el cuaderno y la caja registradora</p>
+          <p>El JSON es un cuaderno: para cambiar una línea reescribes el cuaderno entero y lo pones encima del anterior; si dos escriben a la vez, se lían. SQLite es una caja registradora: apunta operaciones en un diario, las confirma con un recibo y sabe deshacer una venta a medias. Las dos guardan datos; solo una está pensada para que varios cobren a la vez.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Escribir en temporal + <code>sync_all</code> + <code>rename</code></td><td><code>File::create</code> sobre el fichero bueno</td><td>Un corte a mitad deja el fichero truncado para siempre.</td></tr>
+            <tr><td>Bloquear el fichero con <code>fs2</code></td><td>Dos procesos escribiendo el mismo JSON</td><td>El último gana y pierde los cambios del otro.</td></tr>
+            <tr><td>WAL + <code>busy_timeout</code> + <code>BEGIN IMMEDIATE</code></td><td>Ignorar <code>SQLITE_BUSY</code></td><td>Concurrencia real sin errores intermitentes.</td></tr>
+            <tr><td>Migraciones numeradas y registradas</td><td><code>CREATE TABLE IF NOT EXISTS</code> suelto</td><td>El esquema evoluciona sin pasos manuales ni sorpresas.</td></tr>
+            <tr><td>Una transacción por operación compuesta</td><td><code>UPDATE</code> y luego <code>SELECT</code> sin transacción</td><td>Evita lecturas incoherentes y contadores perdidos.</td></tr>
+            <tr><td>Índices solo para consultas reales</td><td>Indexar todas las columnas</td><td>Cada índice cuesta espacio y velocidad de escritura.</td></tr>
+            <tr><td><code>VACUUM INTO</code> o <code>.backup</code> para copias</td><td><code>cp links.db</code> con WAL activo</td><td>La copia puede estar a medias o sin el diario.</td></tr>
+            <tr><td>Probar el mismo contrato en ambos motores</td><td>Tests distintos por implementación</td><td>La trait solo es útil si las dos se comportan igual.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">Empieza por JSON y migra cuando duela</p>
+          <p>No metas SQLite en un CLI que guarda veinte enlaces: el JSON es inspeccionable con <code>cat</code> y no añade una dependencia nativa. Cambia cuando aparezcan escrituras concurrentes, consultas o decenas de miles de registros; la trait hace que el cambio no toque el dominio.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Reescribir el fichero en su sitio</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let mut file = File::create("links.json")?;   // ya has truncado el bueno
+serde_json::to_writer(&amp;mut file, &amp;links)?;
+// si el proceso muere aquí, links.json queda vacío o a medias</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>File::create</code> trunca antes de escribir. No hay recuperación. <strong>Bien:</strong> temporal, <code>sync_all</code> y <code>rename</code>.</p>
+
+        <h3>2. Renombrar antes de sincronizar</h3>
+        <p><strong>Mal:</strong> escribir el temporal, cerrarlo y renombrarlo sin <code>sync_all</code>. El sistema de ficheros puede reordenar las escrituras y dejar el nombre apuntando a un fichero vacío tras un corte de luz. <strong>Bien:</strong> <code>sync_all()</code> antes del <code>rename</code>; en Unix, sincronizar también el directorio con <code>File::open(dir)?.sync_all()</code> si la durabilidad es crítica.</p>
+
+        <h3>3. Ignorar el bloqueo entre procesos</h3>
+        <p><strong>Mal:</strong> dos instancias del CLI abiertas sobre el mismo JSON. Cada una leyó el mapa al arrancar; la segunda escribe y borra los enlaces que añadió la primera. <strong>Bien:</strong> <code>try_lock_exclusive()</code> al abrir y un error claro (<code>StoreError::Locked</code>) en vez de silencio.</p>
+
+        <h3>4. <code>database is locked</code></h3>
+        <p><strong>Mal:</strong> abrir la conexión sin <code>busy_timeout</code> y con transacciones diferidas.</p>
+        <pre><code class="language-text">Error: error de SQLite: database is locked (code 5)</code></pre>
+        <p><strong>Por qué está mal:</strong> dos conexiones compiten por el único escritor de SQLite; sin espera, la segunda falla al instante. <strong>Bien:</strong> <code>busy_timeout</code>, WAL y <code>BEGIN IMMEDIATE</code> para las escrituras.</p>
+
+        <h3>5. Migrar sin versiones</h3>
+        <p><strong>Mal:</strong> ejecutar <code>ALTER TABLE links ADD COLUMN expires_at TEXT</code> en cada arranque.</p>
+        <pre><code class="language-text">Error: error de SQLite: duplicate column name: expires_at (code 1)</code></pre>
+        <p><strong>Por qué está mal:</strong> el esquema ya cambió, pero el programa no sabe que ese paso está hecho. <strong>Bien:</strong> la tabla <code>_migrations</code> y aplicar solo lo que falta.</p>
+
+        <h3>6. Una conexión <code>rusqlite</code> a través de un <code>.await</code></h3>
+        <p><strong>Mal:</strong> en un <em>handler</em> de Axum, guardar <code>Connection</code> en el estado y hacer <code>state.conn.lock().unwrap()</code> antes de un <code>.await</code>.</p>
+        <pre><code class="language-text">error[E0277]: future cannot be sent between threads safely
+  = help: within `impl Future&lt;Output = ...&gt;`,
+          the trait `Send` is not implemented for `std::sync::MutexGuard&lt;'_, rusqlite::Connection&gt;`</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>Connection</code> no es <code>Sync</code> y el <em>guard</em> no puede cruzar un punto de await. <strong>Bien:</strong> <code>tokio::task::spawn_blocking</code> con la conexión movida dentro, un pool como <code>r2d2_sqlite</code> o <code>tokio-rusqlite</code>, y tareas bloqueantes fuera del runtime.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> implementar el <code>Store</code>, comprobar que los dos motores cumplen el mismo contrato y ver el efecto de los índices y de una migración.</p>
+        <ol class="steps">
+          <li>
+            <strong>Añade las dependencias.</strong>
+            <pre><code class="language-bash">cargo add serde --features derive
+cargo add serde_json thiserror
+cargo add rusqlite --features bundled
+cargo add fs2</code></pre>
+            <p><code>bundled</code> compila SQLite dentro del binario: no depende de la versión del sistema, a cambio de unos segundos más de compilación.</p>
+          </li>
+          <li>
+            <strong>Pega el código del ejemplo real</strong> en <code>src/store.rs</code>, añade <code>pub mod store;</code> y ejecuta <code>cargo test</code>. Deben pasar <code>json_cumple_el_contrato</code> y <code>sqlite_cumple_el_contrato</code>. Si uno falla, el contrato está mal definido: arréglalo en las dos implementaciones, no en el test.
+          </li>
+          <li>
+            <strong>Provoca una corrupción controlada.</strong> Escribe <code>echo '{roto' &gt; links.json</code> y ejecuta el CLI con backend JSON. Debes ver un error <code>datos corruptos: …</code> con línea y columna, no un <em>panic</em>. Decide qué hacer: renombrar el fichero a <code>.bak</code> y empezar vacío, o abortar. Documenta la decisión.
+          </li>
+          <li>
+            <strong>Mira el esquema y los índices.</strong>
+            <pre><code class="language-bash">sqlite3 urlshort.db ".schema links"
+sqlite3 urlshort.db "EXPLAIN QUERY PLAN
+  SELECT code, url, created_at, hits FROM links
+  WHERE code = 'rust';"
+sqlite3 urlshort.db "EXPLAIN QUERY PLAN
+  SELECT * FROM links ORDER BY created_at DESC LIMIT 20;"</code></pre>
+            <p>La primera consulta debe usar el índice de la clave primaria (<code>SEARCH links USING INDEX …</code>); la segunda, <code>idx_links_created_at</code>. Si ves <code>SCAN links</code> en la segunda, el índice no está o la consulta no lo aprovecha.</p>
+          </li>
+          <li>
+            <strong>Añade una migración real.</strong> Crea <code>0003_last_hit</code> con <code>ALTER TABLE links ADD COLUMN last_hit_at TEXT;</code>, arranca dos veces y comprueba con <code>SELECT * FROM _migrations;</code> que hay tres filas y ningún duplicado. Actualiza <code>register_hit</code> para escribir <code>last_hit_at = datetime('now')</code> y verifica que los enlaces antiguos (con <code>NULL</code>) siguen funcionando. Después ejecuta <code>EXPLAIN QUERY PLAN SELECT * FROM links ORDER BY hits DESC LIMIT 20;</code> y comprueba que usa <code>idx_links_hits</code>.
+          </li>
+          <li>
+            <strong>Prueba la concurrencia.</strong> Abre dos procesos del CLI con el mismo JSON: el segundo debe fallar con <code>el almacén está bloqueado por otro proceso</code>. Con SQLite, en cambio, ambos deben poder leer y uno esperar al otro para escribir: comprueba que no hay errores intermitentes.
+          </li>
+          <li>
+            <strong>Haz una copia en caliente.</strong>
+            <pre><code class="language-bash">sqlite3 urlshort.db "VACUUM INTO 'backup-2026-01-15.db';"
+ls -lh urlshort.db* backup-2026-01-15.db</code></pre>
+            <p>Abre la copia con <code>sqlite3 backup-2026-01-15.db "SELECT COUNT(*) FROM links;"</code>. Debe funcionar sin el <code>-wal</code> original: la copia es autocontenida.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Puedes responder con datos: qué pasa si matas el proceso a mitad de escritura, cuántos escritores admite cada motor, qué consulta usa qué índice y qué migración está aplicada. Y el mismo test pasa en JSON y en SQLite.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Caducidad, limpieza y migración con relleno</h3>
+          <p>Los enlaces pueden caducar. Añade al dominio <code>expires_at: Option&lt;String&gt;</code> y:</p>
+          <ul>
+            <li>Resuelve un enlace caducado con un error de dominio <code>Expired</code>, que el servidor traducirá a <code>410 Gone</code>.</li>
+            <li>Escribe la migración <code>0004_expires_at</code> que añada la columna <strong>y rellene</strong> los enlaces existentes con <code>NULL</code> (sin caducidad) en la misma transacción.</li>
+            <li>Añade un subcomando <code>urlshort gc --days 30</code> que borre en lotes los enlaces caducados hace más de N días, informando cuántos borró. Debe funcionar con los dos motores y no bloquear la base durante minutos.</li>
+            <li>Haz que el JSON no reescriba el fichero si el <em>gc</em> no borró nada.</li>
+          </ul>
+          <p><em>Pista: en SQLite, <code>DELETE FROM links WHERE expires_at &lt; ?1 LIMIT ?2</code> no existe tal cual; usa una subconsulta con <code>rowid IN (SELECT rowid … LIMIT ?2)</code> dentro de una transacción, o borra por rangos de fecha. En JSON, retén los códigos a borrar, comprueba <code>is_empty()</code> y solo entonces llama a <code>flush</code>. Y recuerda que un <code>ALTER TABLE</code> con valor por defecto no puede usar funciones no constantes en SQLite.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>La persistencia se diseña con tres preguntas: corte a mitad, concurrencia y evolución del esquema.</li>
+          <li>JSON se escribe con <strong>temporal + <code>sync_all</code> + <code>rename</code></strong>; nunca sobre el fichero bueno.</li>
+          <li>Entre procesos, el JSON necesita un <strong>bloqueo exclusivo</strong> (<code>fs2</code>); sin él, el último gana.</li>
+          <li>SQLite aporta transacciones, índices y concurrencia; con <strong>WAL</strong>, <code>busy_timeout</code> y <code>BEGIN IMMEDIATE</code>.</li>
+          <li>Las migraciones son pasos numerados, registrados en <code>_migrations</code> y aplicados una sola vez dentro de una transacción.</li>
+          <li>Una trait <code>Store</code> con dos implementaciones permite cambiar de motor sin tocar el dominio, y un test de contrato lo garantiza.</li>
+          <li>Las copias se hacen con <code>VACUUM INTO</code> o <code>.backup</code>, nunca copiando el fichero con WAL activo.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>cargo add rusqlite --features bundled</code></td><td>SQLite embebido en el binario, sin dependencia del sistema.</td></tr>
+            <tr><td><code>cargo add fs2</code></td><td>Bloqueo de ficheros entre procesos (<code>try_lock_exclusive</code>).</td></tr>
+            <tr><td><code>File::sync_all()</code></td><td>Fuerza los datos a disco antes de un <code>rename</code>.</td></tr>
+            <tr><td><code>PRAGMA journal_mode = WAL</code></td><td>Lectores y escritor concurrentes; se consulta leyendo la fila que devuelve.</td></tr>
+            <tr><td><code>PRAGMA busy_timeout = 5000</code></td><td>Espera hasta 5 s antes de fallar con <code>SQLITE_BUSY</code>.</td></tr>
+            <tr><td><code>TransactionBehavior::Immediate</code></td><td>Toma el bloqueo de escritura al abrir la transacción.</td></tr>
+            <tr><td><code>VACUUM INTO 'backup.db'</code></td><td>Copia consistente en caliente.</td></tr>
+            <tr><td><code>EXPLAIN QUERY PLAN</code></td><td>Muestra si una consulta usa índice o recorre la tabla.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿rusqlite o sqlx?</summary>
+          <div>
+            <p><code>rusqlite</code> es síncrono, directo y con el SQL a la vista; ideal para CLI y para envolver en <code>spawn_blocking</code> dentro de un servidor. <code>sqlx</code> es async, soporta varios motores y verifica las consultas contra el esquema en tiempo de compilación (<code>query!</code>), a cambio de una configuración y una curva mayores. Para este curso, <code>rusqlite</code> enseña mejor lo que hay debajo.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué no un ORM?</summary>
+          <div>
+            <p>Porque añade una capa que oculta el SQL y las transacciones, justo lo que necesitas entender aquí. Diesel y SeaORM son buenas opciones en equipos grandes con muchas entidades; para dos tablas y cinco consultas, el SQL explícito es más corto, más rápido de leer y no te esconde un <code>N+1</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Dónde guardo el fichero en una app real?</summary>
+          <div>
+            <p>Ni en el directorio actual ni dentro del binario: usa el directorio de datos del usuario. En Linux, <code>$XDG_DATA_HOME/urlshort</code> (o <code>~/.local/share/urlshort</code>); en macOS, <code>~/Library/Application Support/urlshort</code>; en Windows, <code>%APPDATA%\urlshort</code>. El crate <code>directories</code> resuelve los tres. Y permite sobreescribirlo con <code>--data</code>, que ya tienes en el CLI.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿SQLite aguanta un servidor web?</summary>
+          <div>
+            <p>Sí, para cargas moderadas y un solo proceso escritor. Con WAL, los lectores no se bloquean. El patrón en Axum es un pool (<code>r2d2_sqlite</code>) y <code>spawn_blocking</code> para no bloquear el runtime, o <code>tokio-rusqlite</code>. Si necesitas varios escritores en máquinas distintas, toca PostgreSQL, no SQLite sobre NFS.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Puedo cambiar de JSON a SQLite sin perder datos?</summary>
+          <div>
+            <p>Sí: escribe un subcomando <code>migrate</code> que abra el <code>JsonStore</code>, recorra <code>list(usize::MAX)</code> e inserte cada enlace en un <code>SqliteStore</code> dentro de una transacción. Como ambos implementan <code>Store</code>, el código es un bucle y el test de contrato ya te dice que los datos caben. Haz copia del JSON antes y verifica el recuento al terminar.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="04" data-lesson="04-calidad-y-ci">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clippy, rustfmt, auditoría y CI — Módulo 4 · Curso Rust</title>
+  <meta name="description" content="Automatizar la calidad en Rust: rustfmt, clippy con -D warnings, lints de crate, MSRV, cargo audit, cargo deny y un workflow de GitHub Actions completo.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Clippy, rustfmt, auditoría y CI</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 4 · Ecosistema y herramientas</span>
+          <span>⏱ 35 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Un proyecto Rust sano no se distingue por no tener warnings: se distingue por <strong>no permitirlos</strong>. La diferencia es de proceso, no de talento. <code>rustfmt</code> elimina las discusiones de estilo, <code>clippy</code> detecta errores lógicos que el compilador acepta, <code>cargo audit</code> vigila las dependencias y un workflow de CI ejecuta todo eso en cada push. Cuando el build está en verde, sabes exactamente qué se ha comprobado.</p>
+        <p>Rust tiene una ventaja rara aquí: las tres herramientas son oficiales, vienen con <code>rustup</code> y comparten la misma salida legible. No hay que ensamblar un linting casero como en otros ecosistemas. Lo que sí hay que decidir es <strong>qué se considera un fallo</strong>: un warning que nunca se corrige es ruido que oculta el siguiente.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque el módulo 7 publica <code>urlshort</code> en crates.io y lo despliega. Un crate publicado con warnings no se puede actualizar con confianza, y una dependencia con un advisory abierto es un incidente esperando fecha. El CI es el contrato que te obliga a ti mismo a no romper lo que ya funciona.</p>
+        </div>
+        <p><strong>Errores típicos al montar calidad y CI:</strong></p>
+        <ul>
+          <li>Ejecutar <code>cargo clippy</code> sin <code>--all-targets</code> y dejar los tests sin analizar.</li>
+          <li>Silenciar un lint con <code>#[allow]</code> global en vez de arreglarlo o acotarlo.</li>
+          <li>Poner <code>-D warnings</code> con la toolchain flotante: una stable nueva rompe el build un martes.</li>
+          <li>Formatear todo el repositorio en el mismo commit que el cambio funcional.</li>
+          <li>Ignorar un advisory de seguridad sin registrar por qué ni hasta cuándo.</li>
+          <li>CI que solo ejecuta <code>cargo test</code>: el formato, los lints y la documentación nunca se comprueban.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Cuatro puertas, un solo objetivo</h3>
+        <pre class="diagram">  CÓDIGO ──► rustfmt ──► ¿formateado?   (estilo, cero semántica)
+         ──► clippy  ──► ¿idiomático?   (lógica + estilo)
+         ──► tests   ──► ¿funciona?     (unitarios, integración, doctests)
+         ──► doc     ──► ¿documentado?  (enlaces y warnings de rustdoc)
+         ──► audit   ──► ¿seguro?       (RUSTSEC)</pre>
+        <p>Ninguna puerta sustituye a otra. <code>rustfmt</code> no detecta un bug; <code>clippy</code> no sabe si tu lógica de negocio es correcta; los tests no comprueban que la documentación compile. El CI las ejecuta todas porque cada una cubre un fallo distinto.</p>
+
+        <h3><code>rustfmt</code>: el fin de las discusiones</h3>
+        <p><code>rustfmt</code> reescribe el código según el estilo oficial. No cambia la semántica: si el resultado se comporta distinto, es un bug de la herramienta. Se ejecuta de dos formas:</p>
+        <pre><code class="language-bash">cargo fmt            # reescribe los ficheros
+cargo fmt --all --check   # no escribe: sale con código 1 si algo no está formateado</code></pre>
+        <p>La configuración vive en <code>rustfmt.toml</code>. Casi todo el mundo usa el estilo por defecto; si tocas algo, que sea poco y justificado, porque cada opción nueva es una fuente de diffs entre editores:</p>
+        <pre><code class="language-toml"># rustfmt.toml
+edition = "2021"
+max_width = 100
+use_field_init_shorthand = true</code></pre>
+        <p>Las opciones marcadas como inestables requieren nightly y <code>unstable_features = true</code>; si tu CI usa stable, no las uses. Y un consejo de higiene: formatea en un commit separado del cambio funcional. Un diff de 2.000 líneas por formato esconde cualquier revisión.</p>
+
+        <h3><code>clippy</code>: el revisor que ya sabe Rust</h3>
+        <p><code>clippy</code> es el linter oficial. Analiza el AST y el árbol de tipos, así que entiende lo que tu código <em>hace</em>, no solo cómo se escribe. Sus lints se agrupan:</p>
+        <table>
+          <thead><tr><th>Grupo</th><th>Qué contiene</th><th>Nivel por defecto</th></tr></thead>
+          <tbody>
+            <tr><td><code>correctness</code></td><td>Errores casi seguros (comparaciones absurdas, bucles infinitos)</td><td>Deny</td></tr>
+            <tr><td><code>suspicious</code></td><td>Código que probablemente no querías escribir</td><td>Warn</td></tr>
+            <tr><td><code>style</code>, <code>complexity</code>, <code>perf</code></td><td>Formas no idiomáticas, complejidad y costes evitables</td><td>Warn</td></tr>
+            <tr><td><code>pedantic</code>, <code>nursery</code>, <code>restriction</code></td><td>Estilo estricto, lints en desarrollo y prohibiciones de equipo</td><td>Allow</td></tr>
+          </tbody>
+        </table>
+        <p>El comando canónico de CI es:</p>
+        <pre><code class="language-bash">cargo clippy --workspace --all-targets --all-features -- -D warnings</code></pre>
+        <p>Cada pieza importa:</p>
+        <ul>
+          <li><code>--workspace</code>: todos los crates, no solo el raíz.</li>
+          <li><code>--all-targets</code>: lib, bins, tests, benches y examples. Sin esto, el código de test no se analiza.</li>
+          <li><code>--all-features</code>: el código condicional también se revisa. Si tus features no son aditivas, este flag lo delata.</li>
+          <li><code>-- -D warnings</code>: todo lo que pase de <code>--</code> va a <code>rustc</code>/<code>clippy</code>; convierte cualquier warning en error.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title"><code>--all-features</code> no siempre es posible</p>
+          <p>Si mantienes features excluyentes (que, como viste en <a href="01-cargo-avanzado.html">Cargo avanzado</a>, no deberías), <code>--all-features</code> no compilará. La solución correcta es rediseñar; la provisional, ejecutar clippy una vez por combinación con <code>--no-default-features --features x</code>. No lo resuelvas quitando el flag: perderías la mitad de la cobertura.</p>
+        </div>
+
+        <h3>Lints a nivel de crate: la política escrita</h3>
+        <p>Puedes fijar la política con atributos al principio de <code>lib.rs</code> (<code>#![deny(unsafe_code)]</code>, <code>#![warn(missing_docs)]</code>), pero es preferible <code>Cargo.toml</code> desde Cargo 1.74: aplica a todos los targets y no ensucia el código:</p>
+        <pre><code class="language-toml">[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"</code></pre>
+        <p>La <code>priority</code> negativa hace que el grupo se aplique antes y que los lints individuales puedan sobrescribirlo. <code>forbid</code> es más fuerte que <code>deny</code>: ni siquiera un <code>#[allow]</code> local puede desactivarlo, así que úsalo solo para reglas no negociables.</p>
+        <p>Cuando un lint tenga un falso positivo, acota el silencio y documenta el motivo:</p>
+        <pre><code class="language-rust">#[expect(clippy::too_many_arguments, reason = "firma impuesta por la API de axum")]
+fn handler(a: String, b: String, c: String, d: String, e: String,
+           f: String, g: String, h: String) { /* … */ }</code></pre>
+        <p><code>#[expect]</code> (Rust 1.81) es mejor que <code>#[allow]</code>: si el lint deja de dispararse, avisa de que la excepción ya no hace falta. Es la diferencia entre una nota y una nota caducada.</p>
+
+        <h3>MSRV: la versión mínima es una promesa</h3>
+        <p><code>rust-version</code> en <code>Cargo.toml</code> declara el compilador mínimo. Cargo avisa si compilas con menos, y el resolutor v3 lo tiene en cuenta al elegir dependencias. Pero declararlo no lo garantiza: hay que <strong>compilar con esa versión</strong> en CI.</p>
+        <pre><code class="language-bash">rustup toolchain install 1.82.0 --profile minimal
+cargo +1.82.0 check --workspace --all-features</code></pre>
+        <p>Subir la MSRV es un cambio incompatible según semver: si publicas la 1.3.0 exigiendo 1.82 y antes exigías 1.75, has roto a quien compila con 1.75. Puede ser aceptable, pero debe ir en la versión adecuada y en el changelog. La herramienta <code>cargo-msrv</code> ayuda a encontrar la mínima real; a mano, la regla es probar con la declarada en CI y no usar APIs más nuevas sin darte cuenta.</p>
+
+        <h3>Seguridad de dependencias: <code>audit</code> y <code>deny</code></h3>
+        <p><code>cargo audit</code> compara tu <code>Cargo.lock</code> contra la base de datos <strong>RUSTSEC</strong> de vulnerabilidades y crates yanked:</p>
+        <pre><code class="language-bash">cargo install cargo-audit --locked
+cargo audit</code></pre>
+        <p>Un hallazgo real tiene esta pinta:</p>
+        <pre><code class="language-text">error: 1 vulnerability found!
+Crate:     time
+Version:   0.1.44
+Title:     Potential segfault in the time crate
+ID:        RUSTSEC-2020-0071
+Solution:  Upgrade to &gt;=0.2.23
+Dependency tree:
+time 0.1.44
+└── chrono 0.4.19
+    └── urlshort 0.3.0</code></pre>
+        <p>El árbol de dependencias es la parte importante: no arreglas <code>time</code>, arreglas quien lo trae. <code>cargo update -p chrono</code> suele resolverlo.</p>
+        <p><code>cargo deny</code> va más allá: reúne advisories, licencias, crates prohibidos, duplicados y orígenes permitidos en un solo <code>deny.toml</code>. Es lo que usa una empresa para decir «no aceptamos GPL en producción» o «nada de OpenSSL, usamos rustls»:</p>
+        <pre><code class="language-toml">[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
+[bans]
+multiple-versions = "warn"
+deny = [
+  { name = "openssl-sys", reason = "usamos rustls; openssl rompe el build multiplataforma" },
+]
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"</code></pre>
+        <p>Genera la plantilla con <code>cargo deny init</code>: según la versión, el esquema puede pedir un campo <code>version</code> en algunas secciones, y la plantilla siempre está al día.</p>
+
+        <h3>El workflow: rápido, cacheado y rompible</h3>
+        <p>Un CI bien diseñado tarda minutos, no horas, y falla por el motivo correcto: cachea <code>~/.cargo</code> y <code>target/</code>, ejecuta el formato antes que la compilación, fija la toolchain, separa la MSRV y la auditoría en jobs propios y convierte los warnings de rustdoc en errores. El ejemplo real de abajo lo implementa entero.</p>
+        <p>Ojo: cambiar <code>RUSTFLAGS</code> invalida la caché de todas las dependencias, así que muchos equipos ponen los lints en <code>[lints]</code> y reservan <code>-D warnings</code> para el paso de clippy.</p>
+
+        <h3>Pre-commit: el CI antes del CI</h3>
+        <p>El CI es la red de seguridad, no la primera línea. Un hook local evita el ciclo de «push, esperar tres minutos, ver que falta un espacio»:</p>
+        <pre><code class="language-bash">#!/usr/bin/env sh
+# .githooks/pre-commit
+set -eu
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --quiet
+# activar una vez: git config core.hooksPath .githooks</code></pre>
+        <p>Versionar el hook en el repositorio (en <code>.githooks/</code>) hace que todo el equipo lo active con un comando. Si el proyecto es grande y el hook tarda demasiado, deja solo <code>fmt</code> y <code>clippy</code>; el CI completo sigue ahí.</p>
+      </section>
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Tres comandos que puedes ejecutar hoy en <code>urlshort</code> para ver el estado real del proyecto:</p>
+        <pre><code class="language-bash">cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace</code></pre>
+        <p>Si el primero falla, la salida es un diff con lo que cambiaría. Si falla el segundo, verás el lint con su ubicación exacta:</p>
+        <pre><code class="language-text">error: unneeded `return` statement
+ --&gt; src/main.rs:6:5
+  |
+6 |     return link.code;
+  |     ^^^^^^^^^^^^^^^^^ help: remove `return`
+  |
+  = note: `-D clippy::needless-return` implied by `-D warnings`
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_return</code></pre>
+        <p>La corrección es la que sugiere el propio lint:</p>
+        <pre><code class="language-rust">// Antes: return explícito al final de la función
+fn code_of(link: &amp;Link) -&gt; String {
+    return link.code.clone();
+}
+// Después: la última expresión es el valor de retorno
+fn code_of(link: &amp;Link) -&gt; &amp;str {
+    &amp;link.code
+}</code></pre>
+        <p>Fíjate en que el arreglo no es solo cosmético: al quitar el <code>return</code> aparece un <code>clone()</code> innecesario. Clippy te lleva a la versión que presta en lugar de copiar, que es exactamente lo que el curso defiende desde el módulo 1. Con <code>[lints.clippy]</code> en deny, cualquier warning de los grupos estándar es un error incluso en local.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El CI completo de <code>urlshort</code>. Tres jobs: calidad, MSRV y auditoría. Copiable tal cual en <code>.github/workflows/ci.yml</code>:</p>
+        <pre><code class="language-yaml">name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --doc --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+  msrv:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.82.0", stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}</code></pre>
+        <p>Y la política de dependencias en <code>deny.toml</code>, ejecutable en local con <code>cargo deny check</code>:</p>
+        <pre><code class="language-toml">[advisories]
+yanked = "deny"
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
+[bans]
+multiple-versions = "warn"
+deny = [
+  { name = "openssl-sys", reason = "usamos rustls; openssl complica el build en Windows" },
+]</code></pre>
+        <p>Decisiones que hacen que este pipeline sea útil y no teatro:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Formato antes que compilación</td><td>Falla en segundos; el feedback llega antes y no consume caché.</td></tr>
+            <tr><td><code>--all-targets</code> en clippy</td><td>Los tests y ejemplos también son código que se publica en el repositorio.</td></tr>
+            <tr><td>Doctests y <code>cargo doc</code> separados</td><td>Distinguen «el ejemplo no compila» de «el enlace está roto».</td></tr>
+            <tr><td>MSRV en matriz con <code>fail-fast: false</code></td><td>Quieres ver a la vez si falla la mínima y la stable, no una detrás de otra.</td></tr>
+            <tr><td>Auditoría como job independiente</td><td>Un advisory nuevo se ve como check propio y no tumba la señal de los tests.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Ejecutar <code>fmt</code> y <code>clippy</code> antes de cada commit</td><td>Dejar que el CI descubra el estilo</td><td>El ciclo de feedback local es de segundos; el de CI, de minutos.</td></tr>
+            <tr><td>Arreglar el lint o acotarlo con <code>#[expect(..., reason)]</code></td><td><code>#![allow(clippy::all)]</code></td><td>Un allow global apaga también los lints que sí importan.</td></tr>
+            <tr><td>Política de lints en <code>[lints]</code></td><td>Atributos repetidos en cada fichero</td><td>Una sola fuente, aplicada a todos los targets.</td></tr>
+            <tr><td>Probar la MSRV declarada en CI</td><td>Declarar 1.82 y compilar solo con 1.90</td><td>La promesa sin verificación es publicidad.</td></tr>
+            <tr><td>Registrar las excepciones de seguridad con fecha y motivo</td><td>Ignorar advisory porque «no es explotable»</td><td>La decisión debe poder revisarse cuando cambie el contexto.</td></tr>
+            <tr><td>Un commit solo de formato</td><td>Mezclar <code>cargo fmt</code> con el cambio de lógica</td><td>El diff funcional debe ser revisable.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">El warning que no arreglas hoy</p>
+          <p>Si un warning se queda más de una semana, o se arregla o se convierte en una excepción con motivo y fecha. Los warnings crónicos son como las pruebas desactivadas: el día que aparece uno de verdad, nadie lo distingue del ruido de fondo.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Clippy sin <code>--all-targets</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-bash">cargo clippy -- -D warnings</code></pre>
+        <p><strong>Por qué está mal:</strong> solo analiza el target por defecto (la lib o el bin). El código de <code>tests/</code>, los ejemplos y los benches queda fuera, que es justo donde más <code>unwrap()</code> y comparaciones raras se acumulan.</p>
+        <p><strong>Bien:</strong></p>
+        <pre><code class="language-bash">cargo clippy --all-targets --all-features -- -D warnings</code></pre>
+
+        <h3>2. Silenciar con <code>allow</code> en la raíz</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">#![allow(clippy::all)]        // «ya lo arreglaremos»
+#![allow(dead_code)]          // el módulo entero, para siempre</code></pre>
+        <p><strong>Por qué está mal:</strong> apaga también <code>correctness</code>, que es donde están los bugs. Y <code>dead_code</code> global oculta funciones que ya nadie llama tras un refactor.</p>
+        <p><strong>Bien:</strong> silencio local, con motivo y con <code>expect</code> para que caduque:</p>
+        <pre><code class="language-rust">#[expect(dead_code, reason = "se usa desde el servidor en la feature http")]
+fn internal_probe() -&gt; bool { true }</code></pre>
+
+        <h3>3. <code>-D warnings</code> con toolchain flotante</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-yaml">- uses: dtolnay/rust-toolchain@stable
+- run: cargo clippy -- -D warnings</code></pre>
+        <p><strong>Por qué está mal:</strong> cada seis semanas sale una stable con lints nuevos o más estrictos. Un martes, sin cambios en tu código, el CI se pone rojo y el equipo aprende a ignorar el rojo.</p>
+        <p><strong>Bien:</strong> fija la versión en la que has validado, y actualízala con un pull request dedicado:</p>
+        <pre><code class="language-yaml">- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: "1.85.0"
+    components: rustfmt, clippy</code></pre>
+
+        <h3>4. Ignorar un advisory sin dejar rastro</h3>
+        <p><strong>Mal:</strong> <code>cargo audit || true</code> con el comentario «este no aplica». El día que aparezca un advisory crítico, el paso ya está neutralizado y nadie lo verá.</p>
+        <p><strong>Bien:</strong> una excepción explícita en la configuración, con motivo, alcance y fecha de revisión: <code>ignore = ["RUSTSEC-2020-0071"]</code> bajo <code>[advisories]</code>, más un issue abierto con esa fecha. Una excepción sin caducidad es una vulnerabilidad con documentación.</p>
+      </section>
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> dejar <code>urlshort</code> con el build en verde bajo el mismo pipeline que usarás en el módulo 7. Necesitas el crate con tests del <a href="../03-errores-y-modularidad/04-tests.html">módulo 3</a>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Instala, mide y formatea.</strong> Añade los componentes con <code>rustup component add rustfmt clippy</code>, ejecuta <code>cargo fmt --all --check</code> y <code>cargo clippy --all-targets --all-features -- -D warnings</code>, y anota cuántos ficheros y lints aparecen antes de tocar nada. Después formatea en un commit aislado (<code>style: aplicar rustfmt</code>).
+          </li>
+          <li>
+            <strong>Arregla los lints uno a uno.</strong> Ejecuta clippy y ve corrigiendo: <code>needless_return</code>, <code>redundant_clone</code>, <code>single_char_pattern</code>… Si alguno es un falso positivo, usa <code>#[expect(..., reason = "…")]</code> en el ítem concreto, nunca en la raíz.
+          </li>
+          <li>
+            <strong>Convierte la política en manifiesto.</strong> Añade el bloque <code>[lints]</code> con <code>unsafe_code = "forbid"</code>, <code>missing_docs = "warn"</code> y <code>clippy::all</code> en deny. Vuelve a ejecutar clippy: ahora hay más trabajo, y ese trabajo es el que el CI va a exigir.
+          </li>
+          <li>
+            <strong>Audita las dependencias.</strong>
+            <pre><code class="language-bash">cargo install cargo-audit --locked
+cargo audit</code></pre>
+            <p>Si aparece un advisory, localiza quién lo trae con el árbol que imprime, actualiza esa dependencia y vuelve a ejecutar. Si no hay parche, documenta la excepción con fecha.</p>
+          </li>
+          <li>
+            <strong>Monta el workflow y el hook.</strong> Copia el <code>ci.yml</code> del ejemplo real, haz push a una rama y comprueba que los tres jobs aparecen. Rompe el formato a propósito y verifica que falla en el primer paso. Después crea <code>.githooks/pre-commit</code> y actívalo con <code>git config core.hooksPath .githooks</code>.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Un clon limpio del repositorio pasa <code>fmt --check</code>, <code>clippy --all-targets --all-features -- -D warnings</code>, <code>test --workspace</code>, <code>doc</code> y <code>audit</code> sin intervención manual. Y has visto el CI fallar al menos una vez por el motivo correcto.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 La puerta de calidad del workspace</h3>
+          <p>Diseña la política de calidad completa para el workspace de <code>urlshort</code> (núcleo, CLI y un futuro servidor) con estas restricciones: MSRV 1.82 intocable durante seis meses; prohibido <code>unsafe</code> salvo en un módulo de integración con C que debe quedar aislado y auditado; licencias permitidas solo MIT, Apache-2.0 y BSD-3-Clause; nada de OpenSSL; y un presupuesto de CI de ocho minutos en un runner de dos núcleos.</p>
+          <p>Entrega: el <code>ci.yml</code> final, el <code>deny.toml</code>, el bloque <code>[lints]</code> de cada crate, y una tabla que explique qué comprueba cada job, cuánto tarda y qué hace fallar. Incluye la estrategia para actualizar la toolchain sin romper el build un lunes, y el procedimiento exacto para aceptar un advisory sin parche durante un máximo de 90 días.</p>
+          <p>Demuestra el diseño con un cambio real: introduce a propósito un <code>unsafe</code> en el núcleo, una dependencia con licencia no permitida y un enlace intra-doc roto, y explica qué job detecta cada uno y con qué mensaje.</p>
+          <p><em>Pista: el aislamiento de <code>unsafe</code> no se consigue con un <code>allow</code> global, sino con un crate separado o con un módulo marcado y una excepción de lint acotada a ese ítem. Para el presupuesto de tiempo, mide antes de optimizar: el orden de los pasos y la caché suelen importar más que paralelizar jobs. Y recuerda que la matriz de MSRV duplica el build: quizá no necesite <code>--all-features</code> ni los tests completos.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>rustfmt</code> elimina el debate de estilo; <code>--check</code> lo convierte en condición de CI.</li>
+          <li><code>clippy</code> analiza tipos y detecta errores lógicos; <code>--all-targets --all-features -- -D warnings</code> es el comando canónico.</li>
+          <li>La política de lints vive mejor en <code>[lints]</code> del manifiesto que repartida en atributos.</li>
+          <li><code>#[expect(..., reason)]</code> documenta y caduca las excepciones; <code>allow</code> global las esconde.</li>
+          <li>La MSRV se declara con <code>rust-version</code> y se verifica compilando con esa versión en CI.</li>
+          <li><code>cargo audit</code> consulta RUSTSEC; <code>cargo deny</code> añade licencias, bans y orígenes.</li>
+          <li>Los warnings crónicos y las excepciones sin fecha son deuda que se paga en producción.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>cargo fmt --all --check</code></td><td>Verifica el formato sin escribir; sale 1 si hay diferencias.</td></tr>
+            <tr><td><code>cargo clippy --all-targets --all-features -- -D warnings</code></td><td>Linter en todos los targets y features, con warnings como errores.</td></tr>
+            <tr><td><code>[lints.rust]</code> / <code>[lints.clippy]</code></td><td>Política de lints declarada en el manifiesto (Cargo 1.74+).</td></tr>
+            <tr><td><code>#[expect(lint, reason = "…")]</code></td><td>Excepción local que avisa cuando deja de ser necesaria.</td></tr>
+            <tr><td><code>cargo +1.82.0 check</code></td><td>Compila con la MSRV declarada usando rustup.</td></tr>
+            <tr><td><code>cargo audit</code></td><td>Compara el lock contra RUSTSEC e imprime el árbol del fallo.</td></tr>
+            <tr><td><code>cargo deny check</code></td><td>Advisories, licencias, bans, duplicados y orígenes en una pasada.</td></tr>
+            <tr><td><code>git config core.hooksPath .githooks</code></td><td>Activa los hooks versionados en el repositorio.</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Clippy y rustfmt vienen con Rust o hay que instalarlos?</summary>
+          <div>
+            <p>Se distribuyen como componentes de <code>rustup</code>, pero no siempre están instalados. <code>rustup component add clippy rustfmt</code> los añade a la toolchain activa. En CI se declaran con <code>components: rustfmt, clippy</code> en la acción de la toolchain. No son crates aparte ni requieren compilación, por lo que el coste de tenerlos es cero.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Merece la pena activar <code>clippy::pedantic</code>?</summary>
+          <div>
+            <p>Depende del proyecto y del equipo. <code>pedantic</code> incluye lints valiosos (<code>missing_errors_doc</code>, <code>must_use_candidate</code>) y otros muy discutibles. Una estrategia que funciona: actívalo como <code>warn</code>, no como <code>deny</code>, revisa los avisos y silencia con <code>#[expect(reason)]</code> los que no compartas. En una librería pública, la documentación de errores que exige <code>pedantic</code> mejora mucho la API. En un prototipo, es ruido.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo actualizo la toolchain sin que el CI explote?</summary>
+          <div>
+            <p>Con un pull request dedicado: cambias la versión fijada, ejecutas <code>cargo clippy</code> en local, arreglas o silencias los lints nuevos con su motivo, y actualizas el changelog si la MSRV sube. Así el fallo se atribuye a la actualización y no a un cambio funcional. Si el proyecto es grande, mantén una rama <code>next-toolchain</code> con la stable nueva y un job informativo (sin bloquear) hasta que esté limpia.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Qué hago con un advisory que no tiene parche?</summary>
+          <div>
+            <p>Primero, determina si te afecta: lee el advisory, mira qué función o feature es vulnerable y si tu código la usa. Si no te afecta, documenta la excepción con motivo y fecha de revisión en la configuración de <code>cargo audit</code> o <code>cargo deny</code>, y abre un issue con esa fecha. Si te afecta, busca alternativa (cambiar de crate, aislar la funcionalidad, parchear con un fork) y trátalo como un incidente con prioridad. Lo que nunca vale es <code>|| true</code>.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

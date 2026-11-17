@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="06" data-lesson="02-reqwest">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HTTP con reqwest — Módulo 6 · Curso Rust</title>
+  <meta name="description" content="Cliente HTTP en Rust con reqwest: conexiones reutilizables, timeouts, JSON con serde, error_for_status, reintentos con backoff, TLS con rustls y límites de respuesta.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>HTTP con reqwest</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 6 · Red y CLI real</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>urlshort sabe acortar URLs, pero no sabe si la URL que le das existe. Un acortador que acepta <code>https://ejemplo.invalido</code> y devuelve un código bonito no está haciendo su trabajo: está guardando basura. Antes de acortar hay que <strong>comprobar el destino</strong>, y eso significa hablar HTTP desde el programa.</p>
+        <p><strong>reqwest</strong> es el cliente HTTP de referencia del ecosistema async de Rust. Construye sobre <code>hyper</code> y <code>tokio</code>, reutiliza conexiones, gestiona TLS, sigue redirecciones, descomprime respuestas y convierte JSON a tipos de Rust con serde. Su API es de alto nivel, pero no esconde lo importante: timeouts, códigos de estado y errores de red son tuyos.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque hacer una petición es fácil y hacerla bien no tanto. La diferencia entre un cliente de juguete y uno de producción está en cinco detalles: un <code>Client</code> reutilizado, timeouts explícitos, <code>error_for_status()</code>, reintentos solo donde tienen sentido y un límite de tamaño para no comerte un gigabyte de HTML. Todo eso cabe en cien líneas.</p>
+        </div>
+        <p><strong>Errores típicos:</strong> crear un <code>Client</code> por petición; no poner timeout y colgarse para siempre; tratar un 404 como éxito porque el cuerpo vino en JSON; parsear HTML como JSON; bloquear el runtime con <code>std::thread::sleep</code>; depender de OpenSSL del sistema cuando bastaba <code>rustls</code>.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué hay debajo de una petición</h3>
+        <p>Cuando llamas a <code>client.get(url).send().await</code> ocurren varias cosas, y cada una puede fallar de forma distinta:</p>
+        <pre class="diagram">  Url::parse ──► DNS ──► TCP ──► TLS (si https) ──► HTTP/1.1 o h2
+                  │        │        │                    │
+                  ▼        ▼        ▼                    ▼
+              host mal   connect  certificado       estado + cabeceras
+              formado    timeout   inválido          + cuerpo (chunks)</pre>
+        <p>reqwest distingue esos fallos con métodos como <code>is_timeout()</code>, <code>is_connect()</code>, <code>is_redirect()</code> o <code>is_decode()</code>. Un <strong>404 no es un error de reqwest</strong>: es una respuesta HTTP perfectamente válida. Confundir «fallo de red» con «el servidor dijo que no» es el primer error de diseño de un cliente.</p>
+
+        <h3>Un cliente, muchas peticiones</h3>
+        <p><code>Client</code> no es una petición: es un <strong>pool de conexiones</strong> más configuración compartida (TLS, proxy, cookies, timeouts). Crear uno por petición tira el pool, repite el <em>handshake</em> TLS y llena la tabla de conexiones del sistema con sockets en <code>TIME_WAIT</code>.</p>
+        <table>
+          <thead><tr><th>Forma</th><th>Qué implica</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td><code>reqwest::get(url)</code></td><td>Crea un <code>Client</code> nuevo y lo tira al terminar.</td><td>Un script de una sola petición. Nunca dentro de un bucle.</td></tr>
+            <tr><td><code>Client::builder()…build()</code></td><td>Configura timeouts, TLS, proxy y redirects; reutiliza conexiones.</td><td>Siempre en una aplicación real. Se clona barato (es un <code>Arc</code> por dentro).</td></tr>
+            <tr><td><code>Client::new()</code></td><td>Valores por defecto, sin timeouts.</td><td>Casi nunca: un cliente sin timeout es una bomba de relojería.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Los tres timeouts</h3>
+        <p>Un timeout global se queda corto en un caso y largo en otro. reqwest permite separarlos:</p>
+        <table>
+          <thead><tr><th>Método</th><th>Qué mide</th><th>Valor razonable</th></tr></thead>
+          <tbody>
+            <tr><td><code>connect_timeout</code></td><td>Solo la conexión TCP (y el saludo TLS): detecta hosts muertos o cortafuegos que descartan paquetes.</td><td>2–5 s</td></tr>
+            <tr><td><code>read_timeout</code></td><td>Cada lectura del cuerpo; se reinicia con cada trozo recibido. Detecta conexiones que se quedan mudas.</td><td>5–15 s</td></tr>
+            <tr><td><code>timeout</code></td><td>La petición completa, desde que empieza a conectar hasta el último byte del cuerpo.</td><td>10–30 s</td></tr>
+          </tbody>
+        </table>
+        <p>Sin ninguno de los tres, una petición puede quedarse esperando indefinidamente. El sistema operativo tarda minutos en rendirse, y tu CLI parece colgado.</p>
+
+        <h3>JSON, cabeceras y estados</h3>
+        <p>La feature <code>json</code> añade dos métodos: <code>.json(&amp;valor)</code> para enviar (serializa con serde y pone <code>Content-Type: application/json</code>) y <code>.json::&lt;T&gt;()</code> para recibir (deserializa el cuerpo). La respuesta solo se convierte si el estado te vale: <code>error_for_status()</code> convierte cualquier 4xx/5xx en <code>Err</code>, conservando el código.</p>
+        <p>Las cabeceras se añaden con <code>.header(header::ACCEPT, "application/json")</code> o con <code>.headers(map)</code>. Para autenticación, <code>.bearer_auth(token)</code> y <code>.basic_auth(usuario, Some(clave))</code> son atajos correctos.</p>
+
+        <h3>TLS: nativa o rustls</h3>
+        <p>reqwest usa por defecto TLS nativo del sistema (<code>native-tls</code>: OpenSSL en Linux, Schannel en Windows). Funciona, pero ata el binario a las bibliotecas del sistema: compilar para Alpine o para <code>musl</code> suele terminar en un error de <code>openssl-sys</code>. La alternativa es <strong>rustls</strong>, TLS en Rust puro, sin dependencias del sistema:</p>
+        <pre><code class="language-toml">[dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "charset", "http2", "rustls-tls",
+] }</code></pre>
+        <p>Al desactivar las features por defecto pierdes también <code>charset</code> y <code>http2</code>: si las quieres, se añaden a mano. En 0.13 la API es la misma; cambian detalles de features y algunas dependencias internas.</p>
+
+        <h3>Proxy, reintentos y tamaño</h3>
+        <p>reqwest respeta <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code> y <code>NO_PROXY</code> del entorno. Para forzar uno: <code>.proxy(reqwest::Proxy::all("http://proxy.local:3128")?)</code>; para ignorarlos, <code>.no_proxy()</code>.</p>
+        <p>Los reintentos no son gratis: solo se reintentan operaciones <strong>idempotentes</strong> (GET, HEAD, PUT, DELETE) y solo ante fallos transitorios (timeout, conexión rechazada, 502/503/504). El patrón es <em>backoff</em> exponencial con un tope, y respetar <code>Retry-After</code> si viene. Un reintento sobre un POST puede duplicar un enlace.</p>
+        <p>reqwest no impone un tamaño máximo de respuesta. Si confías en el servidor, un <code>.text()</code> puede materializar cientos de megas en memoria. La solución es leer por trozos con <code>resp.chunk()</code> y contar bytes, o comprobar <code>content_length()</code> antes cuando existe.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Una petición GET con timeout y comprobación de estado. <code>Cargo.toml</code>:</p>
+        <pre><code class="language-toml">[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }</code></pre>
+        <pre><code class="language-rust">use std::time::Duration;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let body = client
+        .get("https://httpbin.org/uuid")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    println!("{body}");
+    Ok(())
+}</code></pre>
+        <pre><code class="language-bash">cargo run
+# {"uuid":"0f1c2a9e-..."}</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>#[tokio::main]</code> arranca el runtime. reqwest es async: sin runtime, <code>.await</code> no tiene dónde ejecutarse.</li>
+          <li><code>Client::builder()</code> permite configurar antes de construir. <code>.build()</code> devuelve <code>Result</code>: puede fallar al inicializar TLS.</li>
+          <li><code>.send()</code> devuelve la respuesta <strong>en cuanto llegan las cabeceras</strong>. El cuerpo se descarga después, con <code>.text()</code> o <code>.json()</code>.</li>
+          <li><code>error_for_status()</code> convierte 4xx/5xx en <code>Err</code> sin consumir el cuerpo si no hace falta.</li>
+          <li><code>?</code> propaga todo con <code>Box&lt;dyn Error&gt;</code>: cómodo en un binario, insuficiente en una librería, donde querrás un error propio.</li>
+          <li><code>main</code> devuelve <code>Result</code>: si algo falla, Rust imprime el error y sale con código 1.</li>
+        </ul>
+        <div class="callout callout--note">
+          <p class="callout__title">El cuerpo no llega con <code>send()</code></p>
+          <p><code>send()</code> resuelve cuando las cabeceras están listas. Un servidor puede responder <code>200 OK</code> y quedarse a medias del cuerpo; el fallo aparecerá en <code>.text()</code> o <code>.json()</code>. Por eso el timeout total abarca el cuerpo, y por eso <code>read_timeout</code> existe.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El módulo <code>check</code> de urlshort: valida un destino con <code>HEAD</code> antes de acortarlo, reintenta fallos transitorios con backoff, rechaza hosts privados (un acortador no debe convertirse en un escáner de la red interna) y limita el tamaño de lo que descarga.</p>
+        <pre><code class="language-rust">// src/check.rs
+use std::time::Duration;
+
+use reqwest::{header, Client, StatusCode, Url};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CheckError {
+    #[error("URL inválida: {0}")]
+    InvalidUrl(String),
+    #[error("no se pudo contactar con el destino: {0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("el destino respondió {status}")]
+    BadStatus { status: StatusCode },
+    #[error("la respuesta supera {limit} bytes")]
+    TooLarge { limit: usize },
+    #[error("el host es local o privado: {0}")]
+    PrivateHost(String),
+    #[error("agotados los reintentos")]
+    RetriesExhausted,
+}
+
+#[derive(Debug, Clone)]
+pub struct Checker {
+    client: Client,   // clonar es barato: comparte el pool
+    retries: u32,
+}
+
+impl Checker {
+    pub fn new() -&gt; Result&lt;Self, reqwest::Error&gt; {
+        let client = Client::builder()
+            .user_agent(concat!("urlshort/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(3))
+            .read_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()?;
+
+        Ok(Self { client, retries: 3 })
+    }
+
+    /// Devuelve la URL ya validada o un error que explica qué pasó.
+    pub async fn validate(&amp;self, raw: &amp;str) -&gt; Result&lt;Url, CheckError&gt; {
+        let url = Url::parse(raw)
+            .map_err(|err| CheckError::InvalidUrl(err.to_string()))?;
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(CheckError::InvalidUrl(format!(
+                "esquema no admitido: {}",
+                url.scheme()
+            )));
+        }
+
+        let host = url
+            .host_str()
+            .ok_or_else(|| CheckError::InvalidUrl("falta el host".to_string()))?;
+
+        if is_private(host) {
+            return Err(CheckError::PrivateHost(host.to_string()));
+        }
+
+        match self.probe(&amp;url).await? {
+            status if status.is_success() || status.is_redirection() =&gt; Ok(url),
+            status =&gt; Err(CheckError::BadStatus { status }),
+        }
+    }
+
+    // HEAD primero: no descarga cuerpo. Reintenta solo 5xx y fallos de red.
+    async fn probe(&amp;self, url: &amp;Url) -&gt; Result&lt;StatusCode, CheckError&gt; {
+        let mut delay = Duration::from_millis(250);
+        let mut last = CheckError::RetriesExhausted;
+
+        for attempt in 1..=self.retries {
+            match self.client.head(url.clone()).send().await {
+                Ok(resp) =&gt; {
+                    let status = resp.status();
+                    if status.is_server_error() {
+                        last = CheckError::BadStatus { status };
+                    } else if status == StatusCode::METHOD_NOT_ALLOWED {
+                        // Algunos servidores no implementan HEAD: pedimos un byte.
+                        let resp = self
+                            .client
+                            .get(url.clone())
+                            .header(header::RANGE, "bytes=0-0")
+                            .send()
+                            .await?;
+                        return Ok(resp.status());
+                    } else {
+                        return Ok(status);
+                    }
+                }
+                Err(err) if err.is_timeout() || err.is_connect() =&gt; {
+                    last = CheckError::Transport(err);
+                }
+                Err(err) =&gt; return Err(CheckError::Transport(err)),
+            }
+
+            if attempt &lt; self.retries {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);   // 250 ms, 500 ms, 1 s
+            }
+        }
+
+        Err(last)
+    }
+}
+
+fn is_private(host: &amp;str) -&gt; bool {
+    match host.parse::&lt;std::net::IpAddr&gt;() {
+        Ok(std::net::IpAddr::V4(ip)) =&gt; ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) =&gt; ip.is_loopback(),
+        Err(_) =&gt; host == "localhost" || host.ends_with(".local") || host.ends_with(".internal"),
+    }
+}</code></pre>
+        <p>Y el uso desde el CLI: validar, y solo entonces acortar.</p>
+        <pre><code class="language-rust">#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let checker = urlshort::check::Checker::new()?;
+    let url = checker.validate("https://www.rust-lang.org/").await?;
+    println!("ok: {url}");
+    Ok(())
+}</code></pre>
+        <pre><code class="language-bash">$ urlshort short https://no-existe.example
+error: no se pudo contactar con el destino: error sending request for url (...)
+$ echo $?
+1
+
+$ urlshort short http://10.0.0.5/admin
+error: el host es local o privado: 10.0.0.5</code></pre>
+        <p>Para hablar con el servidor de urlshort (lección siguiente), el mismo cliente sirve:</p>
+        <pre><code class="language-rust">#[derive(Debug, serde::Deserialize)]
+pub struct LinkResponse {
+    pub code: String,
+    pub short_url: String,
+}
+
+pub async fn create_link(
+    client: &amp;Client,
+    base: &amp;str,
+    url: &amp;str,
+) -&gt; Result&lt;LinkResponse, CheckError&gt; {
+    let link = client
+        .post(format!("{base}/links"))
+        .json(&amp;serde_json::json!({ "url": url }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::&lt;LinkResponse&gt;()
+        .await?;
+
+    Ok(link)
+}</code></pre>
+        <p>Y si en algún momento descargas contenido de terceros, acota el tamaño:</p>
+        <pre><code class="language-rust">pub async fn fetch_capped(
+    client: &amp;Client,
+    url: &amp;str,
+    max: usize,
+) -&gt; Result&lt;Vec&lt;u8&gt;, CheckError&gt; {
+    let mut resp = client.get(url).send().await?.error_for_status()?;
+
+    if let Some(len) = resp.content_length() {
+        if len &gt; max as u64 {
+            return Err(CheckError::TooLarge { limit: max });
+        }
+    }
+
+    let mut body = Vec::with_capacity(8 * 1024);
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() &gt; max {
+            return Err(CheckError::TooLarge { limit: max });
+        }
+        body.extend_from_slice(&amp;chunk);
+    }
+
+    Ok(body)
+}</code></pre>
+        <div class="callout callout--warning">
+          <p class="callout__title">Validar el host no basta contra SSRF</p>
+          <p><code>is_private</code> mira el nombre y la IP literal, pero un dominio público puede resolver a <code>127.0.0.1</code> (DNS rebinding). En producción, resuelve el nombre, fija la IP en la conexión y vuelve a comprobarla; o valida el destino con una lista de permitidos. Aquí el objetivo es didáctico, no un cortafuegos.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Un <code>Client</code> por proceso, clonado</td><td><code>reqwest::get</code> en un bucle</td><td>Reutiliza conexiones y TLS; evita agotar puertos.</td></tr>
+            <tr><td><code>connect_timeout</code> + <code>timeout</code> siempre</td><td>Dejar los valores por defecto (ninguno)</td><td>Sin timeout, un host mudo cuelga el programa.</td></tr>
+            <tr><td><code>error_for_status()</code> antes de parsear</td><td>Parsear el cuerpo de un 404 como si fuera un enlace</td><td>El cuerpo de un error no tiene tu esquema.</td></tr>
+            <tr><td>Reintentar solo métodos idempotentes y 5xx/timeout</td><td>Reintentar un POST a ciegas</td><td>Puedes crear el recurso dos veces.</td></tr>
+            <tr><td><code>rustls</code> si compilas estático o para Alpine</td><td>Depender de OpenSSL del sistema</td><td>El binario deja de arrastrar bibliotecas nativas.</td></tr>
+            <tr><td>Acotar el tamaño del cuerpo</td><td><code>.text()</code> sobre una URL de terceros</td><td>Una respuesta maliciosa puede agotar la memoria.</td></tr>
+            <tr><td>Propagar un error propio con contexto</td><td><code>unwrap()</code> en el camino del usuario</td><td>El usuario necesita saber si fue DNS, TLS o un 500.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">Depura con curl antes de culpar a tu código</p>
+          <p><code>curl -I -v https://destino</code> muestra la cadena de redirecciones, el TLS y las cabeceras. Si <code>curl</code> tarda 30 segundos, tu programa también: el problema no es reqwest.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Un <code>Client</code> por petición</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">for url in urls {
+    let body = reqwest::get(url).await?.text().await?;   // cliente nuevo cada vez
+    println!("{body}");
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> cada iteración crea un pool, negocia TLS y abre una conexión nueva. Con cien URLs, cien handshakes y cien sockets esperando en <code>TIME_WAIT</code>.</p>
+        <p><strong>Bien:</strong> crear el cliente una vez y clonarlo (o prestarlo).</p>
+        <pre><code class="language-rust">let client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(10))
+    .build()?;
+
+for url in urls {
+    let body = client.get(url).send().await?.error_for_status()?.text().await?;
+    println!("{body}");
+}</code></pre>
+
+        <h3>2. No comprobar el estado</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let link: LinkResponse = client.get(url).send().await?.json().await?;</code></pre>
+        <pre><code class="language-text">Error: error decoding response body
+  caused by: expected value at line 1 column 1</code></pre>
+        <p><strong>Por qué está mal:</strong> un 404 con una página HTML llega como respuesta válida; el fallo aparece al deserializar y el mensaje no dice que era un 404. <strong>Bien:</strong> <code>.error_for_status()?</code> antes de <code>.json()</code>.</p>
+
+        <h3>3. Olvidar la feature <code>json</code></h3>
+        <p><strong>Mal:</strong> declarar <code>reqwest = "0.12"</code> sin features y llamar a <code>.json()</code>.</p>
+        <pre><code class="language-text">error[E0599]: no method named `json` found for struct `reqwest::RequestBuilder`
+in the current scope
+  |
+  = help: items from traits can only be used if the trait is in scope
+  = note: the following trait is implemented but not in scope; perhaps add a `use` for it</code></pre>
+        <p><strong>Por qué está mal:</strong> los métodos de JSON viven detrás de la feature <code>json</code>. <strong>Bien:</strong> <code>features = ["json"]</code> y <code>serde_json</code> en las dependencias.</p>
+
+        <h3>4. Bloquear el runtime</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">async fn esperar() {
+    std::thread::sleep(Duration::from_secs(1));  // bloquea el worker de tokio
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>sleep</code> bloquea el hilo del runtime, que está compartido por todas las tareas. Con pocos workers, todo el servidor se detiene. <strong>Bien:</strong> <code>tokio::time::sleep(delay).await</code>.</p>
+        <p>El mismo problema aparece al retener un <code>std::sync::MutexGuard</code> durante un <code>.await</code>:</p>
+        <pre><code class="language-text">error[E0277]: future cannot be sent between threads safely
+   = help: within `impl Future&lt;Output = ...&gt;`, the trait `Send` is not implemented
+           for `std::sync::MutexGuard&lt;'_, ...&gt;`</code></pre>
+        <p><strong>Bien:</strong> usa <code>tokio::sync::Mutex</code> o suelta el guard antes de esperar.</p>
+
+        <h3>5. Aceptar cualquier cuerpo</h3>
+        <p><strong>Mal:</strong> <code>.text()</code> sin límite sobre una URL que introduce el usuario. Una respuesta de 2 GB se convierte en un <code>String</code> de 2 GB y el proceso muere por <code>OOM</code>. <strong>Bien:</strong> <code>fetch_capped</code> con un máximo explícito; si el contenido no es necesario (solo validar), un <code>HEAD</code> ni siquiera lo descarga.</p>
+
+        <h3>6. Reintentar sin criterio</h3>
+        <p><strong>Mal:</strong> un bucle de tres intentos alrededor de un <code>POST /links</code> ante cualquier error, sin espera. Si el primer POST llegó y la respuesta se perdió, el segundo crea un duplicado. <strong>Bien:</strong> reintentar solo <code>GET</code>/<code>HEAD</code>/<code>PUT</code>/<code>DELETE</code>, solo ante timeout, conexión o 5xx, con backoff y con una <em>idempotency key</em> si el servidor la soporta.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> un subcomando <code>check</code> que lee URLs de un fichero, las comprueba en paralelo y devuelve un código de salida distinto si alguna falla.</p>
+        <ol class="steps">
+          <li>
+            <strong>Añade las dependencias.</strong>
+            <pre><code class="language-bash">cargo add reqwest --features json,rustls-tls --no-default-features
+cargo add tokio --features macros,rt-multi-thread,time
+cargo add serde --features derive
+cargo add serde_json thiserror</code></pre>
+          </li>
+          <li>
+            <strong>Crea <code>src/check.rs</code></strong> con el <code>Checker</code> del ejemplo real y expórtalo desde <code>lib.rs</code> con <code>pub mod check;</code>.
+          </li>
+          <li>
+            <strong>Prepara un fichero de prueba</strong> <code>urls.txt</code>:
+            <pre><code class="language-text">https://www.rust-lang.org/
+https://httpbin.org/status/404
+http://10.0.0.5/admin
+no-es-una-url</code></pre>
+          </li>
+          <li>
+            <strong>Escribe el binario que las procesa en paralelo.</strong>
+            <pre><code class="language-rust">use tokio::task::JoinSet;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let path = std::env::args().nth(1).ok_or("uso: check &lt;fichero&gt;")?;
+    let texto = std::fs::read_to_string(path)?;
+    let checker = urlshort::check::Checker::new()?;
+
+    let mut tareas = JoinSet::new();
+    for linea in texto.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let checker = checker.clone();
+        let url = linea.to_string();
+        tareas.spawn(async move {
+            let resultado = checker.validate(&amp;url).await;
+            (url, resultado.map(|u| u.to_string()).map_err(|e| e.to_string()))
+        });
+    }
+
+    let mut fallos = 0;
+    while let Some(tarea) = tareas.join_next().await {
+        let (url, resultado) = tarea?;
+        match resultado {
+            Ok(destino) =&gt; println!("ok    {url} -&gt; {destino}"),
+            Err(err) =&gt; {
+                fallos += 1;
+                eprintln!("fallo {url}: {err}");
+            }
+        }
+    }
+
+    std::process::exit(if fallos == 0 { 0 } else { 1 });
+}</code></pre>
+            <p>Salida esperada: una línea <code>ok</code> para rust-lang, y fallos para el 404, el host privado y la URL mal formada. Código de salida 1.</p>
+          </li>
+          <li>
+            <strong>Comprueba el comportamiento sin red.</strong> Arranca un servidor local que acepte y no responda: <code>nc -l 9999</code> (o <code>ncat -l 9999</code>). Añade <code>http://127.0.0.1:9999</code> al fichero, ejecuta y mide cuánto tarda: debe fallar por <code>PrivateHost</code> antes de conectar. Cambia la comprobación de host privado por una variable de entorno para probar el timeout y verás el <code>read_timeout</code> en acción.
+          </li>
+          <li>
+            <strong>Limita la concurrencia.</strong> <code>JoinSet</code> lanza todas las tareas a la vez. Con un fichero de 10 000 URLs eso son 10 000 conexiones. Añade un <code>tokio::sync::Semaphore</code> con 16 permisos y adquiérelo dentro de cada tarea antes de llamar a <code>validate</code>.
+          </li>
+          <li>
+            <strong>Pasa clippy.</strong>
+            <pre><code class="language-bash">cargo fmt
+cargo clippy --all-targets -- -D warnings</code></pre>
+            <p>clippy te avisará de <code>manual_map</code> o de closures redundantes; acéptalo, el código queda más corto.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Puedes explicar, para cada fallo del fichero, <strong>qué capa falló</strong> (parseo, DNS/TCP, TLS, estado HTTP o deserialización) y qué timeout lo habría cortado. Si el programa se cuelga en algún caso, todavía te falta un timeout.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Caché condicional y limitador de ritmo</h3>
+          <p>urlshort comprueba muchas URLs del mismo dominio y no quiere abusar del servidor. Implementa un <code>CachedChecker</code> que:</p>
+          <ul>
+            <li>Guarde la última respuesta por URL con su <code>ETag</code> y <code>Last-Modified</code>, y use <code>If-None-Match</code>/<code>If-Modified-Since</code> en la siguiente petición; un <code>304 Not Modified</code> cuenta como válido y no gasta cuota.</li>
+            <li>Respete <code>Cache-Control: max-age</code> y <code>Retry-After</code>.</li>
+            <li>Limite a N peticiones por segundo y por host con un <em>token bucket</em>, compartido entre tareas.</li>
+            <li>No reintente un 429 hasta que pase el tiempo indicado.</li>
+          </ul>
+          <p><em>Pista: guarda las entradas en un <code>tokio::sync::Mutex&lt;HashMap&lt;String, Entrada&gt;&gt;</code> o en un <code>DashMap</code>; el limitador puede ser un <code>Semaphore</code> que se rellena periódicamente con una tarea de fondo, o el crate <code>governor</code>. Para las cabeceras, <code>resp.headers().get(header::ETAG)</code>.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>Client</code> es un <strong>pool de conexiones y configuración</strong>: uno por proceso, clonado cuando haga falta.</li>
+          <li>Configura <code>connect_timeout</code>, <code>read_timeout</code> y <code>timeout</code>. Sin ellos, la petición puede no terminar nunca.</li>
+          <li><code>send()</code> devuelve al recibir cabeceras; el cuerpo se lee con <code>.text()</code>, <code>.json()</code> o <code>.chunk()</code>.</li>
+          <li><code>error_for_status()</code> separa «el servidor dijo que no» de «la red falló»; sin él, un 404 se cuela como éxito.</li>
+          <li>La feature <code>json</code> aporta <code>.json(&amp;valor)</code> y <code>.json::&lt;T&gt;()</code>, construidos sobre serde.</li>
+          <li>Reintenta solo lo idempotente, solo ante fallos transitorios, con backoff y respetando <code>Retry-After</code>.</li>
+          <li><code>rustls</code> evita depender de OpenSSL; el proxy del sistema se respeta por defecto.</li>
+          <li>Acota el tamaño de las respuestas de terceros: <code>content_length()</code> y <code>chunk()</code> con contador.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>cargo add reqwest --features json</code></td><td>Cliente HTTP async con soporte JSON.</td></tr>
+            <tr><td><code>Client::builder()…build()</code></td><td>Crea el cliente con timeouts, TLS, proxy y política de redirecciones.</td></tr>
+            <tr><td><code>.send().await?</code></td><td>Envía la petición y espera las cabeceras de respuesta.</td></tr>
+            <tr><td><code>.error_for_status()?</code></td><td>Convierte 4xx/5xx en <code>Err</code>.</td></tr>
+            <tr><td><code>.json::&lt;T&gt;().await?</code></td><td>Deserializa el cuerpo con serde.</td></tr>
+            <tr><td><code>err.is_timeout()</code> / <code>is_connect()</code></td><td>Distingue el tipo de fallo de red para decidir si reintentar.</td></tr>
+            <tr><td><code>curl -I -v URL</code></td><td>Comprueba fuera de Rust qué responde el destino.</td></tr>
+            <tr><td><code>HTTP_PROXY</code> / <code>NO_PROXY</code></td><td>Variables de entorno que reqwest respeta por defecto.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Y si mi programa no es async?</summary>
+          <div>
+            <p>reqwest tiene un módulo <code>blocking</code> con la misma API sin <code>.await</code>: <code>reqwest::blocking::Client</code>. Por dentro arranca un runtime propio. Es cómodo en scripts, pero no lo uses dentro de un runtime async (provoca un <em>panic</em> por anidar runtimes); ahí ya tienes la versión async.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿rustls o TLS nativo?</summary>
+          <div>
+            <p>Si distribuyes un binario estático, compilas para Alpine/musl o quieres evitar OpenSSL, usa <code>rustls-tls</code> con <code>default-features = false</code>. Si necesitas certificados del almacén del sistema con reglas corporativas exóticas, el TLS nativo suele integrarse mejor. En ambos casos, <code>rustls</code> no valida por defecto certificados de una CA interna: hay que añadirla explícitamente.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo cancelo una petición que tarda demasiado?</summary>
+          <div>
+            <p>Con el <code>timeout</code> del cliente, que es lo normal, o envolviendo la llamada en <code>tokio::time::timeout(Duration::from_secs(3), peticion)</code>. Al soltar el futuro, la conexión se descarta. Para cancelar varias a la vez, <code>tokio::select!</code> con una señal de apagado.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo subo un fichero o un formulario?</summary>
+          <div>
+            <p>Con la feature <code>multipart</code> y <code>reqwest::multipart::Form</code>: <code>Form::new().text("campo", "valor").file("fichero", ruta).await?</code>. Para cuerpos binarios grandes, <code>.body(reqwest::Body::from_stream(stream))</code> evita cargarlo entero en memoria.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué un 200 con JSON me da error de deserialización?</summary>
+          <div>
+            <p>Porque el esquema no coincide: falta un campo obligatorio, un número viene como cadena o el servidor devolvió HTML con un <em>login</em>. El error de serde incluye línea y columna. Marca los campos opcionales con <code>Option&lt;T&gt;</code> y <code>#[serde(default)]</code>, y registra el cuerpo (recortado) cuando falles, para ver qué llegó de verdad.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

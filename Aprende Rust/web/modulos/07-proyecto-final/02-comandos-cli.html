@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="02-comandos-cli">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Comandos: short, resolve, list y delete — Módulo 7 · Curso Rust</title>
+  <meta name="description" content="El CLI de urlshort con clap 4: subcomandos short, resolve, list, delete y serve, flags globales --base-url y --store, salida legible, códigos de salida y tests con try_parse_from.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Comandos: short, resolve, list y delete</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>El dominio ya existe y está probado. Ahora necesita una cara: alguien que escriba <code>urlshort short https://…</code> y reciba una URL corta, o <code>urlshort resolve 9xQ2mK</code> y reciba el destino. Ese alguien puede ser una persona en una terminal o un script en CI, y los dos tienen exigencias distintas: la persona quiere leer una línea clara; el script quiere códigos de salida estables y nada de adornos.</p>
+        <p><code>clap</code> 4 resuelve el 80 % del trabajo por ti: parsea, valida tipos, genera <code>--help</code>, sugiere correcciones y devuelve el código 2 en los errores de uso. El 20 % restante es decisión tuya: qué se imprime, dónde se imprime y qué significa cada código de salida.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque un CLI mal terminado no se puede automatizar. Si los errores van a <em>stdout</em> o si todo sale con código 0, ningún script podrá distinguir un éxito de un fallo. Y si la lógica de los comandos vive dentro de <code>main</code>, ningún test podrá ejercitarla.</p>
+        </div>
+        <p>Al terminar tendrás los cinco subcomandos (<code>short</code>, <code>resolve</code>, <code>list</code>, <code>delete</code> y <code>serve</code>), dos flags globales, una salida pensada para leer y tests que llaman al CLI sin abrir una terminal.</p>
+        <ul>
+          <li>Imprimir los errores en <em>stdout</em> y devolver siempre 0: el script no distingue éxito de fracaso.</li>
+          <li>Validar la URL con <code>clap</code> y luego revalidarla con reglas distintas en el servicio.</li>
+          <li>Llamar a <code>std::process::exit</code> dentro de la función que hace el trabajo: mata el proceso de test.</li>
+          <li>Olvidar que <code>main</code> async necesita <code>#[tokio::main]</code>: el subcomando <code>serve</code> no compila.</li>
+        </ul>
+      </section>
+
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Del argv al caso de uso</h3>
+        <p>Un CLI tiene tres fases que conviene no mezclar: <strong>parsear</strong> (clap convierte texto en tipos), <strong>ejecutar</strong> (el <code>Service</code> hace el trabajo) e <strong>informar</strong> (formatear la salida y elegir el código). Si la fase de ejecutar imprime, no se puede reutilizar; si la de informar valida, hay reglas duplicadas.</p>
+        <pre class="diagram">argv
+  │
+  ▼
+clap::Parser ──► Cli { base_url, store, command }
+  │                        │
+  │ error de uso           │ execute(service, command)
+  ▼                        ├── short   ─┐
+exit 2                     ├── resolve ─┤
+(--help, --version)        ├── list    ─┼──► Service ──► Arc&lt;dyn Store&gt;
+                           ├── delete  ─┤        │
+                           └── serve   ─┘        ▼
+                              stdout · stderr · exit code</pre>
+        <p>El contrato de los comandos, que es lo que un usuario lee en <code>--help</code>:</p>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th><th>Qué imprime</th></tr></thead>
+          <tbody>
+            <tr><td><code>short &lt;url&gt;</code></td><td>Valida, genera un código libre y guarda el enlace</td><td>La URL corta</td></tr>
+            <tr><td><code>resolve &lt;code&gt;</code></td><td>Busca el código, suma una visita y devuelve el destino</td><td>La URL original</td></tr>
+            <tr><td><code>list</code></td><td>Lista los enlaces ordenados por código</td><td>Código, hits y URL</td></tr>
+            <tr><td><code>delete &lt;code&gt;</code></td><td>Borra el enlace</td><td><code>borrado 9xQ2mK</code></td></tr>
+            <tr><td><code>serve --port 3000</code></td><td>Arranca el servidor HTTP (lección 03)</td><td>La dirección de escucha</td></tr>
+          </tbody>
+        </table>
+        <h3>Flags globales: se escriban donde se escriban</h3>
+        <p><code>#[arg(global = true)]</code> hace que un flag valga antes o después del subcomando: <code>urlshort --store x.json list</code> y <code>urlshort list --store x.json</code> producen el mismo <code>Cli</code> sin duplicar definiciones. <code>--base-url</code> decide qué URL se enseña (local, dominio propio, tests) y <code>--store</code> qué fichero se usa; ninguno pertenece a un comando concreto.</p>
+        <h3>Códigos de salida: el contrato con los scripts</h3>
+        <table>
+          <thead><tr><th>Código</th><th>Cuándo</th><th>Quién lo emite</th></tr></thead>
+          <tbody>
+            <tr><td><code>0</code></td><td>Todo fue bien</td><td><code>main</code></td></tr>
+            <tr><td><code>1</code></td><td>Error de ejecución: URL inválida, código inexistente, fichero ilegible</td><td><code>execute</code> + <code>main</code></td></tr>
+            <tr><td><code>2</code></td><td>Error de uso: subcomando desconocido, falta un argumento, puerto no numérico</td><td><code>clap</code>, antes de tu código</td></tr>
+          </tbody>
+        </table>
+        <p>La separación es deliberada: el 2 significa «has escrito mal la orden» y no depende de tu lógica; el 1 significa «la orden era correcta y el mundo falló». Un script puede reintentar un 1 y abortar un 2 sin leer el mensaje.</p>
+        <h3>Qué imprime y qué no</h3>
+        <p>La regla es tajante: <strong>stdout solo lleva el resultado</strong>; los diagnósticos van a stderr. En urlshort 0.1 el CLI es para humanos: imprime una línea por enlace y no tiene flag <code>--json</code>. La salida legible por máquina es el servidor HTTP de la lección 03 y el propio fichero <code>links.json</code>; añadir <code>--json</code> después es un cambio compatible (nuevo flag, mismo <code>Service</code>).</p>
+        <pre class="diagram">$ urlshort --store /tmp/links.json list
+CÓDIGO   HITS  URL
+9xQ2mK      3  https://www.rust-lang.org/learn
+A7bC1z      0  https://example.com
+
+$ urlshort --store /tmp/links.json list &gt; enlaces.txt
+# stdout limpio: solo la tabla, sin mensajes de progreso</pre>
+        <div class="callout callout--note">
+          <p class="callout__title">El nombre del subcomando también es API</p>
+          <p>Renombrar <code>resolve</code> por <code>open</code> rompe los scripts de quien ya lo usa. Los subcomandos son estables dentro de una mayor; los mensajes humanos, no. Si necesitas cambiar un nombre, añade un alias (<code>#[command(alias = "open")]</code>) y documenta el cambio.</p>
+        </div>
+      </section>
+
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El esqueleto más pequeño con subcomandos, sin dominio ni almacenamiento. Compila con <code>cargo add clap --features derive</code>.</p>
+        <pre><code class="language-rust">use clap::{Parser, Subcommand};
+
+/// Acorta URLs desde la terminal.
+#[derive(Debug, Parser)]
+#[command(name = "urlshort", version, about)]
+struct Cli {
+    /// Fichero donde se guardan los enlaces.
+    #[arg(long, global = true, default_value = "links.json")]
+    store: String,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Crea un código corto para una URL.
+    Short { url: String },
+    /// Lista los enlaces guardados.
+    List,
+}
+
+fn main() {
+    let cli = Cli::parse();          // en error de uso: mensaje y exit 2
+    match cli.command {
+        Command::Short { url } =&gt; println!("(guardaría {url} en {})", cli.store),
+        Command::List =&gt; println!("(sin enlaces en {})", cli.store),
+    }
+}</code></pre>
+        <p>Qué hace cada pieza:</p>
+        <ul>
+          <li><code>#[derive(Parser)]</code> genera el parser del struct; los comentarios <code>///</code> se convierten en la ayuda de <code>--help</code>.</li>
+          <li><code>#[command(name, version, about)]</code> toma la versión de <code>Cargo.toml</code>: una sola fuente de verdad.</li>
+          <li><code>#[command(subcommand)]</code> marca el campo con el enum; cada variante es un subcomando en <em>kebab-case</em>.</li>
+          <li><code>global = true</code> permite <code>--store</code> antes o después del subcomando.</li>
+          <li><code>Cli::parse()</code> imprime la ayuda y sale con 2 si algo no encaja; <code>try_parse_from</code> devuelve el error y es lo que usan los tests.</li>
+        </ul>
+        <p>Prueba <code>cargo run -- --help</code>: verás los comandos, las opciones y la versión. Un subcomando inventado termina con código 2; <code>--help</code> termina con 0.</p>
+      </section>
+
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El <code>Cli</code> de urlshort añade la configuración y los cinco comandos. Los campos son <code>pub</code> porque los tests los inspeccionan.</p>
+        <pre><code class="language-rust">// src/cli.rs
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+use crate::domain::Link;
+use crate::error::Error;
+use crate::service::Service;
+
+#[derive(Debug, Parser)]
+#[command(name = "urlshort", version, about = "Acorta URLs desde la terminal")]
+pub struct Cli {
+    /// Base pública para construir la URL corta
+    #[arg(long, global = true, default_value = "http://localhost:3000")]
+    pub base_url: String,
+    /// Fichero JSON donde se guardan los enlaces
+    #[arg(long, global = true, default_value = "links.json", value_name = "PATH")]
+    pub store: PathBuf,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Crea un código corto para una URL
+    Short { url: String },
+    /// Resuelve un código y registra una visita
+    Resolve { code: String },
+    /// Lista los enlaces guardados
+    List,
+    /// Borra un enlace del store
+    Delete { code: String },
+    /// Arranca el servidor HTTP en 127.0.0.1
+    Serve {
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
+}</code></pre>
+        <p>La ejecución delega en <code>Service</code> y solo se ocupa del formato. Es <code>async</code> porque el brazo <code>Serve</code> arranca el servidor; los otros cuatro no esperan nada, pero comparten la firma.</p>
+        <pre><code class="language-rust">pub async fn execute(service: Service, command: Command) -&gt; Result&lt;(), Error&gt; {
+    match command {
+        Command::Short { url } =&gt; {
+            let link = service.short(&amp;url)?;
+            println!("{}", link.short_url(service.base_url()));
+        }
+        Command::Resolve { code } =&gt; {
+            let link = service.resolve(&amp;code)?;          // suma una visita
+            println!("{}", link.url());
+        }
+        Command::List =&gt; print_table(&amp;service.list()?),
+        Command::Delete { code } =&gt; {
+            service.delete(&amp;code)?;
+            println!("borrado {code}");
+        }
+        Command::Serve { port } =&gt; {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            crate::server::serve(service, addr).await?;
+        }
+    }
+    Ok(())
+}
+
+fn print_table(links: &amp;[Link]) {
+    if links.is_empty() {
+        eprintln!("no hay enlaces guardados en este store");
+        return;
+    }
+    println!("{:&lt;8} {:&gt;6}  {}", "CÓDIGO", "HITS", "URL");
+    for link in links {
+        println!("{:&lt;8} {:&gt;6}  {}", link.code(), link.hits(), link.url());
+    }
+}</code></pre>
+        <p>El binario monta el store, crea el <code>Service</code> y traduce el resultado a código de salida. <code>clap</code> sale con 2 si la orden está mal; <code>execute</code> devuelve el error y <code>main</code> lo convierte en mensaje por stderr y código 1. Ningún <code>unwrap</code> en el camino del usuario.</p>
+        <pre><code class="language-rust">// src/main.rs
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use clap::Parser;
+use urlshort::cli::{execute, Cli};
+use urlshort::service::Service;
+use urlshort::store::{JsonStore, Store};
+
+#[tokio::main]
+async fn main() -&gt; ExitCode {
+    let cli = Cli::parse();
+    let store: Arc&lt;dyn Store&gt; = match JsonStore::open(&amp;cli.store) {
+        Ok(store) =&gt; Arc::new(store),
+        Err(err) =&gt; { eprintln!("error: {err}"); return ExitCode::from(1); }
+    };
+    let service = Service::new(store, cli.base_url);
+    match execute(service, cli.command).await {
+        Ok(()) =&gt; ExitCode::SUCCESS,
+        Err(err) =&gt; { eprintln!("error: {err}"); ExitCode::from(1) }
+    }
+}</code></pre>
+        <p>Uso real, con el store en un fichero temporal:</p>
+        <pre><code class="language-bash">cargo run -- --store /tmp/links.json short "https://www.rust-lang.org/learn"
+# http://localhost:3000/9xQ2mK
+cargo run -- --store /tmp/links.json resolve 9xQ2mK
+# https://www.rust-lang.org/learn
+cargo run -- --store /tmp/links.json list
+cargo run -- --store /tmp/links.json delete 9xQ2mK
+# borrado 9xQ2mK</code></pre>
+        <div class="callout callout--tip">
+          <p class="callout__title">Un comando, un efecto</p>
+          <p><code>short</code> escribe, <code>resolve</code> escribe (hits) y lee, <code>list</code> solo lee, <code>delete</code> escribe, <code>serve</code> no toca el store hasta que llega una petición. Si un comando hace dos cosas, el <code>--help</code> miente. Y si dudas de si algo debe imprimirse, pregúntate si un script lo podría parsear: si la respuesta es «da igual», probablemente va a stderr.</p>
+        </div>
+      </section>
+
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Separar <code>execute</code> de <code>main</code></td><td>Lógica y <code>exit</code> en <code>main</code></td><td><code>execute</code> se puede testear; <code>main</code> no.</td></tr>
+            <tr><td>Resultado en stdout, diagnóstico en stderr</td><td>Mezclar avisos con la tabla</td><td><code>&gt; enlaces.txt</code> solo funciona con stdout limpio.</td></tr>
+            <tr><td>Flags globales con <code>global = true</code></td><td>Duplicar <code>--store</code> en cada variante</td><td>Una definición, dos posiciones válidas, misma ayuda.</td></tr>
+            <tr><td>Tipar el puerto como <code>u16</code></td><td>Recibirlo como <code>String</code> y parsearlo a mano</td><td>clap rechaza <code>--port 99999</code> con código 2 y un mensaje claro.</td></tr>
+            <tr><td>Validar la URL una sola vez, en el dominio</td><td>Reglas distintas en clap y en <code>validate_url</code></td><td>Dos validadores divergen y el usuario ve mensajes contradictorios.</td></tr>
+            <tr><td>Tests con <code>try_parse_from</code></td><td>Lanzar el binario desde los tests</td><td>Rápido, sin procesos hijos ni rutas de <code>target/</code>.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">La salida también es una API</p>
+          <p>En cuanto alguien escribe <code>urlshort list | awk '{print $1}'</code>, el número de columnas importa. Documenta el formato en el README y, si necesitas cambiarlo, añade una opción (<code>--json</code>, <code>--quiet</code>) en vez de romper la existente.</p>
+        </div>
+      </section>
+
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Mover <code>cli.command</code> y luego leer <code>cli.base_url</code></h3>
+        <pre><code class="language-rust">fn run(cli: Cli) -&gt; Result&lt;(), Error&gt; {
+    match cli.command {                     // mueve el campo command
+        Command::Short { url } =&gt; {
+            let link = service.short(&amp;url)?;
+            println!("{}", link.short_url(&amp;cli.base_url));   // movido parcialmente
+        }
+        _ =&gt; {}
+    }
+    Ok(())
+}</code></pre>
+        <p><strong>El error real:</strong></p>
+        <pre><code class="language-text">error[E0382]: borrow of partially moved value: `cli`
+  --&gt; src/cli.rs:12:34
+   |
+ 6 |     match cli.command {
+   |           ----------- value partially moved here
+...
+10 |             println!("{}", link.short_url(&amp;cli.base_url));
+   |                                         ^^^^^^^^^^^^^ value borrowed here after partial move
+   |
+   = note: partial move occurs because `cli.command` has type `Command`,
+           which does not implement the `Copy` trait</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>Command</code> contiene <code>String</code> y no es <code>Copy</code>; el <code>match</code> lo mueve y el resto de <code>cli</code> queda inutilizable. <strong>Bien:</strong> desestructura antes del <code>match</code>, como hace <code>main</code>: <code>let Cli { base_url, store, command } = cli;</code>.</p>
+        <h3>2. Devolver siempre 0</h3>
+        <p><strong>Mal:</strong> <code>execute</code> imprime el error y termina con <code>Ok(())</code>. El mensaje se ve, pero <code>echo $?</code> dice 0 y el script continúa como si nada. <strong>Bien:</strong> propaga con <code>?</code> y deja que <code>main</code> decida el código con <code>ExitCode::from(1)</code>.</p>
+        <h3>3. <code>process::exit</code> dentro de la biblioteca</h3>
+        <p><strong>Mal:</strong> <code>if err { eprintln!(…); std::process::exit(1); }</code> dentro de <code>cli::execute</code>. El test que llama a <code>execute</code> mata el proceso de test entero y no hay forma de comprobar el mensaje. <strong>Bien:</strong> <code>Result</code> hasta <code>main</code> y <code>exit</code> solo en el borde del binario.</p>
+        <h3>4. Parsear el puerto a mano</h3>
+        <p><strong>Mal:</strong> <code>port: String</code> y luego <code>port.parse().unwrap()</code>: un valor no numérico produce un <em>panic</em> con traza en vez de un error de uso. <strong>Bien:</strong> <code>port: u16</code>. clap valida el rango y responde con código 2 antes de que tu código se ejecute.</p>
+      </section>
+
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> probar el parseo y el flujo completo sin abrir una terminal. Los tests de parseo viven en <code>src/cli.rs</code>; el de flujo, en <code>tests/cli.rs</code>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Añade los tests de parseo.</strong> <code>try_parse_from</code> recibe un iterador con el nombre del programa en la primera posición, igual que <code>argv</code>.
+            <pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn las_flags_globales_valen_en_cualquier_posicion() {
+        let cli = Cli::try_parse_from([
+            "urlshort", "--base-url", "https://s.dev", "short", "https://example.com",
+        ]).unwrap();
+        assert_eq!(cli.base_url, "https://s.dev");
+        assert!(matches!(cli.command, Command::Short { .. }));
+    }
+
+    #[test]
+    fn delete_sin_codigo_es_error_de_uso() {
+        assert!(Cli::try_parse_from(["urlshort", "delete"]).is_err());
+    }
+
+    #[test]
+    fn el_puerto_por_defecto_es_3000() {
+        let cli = Cli::try_parse_from(["urlshort", "serve"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve { port: 3000 }));
+    }
+}</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba que fallan por la razón correcta.</strong> Quita <code>global = true</code> del flag <code>--base-url</code> y verás fallar el primer test: la opción deja de existir delante del subcomando. Vuelve a ponerlo.
+          </li>
+          <li>
+            <strong>Escribe el test de flujo completo.</strong> Cada paso usa el mismo <code>Service</code> que el CLI; se inspecciona el estado, no la pantalla.
+            <pre><code class="language-rust">// tests/cli.rs
+use std::sync::Arc;
+
+use urlshort::cli::{execute, Command};
+use urlshort::service::Service;
+use urlshort::store::MemoryStore;
+
+#[tokio::test]
+async fn flujo_short_resolve_list_delete() {
+    let service = Service::new(Arc::new(MemoryStore::new()), "https://s.dev");
+
+    execute(service.clone(), Command::Short {
+        url: "https://www.rust-lang.org".into(),
+    }).await.unwrap();
+    let code = service.list().unwrap()[0].code().to_string();
+
+    execute(service.clone(), Command::Resolve { code: code.clone() }).await.unwrap();
+    assert_eq!(service.list().unwrap()[0].hits(), 1);
+
+    execute(service.clone(), Command::Delete { code }).await.unwrap();
+    assert!(service.list().unwrap().is_empty());
+}</code></pre>
+          </li>
+          <li>
+            <strong>Ejecuta todo.</strong> <code>cargo test</code> y <code>cargo clippy --all-targets -- -D warnings</code>. Salida esperada: los tres tests de parseo y el de flujo en verde. Si el de flujo no compila, comprueba que <code>Service</code> implementa <code>Clone</code>: lo necesita para conservar una copia mientras <code>execute</code> consume la otra.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Puedes cambiar el nombre de un subcomando y ver exactamente qué test falla. Eso significa que el contrato del CLI está cubierto: el parseo por un lado y el flujo por otro, sin procesos hijos ni <em>sleeps</em>.</p>
+        </div>
+      </section>
+
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 <code>--json</code> y <code>--dry-run</code> sin romper nada</h3>
+          <p>Añade dos flags globales. <code>--json</code> hace que <code>list</code> imprima un array de objetos y que <code>short</code>/<code>resolve</code> impriman un objeto con <code>code</code>, <code>url</code>, <code>short_url</code>, <code>hits</code> y <code>created_at</code>. <code>--dry-run</code> hace que <code>delete</code> diga qué borraría sin borrar nada.</p>
+          <p>Restricciones: sin <code>--json</code> la salida actual no cambia ni un carácter; <code>--dry-run</code> no debe incrementar hits ni escribir en disco; los códigos de salida se mantienen. ¿Dónde pones el <code>if json</code>: en <code>execute</code>, en una función <code>render</code> o en un trait de presentación?</p>
+          <p><em>Pista: <code>execute</code> ya es el sitio donde el dominio se convierte en texto, así que es el candidato natural. Para el dry-run, mira qué operación del <code>Service</code> te falta: hoy <code>delete</code> borra y devuelve <code>()</code>; un método que solo consulte el enlace te da el «qué borraría» sin efectos. Y serializa con <code>serde_json</code>, que ya está en el árbol de dependencias.</em></p>
+        </div>
+      </section>
+
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>clap</code> 4 con <code>derive</code> convierte una estructura y un enum en un CLI completo con ayuda y validación.</li>
+          <li>Los flags <code>global = true</code> valen antes y después del subcomando; <code>--base-url</code> y <code>--store</code> son configuración.</li>
+          <li><code>execute(service, command)</code> se testea; <code>main</code> solo monta el store y traduce el error a código.</li>
+          <li>Códigos: 0 éxito, 1 fallo de ejecución, 2 error de uso emitido por clap.</li>
+          <li>stdout lleva el resultado; stderr lleva diagnósticos. El CLI 0.1 es para humanos: la salida máquina es el servidor.</li>
+          <li><code>port: u16</code> deja que clap valide el rango antes de arrancar el servidor.</li>
+          <li><code>try_parse_from</code> prueba el parseo sin lanzar procesos; el test de flujo usa <code>Service</code> + <code>MemoryStore</code>.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>#[derive(Parser)]</code></td><td>Genera el parser del struct; los <code>///</code> se vuelven ayuda.</td></tr>
+            <tr><td><code>#[command(subcommand)]</code></td><td>Marca el campo con el enum de subcomandos.</td></tr>
+            <tr><td><code>#[arg(long, global = true)]</code></td><td>Flag disponible antes o después del subcomando.</td></tr>
+            <tr><td><code>Cli::try_parse_from([...])</code></td><td>Parsea un array y devuelve <code>Result</code>: la base de los tests.</td></tr>
+            <tr><td><code>ExitCode::from(1)</code></td><td>Código de salida del binario sin matar el proceso a mano.</td></tr>
+            <tr><td><code>#[tokio::main]</code></td><td>Runtime async para el brazo <code>Serve</code> del comando.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <details>
+          <summary>¿Por qué el CLI no tiene <code>--json</code>?</summary>
+          <div>
+            <p>Porque en 0.1 la interfaz para máquinas es el servidor HTTP: el CLI imprime para humanos y el fichero <code>links.json</code> ya es JSON. Añadir <code>--json</code> después no rompe nada porque es un flag nuevo y el <code>Service</code> no cambia. Lo que sí sería un error es cambiar el formato actual sin avisar: hay scripts que leen la primera columna.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Dónde valido la URL: en clap o en el dominio?</summary>
+          <div>
+            <p>En el dominio, una sola vez. clap comprueba que el argumento existe y que es un <code>String</code>; las reglas de qué es una URL válida viven en <code>validate_url</code>. Si duplicas la comprobación con un parser de clap, tendrás dos mensajes distintos para el mismo error y una de las dos reglas se quedará atrás.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Cómo pruebo lo que se imprime por pantalla?</summary>
+          <div>
+            <p>Capturar stdout de tu propio proceso es incómodo. La alternativa que escala es no probar el texto: prueba el estado (los enlaces en el store) y deja el formato como decisión de presentación. Si el formato es crítico, extrae <code>fn render(&amp;[Link]) -&gt; String</code> y testea esa función pura; <code>println!</code> solo la imprime.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Por qué <code>execute</code> es <code>async</code> si cuatro comandos no esperan nada?</summary>
+          <div>
+            <p>Porque <code>serve</code> sí: arranca el servidor y no termina hasta que lo paras. Una sola función con una firma uniforme evita dos caminos de despacho y dos formas de devolver errores. Si te molesta el <code>await</code>, el precio sería un <code>match</code> en <code>main</code> que separe <code>Serve</code> del resto: legítimo, pero duplica la tabla de comandos.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

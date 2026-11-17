@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="03" data-lesson="02-errores-propios">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Errores propios con thiserror — Módulo 3 · Curso Rust</title>
+  <meta name="description" content="Diseña errores de dominio en Rust: enum con variantes, derive de thiserror, #[error], #[from], #[source], Box&lt;dyn Error&gt;, contexto y separación entre dominio e infraestructura.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Errores propios con thiserror</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 3 · Errores y modularidad</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En la lección anterior los errores eran <code>String</code>. Funciona para un ejercicio, pero tiene dos problemas graves: el llamador no puede distinguir un fallo de otro sin comparar texto, y el mensaje que ve el usuario acaba mezclado con detalles internos. Cuando <strong>urlshort</strong> crezca, necesitarás saber si un enlace no existe (código 3), si ya existe (código 4) o si el disco falló (código 1) sin leer una frase.</p>
+        <p>La solución es la misma que para cualquier otro dato: <strong>un tipo</strong>. Un <code>enum</code> con una variante por clase de fallo, campos con la información concreta y un <code>Display</code> que produzca el mensaje humano. A mano son ochenta líneas de ceremonia; <code>thiserror</code> las genera con atributos.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque «algo falló» no es un error: es una excusa. Un error bien diseñado <strong>nombra</strong> lo que pasó, <strong>conserva</strong> la causa original y <strong>oculta</strong> lo que el usuario no debe ver. Ese triple contrato separa una herramienta depurable de una caja negra.</p>
+        </div>
+        <p><strong>Errores típicos al empezar:</strong> derivar solo <code>Debug</code> y usar el tipo con <code>?</code> hacia <code>Box&lt;dyn Error&gt;</code>; envolver dos veces el mismo <code>io::Error</code> con <code>#[from]</code>; poner la ruta absoluta del servidor en el mensaje público; y usar <code>String</code> como variante comodín.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Qué exige ser un error</h3>
+        <p><code>std::error::Error</code> exige dos supertraits: <code>Debug</code> (diagnóstico) y <code>Display</code> (mensaje humano). Además ofrece <code>source()</code>, que devuelve la causa original, y <code>provide()</code> para backtraces. La cadena de causas permite imprimir «no se pudo guardar el enlace» y, debajo, «permiso denegado».</p>
+        <pre><code class="language-rust">pub trait Error: Debug + Display {
+    fn source(&amp;self) -&gt; Option&lt;&amp;(dyn Error + 'static)&gt; { None }
+}</code></pre>
+        <p>Si implementas <code>Error</code> a mano y te falta <code>Display</code>, el compilador lo dice con <code>E0277</code>. Y si derivas solo <code>Debug</code>, el tipo no es un error para nadie: no puede viajar en <code>Box&lt;dyn Error&gt;</code>.</p>
+
+        <h3>El enum como vocabulario del dominio</h3>
+        <p>Diseñar errores es diseñar el vocabulario de lo que puede salir mal. Cada variante debe responder a una pregunta que el llamador quiera hacer. Si dos variantes se tratan siempre igual, probablemente sean una; si una necesita un dato para el mensaje, lo lleva dentro.</p>
+        <pre><code class="language-rust">#[derive(Debug, thiserror::Error)]
+pub enum DomainError {
+    #[error("URL no válida: {0}")]
+    InvalidUrl(String),
+
+    #[error("no existe ningún enlace con el código `{0}`")]
+    NotFound(String),
+
+    #[error("el código `{0}` ya está en uso")]
+    Conflict(String),
+}</code></pre>
+        <p><code>thiserror</code> genera <code>impl Display</code> con la plantilla de <code>#[error]</code> y <code>impl Error</code> con <code>source()</code> cuando hay causa. <code>Debug</code> no lo genera: se deriva aparte y es obligatorio.</p>
+        <table>
+          <thead><tr><th>Atributo</th><th>Qué genera</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>#[error("… {0} …")]</code></td><td><code>Display</code>; interpola campos por nombre o posición</td><td>Siempre: es el mensaje humano</td></tr>
+            <tr><td><code>#[from]</code></td><td><code>From&lt;T&gt;</code> y marca el campo como <code>source</code></td><td>Cuando adoptas el error externo sin añadir contexto</td></tr>
+            <tr><td><code>#[source]</code></td><td>Devuelve ese campo en <code>Error::source()</code></td><td>Cuando añades contexto y conservas la causa</td></tr>
+            <tr><td><code>#[error(transparent)]</code></td><td>Delega <code>Display</code> y <code>source</code> al campo único</td><td>Enums envoltorio que agrupan capas</td></tr>
+            <tr><td><code>#[backtrace]</code></td><td>Captura y expone un <code>Backtrace</code></td><td>Diagnóstico avanzado</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Dos formas de conservar la causa</h3>
+        <p><code>#[from]</code> solo puede aparecer en un campo y la variante no admite más datos (salvo un backtrace). Sirve para «adopto el error tal cual», no para «lo envuelvo con la ruta que intentaba abrir».</p>
+        <pre><code class="language-rust">#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("no se pudo leer la configuración")]
+    Io(#[from] std::io::Error), // From + source, sin contexto
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("no se pudo acceder a {path}")]
+    Io {
+        path: String,
+        #[source] // no hay From: el contexto se añade a mano
+        source: std::io::Error,
+    },
+}
+
+fn save(path: &amp;str) -&gt; Result&lt;(), StoreError&gt; {
+    std::fs::write(path, b"{}").map_err(|source| StoreError::Io {
+        path: path.to_string(),
+        source,
+    })
+}</code></pre>
+        <div class="callout callout--note">
+          <p class="callout__title">Un campo llamado <code>source</code> ya es la causa</p>
+          <p><code>thiserror</code> trata automáticamente como causa cualquier campo llamado <code>source</code>; <code>#[source]</code> hace falta si se llama <code>cause</code> o <code>io</code>. Y dos <code>#[from] std::io::Error</code> en el mismo enum fallan con <code>E0119</code>: dos <code>From</code> idénticos no pueden coexistir.</p>
+        </div>
+
+        <h3>Jerarquía: dominio, infraestructura y borde</h3>
+        <p>Un error que lo explica todo suele ser un error que no dice nada. La estructura que mejor envejece separa tres capas:</p>
+        <pre class="diagram">  DOMINIO                 INFRAESTRUCTURA              BORDE (CLI / HTTP)
+  ───────                 ────────────────              ──────────────────
+  InvalidUrl              Io { path, source }           main / handler
+  NotFound                Serde { path, source }        │
+  Conflict                Db { … }                      ├─ mensaje al usuario
+        │                        │                      ├─ log con la cadena
+        └────────┬───────────────┘                      └─ código de salida
+                 ▼
+          Error (envoltorio)
+          ├── Domain(#[from] DomainError)
+          └── Store(#[from] StoreError)</pre>
+        <p>El dominio no sabe que existe el disco; la infraestructura no sabe qué es un código duplicado. El envoltorio <code>Error</code>, con <code>#[error(transparent)]</code>, agrupa ambos y permite que <code>?</code> convierta sin <code>map_err</code> en cada capa. El borde —<code>main</code> o un handler de Axum— decide qué se imprime y qué código se devuelve.</p>
+
+        <h3>No exponer las tripas</h3>
+        <p>Un mensaje de error es una interfaz pública: se lee en terminales, logs y respuestas HTTP. La ruta <code>/srv/datos/enlaces.json</code>, el usuario de la base de datos o el SQL que falló no deben aparecer en la respuesta al cliente; sí en el log. La regla: <strong>el mensaje público describe la intención</strong> («no se pudo guardar el enlace») y la causa viaja en <code>source()</code> para quien tenga permiso de verla. <code>Box&lt;dyn Error&gt;</code> es útil en prototipos, tests y binarios pequeños, pero inútil en una API pública: el llamador no puede hacer <code>match</code> sobre variantes.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Tres variantes, tres mensajes y una dependencia. <code>check</code> devuelve el enum concreto, no una caja.</p>
+        <pre><code class="language-rust">// Cargo.toml → thiserror = "2"
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum UrlError {
+    #[error("la URL está vacía")]
+    Empty,
+
+    #[error("falta el esquema en `{0}`")]
+    MissingScheme(String),
+
+    #[error("esquema no permitido: `{0}`")]
+    Scheme(String),
+}
+
+fn check(raw: &amp;str) -&gt; Result&lt;(), UrlError&gt; {
+    let url = raw.trim();
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| UrlError::MissingScheme(url.to_string()))?;
+    if scheme != "http" &amp;&amp; scheme != "https" {
+        return Err(UrlError::Scheme(scheme.to_string()));
+    }
+    if rest.is_empty() {
+        return Err(UrlError::Empty);
+    }
+    Ok(())
+}
+
+fn main() {
+    for raw in ["https://www.rust-lang.org", "www.rust-lang.org", "ftp://x.dev"] {
+        match check(raw) {
+            Ok(()) =&gt; println!("ok   {raw}"),
+            Err(e) =&gt; println!("err  {raw}: {e}"),
+        }
+    }
+}</code></pre>
+        <p>Salida: <code>ok https://www.rust-lang.org</code>, <code>err www.rust-lang.org: falta el esquema en `www.rust-lang.org`</code> y <code>err ftp://x.dev: esquema no permitido: `ftp`</code>.</p>
+        <p><code>#[derive(Debug, Error)]</code> combina el <code>Debug</code> que exige el trait con el <code>Display</code> y el <code>Error</code> que genera el derive; <code>{0}</code> usa el primer campo posicional; <code>ok_or_else</code> convierte la ausencia de esquema en el error con el texto original dentro. En <code>println!</code>, <code>{e}</code> llama a <code>Display</code>; <code>{e:?}</code> llamaría a <code>Debug</code> e imprimiría <code>Scheme("ftp")</code>.</p>
+        <div class="callout callout--tip">
+          <p class="callout__title">El mensaje empieza en minúscula y sin punto final</p>
+          <p>Es la convención de <code>std</code>, porque los mensajes se encadenan: <code>error al guardar: no se pudo acceder a enlaces.json</code> se lee bien; <code>Error al guardar. No se pudo acceder…</code> se lee como dos frases peleadas. Las variantes, en cambio, van en <code>CamelCase</code> y en inglés, como el resto de identificadores.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p><strong>urlshort</strong> ya distingue cinco clases de fallo: <code>InvalidUrl</code>, <code>NotFound</code>, <code>Conflict</code>, <code>Io</code> y <code>Serde</code>. Dominio y almacén tienen su enum; un envoltorio los une y el borde traduce a códigos. (<code>Cargo.toml</code>: <code>thiserror = "2"</code> y <code>serde_json = "1"</code>; la persistencia real llega en el módulo 6.)</p>
+        <pre><code class="language-rust">// src/error.rs
+use thiserror::Error;
+
+pub type Result&lt;T&gt; = std::result::Result&lt;T, Error&gt;;
+
+#[derive(Debug, Error)]
+pub enum DomainError {
+    #[error("URL no válida: {0}")]
+    InvalidUrl(String),
+
+    #[error("no existe ningún enlace con el código `{0}`")]
+    NotFound(String),
+
+    #[error("el código `{0}` ya está en uso")]
+    Conflict(String),
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("no se pudo acceder a {path}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("JSON inválido en {path}")]
+    Serde {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl Error {
+    pub fn exit_code(&amp;self) -&gt; i32 {
+        match self {
+            Error::Domain(DomainError::InvalidUrl(_)) =&gt; 1,
+            Error::Domain(DomainError::NotFound(_)) =&gt; 3,
+            Error::Domain(DomainError::Conflict(_)) =&gt; 4,
+            Error::Store(_) =&gt; 1,
+        }
+    }
+}</code></pre>
+        <p>El almacén construye los errores donde tiene el dato que falta: el <code>path</code> y la causa.</p>
+        <pre><code class="language-rust">// src/store.rs (extracto)
+impl MemoryStore {
+    pub fn insert(&amp;mut self, link: Link) -&gt; Result&lt;()&gt; {
+        if self.links.contains_key(&amp;link.code) {
+            return Err(DomainError::Conflict(link.code).into());
+        }
+        self.links.insert(link.code.clone(), link);
+        Ok(())
+    }
+
+    pub fn get(&amp;self, code: &amp;str) -&gt; Result&lt;&amp;Link&gt; {
+        self.links
+            .get(code)
+            .ok_or_else(|| DomainError::NotFound(code.to_string()).into())
+    }
+
+    pub fn save(&amp;self, path: &amp;std::path::Path) -&gt; Result&lt;()&gt; {
+        let json = serde_json::to_string_pretty(&amp;self.links).map_err(|source| {
+            StoreError::Serde { path: path.display().to_string(), source }
+        })?;
+        std::fs::write(path, json).map_err(|source| StoreError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Ok(())
+    }
+}</code></pre>
+        <p>El borde imprime el mensaje público, recorre la cadena de causas y elige el código. Ese bucle es la razón de ser de <code>source()</code>:</p>
+        <pre><code class="language-rust">// src/main.rs (extracto)
+use std::process::ExitCode;
+
+fn main() -&gt; ExitCode {
+    match run() {
+        Ok(line) =&gt; {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(err) =&gt; {
+            eprintln!("error: {err}");
+            let mut cause = std::error::Error::source(&amp;err);
+            while let Some(c) = cause {
+                eprintln!("  causa: {c}");
+                cause = c.source();
+            }
+            ExitCode::from(err.exit_code() as u8)
+        }
+    }
+}</code></pre>
+        <p>Con un fichero sin permisos: <code>error: no se pudo acceder a enlaces.json</code> y, debajo, <code>causa: Permission denied (os error 13)</code>. En una CLI enseñar la causa está bien; en un servidor HTTP, no: el cliente recibe «no existe el enlace» y la ruta se queda en el log.</p>
+        <p><strong>Los mensajes se prueban.</strong> El texto es contrato: si cambia, se rompen scripts y tests de integración.</p>
+        <pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_url_incluye_el_valor() {
+        let err = DomainError::InvalidUrl(String::from("ftp://x.dev"));
+        assert_eq!(err.to_string(), "URL no válida: ftp://x.dev");
+    }
+
+    #[test]
+    fn io_conserva_la_causa() {
+        use std::error::Error as _;
+        let err = Error::Store(StoreError::Io {
+            path: String::from("enlaces.json"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sin permisos"),
+        });
+        assert_eq!(err.to_string(), "no se pudo acceder a enlaces.json");
+        assert_eq!(err.source().unwrap().to_string(), "sin permisos");
+        assert_eq!(err.exit_code(), 1);
+    }
+}</code></pre>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una variante por caso que el llamador necesite distinguir</td><td><code>Other(String)</code> que se come todo</td><td>El comodín destruye la información que hace útil el enum</td></tr>
+            <tr><td><code>#[from]</code> cuando adoptas el error sin contexto</td><td>Dos <code>#[from]</code> del mismo tipo</td><td>Generan dos <code>From</code> idénticos y falla con <code>E0119</code></td></tr>
+            <tr><td><code>#[source]</code> + <code>map_err</code> cuando añades contexto</td><td>Convertir el error a <code>String</code></td><td>Pierdes la causa y la posibilidad de inspeccionarla</td></tr>
+            <tr><td>Mensaje público sin rutas, usuarios ni SQL</td><td>Volcar el <code>Debug</code> del error al cliente</td><td>Filtra la estructura interna</td></tr>
+            <tr><td>Probar el texto de <code>Display</code> y el <code>source()</code></td><td>Probar solo que «devuelve Err»</td><td>Mensaje y cadena son contrato observable</td></tr>
+            <tr><td>Enum propio en la librería; <code>anyhow</code> en el borde</td><td><code>anyhow::Error</code> en una API pública</td><td>Atar a tus usuarios a tu dependencia rompe la semver</td></tr>
+            <tr><td>Derivar <code>Debug</code> siempre; <code>Clone</code> solo si hace falta</td><td>Traits «por si acaso»</td><td>Un error clonable invita a perder la causa original</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">La prueba del llamador</p>
+          <p>Antes de añadir una variante, pregunta: «¿qué haría distinto el código que la recibe?». Si la respuesta es «nada, imprimirla», quizá no la necesitas. Si es «reintentar», «devolver 404» o «pedir otra entrada», la variante está justificada.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Implementar <code>Error</code> sin <code>Display</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">#[derive(Debug)]
+struct MiError;
+
+impl std::error::Error for MiError {}</code></pre>
+        <pre><code class="language-text">error[E0277]: `MiError` doesn't implement `std::fmt::Display`
+ --&gt; src/main.rs:4:6
+  |
+4 | impl std::error::Error for MiError {}
+  |      ^^^^^^^^^^^^^^^^^^ `MiError` cannot be formatted with the default formatter
+  |
+  = help: the trait `std::fmt::Display` is not implemented for `MiError`
+  = note: required for `MiError` to implement `std::error::Error`</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>Display</code> es supertrait de <code>Error</code>; sin mensaje humano no hay error, solo un tipo con <code>Debug</code>.</p>
+        <p><strong>Bien:</strong> implementar <code>Display</code> o, mejor, derivar <code>thiserror</code>.</p>
+        <pre><code class="language-rust">use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[error("el enlace no es válido")]
+struct MiError;</code></pre>
+
+        <h3>2. Mover un campo detrás de <code>&amp;self</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">pub struct Fallo {
+    mensaje: String,
+}
+
+impl Fallo {
+    pub fn mensaje(&amp;self) -&gt; String {
+        self.mensaje // intenta llevarse el String del struct prestado
+    }
+}</code></pre>
+        <pre><code class="language-text">error[E0507]: cannot move out of `self.mensaje` which is behind a shared reference
+ --&gt; src/lib.rs:8:9
+  |
+7 |     pub fn mensaje(&amp;self) -&gt; String {
+  |                             ------ expected `String` because of return type
+8 |         self.mensaje
+  |         ^^^^^^^^^^^^ move occurs because `self.mensaje` has type `String`,
+  |                      which does not implement the `Copy` trait
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+8 |         self.mensaje.clone()
+  |                    ++++++++</code></pre>
+        <p><strong>Bien:</strong> prestar el texto; un accesor de error casi nunca necesita regalar el <code>String</code>.</p>
+        <pre><code class="language-rust">impl Fallo {
+    pub fn mensaje(&amp;self) -&gt; &amp;str {
+        &amp;self.mensaje
+    }
+}</code></pre>
+        <p>Si de verdad necesitas el valor, que el método consuma <code>self</code> (<code>fn into_mensaje(self) -&gt; String</code>) y que el nombre lo diga. <code>clone()</code> es la última opción.</p>
+
+        <h3>3. Dos <code>#[from]</code> del mismo tipo</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum StoreError {
+    #[error("al leer")]
+    Leer(#[from] std::io::Error),
+    #[error("al escribir")]
+    Escribir(#[from] std::io::Error),
+}</code></pre>
+        <pre><code class="language-text">error[E0119]: conflicting implementations of trait `From&lt;std::io::Error&gt;` for type `StoreError`
+  --&gt; src/main.rs:6:12
+   |
+ 4 |     Leer(#[from] std::io::Error),
+   |          --------------------- first implementation here
+ 6 |     Escribir(#[from] std::io::Error),
+   |              ^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `StoreError`</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>#[from]</code> genera <code>impl From&lt;std::io::Error&gt;</code>, y solo puede haber una; además <code>?</code> no sabría cuál elegir.</p>
+        <p><strong>Bien:</strong> un <code>#[from]</code> y, para el otro, contexto con <code>#[source]</code>.</p>
+        <pre><code class="language-rust">use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum StoreError {
+    #[error("al leer")]
+    Leer(#[from] std::io::Error),
+    #[error("al escribir en {path}")]
+    Escribir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}</code></pre>
+        <p><strong>Y el error de diseño:</strong> <code>#[error("no se pudo abrir /srv/app/datos/enlaces.json: {source}")]</code> filtra la estructura del servidor. Usa mensaje de intención y deja la ruta en el log del borde.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> escribir un error a mano para entender qué genera <code>thiserror</code>, y después sustituirlo por el derive sin cambiar el comportamiento observable.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto y añade la dependencia.</strong>
+            <pre><code class="language-bash">cargo new errores-config --bin
+cd errores-config
+cargo add thiserror@2</code></pre>
+          </li>
+          <li>
+            <strong>Escribe <code>ConfigError</code> a mano.</strong>
+            <pre><code class="language-rust">use std::fmt;
+
+#[derive(Debug)]
+enum ConfigError {
+    Missing(String),
+    Invalid { key: String, value: String },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&amp;self, f: &amp;mut fmt::Formatter&lt;'_&gt;) -&gt; fmt::Result {
+        match self {
+            Self::Missing(k) =&gt; write!(f, "falta la clave `{k}`"),
+            Self::Invalid { key, value } =&gt; write!(f, "`{key}` no es válido: {value}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}</code></pre>
+            <p>Compila y comprueba que se puede imprimir con <code>{}</code>.</p>
+          </li>
+          <li>
+            <strong>Usa el error con <code>?</code>.</strong>
+            <pre><code class="language-rust">fn port_from(cfg: &amp;HashMap&lt;String, String&gt;) -&gt; Result&lt;u16, ConfigError&gt; {
+    let raw = cfg
+        .get("PORT")
+        .ok_or_else(|| ConfigError::Missing(String::from("PORT")))?;
+    let port = raw.parse().map_err(|_| ConfigError::Invalid {
+        key: String::from("PORT"),
+        value: raw.clone(),
+    })?;
+    Ok(port)
+}</code></pre>
+            <p>Con un mapa vacío: <code>falta la clave `PORT`</code>. Con <code>PORT=ochenta</code>: <code>`PORT` no es válido: ochenta</code>.</p>
+          </li>
+          <li>
+            <strong>Sustituye las 25 líneas por el derive.</strong>
+            <pre><code class="language-rust">#[derive(Debug, Error)]
+enum ConfigError {
+    #[error("falta la clave `{0}`")]
+    Missing(String),
+
+    #[error("`{key}` no es válido: {value}")]
+    Invalid { key: String, value: String },
+}</code></pre>
+            <p>La salida debe ser idéntica: el derive es un atajo de implementación, no un cambio de contrato.</p>
+          </li>
+          <li>
+            <strong>Prueba mensaje y causa.</strong> Añade <code>Io</code> con <code>#[source]</code> y un test que compruebe <code>err.to_string()</code> y <code>err.source().is_some()</code>. Ejecuta <code>cargo test</code>.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Sabes qué genera cada atributo; el mensaje público es estable; la causa sigue accesible; y ningún detalle interno aparece en el texto que ve el usuario.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Una taxonomía que sobreviva al servidor</h3>
+          <p>Rediseña los errores de <code>urlshort</code> para que el mismo tipo sirva al CLI y, más adelante, a un servidor HTTP.</p>
+          <ul>
+            <li><code>DomainError</code> con <code>InvalidUrl</code>, <code>NotFound</code>, <code>Conflict</code> y <code>Expired</code>.</li>
+            <li><code>StoreError</code> con <code>Io</code>, <code>Serde</code> y <code>Db</code>, siempre con contexto y <code>#[source]</code>.</li>
+            <li>Envoltorio <code>Error</code> transparente y método <code>exit_code()</code> para el CLI.</li>
+            <li><code>public_message()</code> que devuelva <code>&amp;'static str</code> sin datos internos, listo para HTTP.</li>
+            <li>Dos tests por variante: mensaje público y código de salida.</li>
+            <li>Prohibido <code>String</code> como comodín y <code>unwrap</code> fuera de tests.</li>
+          </ul>
+          <p><em>Pista: no dupliques la tabla de códigos. Define código y mensaje público en un único <code>match</code> por variante, y que CLI y HTTP pregunten al mismo método. Si <code>Expired</code> y <code>NotFound</code> responden distinto al usuario pero igual al shell, decide cuál es la diferencia antes de escribir el enum.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>Un error de verdad implementa <code>Debug + Display + std::error::Error</code>; sin <code>Display</code> no hay mensaje humano.</li>
+          <li><code>thiserror</code> deriva <code>Display</code> y <code>Error</code> desde <code>#[error("…")]</code>; <code>Debug</code> se deriva aparte.</li>
+          <li><code>#[from]</code> genera <code>From</code> y marca la causa; solo una vez por tipo y sin otros campos.</li>
+          <li><code>#[source]</code> conserva la causa cuando añades contexto con <code>map_err</code>.</li>
+          <li><code>#[error(transparent)]</code> delega <code>Display</code> y <code>source</code>: ideal para enums envoltorio.</li>
+          <li>Separa dominio e infraestructura; el borde decide mensaje y código.</li>
+          <li>El mensaje público no filtra rutas; la causa vive en <code>source()</code> y en el log.</li>
+          <li>El texto del error y la cadena de causas se prueban como cualquier contrato.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>cargo add thiserror@2</code></td><td>Añade el derive de errores al <code>Cargo.toml</code>.</td></tr>
+            <tr><td><code>#[derive(Debug, Error)]</code></td><td>Genera <code>Display</code> e <code>Error</code>; exige <code>Debug</code>.</td></tr>
+            <tr><td><code>#[error("…")]</code></td><td>Plantilla del mensaje; interpola campos por nombre o posición.</td></tr>
+            <tr><td><code>#[from]</code></td><td>Genera <code>From&lt;T&gt;</code> y convierte con <code>?</code>; implica <code>source</code>.</td></tr>
+            <tr><td><code>#[source]</code></td><td>Marca qué campo es la causa original.</td></tr>
+            <tr><td><code>#[error(transparent)]</code></td><td>Delega <code>Display</code> y <code>source</code> al campo único.</td></tr>
+            <tr><td><code>err.source()</code></td><td>Devuelve la causa; recórrela en bucle para imprimir la cadena.</td></tr>
+            <tr><td><code>Box&lt;dyn Error&gt;</code></td><td>Error borrado para prototipos y bordes; no para APIs públicas.</td></tr>
+            <tr><td><code>map_err(|e| …)</code></td><td>Construye la variante con contexto cuando el dato está a mano.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿<code>thiserror</code> o <code>anyhow</code>? ¿Puedo usar los dos?</summary>
+          <div>
+            <p>Sí, y es lo habitual: la librería define sus enums con <code>thiserror</code> y el binario los envuelve con <code>anyhow::Context</code> para añadir el «mientras hacía X». <code>anyhow</code> no sustituye a tu enum: lo borra. Si el llamador necesita distinguir variantes, no uses <code>anyhow</code> en esa frontera.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué el derive exige <code>Debug</code> si ya genera <code>Error</code>?</summary>
+          <div>
+            <p>Porque <code>std::error::Error</code> declara <code>Debug</code> como supertrait y <code>thiserror</code> no genera un <code>Debug</code> que quizá quieras personalizar. Es una línea de ceremonia a cambio de que el tipo sirva en <code>Box&lt;dyn Error&gt;</code>, en logs y en tests.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Qué diferencia hay entre <code>#[from]</code> y <code>#[source]</code>?</summary>
+          <div>
+            <p><code>#[from]</code> genera <code>From</code> (para que <code>?</code> convierta solo) y marca el campo como causa. <code>#[source]</code> solo marca la causa; la conversión la escribes con <code>map_err</code> porque necesitas añadir contexto (la ruta, el código, el identificador). Usa <code>#[from]</code> cuando adoptas el error sin más.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Debo implementar <code>PartialEq</code> en mis errores para los tests?</summary>
+          <div>
+            <p>Rara vez. Compara la causa (<code>io::Error</code> no lo implementa) y te obliga a que todos los campos lo hagan. Es mejor comprobar con <code>matches!(err, Error::NotFound(c) if c == "abc234")</code> y, cuando importe, el texto con <code>to_string()</code>. Si necesitas igualdad exacta, suele ser señal de que el test mira demasiado dentro.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo añado un backtrace?</summary>
+          <div>
+            <p>Con <code>#[backtrace]</code> en un campo <code>std::backtrace::Backtrace</code>, o dejando que <code>anyhow</code> lo capture en el borde. Cuesta memoria y solo tiene sentido en diagnóstico; no lo pongas en todas las variantes ni lo devuelvas al usuario. En una CLI, <code>RUST_BACKTRACE=1</code> sobre un <code>panic!</code> suele bastar para bugs, y la cadena de <code>source()</code> para fallos esperados.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

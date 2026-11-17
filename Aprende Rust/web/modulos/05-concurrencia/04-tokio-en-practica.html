@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="04-tokio-en-practica">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tokio: tareas, timeouts y red TCP — Módulo 5 · Curso Rust</title>
+  <meta name="description" content="Tokio en práctica: #[tokio::main], tokio::spawn, join!, try_join!, select!, timeouts, intervalos, spawn_blocking y un servidor TCP con apagado ordenado mediante CancellationToken y ctrl_c.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Tokio: tareas, timeouts y red TCP</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Concurrencia y async</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Ya sabes qué es un future y por qué hace falta un runtime (lo viste en <a href="03-async-await.html">async/await</a>). Toca usarlo. Tokio es la biblioteca que convierte esa teoría en un servidor que atiende conexiones: un planificador de tareas, un reactor de E/S, temporizadores y primitivas de sincronización con una API coherente.</p>
+        <p>Aquí aparecen las cuatro herramientas que usarás a diario: <code>tokio::spawn</code> para lanzar tareas, <code>join!</code>/<code>try_join!</code>/<code>select!</code> para combinar futuros, <code>tokio::time</code> para dar plazos y <code>TcpListener</code> para aceptar conexiones. Con eso se escribe el servidor de urlshort y, más adelante, se cambia por Axum sin reescribir el dominio.</p>
+        <p>También verás lo que casi ningún tutorial cuenta: cómo se para. Un servidor que no sabe apagarse deja conexiones a medias, pierde mensajes en la cola y obliga a matar el proceso. El apagado ordenado con <code>ctrl_c</code> y <code>CancellationToken</code> es parte del diseño, no un extra.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque <code>.await</code> no enseña a estructurar un servidor. La diferencia entre un ejemplo que funciona en localhost y uno que aguanta tráfico está en cuántas tareas lanzas, cuánto bloqueas, qué pasa cuando una conexión se muere y cómo cierras.</p>
+        </div>
+        <p><strong>Errores típicos al empezar:</strong> lanzar una tarea por petición sin límite; usar <code>std::fs</code> dentro de <code>async</code>; olvidar que <code>spawn</code> exige <code>'static</code>; ignorar el <code>JoinError</code> de una tarea que paniquea; y no poner timeout a nada.</p>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>El runtime: dos sabores y un detalle</h3>
+        <p><code>#[tokio::main]</code> arranca el runtime multihilo por defecto: un hilo por núcleo, cada uno con su cola de tareas y robo de trabajo entre colas. Para pruebas deterministas o cargas muy pequeñas existe <code>#[tokio::main(flavor = "current_thread")]</code>, que ejecuta todo en el hilo que llama, y <code>#[tokio::main(flavor = "multi_thread", worker_threads = 4)]</code> si quieres fijar el número de hilos.</p>
+        <p>Ojo con la ilusión: el flavor multihilo no reparte tus <code>await</code>. Reparte <strong>tareas</strong>. Dentro de una tarea el código es secuencial, y dos <code>await</code> seguidos se suman siempre. Para aprovechar los núcleos hay que crear tareas o futuros independientes.</p>
+        <h3>Tareas: spawn, JoinHandle y JoinError</h3>
+        <p><code>tokio::spawn</code> entrega un future al runtime y devuelve un <code>JoinHandle&lt;T&gt;</code>. La tarea empieza a correr de inmediato, en cualquier hilo del pool, y el handle permite esperarla. Requisitos: el future debe ser <code>Send + 'static</code> y su salida <code>Send</code>, porque puede ejecutarse en otro hilo y sobrevivir al ámbito donde se creó.</p>
+        <pre><code class="language-rust">let handle = tokio::spawn(async move {
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    42
+});
+
+match handle.await {
+    Ok(valor) =&gt; println!("{valor}"),
+    Err(e) if e.is_panic() =&gt; eprintln!("la tarea paniqueó"),
+    Err(_) =&gt; eprintln!("la tarea fue cancelada"),     // runtime cerrado o abort
+}</code></pre>
+        <p>El <code>JoinError</code> distingue pánico de cancelación: <code>is_panic()</code> e <code>is_cancelled()</code>. Y soltar el handle <strong>no cancela</strong> la tarea: sigue corriendo hasta terminar. Para abortarla hace falta <code>handle.abort()</code> o cerrar el runtime. Esa asimetría sorprende a quien viene de otros lenguajes.</p>
+        <h3>Combinar futuros: join!, try_join! y select!</h3>
+        <table>
+          <thead><tr><th>Macro</th><th>Qué hace</th><th>Cuándo usarla</th></tr></thead>
+          <tbody>
+            <tr><td><code>join!</code></td><td>Espera a <strong>todos</strong> y devuelve una tupla de resultados</td><td>Operaciones independientes que deben terminar todas</td></tr>
+            <tr><td><code>try_join!</code></td><td>Como <code>join!</code>, pero corta en el primer <code>Err</code></td><td>Varias lecturas que pueden fallar y quieres el primer fallo</td></tr>
+            <tr><td><code>select!</code></td><td>Espera al <strong>primero</strong> que termine y descarta el resto</td><td>Carreras, timeouts, señales de parada</td></tr>
+          </tbody>
+        </table>
+        <p><code>join!</code> no crea hilos ni tareas: conduce los futuros en el mismo task, alternándolos. Es la forma barata de tener concurrencia dentro de una tarea. <code>select!</code> es el más delicado: al ganar una rama, las demás se <strong>cancelan por drop</strong>, así que solo es seguro con operaciones <em>cancel-safe</em> (leer de un canal, esperar un tick, aceptar una conexión). Si necesitas un future que no es <code>Unpin</code>, fíjalo con <code>tokio::pin!</code>.</p>
+        <h3>Tiempo: sleep, timeout e interval</h3>
+        <p><code>tokio::time::sleep(d)</code> ya lo conoces. <code>timeout(d, fut)</code> devuelve <code>Result&lt;T, Elapsed&gt;</code> y cancela el future si vence: la forma más simple de poner un límite a una operación. <code>interval(d)</code> produce ticks periódicos; el primero llega <strong>inmediatamente</strong>, así que muchas veces se consume uno antes del bucle.</p>
+        <pre><code class="language-rust">use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
+
+if timeout(Duration::from_secs(2), consultar()).await.is_err() {
+    eprintln!("la consulta tardó demasiado");
+}
+
+let mut ticker = interval(Duration::from_secs(30));
+ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+ticker.tick().await;              // descarta el tick inmediato
+loop {
+    ticker.tick().await;
+    limpiar_enlaces_caducados().await;
+}</code></pre>
+        <p><code>MissedTickBehavior</code> decide qué pasa si el bucle se retrasa: <code>Burst</code> (por defecto) dispara los ticks perdidos de golpe, <code>Delay</code> los ignora y continúa desde ahora, <code>Skip</code> salta al siguiente múltiplo. Para tareas de mantenimiento casi siempre quieres <code>Delay</code>.</p>
+        <h3>Canales de Tokio</h3>
+        <p><code>tokio::sync::mpsc</code> es como el de la lección 2 pero asíncrono y <strong>acotado</strong> (hay que dar capacidad). <code>send().await</code> espera si la cola está llena, que es justo la contrapresión que quieres en un servidor. <code>oneshot</code> sirve para una única respuesta —ideal para pedirle algo a una tarea y esperar— y <code>watch</code> o <code>broadcast</code> para repartir un valor o un evento a muchos receptores.</p>
+        <table>
+          <thead><tr><th>Canal</th><th>Forma</th><th>Uso típico</th></tr></thead>
+          <tbody>
+            <tr><td><code>mpsc</code></td><td>Muchos → uno, acotado</td><td>Cola de trabajos con contrapresión</td></tr>
+            <tr><td><code>oneshot</code></td><td>Uno → uno, un solo mensaje</td><td>Pedir un resultado y esperar</td></tr>
+            <tr><td><code>watch</code> / <code>broadcast</code></td><td>Uno → muchos</td><td>Estado que se actualiza o eventos</td></tr>
+          </tbody>
+        </table>
+        <h3>Red y bloqueo: lo que no se hace en el executor</h3>
+        <p><code>tokio::net::TcpListener</code> y <code>TcpStream</code> son las versiones no bloqueantes de los sockets. Se usan con <code>AsyncReadExt</code>/<code>AsyncWriteExt</code> (o <code>BufReader::lines()</code>) y <code>.await</code>. El ejemplo clásico es un servidor de eco, que devuelve lo que recibe; el patrón de servidor es siempre el mismo: un bucle que acepta y una tarea por conexión, con un límite razonable para no aceptar diez mil a la vez sin control.</p>
+        <p>Y la regla de oro: <strong>nada bloqueante dentro del executor</strong>. <code>tokio::fs</code> existe porque <code>std::fs</code> bloquea el hilo; para ficheros grandes o CPU pesada lo correcto es <code>tokio::task::spawn_blocking</code>, que ejecuta la closure en un pool de hilos aparte y devuelve un <code>JoinHandle</code>.</p>
+        <h3>Apagar sin romper nada</h3>
+        <p>Un servidor necesita dos cosas: dejar de aceptar y terminar lo que está en curso. El patrón es un <code>tokio::select!</code> en el bucle de aceptación entre <code>listener.accept()</code> y <code>tokio::signal::ctrl_c()</code>. Al recibir la señal, se cancela un <code>CancellationToken</code> compartido con todas las tareas; cada una lo escucha dentro de su propio <code>select!</code> y cierra su conexión con calma.</p>
+        <p><code>CancellationToken</code> vive en <code>tokio-util</code>, no en <code>tokio</code>. Se clona como un <code>Arc</code>, <code>cancelled().await</code> es cancel-safe y <code>child_token()</code> permite cancelar un subárbol sin afectar al resto.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Dos tareas que duermen 200 ms. Sin <code>spawn</code> tardarían 400 ms; con <code>spawn</code> tardan 200.</p>
+        <pre><code class="language-rust">// Cargo.toml: tokio = { version = "1", features = ["full"] }
+use std::time::{Duration, Instant};
+
+#[tokio::main]
+async fn main() {
+    let inicio = Instant::now();
+
+    let h1 = tokio::spawn(acortar("https://www.rust-lang.org"));
+    let h2 = tokio::spawn(acortar("https://crates.io"));
+
+    // join! sobre los handles: espera a las dos tareas
+    let (r1, r2) = tokio::join!(h1, h2);
+    println!("{} / {}", r1.expect("tarea 1"), r2.expect("tarea 2"));
+    println!("en {:?}", inicio.elapsed());
+}
+
+async fn acortar(url: &amp;'static str) -&gt; String {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    url.rsplit('/').next().unwrap_or("raiz").to_string()
+}</code></pre>
+        <pre><code class="language-bash">cargo run --release</code></pre>
+        <pre><code class="language-text">www.rust-lang.org / crates.io
+en 200.8ms</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>tokio::spawn</code> pide un future <code>'static</code>. De ahí el <code>&amp;'static str</code>: si la URL fuera un <code>String</code> local, habría que moverlo con <code>async move</code>.</li>
+          <li>Las dos tareas empiezan ya; el orden de finalización no está garantizado, pero el <code>join!</code> espera a ambas.</li>
+          <li><code>handle.await</code> devuelve <code>Result&lt;String, JoinError&gt;</code>. El <code>expect</code> convierte un pánico de la tarea en un pánico del proceso, que es lo que quieres en un CLI.</li>
+          <li>El tiempo total es 200 ms, no 400: las tareas se solapan. Con <code>join!(acortar(..), acortar(..))</code> también serían 200 ms, sin crear tareas.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>El servidor de urlshort en su forma mínima: acepta conexiones TCP, responde a <code>SHORT &lt;url&gt;</code> y <code>RESOLVE &lt;code&gt;</code>, comparte el mapa entre conexiones y se apaga con Ctrl+C. Necesita <code>tokio-util = "0.7"</code> para el token de cancelación.</p>
+        <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+type Links = Arc&lt;Mutex&lt;HashMap&lt;String, String&gt;&gt;&gt;;
+
+#[tokio::main]
+async fn main() -&gt; std::io::Result&lt;()&gt; {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("escuchando en {}", listener.local_addr()?);
+
+    let links: Links = Arc::new(Mutex::new(HashMap::new()));
+    let token = CancellationToken::new();
+
+    loop {
+        tokio::select! {
+            aceptado = listener.accept() =&gt; {
+                let (stream, addr) = aceptado?;
+                let links = Arc::clone(&amp;links);
+                let token = token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = atender(stream, links, token).await {
+                        eprintln!("{addr}: {e}");
+                    }
+                });
+            }
+            _ = tokio::signal::ctrl_c() =&gt; {
+                println!("apagando: no se aceptan más conexiones");
+                token.cancel();
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn atender(stream: TcpStream, links: Links, token: CancellationToken) -&gt; std::io::Result&lt;()&gt; {
+    let (lectura, mut escritura) = stream.into_split();
+    let mut lineas = BufReader::new(lectura).lines();
+
+    loop {
+        let linea = tokio::select! {
+            _ = token.cancelled() =&gt; break,      // apagado ordenado
+            leida = lineas.next_line() =&gt; match leida? {
+                Some(l) =&gt; l,
+                None =&gt; break,                    // el cliente cerró
+            },
+        };
+        let respuesta = procesar(linea.trim(), &amp;links).await;
+        escritura.write_all(format!("{respuesta}\n").as_bytes()).await?;
+    }
+    Ok(())
+}
+
+async fn procesar(orden: &amp;str, links: &amp;Links) -&gt; String {
+    let mut partes = orden.splitn(2, ' ');
+    match (partes.next(), partes.next()) {
+        (Some("SHORT"), Some(url)) =&gt; {
+            let code = short_code(url);
+            links.lock().await.insert(code.clone(), url.to_string());
+            format!("OK /{code}")
+        }
+        (Some("RESOLVE"), Some(code)) =&gt; match links.lock().await.get(code).cloned() {
+            Some(url) =&gt; format!("OK {url}"),
+            None =&gt; "ERR no existe".to_string(),
+        },
+        _ =&gt; "ERR uso: SHORT &lt;url&gt; | RESOLVE &lt;code&gt;".to_string(),
+    }
+}
+
+fn short_code(url: &amp;str) -&gt; String {
+    let h = url.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{:06x}", h &amp; 0xff_ffff)
+}</code></pre>
+        <pre><code class="language-bash">cargo run --release
+# en otra terminal
+printf 'SHORT https://www.rust-lang.org\nRESOLVE 3f9c21\n' | nc 127.0.0.1 8080</code></pre>
+        <pre><code class="language-text">escuchando en 127.0.0.1:8080
+OK /3f9c21
+OK https://www.rust-lang.org</code></pre>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Una tarea por conexión</td><td>Cada cliente tiene su propio bucle de lectura; el coste es un future, no un hilo.</td></tr>
+            <tr><td><code>into_split</code> + <code>BufReader</code></td><td>Separar lectura y escritura permite leer líneas con buffer sin bloquear la escritura.</td></tr>
+            <tr><td><code>tokio::sync::Mutex</code></td><td>El candado se mantiene durante un <code>await</code>; el de <code>std</code> no sería <code>Send</code>.</td></tr>
+            <tr><td><code>select!</code> con <code>token.cancelled()</code></td><td>Permite cortar una conexión inactiva al apagar, sin esperar a que llegue otra línea.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">Lo que este servidor todavía no hace</p>
+          <p>No limita conexiones simultáneas, no tiene timeout de lectura (un cliente mudo ocupa una tarea para siempre), no valida URLs y pierde todo al reiniciar. Son los deberes del módulo 6 y del proyecto final; aquí el objetivo es que el esqueleto asíncrono y el apagado estén bien puestos.</p>
+        </div>
+      </section>
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Poner <code>timeout</code> a toda E/S externa</td><td>Confiar en que el otro lado responderá</td><td>Sin plazo, una dependencia lenta agota tus tareas y tu memoria.</td></tr>
+            <tr><td><code>spawn_blocking</code> para disco y CPU</td><td><code>std::fs</code> o bucles pesados en <code>async</code></td><td>Bloqueas un hilo del executor y con él a todas sus tareas.</td></tr>
+            <tr><td>Acotar el número de tareas o conexiones</td><td><code>spawn</code> sin límite por petición</td><td>Un pico de tráfico se convierte en un pico de memoria.</td></tr>
+            <tr><td>Tratar <code>JoinError</code> y <code>Elapsed</code></td><td><code>expect</code> en el camino de datos</td><td>Un pánico o un timeout no son imposibles: son parte del funcionamiento normal.</td></tr>
+            <tr><td>Apagado con token y <code>ctrl_c</code></td><td>Matar el proceso con Ctrl+C sin más</td><td>Pierdes peticiones en curso y dejas sockets abiertos.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">La regla de las tres preguntas</p>
+          <p>Antes de lanzar una tarea, pregunta: ¿cuánto puede tardar?, ¿qué pasa si falla?, ¿quién la espera? Si no tienes respuesta para las tres, tienes una fuga de recursos esperando a ocurrir. <code>timeout</code>, <code>JoinError</code> y un <code>JoinHandle</code> (o un token) son las respuestas.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. <code>spawn</code> con datos prestados de la función</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let url = String::from("https://www.rust-lang.org");
+
+tokio::spawn(async {
+    println!("{}", acortar(&amp;url).await);   // préstamo de una local
+});</code></pre>
+        <pre><code class="language-text">error[E0373]: async block may outlive the current function, but it borrows `url`,
+              which is owned by the current function
+ --&gt; src/main.rs:3:18
+  |
+3 |     tokio::spawn(async {
+  |                  ^^^^^ may outlive borrowed value `url`
+4 |         println!("{}", acortar(&amp;url).await);
+  |                                ---- `url` is borrowed here
+  |
+  = note: to force the async block to take ownership of `url` (and any other
+          referenced variables), use the `move` keyword</code></pre>
+        <p><strong>Por qué está mal:</strong> la tarea puede seguir viva cuando <code>main</code> retorne, así que no puede llevarse una referencia a algo local. Es el mismo contrato que <code>thread::spawn</code>, con la misma solución.</p>
+        <p><strong>Bien:</strong> <code>async move</code>, que transfiere la propiedad.</p>
+        <pre><code class="language-rust">let url = String::from("https://www.rust-lang.org");
+tokio::spawn(async move {
+    println!("{}", acortar(&amp;url).await);
+});</code></pre>
+        <h3>2. Bloquear el executor con <code>std::fs</code> o con CPU</h3>
+        <p><strong>Mal:</strong> leer un fichero grande dentro de una tarea.</p>
+        <pre><code class="language-rust">async fn cargar() -&gt; std::io::Result&lt;String&gt; {
+    std::fs::read_to_string("links.json")     // bloquea el hilo del executor
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> mientras el disco responde, ese hilo no atiende ninguna otra tarea. Con cuatro hilos de trabajo y cuatro lecturas lentas, el servidor entero deja de responder. No hay error de compilación: el síntoma es latencia y CPU baja, el peor tipo de bug.</p>
+        <p><strong>Bien:</strong> <code>spawn_blocking</code> (o <code>tokio::fs</code>, que por dentro hace lo mismo).</p>
+        <pre><code class="language-rust">async fn cargar() -&gt; std::io::Result&lt;String&gt; {
+    tokio::task::spawn_blocking(|| std::fs::read_to_string("links.json"))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+}</code></pre>
+        <h3>3. <code>select!</code> con un future que no es <code>Unpin</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">tokio::select! {
+    _ = contar() =&gt; println!("contador listo"),
+    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) =&gt; println!("timeout"),
+}</code></pre>
+        <pre><code class="language-text">error[E0277]: `{async block@src/main.rs:2:9: 2:17}` cannot be unpinned
+ --&gt; src/main.rs:2:9
+  |
+2 |     _ = contar() =&gt; println!("contador listo"),
+  |         ^^^^^^^ within `{async block@src/main.rs:2:9: 2:17}`, the trait `Unpin` is
+  |                 not implemented
+  |
+  = note: consider using the `pin!` macro</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>select!</code> necesita sondear los futuros varias veces y, si no son <code>Unpin</code>, no puede garantizar que no se muevan entre sondeos. El future de una <code>async fn</code> es <code>!Unpin</code> por defecto.</p>
+        <p><strong>Bien:</strong> fíjalo con <code>tokio::pin!</code> y pasa <code>&amp;mut</code>.</p>
+        <pre><code class="language-rust">let cuenta = contar();
+tokio::pin!(cuenta);
+
+tokio::select! {
+    _ = &amp;mut cuenta =&gt; println!("contador listo"),
+    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) =&gt; println!("timeout"),
+}</code></pre>
+        <p>Recuerda además que la rama perdedora se cancela: si <code>contar()</code> hubiera escrito algo a medias, ese trabajo se pierde. <code>select!</code> es potente precisamente porque corta.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> medir la diferencia entre secuencia, <code>join!</code> y <code>spawn</code>, y poner un timeout que se dispare de verdad.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto y añade Tokio.</strong>
+            <pre><code class="language-bash">cargo new tokio-tareas --bin
+cd tokio-tareas
+cargo add tokio --features full,test-util</code></pre>
+          </li>
+          <li>
+            <strong>Compara los tres modos.</strong>
+            <pre><code class="language-rust">use std::time::{Duration, Instant};
+
+async fn trabajo(id: u32) -&gt; u32 {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    id * 10
+}
+
+#[tokio::main]
+async fn main() {
+    let t0 = Instant::now();
+    let a = trabajo(1).await;
+    let b = trabajo(2).await;
+    println!("secuencial: {} en {:?}", a + b, t0.elapsed());   // ~600 ms
+
+    let t0 = Instant::now();
+    let (a, b) = tokio::join!(trabajo(1), trabajo(2));
+    println!("join!:      {} en {:?}", a + b, t0.elapsed());   // ~300 ms
+
+    let t0 = Instant::now();
+    let (ra, rb) = tokio::join!(tokio::spawn(trabajo(1)), tokio::spawn(trabajo(2)));
+    let total = ra.expect("tarea 1") + rb.expect("tarea 2");
+    println!("spawn:      {total} en {:?}", t0.elapsed());     // ~300 ms
+}</code></pre>
+          </li>
+          <li>
+            <strong>Añade un timeout.</strong> Envuelve una llamada a <code>trabajo(3)</code> en <code>tokio::time::timeout(Duration::from_millis(100), …)</code> y comprueba que devuelve <code>Err(Elapsed)</code>. Después sube el plazo a 400 ms y verás el <code>Ok</code>.
+          </li>
+          <li>
+            <strong>Comprueba la cancelación y el test.</strong> Cambia el primer bloque por un <code>select!</code> entre <code>trabajo(1)</code> y <code>sleep(100ms)</code>: el sleep gana y el trabajo se cancela (añade un <code>println!</code> al final de <code>trabajo</code> y verás que nunca se imprime). Después escribe un test con tiempo pausado:
+            <pre><code class="language-rust">#[tokio::test(start_paused = true)]
+async fn el_timeout_salta_sin_esperar() {
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::time::sleep(Duration::from_secs(60)),
+    )
+    .await;
+    assert!(r.is_err());
+}</code></pre>
+            <p>Con <code>start_paused</code>, el reloj avanza solo cuando no queda nada que hacer: el test termina al instante. Termina con <code>cargo clippy -- -D warnings</code>.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Sabes cuándo usar <code>join!</code> (misma tarea, futuros independientes) y cuándo <code>spawn</code> (tareas que sobreviven al ámbito o deben repartirse entre hilos), y sabes poner un plazo sin bloquear el executor.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Apagado ordenado con conexiones en vuelo</h3>
+          <p>El servidor del ejemplo corta las conexiones cuando llega Ctrl+C. Constrúyele un apagado de verdad:</p>
+          <p>Al recibir la señal, deja de aceptar inmediatamente, pero da a las conexiones en curso un margen de 5 segundos para terminar su última petición. Pasado ese margen, cancela lo que quede. Registra cuántas conexiones estaban activas, cuántas terminaron limpias y cuántas se abortaron. El proceso no debe salir hasta que todas hayan cerrado, y debe hacerlo con código 0.</p>
+          <p>Requisitos: <code>CancellationToken</code> con tokens hijos por conexión, un contador atómico de conexiones activas, <code>timeout</code> para el margen y ningún <code>unwrap</code>. Bonus: un comando <code>STATS</code> que devuelva el número de enlaces y de conexiones.</p>
+          <p><em>Pista: guarda los <code>JoinHandle</code> de las conexiones y haz <code>join</code> tras cancelar, o usa <code>tokio_util::task::TaskTracker</code> (feature <code>rt</code>), que está pensado exactamente para esto. El token del servidor se cancela al empezar el margen; el de cada conexión, solo si el margen vence. Y no olvides que al salir de <code>main</code> el runtime se cierra: si quieres contar los cierres, hazlo antes.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>#[tokio::main]</code> arranca el runtime; el flavor multihilo reparte <strong>tareas</strong>, no los <code>await</code> de una misma tarea.</li>
+          <li><code>tokio::spawn</code> exige <code>Send + 'static</code> y devuelve un <code>JoinHandle</code> cuyo <code>JoinError</code> distingue pánico de cancelación.</li>
+          <li><code>join!</code> espera a todos; <code>try_join!</code> corta en el primer error; <code>select!</code> espera al primero y cancela el resto.</li>
+          <li><code>timeout</code> pone plazos; <code>interval</code> repite, con <code>MissedTickBehavior</code> para decidir qué pasa al retrasarse. Los canales de Tokio (<code>mpsc</code>, <code>oneshot</code>, <code>watch</code>, <code>broadcast</code>) son acotados y aplican contrapresión.</li>
+          <li><code>TcpListener</code> + una tarea por conexión es el esqueleto de un servidor; sin límite de conexiones, es también su principal riesgo.</li>
+          <li>Nada bloqueante en el executor: <code>tokio::fs</code> o <code>spawn_blocking</code>.</li>
+          <li>Apagar es parte del diseño: <code>ctrl_c</code>, <code>CancellationToken</code> y un margen para lo que está en vuelo.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>#[tokio::main]</code></td><td>Crea el runtime y ejecuta <code>main</code> como future.</td></tr>
+            <tr><td><code>tokio::spawn(fut)</code></td><td>Lanza una tarea independiente; devuelve <code>JoinHandle</code>.</td></tr>
+            <tr><td><code>tokio::join!</code> / <code>try_join!</code></td><td>Conduce varios futuros a la vez y espera a todos (o al primer error).</td></tr>
+            <tr><td><code>tokio::select!</code></td><td>Espera al primero; el resto se cancela por drop.</td></tr>
+            <tr><td><code>tokio::time::timeout(d, fut)</code></td><td>Devuelve <code>Err(Elapsed)</code> si <code>fut</code> no termina en <code>d</code>.</td></tr>
+            <tr><td><code>tokio::time::interval(d)</code></td><td>Ticks periódicos; el primero es inmediato.</td></tr>
+            <tr><td><code>#[tokio::test]</code></td><td>Test asíncrono; con <code>start_paused</code>, el tiempo avanza solo.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿<code>spawn</code> o <code>join!</code>?</summary>
+          <div>
+            <p><code>join!</code> conduce futuros dentro de la tarea actual: más barato, sin <code>'static</code> y sin <code>Send</code>, ideal cuando las operaciones empiezan y terminan juntas. <code>spawn</code> crea una tarea independiente que el runtime puede mover a otro hilo y que sigue viva aunque nadie espere su handle; cobra el peaje de exigir <code>Send + 'static</code> y de que un pánico se convierte en un <code>JoinError</code> en lugar de propagarse solo.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué mi servidor acepta conexiones pero no responde?</summary>
+          <div>
+            <p>Las tres causas habituales: un <code>std::fs</code> o una llamada bloqueante dentro de la tarea que secuestra el hilo; un <code>.await</code> olvidado (el future se crea pero no se ejecuta); o un candado retenido que bloquea a todas las conexiones. Empieza descartando lo bloqueante, luego revisa candados y por último el <code>select!</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo limito el número de conexiones?</summary>
+          <div>
+            <p>Con un semáforo: <code>tokio::sync::Semaphore</code> con N permisos. Antes de lanzar la tarea pides un permiso (<code>acquire().await</code>) y lo mantienes hasta que la conexión termina; si no hay, el bucle de aceptación espera en lugar de acumular tareas. Es la contrapresión del servidor, equivalente al <code>sync_channel</code> de la lección 2.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿<code>CancellationToken</code> viene con Tokio?</summary>
+          <div>
+            <p>No: está en el crate <code>tokio-util</code>, que se añade aparte (<code>tokio-util = "0.7"</code>). Es la pieza estándar para apagados ordenados porque se puede clonar, se puede observar desde muchas tareas y permite jerarquías con <code>child_token()</code>. Si no quieres la dependencia, un <code>watch::channel(false)</code> cumple un papel parecido con más ceremonia.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

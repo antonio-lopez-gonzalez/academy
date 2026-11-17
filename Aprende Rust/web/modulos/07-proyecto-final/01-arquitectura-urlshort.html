@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="07" data-lesson="01-arquitectura-urlshort">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arquitectura de urlshort — Módulo 7 · Curso Rust</title>
+  <meta name="description" content="Diseño de urlshort: dominio con Link, validate_url y generate_code, el caso de uso Service, el puerto Store y sus adaptadores. Por qué lib + bin y cómo se testea cada capa.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Arquitectura de urlshort</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 7 · Proyecto final</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Treinta y una lecciones después, cada pieza de Rust funciona por separado: propiedad, traits, errores, async, <code>clap</code>, <code>axum</code>, SQLite. El proyecto final consiste en algo distinto y más difícil: <strong>ponerlas juntas sin que se contaminen</strong>. urlshort tiene que acortar una URL desde la terminal, guardarla en disco, resolverla por HTTP, contar visitas y sobrevivir a un test que lo arranca en un puerto efímero.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque la diferencia entre un ejercicio y un crate publicable no es la sintaxis: es el <strong>dibujo de las dependencias</strong>. Si el dominio depende de axum, cada test arrastra un runtime. Si el CLI conoce el fichero, no puedes probar los mensajes de error con un store en memoria. La arquitectura decide qué se puede cambiar sin romper lo demás.</p>
+        </div>
+        <p><strong>Errores típicos al diseñar esto:</strong></p>
+        <ul>
+          <li>Poner <code>#[derive(Serialize)]</code> y las rutas HTTP en el mismo fichero que las reglas del negocio.</li>
+          <li>Creer que «arquitectura» significa más carpetas: aquí son ocho ficheros y una regla.</li>
+        </ul>
+      </section>
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Cuatro capas y una flecha que nunca se invierte</h3>
+        <p>urlshort se organiza en cuatro capas. La regla es una sola: <strong>las dependencias apuntan hacia dentro</strong>. El dominio no sabe que existe HTTP; los adaptadores sí saben que existe el dominio.</p>
+        <pre class="diagram">┌──────────────────────────────────────────────────────────────┐
+│  ADAPTADORES DE ENTRADA    main.rs · cli.rs · server.rs      │
+└──────────────────────────────┬───────────────────────────────┘
+                               │ short() · resolve() · list() · delete()
+┌──────────────────────────────▼───────────────────────────────┐
+│  CASO DE USO             service.rs · Service (Clone)        │
+│  validar → generar código → comprobar → guardar              │
+└──────────────────────────────┬───────────────────────────────┘
+                               │ trait Store  (puerto)
+┌──────────────────────────────▼───────────────────────────────┐
+│  ADAPTADORES DE SALIDA  MemoryStore · JsonStore · SqliteStore│
+└──────────────────────────────────────────────────────────────┘
+  DOMINIO (domain.rs) no depende de nadie: está a la izquierda de todo.</pre>
+        <p>Fíjate en dónde se declara el <code>trait</code>. En Java o C# el puerto viviría en infraestructura y el dominio lo importaría. Aquí se declara junto al caso de uso que lo necesita y el adaptador —que sí conoce el sistema de ficheros— es quien se adapta. Eso es <strong>inversión de dependencias</strong> con traits, sin contenedores de inyección.</p>
+        <h3>Qué es dominio y qué no lo es</h3>
+        <p>El dominio son las reglas que seguirían siendo verdaderas si mañana urlshort se usara desde gRPC: una URL solo es válida con esquema <code>http</code>/<code>https</code>, host y longitud razonable; un enlace tiene código, URL, fecha y contador; dos enlaces no comparten código. <strong>No</strong> es dominio que se guarde en JSON, que el CLI imprima una tabla, que el servidor responda 302 o que la fecha se muestre en tu zona horaria: son decisiones de borde.</p>
+        <h3>El flujo de una petición, de punta a punta</h3>
+        <pre class="diagram">POST /links  {"url": "https://www.rust-lang.org"}
+   │
+   ├─► server::create_link     deserializa con axum::Json (JSON roto: 400)
+   │        └─► Service::short
+   │                 ├─ validate_url(raw)     → InvalidUrl  → 400
+   │                 ├─ generate_code(url, n) → 6 caracteres base62
+   │                 ├─ store.exists(code)    → colisión → salt n+1
+   │                 └─ store.insert(link)    → Conflict   → 409
+   │
+   └─► 201 Created · Location: http://localhost:3000/9xQ2mK</pre>
+        <h3>Decisiones y trade-offs</h3>
+        <table>
+          <thead><tr><th>Decisión</th><th>Ganas</th><th>Pagas</th></tr></thead>
+          <tbody>
+            <tr><td><code>Arc&lt;dyn Store&gt;</code> en vez de genérico <code>Service&lt;S&gt;</code></td><td><code>Service</code> es <code>Clone</code> barato y el router no se llena de genéricos</td><td>Despacho dinámico: nanosegundos, irrelevante frente a leer un fichero</td></tr>
+            <tr><td><code>Store</code> con <code>&amp;self</code> y <code>Mutex</code> interno</td><td>Un <code>Service</code> compartido entre handlers sin candado externo</td><td>Hay que manejar <code>Error::Lock</code> cuando un hilo envenena el candado</td></tr>
+            <tr><td>Código de 6 caracteres base62</td><td>56 mil millones de combinaciones y URLs cortas</td><td>Colisiones: se reintenta con un <em>salt</em> distinto</td></tr>
+            <tr><td><code>lib.rs</code> + <code>main.rs</code></td><td>Tests de integración, doctests y docs.rs reales</td><td>Un <code>use urlshort::…</code> en el binario</td></tr>
+          </tbody>
+        </table>
+        <h3>Dependencias: las que entran y las que no</h3>
+        <table>
+          <thead><tr><th>Crate</th><th>Para qué</th><th>Alternativa descartada</th></tr></thead>
+          <tbody>
+            <tr><td><code>serde</code> + <code>serde_json</code></td><td>Store en disco y cuerpos JSON del servidor</td><td>Un parser a mano: más código y más bugs</td></tr>
+            <tr><td><code>thiserror</code></td><td>Un <code>Error</code> con <code>Display</code> y <code>source</code> sin boilerplate</td><td><code>anyhow</code>: borra los tipos que la biblioteca expone</td></tr>
+            <tr><td><code>chrono</code></td><td><code>created_at</code> como RFC 3339 legible</td><td>Formatear fechas a mano: zonas, <em>leap seconds</em> y ceros a la izquierda</td></tr>
+            <tr><td><code>clap</code> / <code>tokio</code> + <code>axum</code></td><td>CLI y servidor HTTP (lecciones 02 y 03)</td><td>Parsear <code>argv</code> o escribir HTTP a mano</td></tr>
+            <tr><td><code>url</code>, <code>uuid</code>, <code>rand</code> — <strong>no</strong></td><td>Validación propia, base62 del hash y <code>salt</code></td><td>Dependencias para algo que cabe en veinte líneas</td></tr>
+          </tbody>
+        </table>
+        <h3>Cómo se testea cada capa</h3>
+        <table>
+          <thead><tr><th>Capa</th><th>Qué se prueba</th><th>Con qué</th></tr></thead>
+          <tbody>
+            <tr><td>Dominio</td><td>Esquemas rechazados, longitudes, determinismo del código</td><td><code>#[test]</code> puros, sin E/S, milisegundos</td></tr>
+            <tr><td>Caso de uso</td><td>Colisión, <code>NotFound</code>, incremento de hits</td><td><code>MemoryStore</code> dentro de <code>Arc</code></td></tr>
+            <tr><td>Puerto</td><td>Que todo adaptador cumple el mismo contrato</td><td><code>fn contrato(store: &amp;dyn Store)</code> reutilizada</td></tr>
+            <tr><td>Entradas (CLI, HTTP)</td><td>Parseo de argumentos y rutas, códigos de estado</td><td><code>try_parse_from</code> y <code>ServiceExt::oneshot</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>El corazón del dominio en un fichero: un enlace, la validación de URL y el generador de códigos. Va en <code>domain.rs</code>, con <code>error.rs</code> creado y <code>cargo add chrono</code> ya ejecutado.</p>
+        <pre><code class="language-rust">use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use crate::error::Error;
+
+pub const CODE_LEN: usize = 6;
+pub const MAX_URL_LEN: usize = 2048;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    code: String,
+    url: String,
+    created_at: String,
+    hits: u64,
+}
+
+impl Link {
+    pub fn new(code: impl Into&lt;String&gt;, url: impl Into&lt;String&gt;) -&gt; Self {
+        Self {
+            code: code.into(),
+            url: url.into(),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            hits: 0,
+        }
+    }
+
+    pub fn code(&amp;self) -&gt; &amp;str { &amp;self.code }
+    pub fn url(&amp;self) -&gt; &amp;str { &amp;self.url }
+    pub fn created_at(&amp;self) -&gt; &amp;str { &amp;self.created_at }
+    pub fn hits(&amp;self) -&gt; u64 { self.hits }
+    pub fn register_hit(&amp;mut self) { self.hits += 1; }
+
+    pub fn short_url(&amp;self, base_url: &amp;str) -&gt; String {
+        format!("{}/{}", base_url.trim_end_matches('/'), self.code)
+    }
+}
+
+/// Devuelve la URL recortada o un error de dominio.
+pub fn validate_url(raw: &amp;str) -&gt; Result&lt;String, Error&gt; {
+    let url = raw.trim();
+    if url.is_empty() { return Err(Error::InvalidUrl("la URL está vacía".into())); }
+    if url.len() &gt; MAX_URL_LEN { return Err(Error::InvalidUrl("la URL es demasiado larga".into())); }
+    if url.chars().any(char::is_whitespace) { return Err(Error::InvalidUrl("la URL tiene espacios".into())); }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| Error::InvalidUrl("se esperaba http:// o https://".into()))?;
+    // corta en el primer separador de ruta: "https:///x" deja host vacío
+    let host = rest.split(|c| matches!(c, '/' | '?' | '#')).next().unwrap_or("");
+    if host.is_empty() { return Err(Error::InvalidUrl("la URL no tiene host".into())); }
+    Ok(url.to_string())
+}
+
+/// Base62 de 6 caracteres; el `salt` resuelve colisiones.
+pub fn generate_code(seed: &amp;str, salt: u64) -&gt; String {
+    const ALPHABET: &amp;[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&amp;mut hasher);
+    salt.hash(&amp;mut hasher);
+    let mut n = hasher.finish();
+    let mut code = String::with_capacity(CODE_LEN);
+    for _ in 0..CODE_LEN {
+        code.push(ALPHABET[(n % 62) as usize] as char);
+        n /= 62;
+    }
+    code
+}</code></pre>
+        <ul>
+          <li><code>validate_url</code> devuelve un <code>String</code> ya recortado: el resto del programa no vuelve a limpiar la entrada. Es la frontera donde el texto del usuario se convierte en dato del dominio.</li>
+          <li><code>strip_prefix</code> + <code>or_else</code> acepta dos esquemas sin expresiones regulares; <code>ok_or</code> convierte el «no hay prefijo» en error con <code>?</code>.</li>
+        </ul>
+      </section>
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>Así queda el crate: ocho ficheros con una responsabilidad cada uno y un único tipo de error.</p>
+        <pre><code class="language-text">proyectos/urlshort/
+├── Cargo.toml
+├── src/
+│   ├── main.rs        ← arranca: parsea y delega
+│   ├── lib.rs         ← la biblioteca: pub mod …
+│   ├── domain.rs      ← Link, validate_url, generate_code
+│   ├── error.rs       ← enum Error: la única moneda de fallo
+│   ├── store.rs       ← trait Store + MemoryStore + JsonStore
+│   ├── service.rs     ← Service: short, resolve, list, delete
+│   ├── cli.rs         ← clap y salida (lección 02)
+│   └── server.rs      ← router, handlers, ApiError (lección 03)
+└── tests/cli.rs       ← flujo completo contra un fichero temporal</code></pre>
+        <p>El error único. Cada capa puede producir estos seis casos; el adaptador decide qué significa cada uno (400, 404, 409 o 500).</p>
+        <pre><code class="language-rust">// src/error.rs
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("URL inválida: {0}")]
+    InvalidUrl(String),
+    #[error("no existe el código {0}")]
+    NotFound(String),
+    #[error("conflicto con el código {0}")]
+    Conflict(String),
+    #[error("el almacén está bloqueado por otro hilo")]
+    Lock,
+    #[error("fallo de entrada/salida: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON inválido: {0}")]
+    Json(#[from] serde_json::Error),
+}</code></pre>
+        <p>El puerto. Cinco operaciones y una implementación por defecto; recibe <code>&amp;self</code> porque el estado mutable vive dentro del adaptador, no en quien lo llama.</p>
+        <pre><code class="language-rust">// src/store.rs
+pub trait Store: Send + Sync {
+    fn insert(&amp;self, link: Link) -&gt; Result&lt;(), Error&gt;;
+    fn get(&amp;self, code: &amp;str) -&gt; Result&lt;Option&lt;Link&gt;, Error&gt;;
+    fn list(&amp;self) -&gt; Result&lt;Vec&lt;Link&gt;, Error&gt;;
+    fn delete(&amp;self, code: &amp;str) -&gt; Result&lt;bool, Error&gt;;
+    fn update(&amp;self, link: Link) -&gt; Result&lt;(), Error&gt;;
+
+    /// Por defecto, existir es poder leerse. Los adaptadores pueden optimizarlo.
+    fn exists(&amp;self, code: &amp;str) -&gt; Result&lt;bool, Error&gt; {
+        Ok(self.get(code)?.is_some())
+    }
+}</code></pre>
+        <p>El caso de uso. `Service` guarda el trait como objeto y se clona para cada handler; el <code>Mutex</code> está en el adaptador, no aquí.</p>
+        <pre><code class="language-rust">// src/service.rs
+pub const MAX_ATTEMPTS: u64 = 16;
+
+#[derive(Clone)]
+pub struct Service {
+    store: Arc&lt;dyn Store&gt;,
+    base_url: String,
+}
+
+impl Service {
+    pub fn new(store: Arc&lt;dyn Store&gt;, base_url: impl Into&lt;String&gt;) -&gt; Self {
+        Self { store, base_url: base_url.into() }
+    }
+    pub fn base_url(&amp;self) -&gt; &amp;str { &amp;self.base_url }
+
+    pub fn short(&amp;self, raw_url: &amp;str) -&gt; Result&lt;Link, Error&gt; {
+        let url = validate_url(raw_url)?;
+        for salt in 0..MAX_ATTEMPTS {
+            let link = Link::new(generate_code(&amp;url, salt), url.clone());
+            match self.store.insert(link.clone()) {
+                Ok(()) =&gt; return Ok(link),
+                Err(Error::Conflict(_)) =&gt; continue,   // colisión: otro salt
+                Err(err) =&gt; return Err(err),
+            }
+        }
+        Err(Error::Conflict(format!("sin códigos libres para {url}")))
+    }
+
+    pub fn resolve(&amp;self, code: &amp;str) -&gt; Result&lt;Link, Error&gt; {
+        let mut link = self.store.get(code)?.ok_or_else(|| Error::NotFound(code.into()))?;
+        link.register_hit();
+        self.store.update(link.clone())?;
+        Ok(link)
+    }
+    pub fn list(&amp;self) -&gt; Result&lt;Vec&lt;Link&gt;, Error&gt; { self.store.list() }
+
+    pub fn delete(&amp;self, code: &amp;str) -&gt; Result&lt;(), Error&gt; {
+        if self.store.delete(code)? { Ok(()) }
+        else { Err(Error::NotFound(code.into())) }
+    }
+}</code></pre>
+        <p>El adaptador JSON cumple el puerto sin que el caso de uso lo sepa. El <code>Mutex</code> va dentro; el volcado escribe en un temporal y renombra, atómico en el mismo sistema de ficheros.</p>
+        <pre><code class="language-rust">// src/store.rs (adaptador)
+pub struct JsonStore {
+    path: PathBuf,
+    links: Mutex&lt;BTreeMap&lt;String, Link&gt;&gt;,
+}
+
+impl JsonStore {
+    /// Lee el JSON si existe; si no, arranca vacío.
+    pub fn open(path: impl Into&lt;PathBuf&gt;) -&gt; Result&lt;Self, Error&gt; { /* … */ }
+
+    fn flush(&amp;self, links: &amp;BTreeMap&lt;String, Link&gt;) -&gt; Result&lt;(), Error&gt; {
+        let json = serde_json::to_string_pretty(links)?;
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&amp;tmp, json)?;
+        fs::rename(&amp;tmp, &amp;self.path)?;       // o queda el JSON nuevo, o el viejo
+        Ok(())
+    }
+}
+
+impl Store for JsonStore {
+    fn insert(&amp;self, link: Link) -&gt; Result&lt;(), Error&gt; {
+        let mut links = self.links.lock().map_err(|_| Error::Lock)?;
+        if links.contains_key(link.code()) {
+            return Err(Error::Conflict(link.code().to_string()));
+        }
+        links.insert(link.code().to_string(), link);
+        self.flush(&amp;links)                   // si falla, el mapa ya cambió
+    }
+    // get, list, delete y update: candado + operación sobre el mapa
+}</code></pre>
+      </section>
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Declarar el puerto con lo que el dominio necesita</td><td>Copiar la API del ORM en el trait</td><td>Un puerto con <code>begin_transaction</code> obliga a todos los adaptadores a fingir transacciones.</td></tr>
+            <tr><td>Validar en <code>validate_url</code> y devolver el dato limpio</td><td>Repetir <code>starts_with("http")</code> en tres capas</td><td>Las comprobaciones duplicadas divergen y el mensaje cambia según la puerta.</td></tr>
+            <tr><td>Candado dentro del adaptador</td><td><code>Arc&lt;Mutex&lt;Service&gt;&gt;</code> en el servidor</td><td>El que conoce el recurso compartido es el store, no el router.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">No conviertas esto en una catedral</p>
+          <p>Cuatro capas para un acortador es <em>suficiente</em>, no un dogma. Regla práctica: añade una capa cuando puedas nombrar el test que se vuelve posible gracias a ella. Si no puedes, es ceremonia.</p>
+        </div>
+      </section>
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Un método genérico en el trait que vas a usar como <code>dyn</code></h3>
+        <pre><code class="language-rust">pub trait Store: Send + Sync {
+    fn all(&amp;self) -&gt; Result&lt;Vec&lt;Link&gt;, Error&gt;;
+    fn find&lt;F&gt;(&amp;self, predicate: F) -&gt; Result&lt;Option&lt;Link&gt;, Error&gt;
+    where
+        F: Fn(&amp;Link) -&gt; bool;
+}
+
+fn main() {
+    let store: Arc&lt;dyn Store&gt; = Arc::new(MemoryStore::new());
+}</code></pre>
+        <p><strong>El error real:</strong></p>
+        <pre><code class="language-text">error[E0038]: the trait `Store` cannot be made into an object
+ --&gt; src/main.rs:9:36
+  |
+9 |     let store: Arc&lt;dyn Store&gt; = Arc::new(MemoryStore::new());
+  |                        ^^^^^ `Store` cannot be made into an object
+  |
+note: for a trait to be "dyn-compatible" it needs to allow building a vtable
+note: method `find` has generic type parameters</code></pre>
+        <p><strong>Por qué está mal:</strong> un método genérico genera una versión por cada <code>F</code>; la vtable tendría tamaño infinito. <strong>Bien:</strong> el puerto no necesita <code>find</code> genérico (filtra en el caso de uso) o se pasa el predicado como <code>&amp;dyn Fn</code>:</p>
+        <pre><code class="language-rust">fn find(&amp;self, predicate: &amp;dyn Fn(&amp;Link) -&gt; bool) -&gt; Result&lt;Option&lt;Link&gt;, Error&gt;</code></pre>
+        <h3>2. Olvidar <code>Send + Sync</code> en el trait</h3>
+        <p><strong>Mal:</strong> <code>pub trait Store { … }</code> y luego <code>Arc&lt;dyn Store&gt;</code> dentro de un handler. Compila la creación, pero el router no compila: <code>error[E0277]: `dyn Store` cannot be shared between threads safely</code>. <strong>Por qué:</strong> axum exige que el estado sea <code>Send + Sync + 'static</code>. <strong>Bien:</strong> declararlo en el trait, como hace <code>store.rs</code>, para que el adaptador que no lo cumpla falle al implementarlo y no al montar el servidor.</p>
+        <h3>3. Importar axum dentro del dominio</h3>
+        <p><strong>Mal:</strong> <code>src/domain.rs</code> empieza con <code>use axum::http::StatusCode;</code> para mapear errores. Ahora cada test del dominio compila axum, tokio y hyper, el binario sin red arrastra el servidor y el mapeo a HTTP queda enterrado. <strong>Bien:</strong> el dominio produce <code>Error::InvalidUrl</code>; <code>server.rs</code> lo traduce en <code>impl From&lt;Error&gt; for ApiError</code>.</p>
+      </section>
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> crear el crate con la estructura de capas y dejar dominio y puerto en verde antes de escribir una línea de CLI o de HTTP.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el crate y las dependencias.</strong>
+            <pre><code class="language-bash">cargo new urlshort --lib
+cd urlshort
+printf 'fn main() {}\n' &gt; src/main.rs
+cargo add serde --features derive
+cargo add serde_json thiserror chrono
+cargo add clap --features derive
+cargo add tokio --features full
+cargo add axum
+cargo add tower-http --features trace
+cargo add --dev tower --features util
+cargo add --dev http-body-util</code></pre>
+            <p>Cargo detecta <code>src/main.rs</code> además de <code>src/lib.rs</code>: tendrás biblioteca y binario con el mismo nombre.</p>
+          </li>
+          <li>
+            <strong>Escribe el puerto y los dos adaptadores.</strong> <code>MemoryStore</code> sobre <code>Mutex&lt;BTreeMap&lt;…&gt;&gt;</code> y <code>JsonStore</code> con temporal + <code>rename</code>. Ambos devuelven <code>Error::Lock</code> si el candado está envenenado, nunca <code>unwrap</code>.
+          </li>
+          <li>
+            <strong>Prueba el contrato una vez, con dos adaptadores.</strong>
+            <pre><code class="language-rust">fn contrato(store: &amp;dyn Store) {
+    let link = Link::new("abc123", "https://example.com");
+    store.insert(link.clone()).unwrap();
+    assert!(store.exists("abc123").unwrap());
+    assert!(matches!(store.insert(link), Err(Error::Conflict(_))));
+
+    let mut hit = store.get("abc123").unwrap().unwrap();
+    hit.register_hit();
+    store.update(hit).unwrap();
+    assert_eq!(store.get("abc123").unwrap().unwrap().hits(), 1);
+
+    assert!(store.delete("abc123").unwrap());
+    assert!(!store.delete("abc123").unwrap());
+}
+
+#[test]
+fn memory_cumple_el_contrato() { contrato(&amp;MemoryStore::new()); }
+
+#[test]
+fn json_cumple_el_contrato() {
+    let path = std::env::temp_dir().join(format!("urlshort-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&amp;path);
+    contrato(&amp;JsonStore::open(&amp;path).unwrap());
+    let _ = std::fs::remove_file(&amp;path);
+}</code></pre>
+          </li>
+          <li>
+            <strong>Pasa tests y linter.</strong> <code>cargo test</code> y <code>cargo clippy --all-targets -- -D warnings</code>. Salida esperada: <code>test result: ok</code> con las pruebas del dominio y las dos del contrato en verde, sin haber arrancado ningún servidor.
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p><code>cargo test</code> pasa sin haber escrito ni un argumento de CLI ni una ruta. Eso demuestra que el dominio está aislado. Si has necesitado arrancar un servidor para probar la validación de URL, la flecha de dependencias apunta al revés.</p>
+        </div>
+      </section>
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 Enlaces con caducidad, sin romper el puerto</h3>
+          <p>Producto quiere que un enlace pueda nacer con fecha de caducidad. Pasado ese tiempo, resolverlo debe devolver <code>NotFound</code> y <code>list</code> no debe mostrarlo.</p>
+  
+          <p><em>Pista: la hora no debería venir de <code>Utc::now()</code> dentro de la lógica. Si el «reloj» es un parámetro del caso de uso (o del enlace), un test puede simular el futuro. Y ojo con el JSON: un enlace antiguo sin campo de caducidad debe seguir cargando; <code>#[serde(default)]</code> existe para eso.</em></p>
+        </div>
+      </section>
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>urlshort se divide en <strong>dominio</strong>, <strong>caso de uso</strong>, <strong>puerto</strong> y <strong>adaptadores</strong>; las dependencias solo apuntan hacia dentro.</li>
+          <li><code>validate_url</code> devuelve el dato limpio y <code>generate_code</code> produce 6 caracteres base62 con <em>salt</em> para colisiones.</li>
+          <li><code>Error</code> es único: seis variantes que cada adaptador traduce a HTTP, a código de salida o a mensaje.</li>
+          <li><code>trait Store</code> usa <code>&amp;self</code> y <code>Send + Sync</code>; el <code>Mutex</code> vive dentro de <code>MemoryStore</code> y <code>JsonStore</code>.</li>
+          <li><code>Service</code> es <code>Clone</code>, guarda <code>Arc&lt;dyn Store&gt;</code> y se comparte entre peticiones sin envolverlo en otro candado.</li>
+          <li>Separar <code>lib.rs</code> de <code>main.rs</code> permite tests de integración, doctests y documentación en docs.rs.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+          </tbody>
+        </table>
+      </section>
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+        <details>
+          <summary>¿No es excesiva esta estructura para un proyecto pequeño?</summary>
+          <div>
+            <p>Son ocho ficheros y una prohibición (el dominio no importa axum ni clap). El coste real es de veinte minutos; el beneficio aparece el primer día que quieres probar la generación de códigos sin arrancar un servidor. Lo que sí sería excesivo es añadir <code>repository</code>, <code>factory</code> y un contenedor de inyección: eso no lo pide nada de este proyecto.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Por qué <code>Service</code> es <code>Clone</code> y los métodos toman <code>&amp;self</code>?</summary>
+          <div>
+            <p>Porque cada petición de axum recibe una copia del estado: <code>Clone</code> de un <code>Arc</code> y un <code>String</code> son un incremento de contador y una copia corta. Si los métodos pidieran <code>&amp;mut self</code>, necesitarías un <code>Mutex</code> externo alrededor de todo el servicio y serializarías peticiones que solo leen. El candado vive donde está el recurso: en el store.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿Por qué no uso la crate <code>url</code>?</summary>
+          <div>
+            <p>Porque la validación de URLs es un campo minado (IDN, esquemas, puertos, credenciales) y para urlshort solo necesitamos un subconjunto explícito: http/https, host no vacío y un límite de longitud. Al escribir <code>validate_url</code> aprendes dónde está la frontera y, si mañana necesitas la crate real, el cambio queda dentro de un fichero. En un proyecto serio, usa <code>url</code>.</p>
+          </div>
+        </details>
+        <details>
+          <summary>¿<code>DefaultHasher</code> es estable entre versiones de Rust?</summary>
+          <div>
+            <p>No está garantizado por el contrato del lenguaje. En la práctica es estable, pero no lo necesitas: los códigos ya generados viven en el store y no se recalculan. Si te preocupara la reproducibilidad entre compiladores, implementa un hash propio (FNV-1a son diez líneas) o acepta que el código es un dato persistido, que es lo que hace el diseño actual.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

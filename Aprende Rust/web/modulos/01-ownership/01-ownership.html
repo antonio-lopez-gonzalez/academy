@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="01" data-lesson="01-ownership">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ownership: stack, heap, move y drop — Módulo 1 · Curso Rust</title>
+  <meta name="description" content="La propiedad en Rust: qué vive en el stack y qué en el heap, por qué asignar mueve, cuándo un tipo se copia, cómo funciona drop y cómo devolver la propiedad sin clonar.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Ownership: stack, heap, move y drop</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 1 · Ownership y borrowing</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>En cualquier lenguaje, alguien tiene que liberar la memoria que ya no se usa. Con un recolector de basura lo decide el runtime; en C y C++ lo decides tú con <code>free</code> y <code>delete</code>. Rust elige un tercer camino: <strong>cada valor tiene exactamente un dueño</strong>, y el compilador comprueba que nadie lo use cuando el dueño ya no está. Ese contrato se llama <strong>ownership</strong>, y es el mecanismo que permite prescindir del GC sin delegar la memoria al programador.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque el 80 % de los errores de tus primeras semanas (<code>E0382</code>, <code>E0507</code>, «value moved here») salen del mismo sitio: no tienes claro <strong>quién es el dueño</strong> de cada dato en cada línea. Cuando lo tienes claro, los préstamos, las vidas y los slices encajan solos.</p>
+        </div>
+        <p>Al terminar sabrás qué vive en el stack y qué en el heap, por qué una asignación puede invalidar la variable anterior, por qué copiar un <code>i32</code> no es lo mismo que mover un <code>String</code>, en qué orden se libera todo y cómo devolver la propiedad sin pagar un <code>clone()</code>.</p>
+        <p><strong>Errores típicos al empezar:</strong></p>
+        <ul>
+          <li>Añadir <code>clone()</code> en cuanto el compilador se queja, en vez de preguntarse quién debería ser el dueño.</li>
+          <li>Creer que <code>let b = a;</code> copia, como en Java o Python, y usar <code>a</code> después.</li>
+          <li>Intentar marcar como <code>Copy</code> un tipo que contiene un <code>String</code>, o suponer que las variables se liberan en orden de declaración (es al revés).</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+
+        <h3>Dos memorias, dos ritmos</h3>
+        <table>
+          <thead><tr><th></th><th>Stack</th><th>Heap</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Qué guarda</strong></td><td>Variables locales y valores de tamaño fijo, conocido al compilar</td><td>Datos de tamaño variable o que sobreviven a la función</td></tr>
+            <tr><td><strong>Cómo crece</strong></td><td>Un marco por llamada, en orden LIFO; casi gratis</td><td>El asignador busca hueco; reservar y liberar cuesta</td></tr>
+            <tr><td><strong>Quién libera</strong></td><td>Nadie: el marco desaparece al volver</td><td>Alguien debe hacerlo. En Rust, el dueño</td></tr>
+          </tbody>
+        </table>
+        <pre class="diagram">        STACK (LIFO, tamaño fijo)                  HEAP (libre, tamaño variable)
+        ─────────────────────────                  ──────────────────────────────
+   ┌──────────────────────────────┐
+   │ frame de main()              │
+   │   n: i32          = 42       │          ┌──────────────────────────┐
+   │   s: String                  │          │  h  o  l  a              │
+   │     ptr ─────────────────────┼─────────►│  (buffer de 5 bytes)     │
+   │     len     = 5              │          └──────────────────────────┘
+   │     cap     = 5              │
+   └──────────────────────────────┘</pre>
+        <p>La asimetría es la clave: el <code>String</code> vive en el stack (tres palabras) pero <strong>es dueño de un buffer en el heap</strong>. Cuando el marco desaparece, ese buffer quedaría huérfano; el compilador inserta la liberación exactamente donde toca.</p>
+
+        <h3>Las tres reglas</h3>
+        <ol>
+          <li><strong>Cada valor tiene un único dueño</strong>: una variable, un campo, un elemento de un contenedor.</li>
+          <li><strong>Solo hay un dueño a la vez</strong>: asignar, pasar a una función o meter en un <code>Vec</code> <em>mueve</em> la propiedad.</li>
+          <li><strong>Al salir de ámbito, el dueño libera el valor</strong>: se ejecuta <code>drop</code> y la memoria vuelve al asignador.</li>
+        </ol>
+        <p>De ahí salen las tres garantías: no hay <em>use-after-free</em> (nadie usa lo que no posee), ni <em>double free</em> (solo un dueño libera), ni fugas en el camino normal.</p>
+
+        <h3>Anatomía de un <code>String</code></h3>
+        <pre><code class="language-rust">fn main() {
+    let mut s = String::with_capacity(16);   // reserva 16 bytes en el heap
+    s.push_str("abc");                       // cabe: no reasigna
+    println!("len={} cap={}", s.len(), s.capacity());
+}</code></pre>
+        <p><strong>ptr</strong> apunta al buffer; <strong>len</strong> son los bytes escritos (<code>s.len()</code> devuelve bytes, no caracteres); <strong>cap</strong> son los bytes reservados. La salida es <code>len=3 cap=16</code>. Si <code>push_str</code> no cabe, el <code>String</code> reserva más, copia y libera el buffer viejo. Todo ocurre dentro de la biblioteca estándar: para ti sigue siendo un valor con un dueño.</p>
+
+        <h3>Mover no es copiar</h3>
+        <pre><code class="language-rust">fn main() {
+    let code = String::from("k7m2qd");
+    let alias = code;                 // la propiedad se TRANSFIERE
+    println!("{alias}");              // correcto
+    // println!("{code}");            // E0382: borrow of moved value
+}</code></pre>
+        <pre class="diagram">   ANTES                                 DESPUÉS de `let alias = code;`
+   ─────                                 ───────────────────────────────
+   stack              heap               stack                heap
+   code  ────────►  [k7m2qd]            code   (ya no es válido)
+   alias (no existe)                    alias  ────────►  [k7m2qd]</pre>
+        <p>El buffer <strong>no se ha tocado</strong>: se copian las tres palabras del stack y el origen queda marcado como movido. Por eso mover un <code>Vec</code> de un millón de elementos es <strong>O(1)</strong> y clonarlo es <strong>O(n)</strong>. En C++ esto sería una copia superficial con <code>delete</code> doble si usas los dos objetos; en Java, una segunda referencia que el GC mantiene viva. Rust <strong>transfiere</strong> y anula el origen: es <code>std::move</code>, pero comprobado. El movimiento puede ser <strong>parcial</strong>: si mueves un campo, el struct deja de usarse entero, pero los demás campos siguen vivos.</p>
+
+        <h3><code>Copy</code>: los tipos que se copian solos</h3>
+        <p>Enteros, flotantes, <code>bool</code>, <code>char</code>, tuplas y arrays de tipos <code>Copy</code>, y las referencias compartidas <code>&amp;T</code> implementan <code>Copy</code>: asignar <strong>copia</strong>. No lo son <code>&amp;mut T</code>, ni <code>String</code>, ni <code>Vec&lt;T&gt;</code>, ni <code>HashMap</code>, que se mueven. Un tipo solo puede ser <code>Copy</code> si <strong>todos</strong> sus campos lo son.</p>
+        <pre><code class="language-rust">#[derive(Clone, Copy, Debug)]
+struct Code { value: u32 }             // todos los campos son Copy
+
+fn main() {
+    let a = 42;
+    let b = a;                         // copia: `a` sigue vivo
+    let c = Code { value: 7 };
+    let d = c;                         // copia: Code es Copy
+    println!("{a} {b} {c:?} {d:?}");
+}</code></pre>
+
+        <h3><code>drop</code>: el final del ámbito es el final del valor</h3>
+        <pre><code class="language-rust">struct Label(&amp;'static str);
+impl Drop for Label {
+    fn drop(&amp;mut self) { println!("drop {}", self.0); }
+}
+
+fn main() {
+    let _first = Label("primera");
+    let _second = Label("segunda");
+    println!("fin del cuerpo");
+}</code></pre>
+        <pre><code class="language-text">fin del cuerpo
+drop segunda
+drop primera</code></pre>
+        <p>Las variables locales se liberan en <strong>orden inverso</strong> al de declaración, como una pila. Dentro de un struct, los campos se liberan en <strong>orden de declaración</strong>, después de tu <code>Drop::drop</code>. Y ojo: <code>drop(x)</code> mueve y libera en ese punto; <code>let _ = x;</code> libera ya; <code>let _x = x;</code> <strong>no</strong> libera, porque <code>_x</code> es un nombre normal.</p>
+
+        <h3>Pasar por valor es transferir</h3>
+        <pre><code class="language-rust">fn consume(s: String) -&gt; usize { s.len() }      // libera `s` al volver
+fn hand_back(s: String) -&gt; String { s }           // la propiedad sale
+
+fn main() {
+    let code = String::from("abc123");
+    let n = consume(code);                      // movido
+    let code2 = hand_back(String::from("def456")); // el dueño es code2
+    println!("{n} {code2}");
+}</code></pre>
+        <p>Si la función necesita el valor para siempre (guardarlo, consumirlo), que lo reciba por valor; si solo lo lee, que lo pida prestado. <strong>Devolver la propiedad</strong> es correcto pero ruidoso, y es lo que los préstamos evitan. Y cuando el valor está detrás de un <code>&amp;mut</code>, <code>std::mem::take(&amp;mut campo)</code> lo saca y deja <code>Default::default()</code>; <code>std::mem::replace(&amp;mut campo, nuevo)</code> lo saca y deja <code>nuevo</code>. Ambos son O(1) y evitan el clásico «no puedo mover esto porque está detrás de una referencia».</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Los tres comportamientos en un programa mínimo. <code>cargo new ownership-min --bin</code> y pega esto en <code>src/main.rs</code>:</p>
+        <pre><code class="language-rust">fn main() {
+    let code = String::from("k7m2qd");   // dueño de un buffer en el heap
+    let alias = code;                    // MOVE
+    println!("{alias}");
+
+    let n = 42;                          // i32 es Copy
+    let m = n;                           // COPIA: `n` sigue vivo
+    println!("{n} y {m}");
+
+    let original = String::from("urlshort");
+    let view = &amp;original;               // PRÉSTAMO: no mueve
+    println!("{original} / {view}");
+}</code></pre>
+        <pre><code class="language-bash">cargo run --quiet</code></pre>
+        <pre><code class="language-text">k7m2qd
+42 y 42
+urlshort / urlshort</code></pre>
+        <p>Línea a línea: <code>String::from</code> reserva 6 bytes y devuelve las tres palabras del stack; <code>let alias = code</code> copia esas palabras y marca <code>code</code> como movida, sin tocar el texto; con <code>i32</code> no hay dueño que transferir, son 4 bytes copiados; y <code>&amp;original</code> crea un puntero que <strong>no</strong> transfiere la propiedad. Cambia <code>&amp;original</code> por <code>original</code> y el compilador responderá:</p>
+        <pre><code class="language-text">error[E0382]: borrow of moved value: `original`
+  |
+  |     let view = original;
+  |                -------- value moved here
+  |     println!("{original} / {view}");
+  |               ^^^^^^^^ value borrowed here after move
+  |
+  = note: move occurs because `original` has type `String`,
+          which does not implement the `Copy` trait</code></pre>
+        <p>Te dice dónde se movió, dónde se usó después y la causa raíz. La solución no es clonar: es decidir quién debe ser el dueño.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>En <strong>urlshort</strong>, cada enlace es un valor con dueño. Cuando el CLI lo crea y lo guarda, la propiedad viaja del <code>main</code> al almacén: nadie más lo necesita, así que se mueve en lugar de copiarse.</p>
+        <pre><code class="language-rust">#[derive(Debug)]
+pub struct Link {
+    pub code: String,
+    pub url: String,
+    pub hits: u32,
+}
+
+impl Link {
+    // Recibe préstamos y construye sus propios String: el Link debe
+    // sobrevivir al llamante, así que aquí la copia está justificada.
+    pub fn new(code: &amp;str, url: &amp;str) -&gt; Self {
+        Self { code: code.to_string(), url: url.to_string(), hits: 0 }
+    }
+}
+
+#[derive(Default)]
+pub struct Store { links: Vec&lt;Link&gt; }
+
+impl Store {
+    // POR VALOR: el store pasa a ser el único dueño del enlace.
+    pub fn insert(&amp;mut self, link: Link) { self.links.push(link); }
+
+    // Se lleva todo y deja el store vacío, sin clonar.
+    pub fn drain(&amp;mut self) -&gt; Vec&lt;Link&gt; { std::mem::take(&amp;mut self.links) }
+}
+
+fn main() {
+    let mut store = Store::default();
+    let url = String::from("https://www.rust-lang.org/learn");
+    let code = String::from("k7m2qd");
+    let link = Link::new(&amp;code, &amp;url);   // presta: url y code siguen nuestros
+    store.insert(link);                   // el Link se MUEVE al store
+    println!("{url} sigue disponible");
+    println!("{:?}", store.links[0]);
+    let archived = store.drain();
+    println!("{} enlaces archivados", archived.len());
+}</code></pre>
+        <pre><code class="language-bash">cargo run --quiet</code></pre>
+        <pre><code class="language-text">https://www.rust-lang.org/learn sigue disponible
+Link { code: "k7m2qd", url: "https://www.rust-lang.org/learn", hits: 0 }
+1 enlaces archivados</code></pre>
+        <p><code>Link::new</code> recibe <code>&amp;str</code> porque no necesita poseer los datos del llamante; <code>insert</code> recibe <code>Link</code> por valor porque un enlace guardado pertenece al store; y <code>drain</code> usa <code>mem::take</code> para devolver el <code>Vec</code> en O(1) y dejar el store utilizable, sin estados a medias.</p>
+        <div class="callout callout--analogy">
+          <p class="callout__title">Analogía: la escritura de una casa</p>
+          <p>Poseer un valor es figurar en la escritura. Asignar es <strong>firmar el traspaso</strong>: la casa no se mueve, cambia el titular y el anterior ya no puede entrar. Prestar (<code>&amp;</code>) es dejar las llaves para una visita; prestar en mutable (<code>&amp;mut</code>) es dejar que alguien reforme, sin nadie más dentro. Y <code>drop</code> es demoler cuando el titular desaparece, sin que nadie tenga que acordarse de llamar al ayuntamiento.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Preguntarte «¿quién debe ser el dueño?»</td><td><code>clone()</code> hasta que compile</td><td>El clon esconde un problema de diseño y cuesta en cada llamada.</td></tr>
+            <tr><td>Pasar <code>&amp;str</code> / <code>&amp;[T]</code> si solo se lee</td><td>Pasar <code>String</code> por valor y devolverlo</td><td>Prestar no transfiere propiedad y acepta más tipos.</td></tr>
+            <tr><td>Recibir por valor si la función consume o guarda</td><td>Recibir por valor «por si acaso» y clonar dentro</td><td>La firma documenta la intención: quien llama sabe que pierde el valor.</td></tr>
+            <tr><td>Derivar <code>Copy</code> solo en tipos sin recursos</td><td>Derivar <code>Copy</code> con <code>String</code> o <code>Vec</code> dentro</td><td><code>Copy</code> implica copia bit a bit; un recurso no puede duplicarse así.</td></tr>
+            <tr><td>Usar <code>mem::take</code> / <code>mem::replace</code> para vaciar campos</td><td>Reasignar <code>Vec::new()</code> y perder lo anterior</td><td>Son O(1) y no dejan estados a medias.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">La regla del bolígrafo</p>
+          <p>Hay un bolígrafo. Si lo tienes tú, nadie más escribe con él. Si lo dejas, tú ya no lo tienes. Solo puedes <strong>enseñarlo</strong> (<code>&amp;T</code>) o <strong>dejarlo escribir</strong> (<code>&amp;mut T</code>), y mientras lo enseñas no puedes prestarlo para escribir. Cuando interiorizas esto, dejas de pelearte con el compilador: empiezas a ver el flujo de propiedad.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+
+        <h3>1. Usar un valor después de moverlo</h3>
+        <pre><code class="language-rust">fn main() {
+    let url = String::from("https://sho.rt/a");
+    register(url);                    // se mueve
+    println!("{url}");                 // ya no existe
+}
+
+fn register(url: String) { println!("guardada {url}"); }</code></pre>
+        <pre><code class="language-text">error[E0382]: borrow of moved value: `url`
+ --> src/main.rs:4:15
+  |
+2 |     let url = String::from("https://sho.rt/a");
+  |         --- move occurs because `url` has type `String`,
+  |             which does not implement the `Copy` trait
+3 |     register(url);
+  |               --- value moved here
+4 |     println!("{url}");
+  |               ^^^ value borrowed here after move</code></pre>
+        <p>El compilador ofrece <code>clone()</code> porque es una salida válida, pero casi nunca es la mejor: si <code>main</code> necesita la URL después, el dueño debería seguir siendo <code>main</code>. Lo mismo ocurre al mover dentro de un bucle (<code>value moved here, in previous iteration of loop</code>). La versión correcta presta:</p>
+        <pre><code class="language-rust">fn register(url: &amp;str) { println!("guardada {url}"); }
+
+fn main() {
+    let url = String::from("https://sho.rt/a");
+    register(&amp;url);                  // presta: el dueño sigue siendo main
+    println!("{url}");
+}</code></pre>
+
+        <h3>2. Mover un elemento fuera de un índice</h3>
+        <pre><code class="language-rust">fn main() {
+    let codes = vec![String::from("abc"), String::from("def")];
+    let first = codes[0];          // ¿se lleva el String del Vec?
+}</code></pre>
+        <pre><code class="language-text">error[E0507]: cannot move out of index of `Vec&lt;String&gt;`
+ --> src/main.rs:3:19
+  |
+3 |     let first = codes[0];
+  |                   ^^^^^^^^^^ move occurs because value has type `String`,
+  |                              which does not implement the `Copy` trait</code></pre>
+        <p>Si el compilador lo permitiese, el <code>Vec</code> quedaría con un hueco inválido en la posición 0: indexar produce un <em>lugar</em>, no un valor. Soluciones: prestar (<code>&amp;codes[0]</code>), clonar explícitamente o sacarlo con <code>remove(0)</code>, que desplaza el resto.</p>
+
+        <h3>3. Derivar <code>Copy</code> en un tipo con dueño</h3>
+        <pre><code class="language-rust">#[derive(Clone, Copy)]
+struct Link {
+    code: String,
+    hits: u32,
+}</code></pre>
+        <pre><code class="language-text">error[E0204]: the trait `Copy` cannot be implemented for this type
+ --> src/main.rs:2:17
+  |
+1 | #[derive(Clone, Copy)]
+  |                 ---- in this derive macro expansion
+2 | struct Link {
+  |        ^^^^
+3 |     code: String,
+  |     ----------- this field does not implement `Copy`</code></pre>
+        <p><code>Copy</code> significa «puedo duplicar estos bytes sin consecuencias». Un <code>String</code> es un puntero a memoria que alguien libera: copiarlo a pelo daría dos dueños del mismo buffer y un <em>double free</em> garantizado. Deriva solo <code>Clone</code> y decide en cada llamada si el clon está justificado; si el tipo es realmente pequeño, usa campos <code>Copy</code> (<code>u32</code>, <code>[u8; 8]</code>, <code>&amp;'static str</code>).</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> observar mover, copiar y liberar, y arreglar un <code>E0382</code> sin <code>clone()</code>. Necesitas el toolchain del <a href="../00-fundamentos/02-instalacion-y-toolchain.html">módulo 0</a>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto.</strong>
+            <pre><code class="language-bash">cargo new ownership-lab --bin
+cd ownership-lab</code></pre>
+          </li>
+          <li>
+            <strong>Provoca el movimiento.</strong> Pega esto y ejecuta <code>cargo build</code>:
+            <pre><code class="language-rust">fn main() {
+    let url = String::from("https://sho.rt/k7m2qd");
+    let saved = url;
+    println!("{url}");
+    println!("{saved}");
+}</code></pre>
+            <p>Salida esperada: <code>error[E0382]: borrow of moved value: `url`</code>. Localiza la línea del movimiento y la del uso posterior.</p>
+          </li>
+          <li>
+            <strong>Arréglalo sin clonar.</strong> Decide quién debe ser el dueño y presta:
+            <pre><code class="language-rust">fn main() {
+    let url = String::from("https://sho.rt/k7m2qd");
+    let saved = &amp;url;              // prestamos, no movemos
+    println!("{url}");
+    println!("{saved}");
+}</code></pre>
+          </li>
+          <li>
+            <strong>Mueve de verdad, con una función.</strong> Consume el <code>String</code> y devuelve la propiedad para seguir usándolo. Salida esperada: <code>https://sho.rt/k7m2qd</code>.
+            <pre><code class="language-rust">fn normalize(mut url: String) -&gt; String {
+    url.make_ascii_lowercase();        // modifica el buffer existente
+    url                                // devuelve la propiedad
+}
+
+fn main() {
+    let url = String::from("HTTPS://SHO.RT/K7M2QD");
+    let url = normalize(url);         // movimiento de ida y vuelta
+    println!("{url}");
+}</code></pre>
+          </li>
+          <li>
+            <strong>Comprueba el orden de liberación.</strong>
+            <pre><code class="language-rust">struct Label(&amp;'static str);
+impl Drop for Label {
+    fn drop(&amp;mut self) { println!("drop {}", self.0); }
+}
+fn main() {
+    let _a = Label("a");
+    let _b = Label("b");
+    let _c = Label("c");
+    println!("fin");
+}</code></pre>
+            <p>Salida esperada: <code>fin</code>, <code>drop c</code>, <code>drop b</code>, <code>drop a</code>. Añade <code>drop(_b);</code> antes del <code>println!</code> y explica por qué <code>b</code> sale primero.</p>
+          </li>
+          <li>
+            <strong>Cierra con clippy.</strong>
+            <pre><code class="language-bash">cargo clippy -- -D warnings</code></pre>
+            <p>Debe pasar sin avisos. Si sugiere cambiar un <code>clone()</code> por un préstamo, hazlo: está viendo exactamente lo que esta lección enseña.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Puedes explicar, señalando líneas concretas, dónde se mueve cada <code>String</code> y quién lo libera. Si además sabes por qué el paso 2 no debe arreglarse con <code>.clone()</code>, ya piensas en Rust y no en Java.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 La rotación del archivo de enlaces</h3>
+          <p><code>urlshort</code> guarda los enlaces del día en un <code>Store</code> con un <code>Vec&lt;Link&gt;</code>. A medianoche hay que <strong>archivar</strong> el contenido: mover todos los enlaces al archivo histórico, dejar el store listo para el día siguiente y no copiar ni un solo <code>Link</code>.</p>
+          <p>Diseña dos structs, <code>Store</code> y <code>Archive</code>, con estas operaciones: crear un store vacío, insertar un enlace construido a partir de <code>&amp;str</code>, rotar el store hacia el archivo y consultar cuántos enlaces hay en cada lado. El <code>main</code> debe seguir usando el store después de la rotación y el archivo debe conservar los enlaces rotados. Nada de <code>clone()</code>, nada de <code>Rc</code>.</p>
+          <p><em>Pista: el archivo puede recibir el <code>Vec&lt;Link&gt;</code> por valor, o el store puede empujar sus enlaces con <code>extend</code>. Para vaciar sin perder la capacidad reservada, <code>std::mem::take</code> deja un <code>Vec</code> vacío; <code>std::mem::replace</code> te deja elegir qué queda. Y piensa qué pasa si la rotación se llama dos veces: el segundo archivo debe quedar vacío, no con los enlaces repetidos.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li>El <strong>stack</strong> guarda valores de tamaño fijo y muere con la función; el <strong>heap</strong> guarda datos variables que necesitan dueño.</li>
+          <li>Tres reglas: un dueño por valor, la propiedad se transfiere, y el valor se libera al salir de ámbito.</li>
+          <li>Un <code>String</code> son tres palabras en el stack (<code>ptr</code>, <code>len</code>, <code>capacity</code>) y un buffer en el heap.</li>
+          <li>Asignar un <code>String</code> <strong>mueve</strong> (O(1)) y clonarlo <strong>copia</strong> el buffer (O(n)); los tipos <code>Copy</code> (enteros, <code>bool</code>, <code>char</code>, <code>&amp;T</code>) se copian bit a bit.</li>
+          <li>Las variables se liberan en orden <strong>inverso</strong>; los campos de un struct, en orden de declaración.</li>
+          <li><code>mem::take</code> y <code>mem::replace</code> permiten mover desde un <code>&amp;mut</code> sin dejar huecos.</li>
+        </ul>
+        <h3>Comandos y conceptos de esta lección</h3>
+        <table>
+          <thead><tr><th>Comando / concepto</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>String::with_capacity(n)</code></td><td>Reserva <code>n</code> bytes: evita reasignaciones en bucles de <code>push</code>.</td></tr>
+            <tr><td><code>#[derive(Clone, Copy)]</code></td><td>Copia implícita en tipos cuyos campos sean todos <code>Copy</code>.</td></tr>
+            <tr><td><code>impl Drop for T</code></td><td>Código al liberar el valor; se llama solo, nunca a mano.</td></tr>
+            <tr><td><code>drop(x)</code></td><td>Mueve <code>x</code> y lo libera en ese punto.</td></tr>
+            <tr><td><code>std::mem::take(&amp;mut campo)</code></td><td>Saca el valor y deja <code>Default::default()</code>. O(1).</td></tr>
+            <tr><td><code>std::mem::replace(&amp;mut campo, nuevo)</code></td><td>Saca el valor y deja <code>nuevo</code>. O(1).</td></tr>
+            <tr><td><code>cargo clippy -- -D warnings</code></td><td>Detecta <code>clone()</code> innecesarios y patrones mejorables.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Por qué Rust no copia al asignar, como Java o Python?</summary>
+          <div>
+            <p>Porque allí una variable es una <strong>referencia</strong> a un objeto que el GC mantiene vivo; copiarla es barato y seguro. Sin GC, dos referencias al mismo buffer sin control serían un <em>double free</em>. La solución no es copiar los datos siempre: es <strong>transferir</strong> la propiedad, que cuesta lo mismo que copiar una referencia.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Entonces, ¿cuándo está justificado un <code>clone()</code>?</summary>
+          <div>
+            <p>Cuando de verdad necesitas <strong>dos copias independientes</strong>: un snapshot para un informe, un valor guardado en dos estructuras, un dato que cruza a otro hilo. No lo está cuando solo querías calmar al compilador: si la firma puede ser <code>&amp;T</code> y el código sigue claro, no clones.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Si mover un <code>Vec</code> es O(1), ¿por qué importa el tamaño?</summary>
+          <div>
+            <p>Porque mover solo copia las tres palabras del stack; el buffer se queda donde está y cambia de dueño. Lo que cuesta O(n) es <code>clone()</code>, que reserva otro buffer y copia elemento a elemento. Pasar un <code>Vec</code> por valor es, en la práctica, tan barato como pasar un puntero.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Puedo implementar <code>Drop</code> y <code>Copy</code> a la vez?</summary>
+          <div>
+            <p>No: el compilador lo rechaza con <code>E0184</code>. Un tipo <code>Copy</code> se duplica sin avisar, y un <code>Drop</code> que libera un recurso se ejecutaría dos veces. Es la comprobación que impide el <em>double free</em>: si tu tipo necesita limpieza, no puede copiarse a la ligera.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

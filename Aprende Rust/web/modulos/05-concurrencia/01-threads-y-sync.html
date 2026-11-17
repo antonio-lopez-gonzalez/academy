@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="01-threads-y-sync">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Threads, Send, Sync, Mutex y Arc — Módulo 5 · Curso Rust</title>
+  <meta name="description" content="Hilos en Rust: thread::spawn, closures move, los traits Send y Sync, Arc&lt;Mutex&lt;T&gt;&gt;, RwLock, MutexGuard, interbloqueos y thread::scope sobre el contador de visitas de urlshort.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Threads, Send, Sync, Mutex y Arc</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Concurrencia y async</span>
+          <span>⏱ 45 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>Hasta ahora todos tus programas han hecho una cosa a la vez. Eso funciona hasta que el programa tiene que esperar: al disco, a la red, a que otro servicio conteste. Un servidor de URLs cortas pasa la mayor parte del tiempo esperando, y un único hilo que espera deja de atender a todo el mundo.</p>
+        <p>Rust ataca la concurrencia desde dos frentes. El primero son los <strong>hilos del sistema operativo</strong> (<code>std::thread</code>), con memoria compartida y sincronización explícita: el modelo clásico de C, Java o C#, con una diferencia enorme. El segundo es <code>async</code>/<code>await</code>, que llega en la lección 3. Esta lección es la base de ambos: sin entender qué datos pueden cruzar de un hilo a otro, el resto es magia mal copiada.</p>
+        <p>La promesa es concreta: las <strong>carreras de datos</strong> (dos hilos escribiendo el mismo dato sin coordinarse) son un <strong>error de compilación</strong>, no un bug que aparece en producción un viernes a las tres de la mañana. No las evitas con disciplina: no compilan.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> es la respuesta que todo el mundo copia, y casi nunca se explica <strong>qué resuelve cada pieza</strong>. Aquí verás que <code>Arc</code> y <code>Mutex</code> atacan dos problemas distintos, que uno sin el otro no sirve, y cuándo el par completo es la herramienta equivocada.</p>
+        </div>
+        <p><strong>Errores típicos al empezar:</strong></p>
+        <ul>
+          <li>Meter un <code>Rc</code> dentro de un hilo y no entender por qué el compilador habla de <code>Send</code>.</li>
+          <li>Compartir un <code>Arc</code> sin <code>Mutex</code> y descubrir que no hay forma de mutar nada.</li>
+          <li>Retener el <code>MutexGuard</code> más de lo necesario y serializar todo el programa.</li>
+          <li>Bloquear dos mutex en órdenes distintos y congelar el proceso con un interbloqueo.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Un hilo del sistema operativo, no una corrutina</h3>
+        <p><code>std::thread::spawn</code> pide al sistema operativo un hilo nuevo: su stack, su estado de CPU, su entrada en el planificador. Compartes el heap con el hilo principal, y esa es toda la historia: no hay aislamiento, no hay paso de mensajes implícito, no hay nada que impida que dos hilos toquen el mismo byte a la vez… salvo el compilador, que sí lo impide.</p>
+        <p><code>spawn</code> recibe una closure <code>FnOnce</code> y devuelve un <code>JoinHandle&lt;T&gt;</code>, donde <code>T</code> es lo que devuelve la closure. El hilo arranca en cuanto lo pides: no hay <code>start()</code>. Si no llamas a <code>join</code>, se desprende y el programa puede terminar antes, matándolo a mitad.</p>
+        <pre><code class="language-rust">let handle = std::thread::spawn(|| {
+    // esto corre en otro hilo del sistema operativo
+    42
+});
+
+// join bloquea hasta que termina y devuelve Result&lt;T, Box&lt;dyn Any + Send&gt;&gt;
+let valor: i32 = handle.join().expect("el hilo ha paniqueado");</code></pre>
+        <p>Dos detalles que confunden al principio. Primero, <code>join</code> devuelve <code>Result</code>: si el hilo paniqueó, el <code>Err</code> lleva el <em>payload</em> del pánico; un pánico en un hilo no mata el proceso por sí solo, lo propagas tú al hacer <code>join</code>. Segundo, <code>spawn</code> exige <code>'static</code>: el hilo puede vivir más que la función que lo creó, así que no puede llevarse prestado nada que muera antes. De ahí el <code>move</code>, que no copia el dato: transfiere su propiedad al cierre y de ahí al hilo.</p>
+        <h3>La memoria compartida, dibujada</h3>
+        <pre class="diagram">   Arc::clone ──┬──► refcount 3 ─────────► hilo 1 ─┐
+                ├──► refcount 3 ─────────► hilo 2  ├──► Mutex&lt;HashMap&gt;
+                └──► refcount 3 ─────────► hilo 3 ─┘         │
+                                                             ▼
+                                              un solo escritor a la vez
+   el último Arc que muere ──► libera el Mutex ──► libera el mapa
+   (el contador es atómico: no necesita Mutex)</pre>
+        <p>El diagrama contiene la lección entera: <code>Arc</code> resuelve <strong>quién es dueño</strong> (varios dueños, liberación cuando muere el último); <code>Mutex</code> resuelve <strong>quién puede tocar</strong> (uno a la vez). Son problemas ortogonales y por eso hacen falta los dos.</p>
+        <h3>Send y Sync: los dos traits marcadores</h3>
+        <p>Rust no adivina si un tipo es seguro de compartir: lo declara con dos traits sin métodos, llamados <em>marcadores</em>. El compilador los implementa solo según los campos del tipo, y algunos tipos tienen la implementación <strong>prohibida</strong> a propósito.</p>
+        <p><code>Send</code> significa que el valor puede <strong>transferirse</strong> a otro hilo: su propiedad puede cruzar. <code>Sync</code> significa que <code>&amp;T</code> puede compartirse entre hilos: varios pueden leerlo a la vez. De ahí la regla que más se repite: para entrar en <code>spawn</code>, una closure debe ser <code>Send + 'static</code>. Y una relación útil: <code>T</code> es <code>Sync</code> si y solo si <code>&amp;T</code> es <code>Send</code>.</p>
+        <table>
+          <thead><tr><th>Tipo</th><th>¿Send?</th><th>¿Sync?</th><th>Motivo</th></tr></thead>
+          <tbody>
+            <tr><td><code>Rc&lt;T&gt;</code></td><td><strong>No</strong></td><td><strong>No</strong></td><td>Su contador de referencias no es atómico: dos hilos lo corromperían.</td></tr>
+            <tr><td><code>RefCell&lt;T&gt;</code></td><td>Sí</td><td><strong>No</strong></td><td>Su préstamo en ejecución no es seguro entre hilos.</td></tr>
+            <tr><td><code>Cell&lt;T&gt;</code></td><td>Sí</td><td><strong>No</strong></td><td>Muta a través de <code>&amp;T</code> sin sincronización.</td></tr>
+            <tr><td><code>Mutex&lt;T&gt;</code></td><td>Sí si <code>T: Send</code></td><td>Sí si <code>T: Send</code></td><td>El candado hace segura la mutación compartida.</td></tr>
+            <tr><td><code>Arc&lt;T&gt;</code></td><td>Sí si <code>T: Send + Sync</code></td><td>Sí si <code>T: Send + Sync</code></td><td>Contador atómico <em>y</em> contenido seguro de compartir.</td></tr>
+            <tr><td><code>*mut T</code></td><td><strong>No</strong></td><td><strong>No</strong></td><td>La puerta de <code>unsafe</code>: nadie garantiza nada.</td></tr>
+          </tbody>
+        </table>
+        <p>Fíjate en la fila de <code>Arc</code>: <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> es <code>Send + Sync</code> porque <code>Mutex&lt;T&gt;</code> lo es. Y <code>Arc&lt;RefCell&lt;T&gt;&gt;</code> <strong>no</strong> es <code>Sync</code>: el candado atómico protege el contador, no el contenido. Esa es la razón exacta por la que <code>Arc</code> solo no sirve para mutar.</p>
+        <h3>Arc&lt;Mutex&lt;T&gt;&gt;: por qué ambos</h3>
+        <table>
+          <thead><tr><th>Configuración</th><th>Qué falla</th><th>Error que ves</th></tr></thead>
+          <tbody>
+            <tr><td><code>Mutex&lt;T&gt;</code> suelto</td><td>No puedes mover el mutex a tres hilos: solo hay un dueño</td><td><code>E0382</code> use of moved value, en el segundo <code>move</code></td></tr>
+            <tr><td><code>Arc&lt;T&gt;</code> sin mutex</td><td>Varios dueños, todos de solo lectura: no hay <code>&amp;mut</code></td><td><code>E0596</code> cannot borrow as mutable</td></tr>
+            <tr><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code></td><td>Nada: varios dueños y un escritor a la vez</td><td>Compila</td></tr>
+          </tbody>
+        </table>
+        <p><code>Arc::clone</code> no copia el dato: incrementa un contador atómico y te da otro mando a distancia. Cuesta una operación atómica, no una copia del <code>HashMap</code>. Por eso clonar <code>Arc</code> en cada iteración es correcto y barato, mientras que clonar el contenido sería el vicio que este curso te pide evitar.</p>
+        <h3>MutexGuard y Drop: el candado que se suelta solo</h3>
+        <p><code>lock()</code> devuelve <code>LockResult&lt;MutexGuard&lt;T&gt;&gt;</code>. El guard es un puntero inteligente al dato <em>y</em> la prueba de que tienes el candado: implementa <code>Deref</code>/<code>DerefMut</code>, y su <code>Drop</code> libera el mutex. No puedes olvidarte de desbloquear; lo que sí puedes es desbloquear demasiado tarde, o arrastrarlo mientras haces I/O o pides otro candado.</p>
+        <div class="callout callout--warning">
+          <p class="callout__title">El guard que nadie ve y el mutex envenenado</p>
+          <p><code>hits.lock().expect("lock").insert(k, v);</code> retiene el guard hasta el final de la sentencia; <code>let n = *m.lock().expect("lock");</code> lo suelta justo después de copiar. Y si un hilo paniquea con el candado tomado, el mutex queda <strong>envenenado</strong>: los siguientes <code>lock()</code> devuelven <code>Err(PoisonError)</code>, porque el dato puede estar a medias. Propaga el pánico con <code>expect</code>, recupera el dato con <code>err.into_inner()</code> o cambia a <code>parking_lot</code>, pero no lo ignores sin saber por qué.</p>
+        </div>
+        <h3>RwLock: muchos lectores o un escritor</h3>
+        <p><code>RwLock&lt;T&gt;</code> permite <strong>varios lectores simultáneos</strong> (<code>read()</code>) o <strong>un escritor exclusivo</strong> (<code>write()</code>), nunca ambos. Para urlshort es el patrón natural: resolver un código es leer y las lecturas son la mayoría del tráfico; solo <code>short</code> escribe. No es gratis —suele costar más que <code>Mutex</code> sin contención— y la política de <em>writer starvation</em> depende de la plataforma: un flujo continuo de lectores puede retrasar al escritor.</p>
+        <h3>Interbloqueos: el abrazo mortal</h3>
+        <pre class="diagram">  hilo A                          hilo B
+  ──────                          ──────
+  lock(a)  ✔                      lock(b)  ✔
+  lock(b)  ✘ espera a B           lock(a)  ✘ espera a A
+            │                              │
+            └────────► nadie avanza ◄──────┘
+                       el proceso se congela</pre>
+        <p>Las reglas para no caer en él son viejas y siguen siendo ciertas: <strong>un solo candado</strong> siempre que se pueda (la mayoría de los interbloqueos necesitan dos); <strong>orden global</strong> documentado si hay varios; <strong>ámbito corto</strong>, soltando el primero antes de pedir el segundo; y <strong>nunca llames a código ajeno</strong> con el candado en la mano, porque no sabes qué candados pide dentro. Recuerda que un <code>Mutex</code> de la biblioteca estándar <strong>no es reentrante</strong>: pedirlo dos veces en el mismo hilo también se bloquea.</p>
+        <h3>thread::scope: prestar sin 'static</h3>
+        <p>Desde Rust 1.63, <code>thread::scope</code> crea un ámbito en el que los hilos pueden tomar prestados datos locales. El ámbito no termina hasta que todos han terminado, así que el compilador sabe que los préstamos son válidos. Ahorra el <code>Arc</code> cuando los datos viven en la misma función.</p>
+        <pre><code class="language-rust">let mut visitas = vec![10u64, 32, 7, 90];
+
+thread::scope(|s| {
+    for v in &amp;mut visitas {
+        s.spawn(move || *v *= 2);      // préstamo mutable, sin Arc ni Mutex
+    }
+});                                    // aquí ya han terminado todos
+
+println!("{visitas:?}");               // [20, 64, 14, 180]</code></pre>
+        <p><code>scope</code> relaja <code>'static</code>, no <code>Send</code>: un <code>Rc</code> sigue sin poder cruzar a otro hilo dentro del ámbito, por el mismo motivo de siempre.</p>
+        <h3>Cuándo NO usar hilos</h3>
+        <p>Crear un hilo cuesta decenas de microsegundos y reserva su stack (2 MiB por defecto); un cambio de contexto cuesta microsegundos. Si la tarea dura menos, paralelizarla es perder tiempo, y lo medirás en el ejercicio. Con muchas conexiones esperando E/S, <code>async</code> gana (miles de tareas en pocos hilos); con cálculo pesado y divisible, hilos o <code>rayon</code>; para un contador, <code>AtomicU64</code>.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Cuatro hilos que devuelven un valor. El programa no imprime nada en orden garantizado, y eso es parte de la lección.</p>
+        <pre><code class="language-rust">// src/main.rs
+use std::thread;
+
+fn main() {
+    let mut handles = Vec::new();
+
+    for id in 0..4u64 {
+        // `move` se lleva el u64 (que es Copy) al hilo nuevo
+        let handle = thread::spawn(move || {
+            println!("hilo {id}");
+            id * id                 // valor de retorno del hilo
+        });
+        handles.push(handle);
+    }
+
+    let mut total = 0;
+    for handle in handles {
+        total += handle.join().expect("el hilo ha paniqueado");
+    }
+    println!("total = {total}");
+}</code></pre>
+        <pre><code class="language-bash">cargo run</code></pre>
+        <p>Salida posible (las cuatro primeras líneas cambian de orden en cada ejecución):</p>
+        <pre><code class="language-text">hilo 0
+hilo 2
+hilo 1
+hilo 3
+total = 14</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>for id in 0..4u64</code> fija el tipo del contador; sin el sufijo, <code>id * id</code> se suma a <code>total</code> y también acaba siendo <code>u64</code>.</li>
+          <li><code>move</code> es obligatorio: la closure debe ser <code>'static</code>. Al ser <code>Copy</code>, cada iteración se lleva su propia copia del número.</li>
+          <li><code>Vec&lt;JoinHandle&lt;u64&gt;&gt;</code> es el tipo inferido. Un <code>JoinHandle</code> es un recurso: soltarlo sin <code>join</code> desprende el hilo.</li>
+          <li><code>join()</code> devuelve <code>Result&lt;u64, Box&lt;dyn Any + Send&gt;&gt;</code>. El <code>expect</code> convierte un pánico del hilo en un pánico del principal, que es lo que quieres en un CLI.</li>
+          <li>El orden no está definido porque el planificador decide cuándo corre cada hilo. <strong>Nunca escribas un programa que dependa de ese orden.</strong></li>
+        </ul>
+        <p>El compilador no es tiquismiquis: si omites el <code>move</code>, te dará un <code>error[E0373]: closure may outlive the current function</code>. El hilo puede seguir vivo cuando <code>main</code> retorne, y entonces <code>id</code> ya no existiría. Con <code>move</code>, el dato viaja con el hilo.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>urlshort necesita contar visitas por código. Varios hilos registran visitas a la vez sobre un mapa compartido: el caso canónico de <code>Arc&lt;Mutex&lt;HashMap&lt;String, u64&gt;&gt;&gt;</code>.</p>
+        <pre><code class="language-rust">// src/hits.rs
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+pub type Hits = HashMap&lt;String, u64&gt;;
+
+/// Registra `veces` visitas. El candado vive solo aquí dentro.
+fn registrar(hits: &amp;Mutex&lt;Hits&gt;, code: &amp;str, veces: u64) {
+    let mut guard = hits.lock().expect("mutex envenenado");
+    *guard.entry(code.to_string()).or_insert(0) += veces;
+}
+
+fn main() {
+    let hits = Arc::new(Mutex::new(Hits::new()));
+    let lotes: [(&amp;str, u64); 4] = [
+        ("k7m2qd", 120),
+        ("p3x9ab", 45),
+        ("k7m2qd", 30),
+        ("z8n4ce", 7),
+    ];
+
+    let mut handles = Vec::new();
+    for (code, veces) in lotes {
+        let hits = Arc::clone(&amp;hits);        // mando extra, no copia del mapa
+        handles.push(thread::spawn(move || registrar(&amp;hits, code, veces)));
+    }
+    for handle in handles {
+        handle.join().expect("un hilo de visitas ha paniqueado");
+    }
+
+    // Copiamos y ordenamos FUERA del candado
+    let mut filas: Vec&lt;(String, u64)&gt; = {
+        let guard = hits.lock().expect("mutex envenenado");
+        guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    };
+    filas.sort_by(|a, b| b.1.cmp(&amp;a.1));
+
+    for (code, n) in filas {
+        println!("/{code}  {n} visitas");
+    }
+}</code></pre>
+        <pre><code class="language-bash">cargo run --release</code></pre>
+        <pre><code class="language-text">/k7m2qd  150 visitas
+/p3x9ab  45 visitas
+/z8n4ce  7 visitas</code></pre>
+        <p>Decisiones que merecen un comentario: <code>Arc::clone</code> es barato porque solo toca el contador (el original debe seguir vivo en <code>main</code>); <code>registrar</code> acepta <code>&amp;Mutex&lt;Hits&gt;</code> porque no necesita el <code>Arc</code>; el candado cubre solo el <code>entry</code>, así que la sección crítica dura nanosegundos y todo lo demás corre en paralelo; y se usa <code>expect</code> en lugar de <code>unwrap</code> para que el mensaje diga qué falló.</p>
+        <div class="callout callout--analogy">
+          <p class="callout__title">Analogía: el mando y la llave</p>
+          <p><code>Arc</code> es un mando a distancia compartido: varias personas pueden tener uno y el aparato se apaga cuando se pierde el último. <code>Mutex</code> es la llave del cuarto donde está el aparato: solo entra quien la tiene, y debe devolverla.</p>
+        </div>
+        <p>Si cada visita hiciera su propio <code>lock</code>, el mutex sería el cuello de botella: por eso el ejemplo registra <em>lotes</em>. Cuando la contención duele, la siguiente parada son los contadores por fragmento (<em>sharding</em>) o un <code>AtomicU64</code> por código: es el reto de esta lección.</p>
+      </section>
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Usar <code>AtomicU64</code> para contadores</td><td><code>Arc&lt;Mutex&lt;u64&gt;&gt;</code> para incrementar un número</td><td>Un atómico no bloquea: <code>fetch_add</code> es una sola instrucción de CPU.</td></tr>
+            <tr><td>Mantener la sección crítica al mínimo</td><td>Hacer I/O con el guard vivo</td><td>El mutex serializa: todo lo que esté dentro se ejecuta de uno en uno.</td></tr>
+            <tr><td>Prestar con <code>thread::scope</code> si los datos son locales</td><td>Un <code>Arc</code> para todo, por reflejo</td><td>Si los datos no sobreviven a la función, no hace falta compartir propiedad.</td></tr>
+            <tr><td>Documentar el orden si hay varios candados</td><td>Tomarlos en el orden que pida el código</td><td>El interbloqueo no se reproduce en los tests: aparece en producción.</td></tr>
+            <tr><td>Un <code>RwLock</code> con muchas lecturas y pocas escrituras</td><td><code>RwLock</code> por defecto en todo</td><td>Cuesta más que un <code>Mutex</code> y puede dar hambre al escritor.</td></tr>
+            <tr><td>Medir antes de paralelizar</td><td>Paralelizar bucles de 1 000 iteraciones</td><td>El coste de crear hilos puede superar el trabajo útil.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">Regla de oro</p>
+          <p>Antes de escribir <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>, pregúntate: ¿puedo <strong>enviar mensajes</strong> en lugar de compartir memoria? La lección siguiente responde que sí, y casi siempre sale mejor. Si aun así compartes, escribe en un comentario qué protege el candado y qué no.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Compartir un <code>Rc</code> entre hilos</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">use std::rc::Rc;
+use std::sync::Mutex;
+use std::thread;
+
+fn main() {
+    let datos = Rc::new(Mutex::new(vec![1, 2, 3]));
+    let copia = Rc::clone(&amp;datos);
+    thread::spawn(move || {
+        copia.lock().expect("lock").push(4);
+    });
+}</code></pre>
+        <pre><code class="language-text">error[E0277]: `Rc&lt;Mutex&lt;Vec&lt;i32&gt;&gt;&gt;` cannot be sent between threads safely
+ --&gt; src/main.rs:8:19
+  |
+8 |     thread::spawn(move || {
+  |           ----- ^------
+  |           |     |
+  |           |     within this `{closure@src/main.rs:8:19: 8:31}`
+  |           required by a bound introduced by this call
+  |
+  = help: the trait `Send` is not implemented for `Rc&lt;Mutex&lt;Vec&lt;i32&gt;&gt;&gt;`</code></pre>
+        <p><strong>Por qué está mal:</strong> el contador de <code>Rc</code> es un <code>usize</code> normal. Dos hilos incrementándolo a la vez pueden perder incrementos y liberar el dato dos veces. <code>Send</code> está prohibido para <code>Rc</code> exactamente por eso.</p>
+        <p><strong>Bien:</strong> <code>Arc</code>, que usa instrucciones atómicas para el contador.</p>
+        <pre><code class="language-rust">let datos = Arc::new(Mutex::new(vec![1, 2, 3]));
+let copia = Arc::clone(&amp;datos);
+let h = thread::spawn(move || copia.lock().expect("lock").push(4));
+h.join().expect("hilo caido");</code></pre>
+        <h3>2. Dos préstamos mutables en <code>thread::scope</code></h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let mut total = 0u64;
+thread::scope(|s| {
+    s.spawn(|| total += 1);
+    s.spawn(|| total += 1);
+});
+println!("{total}");</code></pre>
+        <pre><code class="language-text">error[E0499]: cannot borrow `total` as mutable more than once at a time
+ --&gt; src/main.rs:4:17
+  |
+2 |     thread::scope(|s| {
+  |                    - first mutable borrow occurs here
+3 |         s.spawn(|| total += 1);
+  |                 -- ----- previous borrow occurs due to use of `total`
+4 |         s.spawn(|| total += 1);
+  |                 ^^ second mutable borrow occurs here</code></pre>
+        <p><strong>Por qué está mal:</strong> <code>scope</code> permite prestar, pero no cambia las reglas del préstamo: dos closures pidiendo <code>&amp;mut total</code> a la vez son exactamente lo que el borrow checker prohíbe, con hilos o sin ellos.</p>
+        <p><strong>Bien:</strong> un atómico, o un acumulador por hilo sumado al final.</p>
+        <pre><code class="language-rust">use std::sync::atomic::{AtomicU64, Ordering};
+
+let total = AtomicU64::new(0);
+thread::scope(|s| {
+    for _ in 0..2 {
+        // AtomicU64 muta a través de &amp;self: préstamos compartidos
+        s.spawn(|| total.fetch_add(1, Ordering::Relaxed));
+    }
+});
+println!("{}", total.load(Ordering::Relaxed));   // 2</code></pre>
+        <h3>3. El interbloqueo silencioso</h3>
+        <p><strong>Mal:</strong> dos candados en órdenes opuestos. Compila, arranca y se congela sin mensaje de error.</p>
+        <pre><code class="language-rust">fn main() {
+    let a = std::sync::Mutex::new(1);
+    let b = std::sync::Mutex::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _ga = a.lock().expect("lock a");
+            let _gb = b.lock().expect("lock b");   // espera a b
+        });
+        s.spawn(|| {
+            let _gb = b.lock().expect("lock b");
+            let _ga = a.lock().expect("lock a");   // espera a a: nadie avanza
+        });
+    });   // scope espera a los dos: el programa no termina nunca
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> cada hilo tiene un candado y espera el del otro; nadie lo suelta porque nadie puede avanzar. Ojo al detalle de <code>_ga</code>: un guion bajo delante <strong>no</strong> acorta la vida del guard, solo silencia el aviso de variable sin usar. Se libera al final del ámbito, justo lo que provoca el abrazo mortal.</p>
+        <p><strong>Bien:</strong> un orden global (siempre <code>a</code> y luego <code>b</code>), o soltar el primero antes de pedir el segundo. Si el orden no se puede fijar, <code>try_lock</code> con reintento o un diseño donde un solo hilo sea dueño de ambos datos.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> paralelizar una suma con <code>thread::scope</code>, medirla y descubrir por tu cuenta que paralelizar no siempre acelera. Necesitas el toolchain de la lección <a href="../00-fundamentos/02-instalacion-y-toolchain.html">Instalación</a>.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto y compara secuencial con paralelo.</strong> Ejecuta <code>cargo new visitas-paralelas --bin</code>, entra en la carpeta y pega esto en <code>src/main.rs</code>:
+            <pre><code class="language-rust">use std::thread;
+use std::time::Instant;
+
+fn main() {
+    let visitas: Vec&lt;u64&gt; = (1..=10_000).collect();
+
+    let t0 = Instant::now();
+    let secuencial: u64 = visitas.iter().sum();
+    println!("secuencial: {secuencial} en {:?}", t0.elapsed());
+
+    let t0 = Instant::now();
+    let paralelo = thread::scope(|s| {
+        let handles: Vec&lt;_&gt; = visitas
+            .chunks(visitas.len().div_ceil(4))
+            .map(|trozo| s.spawn(move || trozo.iter().sum::&lt;u64&gt;()))
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("hilo caido"))
+            .sum::&lt;u64&gt;()
+    });
+    println!("paralelo:   {paralelo} en {:?}", t0.elapsed());
+}</code></pre>
+            <p>Ambas ramas deben imprimir <code>50005000</code>. <code>div_ceil</code> redondea hacia arriba y evita el pánico si el vector es pequeño.</p>
+          </li>
+          <li>
+            <strong>Compara los tiempos.</strong>
+            <pre><code class="language-bash">cargo run --release</code></pre>
+            <pre><code class="language-text">secuencial: 50005000 en 6.1µs
+paralelo:   50005000 en 118.4µs</code></pre>
+            <p>La versión paralela es <strong>veinte veces más lenta</strong>. No es un fallo: crear cuatro hilos y unirlos cuesta más que sumar diez mil números. Este es el dato que separa la teoría de la ingeniería.</p>
+          </li>
+          <li>
+            <strong>Dale trabajo de verdad.</strong> Sustituye la suma por algo caro (sumar los cuadrados con un bucle interno de mil pasos por elemento) y repite. Ahora deberías ver una mejora cercana al número de núcleos; compruébalos con <code>nproc</code> (Linux/WSL) o <code>sysctl -n hw.ncpu</code> (macOS).
+          </li>
+          <li>
+            <strong>Añade un contador y pasa las comprobaciones.</strong> Cuenta con un <code>AtomicU64</code> cuántos trozos procesa cada hilo y repite con <code>Arc&lt;Mutex&lt;u64&gt;&gt;</code>; explica la diferencia en un comentario. Termina con:
+            <pre><code class="language-bash">cargo clippy -- -D warnings
+cargo test</code></pre>
+            <p>Si clippy sugiere <code>div_ceil</code>, acéptalo: es la forma idiomática de redondear hacia arriba desde Rust 1.73.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Sabes explicar, con tus números, por qué un <code>spawn</code> por elemento es una mala idea, y sabes cuándo <code>Arc</code>, cuándo <code>AtomicU64</code> y cuándo <code>scope</code>. Ese criterio separa «compila» de «funciona».</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El contador de visitas sin cuello de botella</h3>
+          <p>El ejemplo real funciona, pero todos los hilos compiten por un único mutex. Con 32 núcleos y un millón de visitas, ese candado es el limitador. Diseña un contador que escale:</p>
+          <p>Fragmenta el mapa en <em>N</em> trozos (por ejemplo, <code>vec![Mutex::new(HashMap::new()); N]</code> con <em>N</em> igual al número de núcleos). Cada hilo calcula el fragmento con <code>hash(code) % N</code> y solo bloquea ese. Al final, fusiona los fragmentos en un único <code>HashMap</code>. Mide con 4, 8 y 16 hilos frente a la versión de un solo mutex y comprueba dónde deja de mejorar.</p>
+          <p>Requisitos: sin <code>unsafe</code>, sin <code>unwrap</code> en el camino de datos, y un test que verifique que la suma de visitas tras la fusión es la esperada. Bonus: lo mismo con un <code>AtomicU64</code> por código.</p>
+          <p><em>Pista: el fragmento no puede depender del hilo, o perderías el reparto. Antes de fusionar, asegúrate de que nadie sigue escribiendo: el <code>join</code> de todos los handles es tu barrera. Si mides y no mejora, sospecha del cálculo del hash antes que de los hilos.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>thread::spawn</code> crea un hilo del sistema operativo y devuelve un <code>JoinHandle</code> que hay que unir para recoger el resultado y propagar pánicos. <code>move</code> transfiere la propiedad a la closure; <code>spawn</code> exige <code>Send + 'static</code>.</li>
+          <li><code>Send</code> permite mover el valor a otro hilo; <code>Sync</code> permite compartir <code>&amp;T</code>. <code>Rc</code> y <code>RefCell</code> fallan por motivos distintos y muy concretos.</li>
+          <li><code>Arc</code> da varios dueños con contador atómico; <code>Mutex</code> da acceso exclusivo. Juntos resuelven «varios dueños, un escritor».</li>
+          <li><code>MutexGuard</code> libera el candado en su <code>Drop</code>: no se olvida, pero se puede retener demasiado.</li>
+          <li><code>RwLock</code> brilla con muchas lecturas y pocas escrituras; no es un sustituto universal de <code>Mutex</code>.</li>
+          <li>Los interbloqueos se evitan con orden global, secciones cortas y sin llamar a código ajeno con el candado tomado.</li>
+          <li><code>thread::scope</code> (1.63+) permite prestar datos locales sin <code>Arc</code>, manteniendo la exigencia de <code>Send</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>std::thread::spawn(closure)</code></td><td>Arranca un hilo del SO y devuelve <code>JoinHandle&lt;T&gt;</code>.</td></tr>
+            <tr><td><code>handle.join()</code></td><td>Bloquea hasta que el hilo termina; <code>Err</code> si paniqueó.</td></tr>
+            <tr><td><code>std::thread::scope(|s| …)</code></td><td>Hilos con préstamos locales; espera a todos al salir del bloque.</td></tr>
+            <tr><td><code>Arc::clone(&amp;x)</code></td><td>Segundo dueño barato: incrementa un contador atómico.</td></tr>
+            <tr><td><code>mutex.lock()</code></td><td>Bloquea hasta obtener el candado; devuelve <code>MutexGuard</code>.</td></tr>
+            <tr><td><code>rwlock.read()</code> / <code>.write()</code></td><td>Préstamo compartido o exclusivo según el modo.</td></tr>
+            <tr><td><code>AtomicU64::fetch_add(1, Relaxed)</code></td><td>Incremento atómico sin candado; ideal para contadores.</td></tr>
+            <tr><td><code>cargo run --release</code></td><td>Medir concurrencia en debug no tiene sentido: cambia los tiempos.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Siempre que comparto estado entre hilos necesito <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>?</summary>
+          <div>
+            <p>No. Es la respuesta correcta para «varios dueños y mutación», y nada más. Si solo lees, <code>Arc&lt;T&gt;</code> basta (o incluso <code>&amp;T</code> con <code>thread::scope</code>). Si es un contador, <code>AtomicU64</code>. Si cada hilo puede tener su copia, no compartas: clona y ahorra sincronización. Y si puedes enviar mensajes en vez de compartir, la lección siguiente te dará una herramienta mejor.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Por qué el mutex no es reentrante? En Java <code>synchronized</code> sí lo es.</summary>
+          <div>
+            <p>Porque un candado reentrante esconde el error. Si una función toma el mutex y llama a otra que también lo toma, el diseño está pidiendo el mismo dato dos veces y puede dejar el estado a medias entre ambas. Que se bloquee es incómodo; que funcione en silencio suele ser peor. La solución idiomática es tomar el candado en un solo sitio y pasar el <code>&amp;mut T</code> ya protegido.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Mi mutex se ha «envenenado». ¿Qué hago?</summary>
+          <div>
+            <p>El envenenamiento avisa de que un hilo paniqueó con el candado tomado y el dato puede estar a medio actualizar. Tienes tres opciones honestas: propagar el pánico con <code>expect</code> (razonable en un CLI), recuperar el dato con <code>err.into_inner()</code> si la operación era atómica, o cambiar a <code>parking_lot::Mutex</code>, que no envenena.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cuántos hilos debo lanzar?</summary>
+          <div>
+            <p>Para trabajo de CPU, tantos como núcleos (<code>std::thread::available_parallelism()</code>) y repartir en trozos, no un hilo por elemento. Para trabajo de E/S, los hilos se pasan el tiempo bloqueados y el modelo deja de escalar: ahí gana <code>async</code>, porque miles de tareas caben en unos pocos hilos. Y si el problema es «procesar una colección en paralelo», <code>rayon</code> ya resuelve el reparto con <code>par_iter()</code>.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

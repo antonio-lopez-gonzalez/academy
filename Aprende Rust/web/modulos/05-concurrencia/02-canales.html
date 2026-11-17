@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="es" data-theme="dark" data-module="05" data-lesson="02-canales">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Canales y trabajo en paralelo — Módulo 5 · Curso Rust</title>
+  <meta name="description" content="Canales en Rust con std::sync::mpsc: productores y consumidores, cierre del canal, recv_timeout, try_recv, fan-out/fan-in y un pool de trabajadores para acortar URLs en paralelo.">
+  <script>document.documentElement.dataset.theme = localStorage.getItem('rust-theme') || 'dark';</script>
+  <link rel="stylesheet" href="../../assets/css/site.css">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main>
+    <article class="lesson">
+      <header class="lesson-header">
+        <h1>Canales y trabajo en paralelo</h1>
+        <div class="lesson-header__meta">
+          <span class="badge">Módulo 5 · Concurrencia y async</span>
+          <span>⏱ 40 minutos</span>
+        </div>
+      </header>
+
+      <!-- ============================ 1 · INTRODUCCIÓN ============================ -->
+      <section id="introduccion">
+        <h2><span class="section-number">1 ·</span> Introducción</h2>
+        <p>La lección anterior compartía memoria y la protegía con candados (mira <a href="01-threads-y-sync.html">threads y sincronización</a>). Funciona, pero obliga a todo el mundo a pensar en el mismo cerrojo: quién lo tiene, cuánto tiempo, en qué orden. Hay una alternativa más antigua y, para muchos problemas, mejor: <strong>no compartir nada</strong> y <strong>enviar mensajes</strong>.</p>
+        <p>Un canal es una cola con dos extremos: uno envía, otro recibe. El emisor no sabe quién consume; el consumidor no sabe quién produce. Los datos viajan <strong>por valor</strong>, así que la propiedad se transfiere de verdad y desaparecen las carreras por el mismo byte. Es el modelo de Go («no te comuniques compartiendo memoria; comparte memoria comunicándote») y el que usa Erlang desde los años ochenta.</p>
+        <p>En Rust, un canal no es una convención: es un tipo. <code>Sender&lt;T&gt;</code> e <code>Receiver&lt;T&gt;</code> solo existen si alguien los creó juntos, y el compilador comprueba que lo que envías es del tipo declarado. Si el receptor desaparece, <code>send</code> te devuelve un <code>Result</code> en vez de escribir en el vacío.</p>
+        <div class="callout callout--why">
+          <p class="callout__title">¿Por qué existe esta lección?</p>
+          <p>Porque un pool de trabajadores con un mutex compartido es la primera solución que se intenta y la que peor escala. Los canales convierten «protege este estado» en «reparte este trabajo», que es un problema mucho más fácil de razonar, de testear y de parar.</p>
+        </div>
+        <p><strong>Errores típicos al empezar:</strong></p>
+        <ul>
+          <li>Intentar clonar el <code>Receiver</code> para tener varios consumidores: no implementa <code>Clone</code>.</li>
+          <li>Olvidar soltar el <code>Sender</code> original y quedarse esperando un mensaje que nunca llega.</li>
+          <li>Tratar <code>try_recv</code> como si <code>Empty</code> significara «el canal se cerró».</li>
+          <li>Mantener el candado de la cola mientras se procesa el trabajo: vuelves al cuello de botella.</li>
+        </ul>
+      </section>
+
+      <!-- ============================ 2 · TEORÍA ============================ -->
+      <section id="teoria">
+        <h2><span class="section-number">2 ·</span> Teoría</h2>
+        <h3>Un canal, dos extremos</h3>
+        <p><code>std::sync::mpsc::channel</code> crea un par <code>(Sender&lt;T&gt;, Receiver&lt;T&gt;)</code>. Las siglas significan <em>multi-producer, single-consumer</em>: muchos emisores, un solo receptor. El canal es <strong>ilimitado</strong> (<em>unbounded</em>): <code>send</code> no bloquea nunca y la memoria crece si el consumidor no da abasto. Ese detalle importa más de lo que parece y lo retomamos con <code>sync_channel</code>.</p>
+        <pre class="diagram">   productor 1 ──┐
+   productor 2 ──┼──► [ mensaje ][ mensaje ][ mensaje ] ──► consumidor
+   productor 3 ──┘        cola en memoria (FIFO)
+        ▲                                                        │
+        └────────────── send(msg) devuelve Result ◄──────────────┘
+                        Err si el receptor murió</pre>
+        <p><code>send</code> devuelve <code>Result&lt;(), SendError&lt;T&gt;&gt;</code>. El error no es un capricho: significa que el receptor ya no existe y el mensaje <strong>te devuelve la propiedad</strong> para que puedas hacer otra cosa con él. <code>recv</code> devuelve <code>Result&lt;T, RecvError&gt;</code> y <strong>bloquea</strong> hasta que hay un mensaje o hasta que todos los emisores han desaparecido.</p>
+        <h3>Quién se puede clonar y por qué</h3>
+        <p><code>Sender</code> implementa <code>Clone</code>; <code>Receiver</code> no. No es una limitación arbitraria: el diseño garantiza que solo un consumidor toca cada mensaje, y por eso el mensaje se puede mover sin sincronización adicional. Clonar el receptor daría dos consumidores compitiendo por la misma cola… que es exactamente lo que <code>crossbeam-channel</code> y <code>flume</code> ofrecen cuando de verdad lo necesitas.</p>
+        <table>
+          <thead><tr><th>Quiero…</th><th>Con <code>std::sync::mpsc</code></th><th>Alternativa</th></tr></thead>
+          <tbody>
+            <tr><td>Varios productores, un consumidor</td><td>Clona el <code>Sender</code></td><td>—</td></tr>
+            <tr><td>Varios consumidores (pool)</td><td><code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code></td><td><code>crossbeam-channel</code> o <code>flume</code>, con <code>Receiver: Clone</code></td></tr>
+            <tr><td>Capacidad limitada (backpressure)</td><td><code>sync_channel(n)</code></td><td>Igual en crossbeam y flume</td></tr>
+          </tbody>
+        </table>
+        <h3>El cierre: cuando todos los emisores se van</h3>
+        <p>Un canal se cierra cuando <strong>el último <code>Sender</code> se libera</strong>. A partir de ahí, <code>recv</code> devuelve <code>Err(RecvError)</code> de inmediato y el receptor puede terminar. Eso hace que <code>for mensaje in rx</code> sea un bucle con final natural: itera hasta que el canal se cierra.</p>
+        <pre><code class="language-rust">let (tx, rx) = mpsc::channel::&lt;u32&gt;();
+
+thread::spawn(move || {
+    for n in 1..=3 {
+        tx.send(n).expect("el receptor ya no escucha");
+    }
+    // aquí `tx` se libera: si era el último emisor, el canal se cierra
+});
+
+for n in rx {                 // termina solo cuando el canal se cierra
+    println!("recibido {n}");
+}</code></pre>
+        <p>De ahí el error clásico: si el hilo principal conserva una copia del <code>Sender</code>, el bucle no termina nunca, porque el canal sigue abierto aunque los trabajadores hayan acabado. <code>drop(tx)</code> es una línea que evita una tarde de depuración.</p>
+        <h3>Bloquearse, esperar un poco o no esperar</h3>
+        <table>
+          <thead><tr><th>Método</th><th>Comportamiento</th><th>Cuándo usarlo</th></tr></thead>
+          <tbody>
+            <tr><td><code>recv()</code></td><td>Bloquea hasta que hay mensaje o el canal se cierra</td><td>Consumidor dedicado que no hace otra cosa</td></tr>
+            <tr><td><code>recv_timeout(d)</code></td><td>Bloquea como máximo <code>d</code>; error <code>Timeout</code> o <code>Disconnected</code></td><td>Bucles con trabajo periódico o apagado ordenado</td></tr>
+            <tr><td><code>try_recv()</code></td><td>No bloquea: <code>Ok(msg)</code>, <code>Err(Empty)</code> o <code>Err(Disconnected)</code></td><td>Drenar lo pendiente sin bloquear al productor</td></tr>
+            <tr><td><code>send(msg)</code></td><td>Nunca bloquea (canal ilimitado)</td><td>Productor que no puede parar</td></tr>
+            <tr><td><code>sync_channel(n)</code> + <code>send</code></td><td>Bloquea si hay <code>n</code> mensajes sin consumir</td><td>Cuando el productor debe ir al ritmo del consumidor</td></tr>
+          </tbody>
+        </table>
+        <p>La distinción entre <code>Empty</code> y <code>Disconnected</code> es la que más se ignora. <code>Empty</code> significa «ahora no hay nada, vuelve luego»; <code>Disconnected</code> significa «no habrá nada más, sal del bucle». Confundirlos produce bucles infinitos que giran al 100 % de CPU.</p>
+        <h3>Fan-out y fan-in</h3>
+        <pre class="diagram">  FAN-OUT (repartir)                       FAN-IN (recolectar)
+
+  trabajo ──┬──► worker 1 ──┐              worker 1 ──┐
+            ├──► worker 2 ──┤              worker 2 ──┼──► resultados ──► main
+            └──► worker 3 ──┘              worker 3 ──┘
+      un canal de tareas                 un canal compartido de resultados
+      (un consumidor por tarea)           (todos clonan el Sender)</pre>
+        <p>Las dos formas se combinan constantemente. El patrón <em>pool</em> reparte trabajo desde un canal y devuelve resultados por otro. Y ahí aparece la asimetría del estándar: para repartir necesitas varios consumidores del mismo canal de tareas, que <code>mpsc</code> no da. Las salidas honestas son dos: envolver el receptor en <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code> —el candado se toma solo para <code>recv</code>, no para procesar— o cambiar a <code>crossbeam-channel</code>, cuyo <code>Receiver</code> sí es clonable. Un canal tampoco te dice nada sobre el orden: si tres trabajadores responden, los resultados llegan según acaban, y ordenar es trabajo del receptor.</p>
+      </section>
+
+      <!-- ============================ 3 · EJEMPLO MÍNIMO ============================ -->
+      <section id="ejemplo-minimo">
+        <h2><span class="section-number">3 ·</span> Ejemplo mínimo</h2>
+        <p>Un productor, un consumidor y un canal que se cierra solo cuando el productor termina.</p>
+        <pre><code class="language-rust">// src/main.rs
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+
+    let productor = thread::spawn(move || {
+        for n in 1..=4 {
+            tx.send(n).expect("el receptor ha desaparecido");
+        }
+        // al terminar la closure, `tx` se libera y el canal se cierra
+    });
+
+    let mut total = 0;
+    for n in rx {                 // se detiene al cerrarse el canal
+        total += n;
+    }
+
+    productor.join().expect("el productor ha paniqueado");
+    println!("total = {total}");
+}</code></pre>
+        <pre><code class="language-bash">cargo run</code></pre>
+        <pre><code class="language-text">total = 10</code></pre>
+        <p>Línea a línea:</p>
+        <ul>
+          <li><code>channel()</code> infiere el tipo del mensaje del primer uso: <code>i32</code>, porque <code>1..=4</code> produce enteros y <code>total</code> empieza en <code>0</code>.</li>
+          <li><code>move</code> se lleva <code>tx</code> al hilo. Si no lo hiciera, la closure no sería <code>'static</code> y <code>spawn</code> no la aceptaría.</li>
+          <li><code>send</code> devuelve <code>Result</code>: el mensaje podría no tener receptor. <code>expect</code> documenta que aquí eso sería un fallo del programa.</li>
+          <li><code>for n in rx</code> consume el receptor y termina con <code>Err(RecvError)</code>, que el iterador traduce en «fin del bucle». No hace falta centinela ni <code>None</code>.</li>
+          <li><code>join</code> después de consumir: el productor ya ha terminado, pero unirlo propaga cualquier pánico que hubiera ocurrido dentro.</li>
+        </ul>
+        <p>En el otro extremo, si el receptor se va, <code>send</code> falla con <code>SendError</code> y te devuelve el mensaje que no pudo entregar.</p>
+      </section>
+
+      <!-- ============================ 4 · EJEMPLO REAL ============================ -->
+      <section id="ejemplo-real">
+        <h2><span class="section-number">4 ·</span> Ejemplo real</h2>
+        <p>urlshort recibe un lote de URLs para acortar. El cálculo del código es barato pero independiente por URL, así que se reparte entre trabajadores: un canal de tareas (<em>fan-out</em>) y otro de resultados (<em>fan-in</em>).</p>
+        <pre><code class="language-rust">use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+const ALPHABET: &amp;[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
+
+/// Código de 6 caracteres derivado del contenido (FNV-1a de juguete).
+fn short_code(url: &amp;str) -&gt; String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (0..6)
+        .map(|i| ALPHABET[((h &gt;&gt; (i * 6)) % ALPHABET.len() as u64) as usize] as char)
+        .collect()
+}
+
+fn main() {
+    let urls = vec![
+        "https://www.rust-lang.org/learn",
+        "https://doc.rust-lang.org/std/thread/",
+        "https://crates.io/crates/tokio",
+        "https://blog.rust-lang.org",
+        "https://this-week-in-rust.org",
+        "https://docs.rs/crossbeam-channel",
+    ];
+
+    // Canal de tareas: varios consumidores comparten el receptor detrás de un Mutex
+    let (job_tx, job_rx) = mpsc::channel::&lt;&amp;str&gt;();
+    let job_rx = Arc::new(Mutex::new(job_rx));
+
+    // Canal de resultados: todos los trabajadores clonan el emisor
+    let (res_tx, res_rx) = mpsc::channel::&lt;(String, &amp;str)&gt;();
+
+    let mut handles = Vec::new();
+    for id in 0..3 {
+        let job_rx = Arc::clone(&amp;job_rx);
+        let res_tx = res_tx.clone();
+        handles.push(thread::spawn(move || loop {
+            // El candado se toma SOLO para recoger trabajo, nunca para procesarlo
+            let job = {
+                let guard = job_rx.lock().expect("cola envenenada");
+                guard.recv()
+            };
+            let Ok(url) = job else { break };   // canal cerrado: fin del trabajador
+
+            let code = short_code(url);
+            if res_tx.send((code, url)).is_err() {
+                break;                          // el receptor de resultados se fue
+            }
+            println!("trabajador {id} ha acortado {url}");
+        }));
+    }
+
+    for url in urls {
+        job_tx.send(url).expect("no quedan trabajadores");
+    }
+    drop(job_tx);      // sin esto, los trabajadores esperarían para siempre
+    drop(res_tx);      // sin esto, el bucle de resultados no terminaría
+
+    let mut filas: Vec&lt;(String, &amp;str)&gt; = Vec::new();
+    for par in res_rx {
+        filas.push(par);
+    }
+    filas.sort_by(|a, b| a.0.cmp(&amp;b.0));
+
+    for (code, url) in filas {
+        println!("/{code}  {url}");
+    }
+    for h in handles {
+        h.join().expect("un trabajador ha paniqueado");
+    }
+}</code></pre>
+        <pre><code class="language-bash">cargo run --release</code></pre>
+        <p>La salida mezcla líneas de <code>trabajador N ha acortado …</code> —impredecibles, como debe ser— con el listado final ordenado por código. Lo importante son estas decisiones:</p>
+        <table>
+          <thead><tr><th>Decisión</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td><code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code> para las tareas</td><td><code>mpsc</code> no permite varios receptores. El candado se suelta antes de calcular, así que no serializa el trabajo.</td></tr>
+            <tr><td><code>drop(job_tx)</code> tras enviar</td><td>El cierre del canal es la señal de fin para los trabajadores: no hace falta inventar un mensaje <code>Stop</code>.</td></tr>
+            <tr><td><code>drop(res_tx)</code> en el hilo principal</td><td>El emisor original también mantiene el canal abierto; sin soltarlo, <code>res_rx</code> nunca termina.</td></tr>
+            <tr><td><code>&amp;str</code> en lugar de <code>String</code></td><td>Las URLs son literales: se mueven punteros, no se copia texto. El <code>String</code> que sí se crea es el código.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--warning">
+          <p class="callout__title">El <code>Mutex</code> del pool no es el de la lección anterior</p>
+          <p>Aquí el candado protege la <strong>cola</strong>, no el trabajo. Si lo mantuvieras mientras llamas a <code>short_code</code>, tendrías un solo trabajador efectivo y el pool no serviría de nada. La regla es siempre la misma: mide la sección crítica y deja fuera todo lo que no la necesite.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 5 · BUENAS PRÁCTICAS ============================ -->
+      <section id="buenas-practicas">
+        <h2><span class="section-number">5 ·</span> Buenas prácticas</h2>
+        <table>
+          <thead><tr><th>Haz esto</th><th>Evita esto</th><th>Por qué</th></tr></thead>
+          <tbody>
+            <tr><td>Enviar mensajes con datos ya calculados</td><td>Enviar referencias a estado compartido</td><td>El mensaje se mueve: si lleva un <code>&amp;'static str</code> o un <code>String</code>, no hace falta candado alguno.</td></tr>
+            <tr><td>Dejar que el cierre del canal indique el fin</td><td>Mensajes centinela como <code>Msg::Stop</code> por cada trabajador</td><td>Soltar el emisor es imposible de olvidar y funciona con N productores.</td></tr>
+            <tr><td><code>drop(tx)</code> explícito antes de consumir</td><td>Confiar en que el emisor «ya no se usa»</td><td>Mientras exista una copia, el canal sigue abierto.</td></tr>
+            <tr><td><code>sync_channel</code> si el productor es más rápido</td><td>Un canal ilimitado que crece sin control</td><td>La cola ilimitada es una fuga de memoria con buen marketing.</td></tr>
+            <tr><td>Distinguir <code>Empty</code> de <code>Disconnected</code></td><td><code>while let Ok(_)</code> sobre <code>try_recv</code></td><td>Si no distingues, o giras en vacío o terminas antes de tiempo.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout callout--tip">
+          <p class="callout__title">¿Y si necesito <code>select!</code>?</p>
+          <p>La biblioteca estándar no tiene un <code>select</code> sobre varios canales. Si tu consumidor debe atender trabajo, resultados y una señal de parada a la vez, el siguiente paso natural es <code>crossbeam-channel</code> (<code>crossbeam::select!</code>) o <code>flume</code>. En async, Tokio trae su propio <code>select!</code> y lo verás en la lección 4.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 6 · ERRORES HABITUALES ============================ -->
+      <section id="errores">
+        <h2><span class="section-number">6 ·</span> Errores habituales</h2>
+        <h3>1. Mover el receptor a un hilo y seguir usándolo</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">let (tx, rx) = mpsc::channel::&lt;i32&gt;();
+tx.send(1).expect("send");
+
+let hilo = thread::spawn(move || rx.recv().expect("recv"));
+println!("{:?}", rx.recv());      // rx ya no está aquí</code></pre>
+        <pre><code class="language-text">error[E0382]: use of moved value: `rx`
+ --&gt; src/main.rs:5:20
+  |
+4 |     let hilo = thread::spawn(move || rx.recv().expect("recv"));
+  |                             ------- value moved into closure here
+5 |     println!("{:?}", rx.recv());
+  |                      ^^ value used here after move
+  |
+  = note: move occurs because `rx` has type `Receiver&lt;i32&gt;`,
+          which does not implement the `Copy` trait</code></pre>
+        <p><strong>Por qué está mal:</strong> el receptor es un recurso único: si se mueve al hilo, el hilo principal deja de tenerlo. Y no hay <code>Copy</code> que lo salve, porque duplicarlo sería tener dos consumidores de la misma cola.</p>
+        <p><strong>Bien:</strong> decide dónde vive el receptor. Si el consumidor es el hilo, el principal solo conserva el emisor.</p>
+        <pre><code class="language-rust">let (tx, rx) = mpsc::channel::&lt;i32&gt;();
+let hilo = thread::spawn(move || rx.recv());
+tx.send(1).expect("el consumidor se ha ido");
+println!("{:?}", hilo.join().expect("hilo caido"));</code></pre>
+        <h3>2. Intentar clonar el <code>Receiver</code> para un pool</h3>
+        <p><strong>Mal:</strong></p>
+        <pre><code class="language-rust">for _ in 0..3 {
+    let rx = rx.clone();          // no existe Receiver::clone
+    thread::spawn(move || rx.recv());
+}</code></pre>
+        <pre><code class="language-text">error[E0599]: no method named `clone` found for struct
+              `std::sync::mpsc::Receiver&lt;Job&gt;` in the current scope
+ --&gt; src/main.rs:5:22
+  |
+5 |         let rx = rx.clone();
+  |                      ^^^^^ method not found in `Receiver&lt;Job&gt;`</code></pre>
+        <p><strong>Por qué está mal:</strong> el estándar garantiza un único consumidor por mensaje. Si quieres varios, tienes que aportar la sincronización tú o cambiar de crate.</p>
+        <p><strong>Bien:</strong> <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code> (como en el ejemplo real), o directamente <code>crossbeam-channel</code>, donde <code>Receiver</code> sí es <code>Clone</code> y reparte trabajo sin candado.</p>
+        <h3>3. Olvidar soltar el emisor: el bucle que no termina</h3>
+        <p><strong>Mal:</strong> tres hilos envían y el principal consume… pero conserva su copia de <code>tx</code>.</p>
+        <pre><code class="language-rust">let (tx, rx) = mpsc::channel();
+for i in 0..3 {
+    let tx = tx.clone();
+    thread::spawn(move || tx.send(i).expect("send"));
+}
+
+for v in rx {                    // imprime 0, 1 y 2... y se queda esperando
+    println!("{v}");
+}</code></pre>
+        <p><strong>Por qué está mal:</strong> el canal se cierra cuando se libera el <strong>último</strong> emisor. El original sigue vivo en <code>main</code>, así que el receptor nunca ve el cierre. No hay error de compilación ni de ejecución: el programa simplemente se queda colgado, que es el peor fallo posible.</p>
+        <p><strong>Bien:</strong> <code>drop(tx)</code> antes del bucle.</p>
+        <pre><code class="language-rust">let (tx, rx) = mpsc::channel();
+for i in 0..3 {
+    let tx = tx.clone();
+    thread::spawn(move || tx.send(i).expect("send"));
+}
+drop(tx);                        // el principal ya no enviará nada más
+
+for v in rx {
+    println!("{v}");
+}</code></pre>
+        <p>La otra cara de la moneda: si el receptor se va, <code>send</code> falla con <code>SendError</code>. Trátalo como una señal de parada (<code>break</code>), no como un pánico, cuando el consumidor puede cancelar el trabajo legítimamente.</p>
+      </section>
+
+      <!-- ============================ 7 · EJERCICIO ============================ -->
+      <section id="ejercicio">
+        <h2><span class="section-number">7 ·</span> Ejercicio guiado</h2>
+        <p><strong>Objetivo:</strong> construir un <em>fan-in</em> con tres productores, agregar los mensajes en un <code>HashMap</code> y cerrar el bucle sin colgarte.</p>
+        <ol class="steps">
+          <li>
+            <strong>Crea el proyecto.</strong>
+            <pre><code class="language-bash">cargo new fan-in --bin
+cd fan-in</code></pre>
+          </li>
+          <li>
+            <strong>Pega el recolector.</strong> Cada hilo envía diez visitas con su propio código.
+            <pre><code class="language-rust">use std::collections::HashMap;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let (tx, rx) = mpsc::channel::&lt;(String, u64)&gt;();
+
+    let mut handles = Vec::new();
+    for hilo in 0..3u64 {
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..10u64 {
+                let code = format!("c{hilo}{i}");
+                tx.send((code, hilo + i)).expect("receptor caido");
+            }
+        }));
+    }
+    drop(tx);                    // imprescindible: el principal no envía
+
+    let mut total: HashMap&lt;String, u64&gt; = HashMap::new();
+    while let Ok((code, n)) = rx.recv_timeout(Duration::from_secs(1)) {
+        *total.entry(code).or_insert(0) += n;
+    }
+
+    for h in handles {
+        h.join().expect("un hilo ha paniqueado");
+    }
+    println!("{} codigos, {} visitas", total.len(), total.values().sum::&lt;u64&gt;());
+}</code></pre>
+            <pre><code class="language-text">30 codigos, 165 visitas</code></pre>
+            <p>Cada hilo <code>h</code> envía <code>h + i</code> para <code>i</code> de 0 a 9: la suma de <code>i</code> es 45, así que los totales son 45, 55 y 65. Si te sale otra cosa, revisa si estás contando el 10.</p>
+          </li>
+          <li>
+            <strong>Distingue los dos errores.</strong> El <code>while let Ok</code> se traga <code>Timeout</code> y <code>Disconnected</code> por igual: funciona, pero no sabes por qué terminó. Sustitúyelo por un <code>match</code> sobre <code>Err(RecvTimeoutError::Timeout)</code> y <code>Err(RecvTimeoutError::Disconnected)</code>, e imprime un mensaje distinto en cada caso.
+          </li>
+          <li>
+            <strong>Rompe el cierre a propósito.</strong> Comenta el <code>drop(tx)</code> y ejecuta con un límite de tiempo:
+            <pre><code class="language-bash">cargo run          # se queda esperando: el canal sigue abierto
+cargo clippy -- -D warnings</code></pre>
+            <p>Recupera el <code>drop</code> y comprueba que vuelve a terminar. Este es el bug que más veces vas a escribir en tu vida con canales.</p>
+          </li>
+        </ol>
+        <div class="callout callout--tip">
+          <p class="callout__title">Criterio de éxito</p>
+          <p>Sabes explicar por qué el canal se cierra al soltar el último <code>Sender</code>, por qué el receptor no se clona y qué diferencia hay entre <code>Empty</code>, <code>Timeout</code> y <code>Disconnected</code>. Con eso, los canales dejan de ser magia.</p>
+        </div>
+      </section>
+
+      <!-- ============================ 8 · RETO ============================ -->
+      <section id="reto">
+        <h2><span class="section-number">8 ·</span> Reto</h2>
+        <div class="challenge">
+          <h3>🎯 El lote ordenado y con backpressure</h3>
+          <p>El ejemplo real reparte trabajo, pero tiene dos defectos: el canal de tareas es ilimitado (un lote de un millón de URLs se traga la memoria) y los resultados salen desordenados. Construye la versión de producción:</p>
+          <p>Usa <code>sync_channel</code> con una capacidad pequeña para las tareas, de modo que el productor se bloquee si los trabajadores van lentos. Cada trabajo lleva un índice; los resultados viajan con ese índice y el receptor los reordena en un <code>Vec</code> (o los escribe en orden usando un <code>BTreeMap</code> de pendientes). Añade un límite global: si una URL tarda más de lo aceptable, el lote se cancela y los trabajadores terminan sin procesar el resto.</p>
+          <p>Requisitos: nada de <code>unwrap</code>, todos los <code>JoinHandle</code> unidos, y un test que verifique que el resultado mantiene el orden de entrada aunque los trabajadores terminen en otro orden.</p>
+          <p><em>Pista: para cancelar sin inventar mensajes usa el cierre del canal de tareas (suelta el emisor) y un <code>AtomicBool</code> que los trabajadores consulten antes de cada unidad. Y cuidado con la capacidad del <code>sync_channel</code>: si es 0, cada <code>send</code> espera a que alguien recoja, lo que convierte el reparto en un encuentro punto a punto.</em></p>
+        </div>
+      </section>
+
+      <!-- ============================ 9 · RESUMEN ============================ -->
+      <section id="resumen">
+        <h2><span class="section-number">9 ·</span> Resumen</h2>
+        <ul>
+          <li><code>mpsc::channel</code> crea <code>(Sender, Receiver)</code>: muchos emisores, un solo consumidor, cola ilimitada.</li>
+          <li><code>Sender</code> es <code>Clone</code>; <code>Receiver</code> no, porque cada mensaje debe tener un único dueño.</li>
+          <li>El canal se cierra al liberar el último <code>Sender</code>; entonces <code>recv</code> devuelve <code>Err</code> y <code>for m in rx</code> termina.</li>
+          <li><code>sync_channel(n)</code> añade capacidad limitada y <em>backpressure</em>; <code>recv_timeout</code> y <code>try_recv</code> evitan bloqueos indefinidos.</li>
+          <li><code>Empty</code>, <code>Timeout</code> y <code>Disconnected</code> son cosas distintas: solo la última significa «no habrá más».</li>
+          <li>Para varios consumidores: <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code> con el candado solo alrededor de <code>recv</code>, o <code>crossbeam-channel</code>/<code>flume</code>.</li>
+        </ul>
+        <table>
+          <thead><tr><th>Comando</th><th>Qué hace</th></tr></thead>
+          <tbody>
+            <tr><td><code>mpsc::channel()</code></td><td>Crea un canal ilimitado; el tipo se infiere del primer envío.</td></tr>
+            <tr><td><code>tx.send(v)</code></td><td>Envía por valor; <code>Err(SendError)</code> si el receptor ya no existe.</td></tr>
+            <tr><td><code>rx.recv()</code></td><td>Bloquea hasta un mensaje o hasta el cierre del canal.</td></tr>
+            <tr><td><code>rx.recv_timeout(d)</code></td><td>Como <code>recv</code> con fecha límite; distingue <code>Timeout</code> de <code>Disconnected</code>.</td></tr>
+            <tr><td><code>rx.try_recv()</code></td><td>No bloquea: <code>Ok</code>, <code>Empty</code> o <code>Disconnected</code>.</td></tr>
+            <tr><td><code>mpsc::sync_channel(n)</code></td><td>Canal acotado: <code>send</code> bloquea si hay <code>n</code> mensajes sin recoger.</td></tr>
+            <tr><td><code>drop(tx)</code></td><td>Cierra el canal si era el último emisor; señal de fin para el consumidor.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ============================ 10 · FAQ ============================ -->
+      <section id="faq">
+        <h2><span class="section-number">10 ·</span> Preguntas frecuentes</h2>
+
+        <details>
+          <summary>¿Por qué el canal por defecto es ilimitado?</summary>
+          <div>
+            <p>Porque así <code>send</code> nunca bloquea y no puede crear un interbloqueo por sí mismo: el productor siempre avanza. El precio es que la memoria absorbe el desequilibrio entre producción y consumo. En un servidor real casi siempre quieres <code>sync_channel</code> o el <code>mpsc::channel(capacidad)</code> de Tokio, que aplican contrapresión y hacen visible el problema en forma de espera en lugar de consumo creciente.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Si el receptor muere, ¿se pierde el mensaje?</summary>
+          <div>
+            <p>No: <code>send</code> devuelve <code>Err(SendError(msg))</code> con el valor dentro, así que recuperas la propiedad. Ese diseño es muy de Rust: el error no es un código numérico, es el dato que no pudo entregarse. Puedes registrarlo, reintentar en otro canal o descartarlo explícitamente.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿<code>crossbeam-channel</code> es mejor que la biblioteca estándar?</summary>
+          <div>
+            <p>Es más completo: <code>Receiver</code> clonable, <code>select!</code>, canales acotados e ilimitados con la misma API y mejor rendimiento en varios escenarios. La estándar basta cuando hay un consumidor y no necesitas esperar a varios canales. En un pool de trabajo real, <code>crossbeam-channel</code> evita el <code>Mutex</code> alrededor del receptor y suele ser la elección por defecto. <code>flume</code> ofrece lo mismo con una API algo más moderna y variantes <code>async</code>.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>¿Cómo paro un pool de trabajadores con elegancia?</summary>
+          <div>
+            <p>Con el cierre del canal: sueltas el emisor de tareas y cada trabajador termina cuando <code>recv</code> devuelve <code>Err</code>. Si además el trabajo puede ser largo, añade una señal de cancelación (un <code>AtomicBool</code> o un <code>watch</code> en async) que los trabajadores consulten entre unidades, y espera a todos con <code>join</code>. Evita el mensaje <code>Stop</code> por trabajador: es fácil olvidar uno y deja el pool a medias.</p>
+          </div>
+        </details>
+      </section>
+    </article>
+  </main>
+
+  <script>window.SITE_BASE = '../../';</script>
+  <script src="../../assets/js/course-data.js"></script>
+  <script src="../../assets/js/highlight.js"></script>
+  <script src="../../assets/js/site.js"></script>
+</body>
+</html>

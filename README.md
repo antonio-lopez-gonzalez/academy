@@ -51,6 +51,7 @@ buenas prácticas, errores habituales, ejercicio guiado, reto, resumen y pregunt
 | `Aprende RabbitMQ` | RabbitMQ (AMQP, patrones, DLQ, quorum) | 8 | 32 | `proyectos/job-queue` |
 | `Aprende MinIO` | MinIO (S3, buckets, lifecycle, operación) | 8 | 32 | `proyectos/document-store` |
 | `Aprende AI-DLC con Cursor y Claude` | AI-DLC (Cursor + Claude, gates, auditoría) | 9 | 36 | `proyectos/aidlc-lite` |
+| `Aprende Rust` | Rust (ownership, traits, async, Axum) | 8 | 32 | `proyectos/urlshort` |
 
 > Conteos de `web/modulos/`. Cada curso añade además `web/recursos/` (cheatsheet, glosario, FAQ).
 
